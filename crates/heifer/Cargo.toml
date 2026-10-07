@@ -1,0 +1,17 @@
+[package]
+name = "heifer"
+description = "Pure-Rust HEIF/HEIC image decoder and encoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+heifer-isobmff.workspace = true
+heifer-hevc-dec.workspace = true
+heifer-hevc-enc.workspace = true
+
+[lints]
+workspace = true

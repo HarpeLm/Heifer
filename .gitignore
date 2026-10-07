@@ -1,0 +1,3 @@
+target/
+tests/fixtures/*
+!tests/fixtures/.gitkeep
