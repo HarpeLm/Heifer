@@ -223,3 +223,85 @@ fn cabac_starts_on_real_slice_data() {
         }
     }
 }
+
+/// Counts what the parser produces.
+#[derive(Default)]
+struct Counter {
+    cus: u32,
+    blocks: [u32; 3],
+}
+
+impl heifer_hevc_dec::syntax::Sink for Counter {
+    fn transform_block(&mut self, tb: &heifer_hevc_dec::syntax::TransformBlock<'_>) {
+        self.blocks[usize::from(tb.c_idx)] += 1;
+    }
+    fn coding_unit(&mut self, _: &heifer_hevc_dec::syntax::CodingUnit) {
+        self.cus += 1;
+    }
+}
+
+/// Parses all slice data of an item. A desynchronized CABAC decoder cannot end exactly on the
+/// last CTU at the last byte, so this checks the whole syntax and every context table.
+fn parse_all(file: &str, item: u32) -> Option<Counter> {
+    use heifer_hevc_dec::slice::SliceHeader;
+    use heifer_hevc_dec::syntax::{Picture, decode_slice_segment};
+    let stream = bitstream(file, item)?;
+    let nals: Vec<_> = split_annex_b(&stream)
+        .map(|n| NalUnit::parse(n).unwrap())
+        .collect();
+    let mut sets = heifer_hevc_dec::params::ParameterSets::default();
+    for nal in &nals {
+        sets.add(nal).unwrap();
+    }
+    let mut counter = Counter::default();
+    let mut picture = None;
+    for nal in nals.iter().filter(|n| n.header.unit_type.is_slice()) {
+        let header = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, None).unwrap();
+        let (pps, sps) = sets
+            .get(usize::from(header.slice_pic_parameter_set_id))
+            .unwrap();
+        let pic = picture.get_or_insert_with(|| Picture::new(sps, pps));
+        let data = &nal.rbsp[header.header_size..];
+        let qp = header.slice_qp_y(&sets).unwrap();
+        let stats = decode_slice_segment(pic, &header, qp, data, &mut counter)
+            .unwrap_or_else(|e| panic!("{file} item {item}: {e}"));
+        assert_eq!(
+            stats.end_position,
+            data.len(),
+            "{file} item {item}: slice data not fully consumed"
+        );
+    }
+    assert!(
+        picture.unwrap().is_complete(),
+        "{file} item {item}: picture incomplete"
+    );
+    Some(counter)
+}
+
+#[test]
+fn parse_complete_slices() {
+    for (file, item) in [
+        ("single_image.heic", 1002),
+        ("single_image.heic", 1005),
+        ("grid.heic", 1002),
+        ("grid.heic", 1011),
+        ("alpha.heic", 1002),
+        ("alpha.heic", 1008),
+        ("collection.heic", 1020),
+        ("burst.heic", 1366),
+        ("libheif_example.heic", 20004),
+        ("libheif_example.heic", 20005),
+    ] {
+        parse_all(file, item);
+    }
+}
+
+#[test]
+fn single_image_coding_tree_counts() {
+    // Reference counts from this parser, pinned to detect regressions.
+    let Some(c) = parse_all("single_image.heic", 1002) else {
+        return;
+    };
+    assert_eq!(c.cus, 17001);
+    assert_eq!(c.blocks, [46239, 17436, 17436]);
+}

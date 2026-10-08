@@ -7,7 +7,9 @@ pub mod cabac;
 pub mod contexts;
 pub mod nal;
 pub mod params;
+pub mod scan;
 pub mod slice;
+pub mod syntax;
 #[cfg(test)]
 mod testutil;
 
