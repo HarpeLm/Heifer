@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Runs every fuzz target for about 50 minutes every night. The corpus is cached between runs so
+# Runs every fuzz target for about 50 minutes every night, each on its own machine. The corpus is cached between runs so
 # that fuzzing resumes where it stopped. Crashes make the run fail and are uploaded as artifacts.
 on:
   schedule:
@@ -15,6 +15,10 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [hevc, decode, parallel, container, cabac]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -26,10 +30,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            fuzz/corpus
+            fuzz/corpus/${{ matrix.target }}
             tests/conformance
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
 
       - name: Download seed files
         run: |
@@ -39,22 +43,22 @@ jobs:
           ./scripts/fetch-conformance.sh
 
       - name: Fuzz
-        run: ./scripts/fuzz.sh "${{ github.event.inputs.duration || '50m' }}"
+        run: ./scripts/fuzz.sh "${{ github.event.inputs.duration || '50m' }}" ${{ matrix.target }}
 
       - name: Save corpus
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            fuzz/corpus
+            fuzz/corpus/${{ matrix.target }}
             tests/conformance
-          key: fuzz-corpus-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
 
       - name: Upload crashes
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.target }}
           path: |
             fuzz/artifacts
             fuzz/logs

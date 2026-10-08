@@ -4,6 +4,7 @@
 # Usage:
 #   scripts/fuzz.sh            # 8 hours
 #   scripts/fuzz.sh 30m        # any duration: 90s, 30m, 8h, 2d
+#   scripts/fuzz.sh 2h hevc    # a single target, on all cores
 #
 # Stop at any time with Ctrl+C. Interesting inputs accumulate in fuzz/corpus/ (reused by the next
 # run), crashes are written to fuzz/artifacts/<target>/ and logs to fuzz/logs/.
@@ -13,6 +14,7 @@ cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
 duration=${1:-8h}
+only=${2:-}
 case "$duration" in
   *d) seconds=$(( ${duration%d} * 86400 )) ;;
   *h) seconds=$(( ${duration%h} * 3600 )) ;;
@@ -43,9 +45,10 @@ done
 [ -n "$(ls corpus/cabac)" ] || printf '\x1a\x00\x01\x02' > corpus/cabac/seed
 
 # Share cores: the HEVC decoder is the deepest code, the container parser the fastest.
-share() { local n=$(( cores * $1 / 10 )); [ "$n" -lt 1 ] && n=1; echo "$n"; }
+share() { local n=$(( cores * $1 / 10 )); [ -n "$only" ] && n=$cores; [ "$n" -lt 1 ] && n=1; echo "$n"; }
 run() {
   local target=$1 jobs=$2; shift 2
+  [ -n "$only" ] && [ "$only" != "$target" ] && return
   echo "  $target: $jobs process(es)"
   cargo +nightly fuzz run -O -s none "$target" "corpus/$target" -- \
     -fork="$jobs" -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
