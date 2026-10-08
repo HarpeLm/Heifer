@@ -197,3 +197,29 @@ fn libheif_example_wavefront_entry_points() {
     let total: usize = h.entry_point_offsets.iter().map(|&o| o as usize).sum();
     assert!(total + h.header_size < *nal_len);
 }
+
+#[test]
+fn cabac_starts_on_real_slice_data() {
+    use heifer_hevc_dec::cabac::ArithmeticDecoder;
+    use heifer_hevc_dec::contexts::Contexts;
+    use heifer_hevc_dec::slice::SliceHeader;
+    for (file, item) in [
+        ("single_image.heic", 1002),
+        ("grid.heic", 1011),
+        ("libheif_example.heic", 20004),
+    ] {
+        let Some(stream) = bitstream(file, item) else {
+            continue;
+        };
+        let mut sets = heifer_hevc_dec::params::ParameterSets::default();
+        for raw in split_annex_b(&stream) {
+            let nal = NalUnit::parse(raw).unwrap();
+            if !sets.add(&nal).unwrap() && nal.header.unit_type.is_slice() {
+                let h = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, None).unwrap();
+                let _contexts = Contexts::new(h.slice_qp_y(&sets).unwrap());
+                // The first 9 bits of slice data must form a valid initial CABAC offset (< 510).
+                ArithmeticDecoder::new(&nal.rbsp[h.header_size..]).unwrap();
+            }
+        }
+    }
+}

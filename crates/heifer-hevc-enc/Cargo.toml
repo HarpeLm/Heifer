@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+heifer-hevc-dec.workspace = true
 
 
 [lints]

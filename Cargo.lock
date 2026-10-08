@@ -24,6 +24,7 @@ dependencies = [
 name = "heifer-hevc-enc"
 version = "0.0.1"
 dependencies = [
+ "heifer-hevc-dec",
  "thiserror",
 ]
 

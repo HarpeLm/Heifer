@@ -3,6 +3,8 @@
 //! Spec: ITU-T H.265. Only intra coding is needed for still images.
 
 pub mod bitreader;
+pub mod cabac;
+pub mod contexts;
 pub mod nal;
 pub mod params;
 pub mod slice;

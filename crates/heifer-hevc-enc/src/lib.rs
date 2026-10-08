@@ -2,6 +2,8 @@
 //!
 //! Spec: ITU-T H.265. Only intra coding is needed for still images.
 
+pub mod cabac;
+
 /// Errors produced while encoding an image.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
