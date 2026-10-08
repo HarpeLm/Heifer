@@ -5,6 +5,9 @@
 pub mod bitreader;
 pub mod nal;
 pub mod params;
+pub mod slice;
+#[cfg(test)]
+mod testutil;
 
 /// Errors produced while decoding an HEVC bitstream.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

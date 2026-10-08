@@ -114,7 +114,7 @@ fn single_image_parameter_sets() {
         ),
         (2, 5)
     );
-    assert_eq!(sps.num_short_term_ref_pic_sets, 2);
+    assert_eq!(sps.st_rps_num_delta_pocs, vec![0, 0]);
     assert!(sps.sample_adaptive_offset_enabled_flag && sps.strong_intra_smoothing_enabled_flag);
     assert!(sps.vui.is_none());
     assert!(pps.sign_data_hiding_enabled_flag && pps.cabac_init_present_flag);
@@ -142,4 +142,58 @@ fn libheif_example_parameter_sets() {
     );
     assert!(sps.vui.is_some());
     assert!(pps.diff_cu_qp_delta_depth.is_some());
+}
+
+fn slice_headers(
+    file: &str,
+    item: u32,
+) -> Option<Vec<(heifer_hevc_dec::slice::SliceHeader, usize)>> {
+    use heifer_hevc_dec::slice::SliceHeader;
+    let stream = bitstream(file, item)?;
+    let mut sets = heifer_hevc_dec::params::ParameterSets::default();
+    let mut out = Vec::new();
+    for raw in split_annex_b(&stream) {
+        let nal = NalUnit::parse(raw).unwrap();
+        if !sets.add(&nal).unwrap() && nal.header.unit_type.is_slice() {
+            let h = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, None).unwrap();
+            assert_eq!(
+                h.slice_qp_y(&sets).unwrap(),
+                26 + i32::from(h.slice_qp_delta)
+                    + i32::from(sets.get(0).unwrap().0.init_qp_minus26)
+            );
+            out.push((h, raw.len()));
+        }
+    }
+    Some(out)
+}
+
+#[test]
+fn single_image_slice_header() {
+    use heifer_hevc_dec::slice::SliceType;
+    // Values checked against `ffmpeg -bsf:v trace_headers`.
+    let Some(slices) = slice_headers("single_image.heic", 1002) else {
+        return;
+    };
+    assert_eq!(slices.len(), 1);
+    let (h, _) = &slices[0];
+    assert!(h.first_slice_segment_in_pic_flag);
+    assert_eq!(h.slice_type, SliceType::I);
+    assert!(h.slice_sao_luma_flag && h.slice_sao_chroma_flag);
+    assert_eq!(h.slice_qp_delta, 2);
+    assert!(h.entry_point_offsets.is_empty());
+}
+
+#[test]
+fn libheif_example_wavefront_entry_points() {
+    let Some(slices) = slice_headers("libheif_example.heic", 20004) else {
+        return;
+    };
+    let (h, nal_len) = &slices[0];
+    assert_eq!(h.slice_qp_delta, -9);
+    // One entry point per CTB row after the first: 856 / 64 = 14 rows.
+    assert_eq!(h.entry_point_offsets.len(), 13);
+    assert_eq!(h.entry_point_offsets[0], 8266);
+    // Substreams must fit inside the NAL unit.
+    let total: usize = h.entry_point_offsets.iter().map(|&o| o as usize).sum();
+    assert!(total + h.header_size < *nal_len);
 }

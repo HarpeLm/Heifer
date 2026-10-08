@@ -200,15 +200,22 @@ impl ScalingList {
 
 /// Reads one `st_ref_pic_set(stRpsIdx)` (§7.3.7) and returns its `NumDeltaPocs`.
 /// Contents are discarded: they only matter for inter prediction.
-fn skip_st_ref_pic_set(
+///
+/// `num_delta_pocs` holds `NumDeltaPocs` of the SPS sets. `idx == num_delta_pocs.len()` means
+/// the set is coded in a slice header, where `delta_idx_minus1` selects the reference set.
+pub(crate) fn skip_st_ref_pic_set(
     r: &mut BitReader<'_>,
     idx: usize,
     num_delta_pocs: &[u32],
 ) -> Result<u32, Error> {
     let inter_ref_pic_set_prediction_flag = idx != 0 && r.flag()?;
     if inter_ref_pic_set_prediction_flag {
-        // In an SPS, the reference set is always the previous one (delta_idx_minus1 is only in slice headers).
-        let ref_num = num_delta_pocs[idx - 1];
+        let delta_idx = if idx == num_delta_pocs.len() {
+            r.ue_max(idx as u32 - 1, "delta_idx_minus1")? as usize + 1
+        } else {
+            1
+        };
+        let ref_num = num_delta_pocs[idx - delta_idx];
         r.flag()?; // delta_rps_sign
         r.ue_max(32767, "abs_delta_rps_minus1")?;
         let mut count = 0;
@@ -442,10 +449,13 @@ pub struct Sps {
     pub sample_adaptive_offset_enabled_flag: bool,
     /// PCM parameters, if `pcm_enabled_flag` is set.
     pub pcm: Option<Pcm>,
-    /// `num_short_term_ref_pic_sets`, needed to parse slice headers.
-    pub num_short_term_ref_pic_sets: u8,
+    /// `NumDeltaPocs` of each short-term reference picture set; its length is
+    /// `num_short_term_ref_pic_sets`. Needed to parse slice headers.
+    pub st_rps_num_delta_pocs: Vec<u32>,
     /// `long_term_ref_pics_present_flag`.
     pub long_term_ref_pics_present_flag: bool,
+    /// `num_long_term_ref_pics_sps`, needed to parse slice headers.
+    pub num_long_term_ref_pics_sps: u8,
     /// `sps_temporal_mvp_enabled_flag`.
     pub sps_temporal_mvp_enabled_flag: bool,
     /// `strong_intra_smoothing_enabled_flag`.
@@ -560,9 +570,10 @@ impl Sps {
             num_delta_pocs.push(n);
         }
         let long_term_ref_pics_present_flag = r.flag()?;
+        let mut num_long_term_ref_pics_sps = 0;
         if long_term_ref_pics_present_flag {
-            let n = r.ue_max(32, "num_long_term_ref_pics_sps")?;
-            for _ in 0..n {
+            num_long_term_ref_pics_sps = r.ue_max(32, "num_long_term_ref_pics_sps")? as u8;
+            for _ in 0..num_long_term_ref_pics_sps {
                 r.skip(usize::from(log2_max_pic_order_cnt_lsb) + 1)?;
             }
         }
@@ -616,8 +627,9 @@ impl Sps {
             amp_enabled_flag,
             sample_adaptive_offset_enabled_flag,
             pcm,
-            num_short_term_ref_pic_sets: num_short_term_ref_pic_sets as u8,
+            st_rps_num_delta_pocs: num_delta_pocs,
             long_term_ref_pics_present_flag,
+            num_long_term_ref_pics_sps,
             sps_temporal_mvp_enabled_flag,
             strong_intra_smoothing_enabled_flag,
             vui,
@@ -1005,61 +1017,17 @@ impl ParameterSets {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::testutil::BitWriter;
 
-    /// Writes bits MSB-first, with Exp-Golomb helpers, to build test parameter sets.
-    #[derive(Default)]
-    struct BitWriter {
-        bytes: Vec<u8>,
-        n: usize,
-    }
-
-    impl BitWriter {
-        fn bit(&mut self, b: bool) -> &mut Self {
-            if self.n % 8 == 0 {
-                self.bytes.push(0);
-            }
-            if b {
-                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.n % 8);
-            }
-            self.n += 1;
-            self
-        }
-        fn bits(&mut self, v: u32, n: u32) -> &mut Self {
-            for i in (0..n).rev() {
-                self.bit(i < 32 && (v >> i) & 1 == 1);
-            }
-            self
-        }
-        fn ue(&mut self, v: u32) -> &mut Self {
-            let x = v + 1;
-            let len = 32 - x.leading_zeros();
-            self.bits(0, len - 1).bits(x, len)
-        }
-        fn se(&mut self, v: i32) -> &mut Self {
-            self.ue(if v > 0 {
-                2 * v as u32 - 1
-            } else {
-                (-2 * v) as u32
-            })
-        }
-        fn finish(&mut self) -> Vec<u8> {
-            self.bit(true);
-            while self.n % 8 != 0 {
-                self.bit(false);
-            }
-            std::mem::take(&mut self.bytes)
-        }
-    }
-
-    fn ptl(w: &mut BitWriter) {
+    pub(crate) fn ptl(w: &mut BitWriter) {
         w.bits(0, 2).bit(false).bits(1, 5).bits(0x6000_0000, 32);
         w.bits(0, 4 + 43 + 1).bits(93, 8);
     }
 
     /// A small SPS: 4:2:0, 64×48 cropped to 62×46, 8 bits, CTB 32, no tools.
-    fn small_sps() -> Vec<u8> {
+    pub(crate) fn small_sps() -> Vec<u8> {
         let mut w = BitWriter::default();
         w.bits(0, 4).bits(0, 3).bit(true);
         ptl(&mut w);
@@ -1098,7 +1066,7 @@ mod tests {
         );
         assert!(sps.sample_adaptive_offset_enabled_flag);
         assert!(sps.strong_intra_smoothing_enabled_flag);
-        assert_eq!(sps.num_short_term_ref_pic_sets, 1);
+        assert_eq!(sps.st_rps_num_delta_pocs, vec![1]);
     }
 
     #[test]

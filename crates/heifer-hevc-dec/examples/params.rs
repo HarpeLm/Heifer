@@ -1,17 +1,27 @@
-//! Prints the parameter sets of an HEVC Annex B file (`.h265`) using the spec's field names,
+//! Prints the parameter sets and slice headers of an HEVC Annex B file (`.h265`) using the spec's field names,
 //! in the same `name = value` form as `ffmpeg -bsf:v trace_headers`, for comparison.
 //!
 //! Usage: cargo run -p heifer-hevc-dec --example params -- <file.h265>
 
 use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;
+use heifer_hevc_dec::slice::{SliceHeader, SliceType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("usage: params <file.h265>")?;
     let stream = std::fs::read(path)?;
     let mut sets = ParameterSets::default();
+    let mut slices = Vec::new();
     for nal in split_annex_b(&stream) {
-        sets.add(&NalUnit::parse(nal)?)?;
+        let nal = NalUnit::parse(nal)?;
+        if !sets.add(&nal)? && nal.header.unit_type.is_slice() {
+            let previous = slices
+                .iter()
+                .rev()
+                .find(|s: &&SliceHeader| !s.dependent_slice_segment_flag);
+            let header = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, previous)?;
+            slices.push(header);
+        }
     }
 
     let p = |name: &str, value: &dyn std::fmt::Display| println!("{name} = {value}");
@@ -76,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         p("pcm_enabled_flag", &b(sps.pcm.is_some()));
         p(
             "num_short_term_ref_pic_sets",
-            &sps.num_short_term_ref_pic_sets,
+            &sps.st_rps_num_delta_pocs.len(),
         );
         p(
             "long_term_ref_pics_present_flag",
@@ -185,6 +195,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "slice_segment_header_extension_present_flag",
             &b(pps.slice_segment_header_extension_present_flag),
         );
+    }
+    for s in &slices {
+        p(
+            "first_slice_segment_in_pic_flag",
+            &b(s.first_slice_segment_in_pic_flag),
+        );
+        p(
+            "no_output_of_prior_pics_flag",
+            &b(s.no_output_of_prior_pics_flag),
+        );
+        p("slice_pic_parameter_set_id", &s.slice_pic_parameter_set_id);
+        let slice_type = match s.slice_type {
+            SliceType::B => 0,
+            SliceType::P => 1,
+            SliceType::I => 2,
+        };
+        p("slice_type", &slice_type);
+        p("slice_sao_luma_flag", &b(s.slice_sao_luma_flag));
+        p("slice_sao_chroma_flag", &b(s.slice_sao_chroma_flag));
+        p("slice_qp_delta", &s.slice_qp_delta);
+        p(
+            "slice_loop_filter_across_slices_enabled_flag",
+            &b(s.slice_loop_filter_across_slices_enabled_flag),
+        );
+        if !s.entry_point_offsets.is_empty() {
+            p("num_entry_point_offsets", &s.entry_point_offsets.len());
+            for (i, o) in s.entry_point_offsets.iter().enumerate() {
+                p(&format!("entry_point_offset_minus1[{i}]"), &(o - 1));
+            }
+        }
+        p("# SliceQpY", &s.slice_qp_y(&sets)?);
+        p("# header_size_bytes", &s.header_size);
     }
     Ok(())
 }
