@@ -29,6 +29,8 @@ jobs:
       # No wasm-opt here: Ubuntu's binaryen breaks wasm-bindgen's externref table
       # ("WebAssembly.Table.grow(): failed to grow table") and the decoder never starts.
       - run: ./scripts/build-demo.sh
+      - name: Version the decoder files (avoids stale browser caches)
+        run: sed -i "s/const VERSION = \"dev\"/const VERSION = \"${GITHUB_SHA::8}\"/" demo/web/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: demo/web

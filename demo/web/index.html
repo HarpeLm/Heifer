@@ -185,11 +185,16 @@ heifer = <span class="s">"0.1"</span>
 </div>
 
 <script type="module">
-  import init, { decode } from "./pkg/heifer_demo.js";
+  // Replaced by the commit hash when deployed, so browsers never mix cached and new decoder files.
+  const VERSION = "dev";
+  let decode;
   const $ = id => document.getElementById(id);
   const status = $("status"), canvas = $("canvas"), save = $("save"), drop = $("drop"), result = $("result"), stats = $("stats");
   let name = "image";
-  const ready = init().then(
+  const ready = import(`./pkg/heifer_demo.js?v=${VERSION}`).then(m => {
+    decode = m.decode;
+    return m.default({ module_or_path: `./pkg/heifer_demo_bg.wasm?v=${VERSION}` });
+  }).then(
     () => { status.textContent = "Ready. Nothing is uploaded: decoding happens in this tab."; },
     e => { status.className = "error"; status.textContent = `The decoder failed to load: ${e.message ?? e}`; throw e; },
   );
