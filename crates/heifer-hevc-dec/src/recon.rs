@@ -388,33 +388,51 @@ impl<'a> Reconstructor<'a> {
         let mut refs = [0i32; 4 * 32 + 1];
         let mut avail = [false; 4 * 32 + 1];
         let (refs, avail) = (&mut refs[..total], &mut avail[..total]);
-        let pos = |i: usize| -> (i64, i64) {
-            if i < 2 * n {
-                (i64::from(x0) - 1, i64::from(y0) + (2 * n - 1 - i) as i64)
-            } else {
-                (i64::from(x0) + (i - 2 * n) as i64 - 1, i64::from(y0) - 1)
-            }
-        };
         let mut any = false;
-        // Availability only changes between 4×4 luma blocks: reuse it within a block.
-        let mut cached: Option<((i64, i64), bool)> = None;
-        for i in 0..total {
-            let (xc, yc) = pos(i);
-            let (xn, yn) = (xc * i64::from(sw), yc * i64::from(sh));
-            let key = (xn >> 2, yn >> 2);
-            let ok = match cached {
-                Some((k, ok)) if k == key => ok,
-                _ => {
-                    let ok = self.available(xl, yl, xn, yn);
-                    cached = Some((key, ok));
-                    ok
+        // Availability is decided per 4×4 luma block, i.e. per run of `unit_x` (`unit_y`)
+        // samples of this component along the top row (left column).
+        let (unit_x, unit_y) = ((4 / sw).max(1) as usize, (4 / sh).max(1) as usize);
+        let (sw64, sh64) = (i64::from(sw), i64::from(sh));
+        let (x0u, y0u) = (x0 as usize, y0 as usize);
+        let available = |xc: i64, yc: i64| self.available(xl, yl, xc * sw64, yc * sh64);
+        // Left column, rows y0..y0+2n, stored from index 2n-1 downwards.
+        let mut k = 0;
+        while k < 2 * n {
+            let y = y0u + k;
+            let len = (unit_y - y % unit_y).min(2 * n - k);
+            if available(i64::from(x0) - 1, y as i64) {
+                for j in 0..len {
+                    refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
+                    avail[2 * n - 1 - k - j] = true;
                 }
-            };
-            if ok {
-                refs[i] = i32::from(plane[yc as usize * stride + xc as usize]);
-                avail[i] = true;
                 any = true;
             }
+            k += len;
+        }
+        // Corner.
+        if available(i64::from(x0) - 1, i64::from(y0) - 1) {
+            refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
+            avail[2 * n] = true;
+            any = true;
+        }
+        // Top row, columns x0..x0+2n, contiguous in the plane.
+        let mut k = 0;
+        while k < 2 * n {
+            let x = x0u + k;
+            let len = (unit_x - x % unit_x).min(2 * n - k);
+            if available(x as i64, i64::from(y0) - 1) {
+                let row = (y0u - 1) * stride + x;
+                for ((r, a), &v) in refs[2 * n + 1 + k..2 * n + 1 + k + len]
+                    .iter_mut()
+                    .zip(&mut avail[2 * n + 1 + k..])
+                    .zip(&plane[row..row + len])
+                {
+                    *r = i32::from(v);
+                    *a = true;
+                }
+                any = true;
+            }
+            k += len;
         }
         if !any {
             refs.fill(1 << (bit_depth - 1));
