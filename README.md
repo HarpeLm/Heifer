@@ -57,7 +57,7 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 
 - **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
-- **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed every night.
+- **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
@@ -150,7 +150,7 @@ the Range Extensions:
 ### Robustness
 
 Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets with HEIF/HEVC dictionaries run
-every night on GitHub Actions: full decoding, container parsing, HEVC decoding, a parallel-vs-sequential
+around the clock on GitHub Actions (5h15 sessions every 6 hours): full decoding, container parsing, HEVC decoding, a parallel-vs-sequential
 differential check and a CABAC round trip. Fuzzing already found and fixed a memory exhaustion bug.
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Real-world compatibility
