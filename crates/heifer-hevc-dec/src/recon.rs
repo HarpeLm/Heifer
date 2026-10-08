@@ -199,8 +199,8 @@ impl<'a> Reconstructor<'a> {
         });
     }
 
-    /// Applies the in-loop filters (unless `skip_filters`) and returns the picture cropped to
-    /// its conformance window.
+    /// Applies the in-loop filters (unless `skip_filters`) and returns the decoded picture,
+    /// uncropped (see [`Frame::cropped`]).
     pub fn finish(mut self, skip_filters: bool) -> Frame {
         if !skip_filters {
             filters::deblock(
@@ -218,7 +218,7 @@ impl<'a> Reconstructor<'a> {
                 &self.layout,
             );
         }
-        self.frame.cropped(self.sps)
+        self.frame
     }
 
     /// Marks block edges (left and top) for the deblocking filter.
@@ -262,7 +262,21 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (§8.4.4.2).
-    fn predict(&self, c: usize, x0: u32, y0: u32, n: usize, mode: u8, pred: &mut [i32]) {
+    #[allow(clippy::too_many_arguments)]
+    fn predict(
+        &self,
+        c: usize,
+        x0: u32,
+        y0: u32,
+        n: usize,
+        mode: u8,
+        transquant_bypass: bool,
+        pred: &mut [i32],
+    ) {
+        // disableIntraBoundaryFilter (range extension).
+        let boundary_filters = c == 0
+            && n < 32
+            && !(self.sps.range_extension.implicit_rdpcm_enabled_flag && transquant_bypass);
         let (sw, sh) = if c == 0 {
             (1, 1)
         } else {
@@ -376,7 +390,7 @@ impl<'a> Reconstructor<'a> {
                 let sum: i32 = (0..n_i).map(|i| top(&refs, i) + left(&refs, i)).sum();
                 let dc = (sum + n_i) >> (log2n + 1);
                 pred[..n * n].fill(dc);
-                if c == 0 && n < 32 {
+                if boundary_filters {
                     pred[0] = (left(&refs, 0) + 2 * dc + top(&refs, 0) + 2) >> 2;
                     for x in 1..n_i {
                         pred[x as usize] = (top(&refs, x) + 3 * dc + 2) >> 2;
@@ -437,7 +451,7 @@ impl<'a> Reconstructor<'a> {
                         pred[(y * n_i + x) as usize] = v;
                     }
                 }
-                if c == 0 && n < 32 {
+                if boundary_filters {
                     let corner = refs[2 * n];
                     if mode == 26 {
                         for y in 0..n_i {
@@ -485,12 +499,43 @@ impl<'a> Reconstructor<'a> {
         i32::from(list.lists[size_id][matrix_id][i])
     }
 
+    /// Range extension tools for blocks coded without transform (transform skip or
+    /// transquant bypass): 180° rotation of 4×4 blocks, then implicit RDPCM for intra
+    /// horizontal/vertical blocks (residual accumulated along the prediction direction).
+    fn rotate_and_rdpcm(&self, tb: &TransformBlock<'_>, r: &mut [i32]) {
+        let n = 1usize << tb.log2_size;
+        let ext = &self.sps.range_extension;
+        if ext.transform_skip_rotation_enabled_flag && n == 4 {
+            r.reverse();
+        }
+        if ext.implicit_rdpcm_enabled_flag {
+            match tb.intra_mode {
+                10 => {
+                    for y in 0..n {
+                        for x in 1..n {
+                            r[y * n + x] += r[y * n + x - 1];
+                        }
+                    }
+                }
+                26 => {
+                    for y in 1..n {
+                        for x in 0..n {
+                            r[y * n + x] += r[(y - 1) * n + x];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Computes the residual of a block from its coefficients (§8.6.2 to §8.6.4).
     fn residual(&self, tb: &TransformBlock<'_>, coeffs: &[i32], out: &mut [i32]) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         if tb.transquant_bypass {
             out[..n * n].copy_from_slice(&coeffs[..n * n]);
+            self.rotate_and_rdpcm(tb, &mut out[..n * n]);
             return;
         }
         let bit_depth = i32::from(self.frame.bit_depth[usize::from(c > 0)]);
@@ -558,9 +603,10 @@ impl<'a> Reconstructor<'a> {
         let bd_shift2 = 20 - bit_depth;
         if tb.transform_skip {
             let ts_shift = 5 + i32::from(tb.log2_size);
-            for i in 0..n * n {
-                out[i] = ((d[i] << ts_shift) + (1 << (bd_shift2 - 1))) >> bd_shift2;
+            for (o, &v) in out.iter_mut().zip(&d) {
+                *o = ((v << ts_shift) + (1 << (bd_shift2 - 1))) >> bd_shift2;
             }
+            self.rotate_and_rdpcm(tb, &mut out[..n * n]);
             return;
         }
 
@@ -593,7 +639,15 @@ impl<'a> Reconstructor<'a> {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         let mut pred = vec![0i32; n * n];
-        self.predict(c, tb.x, tb.y, n, tb.intra_mode, &mut pred);
+        self.predict(
+            c,
+            tb.x,
+            tb.y,
+            n,
+            tb.intra_mode,
+            tb.transquant_bypass,
+            &mut pred,
+        );
 
         let mut residual = vec![0i32; n * n];
         if let Some(coeffs) = tb.coeffs {

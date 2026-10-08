@@ -11,6 +11,7 @@ pub mod nal;
 pub mod params;
 pub mod recon;
 pub mod scan;
+pub mod sei;
 pub mod slice;
 pub mod syntax;
 #[cfg(test)]
@@ -28,4 +29,7 @@ pub enum Error {
     /// A feature that is not implemented yet.
     #[error("not implemented: {0}")]
     Unimplemented(&'static str),
+    /// The decoded picture differs from the hash sent in the stream.
+    #[error("decoded picture does not match its {0} hash")]
+    HashMismatch(&'static str),
 }

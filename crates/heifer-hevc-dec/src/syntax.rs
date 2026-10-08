@@ -213,15 +213,12 @@ pub fn decode_slice_segment(
     data: &[u8],
     sink: &mut impl Sink,
 ) -> Result<SliceStats, Error> {
-    if pic
-        .sps
-        .range_extension
-        .persistent_rice_adaptation_enabled_flag
-        || pic.sps.range_extension.cabac_bypass_alignment_enabled_flag
-        || pic.sps.range_extension.implicit_rdpcm_enabled_flag
+    if pic.sps.range_extension.cabac_bypass_alignment_enabled_flag
         || pic.sps.range_extension.extended_precision_processing_flag
     {
-        return Err(Error::Unimplemented("range extension coding tools"));
+        return Err(Error::Unimplemented(
+            "range extension tools: CABAC bypass alignment, extended precision",
+        ));
     }
     let (sps, pps) = (pic.sps, pic.pps);
     let mut p = Parser {
@@ -833,8 +830,10 @@ impl Parser<'_, '_> {
         };
         if self.sps.chroma_array_type() == 2 {
             // Table 8-3: 4:2:2 mode mapping.
+            // Chroma has half the horizontal resolution: horizontal-ish angles are doubled and
+            // vertical-ish ones halved, then rounded to the nearest mode.
             const MAP_422: [u8; 35] = [
-                0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24,
+                0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24,
                 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
             ];
             MAP_422[usize::from(mode)]
@@ -1196,8 +1195,19 @@ impl Parser<'_, '_> {
 
         let sb_width = 1usize << log2_sb;
         let mut coded_sb = [[false; 8]; 8];
+        // Implicit RDPCM (intra, horizontal/vertical, no transform) disables sign hiding.
+        let implicit_rdpcm = self.sps.range_extension.implicit_rdpcm_enabled_flag
+            && (transform_skip || self.cu_transquant_bypass)
+            && (intra_mode == 10 || intra_mode == 26);
         let sign_hiding_allowed =
-            self.pps.sign_data_hiding_enabled_flag && !self.cu_transquant_bypass;
+            self.pps.sign_data_hiding_enabled_flag && !self.cu_transquant_bypass && !implicit_rdpcm;
+        // Persistent Rice adaptation (§9.3.3.11): statistics per sub-block type.
+        let persistent_rice = self
+            .sps
+            .range_extension
+            .persistent_rice_adaptation_enabled_flag;
+        let sb_type =
+            2 * usize::from(luma) + usize::from(transform_skip || self.cu_transquant_bypass);
         let ts_ctx = self.sps.range_extension.transform_skip_context_enabled_flag
             && (transform_skip || self.cu_transquant_bypass);
         // `greater1Ctx` of the last coded sub-block; starts at 1 so the first sub-block is unaffected.
@@ -1302,7 +1312,12 @@ impl Parser<'_, '_> {
             }
 
             // coeff_abs_level_remaining and final levels.
-            let mut rice: u32 = 0;
+            let mut rice: u32 = if persistent_rice {
+                u32::from(self.ctx.stat_coeff[sb_type] / 4)
+            } else {
+                0
+            };
+            let mut first_remaining = true;
             let mut sum_abs: i64 = 0;
             for k in 0..n_sig {
                 let base = 1 + i32::from(greater1[k]) + i32::from(first_g1 == Some(k) && greater2);
@@ -1314,11 +1329,25 @@ impl Parser<'_, '_> {
                 let mut abs = base;
                 if base == threshold {
                     let rem = self.coeff_abs_level_remaining(rice)?;
+                    if persistent_rice && first_remaining {
+                        let stat = &mut self.ctx.stat_coeff[sb_type];
+                        if rem >= (3 << (*stat / 4)) {
+                            *stat += 1;
+                        } else if 2 * rem < (1 << (*stat / 4)) && *stat > 0 {
+                            *stat -= 1;
+                        }
+                    }
+                    first_remaining = false;
                     abs = base
                         .checked_add(rem as i32)
                         .ok_or(Error::Invalid("coefficient overflow"))?;
                     if abs > 3 * (1 << rice) {
-                        rice = (rice + 1).min(4);
+                        // Capped at 4 unless persistent Rice adaptation is enabled (§9.3.3.11).
+                        rice = if persistent_rice {
+                            rice + 1
+                        } else {
+                            (rice + 1).min(4)
+                        };
                     }
                 }
                 let (xp, yp) = pos_scan[usize::from(sig[k])];

@@ -1,9 +1,11 @@
 //! Decoding of a complete still picture from an HEVC Annex B bitstream.
 
 use crate::Error;
+use crate::nal::NalUnitType;
 use crate::nal::{NalUnit, split_annex_b};
 use crate::params::ParameterSets;
 use crate::recon::{Frame, Reconstructor};
+use crate::sei::{PictureHash, parse_picture_hash};
 use crate::slice::SliceHeader;
 use crate::syntax::{Picture, decode_slice_segment};
 
@@ -12,26 +14,66 @@ use crate::syntax::{Picture, decode_slice_segment};
 pub struct DecodeOptions {
     /// Skip the in-loop filters (deblocking and SAO). Useful for debugging.
     pub skip_loop_filters: bool,
+    /// Check the decoded picture against the hash SEI message, when the stream has one, and
+    /// fail with [`Error::HashMismatch`] if it differs.
+    pub verify_hash: bool,
+}
+
+/// Result of the decoded picture hash check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashCheck {
+    /// The stream has no decoded picture hash for this picture, or checking was not requested.
+    NotChecked,
+    /// The decoded picture matches the hash (MD5, CRC or checksum).
+    Verified(&'static str),
 }
 
 /// Decodes the first picture of an HEVC Annex B bitstream (as produced by
 /// `heifer_isobmff::HeifFile::hevc_bitstream`), cropped to its conformance window.
 pub fn decode_picture(stream: &[u8], options: DecodeOptions) -> Result<Frame, Error> {
+    decode_picture_checked(stream, options).map(|(frame, _)| frame)
+}
+
+/// Like [`decode_picture`], also reporting whether the decoded picture hash was verified.
+pub fn decode_picture_checked(
+    stream: &[u8],
+    options: DecodeOptions,
+) -> Result<(Frame, HashCheck), Error> {
     let nals: Vec<NalUnit<'_>> = split_annex_b(stream)
         .map(NalUnit::parse)
         .collect::<Result<_, _>>()?;
+    // Parameter sets are activated in stream order: those sent before the first slice are
+    // used for the first picture (later ones may redefine the same IDs for following pictures).
     let mut sets = ParameterSets::default();
-    for nal in &nals {
+    for nal in nals.iter().take_while(|n| !n.header.unit_type.is_slice()) {
         sets.add(nal)?;
     }
 
     let mut state: Option<(Picture<'_>, Reconstructor<'_>)> = None;
     let mut previous: Option<SliceHeader> = None;
-    for nal in nals.iter().filter(|n| n.header.unit_type.is_slice()) {
-        let header = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, previous.as_ref())?;
-        if header.first_slice_segment_in_pic_flag && state.is_some() {
+    let mut hash: Option<PictureHash> = None;
+    for nal in &nals {
+        match nal.header.unit_type {
+            // The hash of a picture is sent in a suffix SEI after its slices.
+            NalUnitType::SuffixSei if state.is_some() && hash.is_none() && options.verify_hash => {
+                let components = if sets.sps.iter().flatten().any(|s| s.chroma_format_idc == 0) {
+                    1
+                } else {
+                    3
+                };
+                hash = parse_picture_hash(&nal.rbsp, components)?;
+                continue;
+            }
+            t if !t.is_slice() => continue,
+            _ => {}
+        }
+        // first_slice_segment_in_pic_flag is the first bit: stop before parsing the next
+        // picture's header, which may use inter prediction.
+        let first_in_pic = nal.rbsp.first().is_some_and(|b| b & 0x80 != 0);
+        if first_in_pic && state.is_some() {
             break; // Only the first picture is decoded.
         }
+        let header = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, previous.as_ref())?;
         let (pps, sps) = sets.get(usize::from(header.slice_pic_parameter_set_id))?;
         let (pic, recon) =
             state.get_or_insert_with(|| (Picture::new(sps, pps), Reconstructor::new(sps, pps)));
@@ -49,5 +91,16 @@ pub fn decode_picture(stream: &[u8], options: DecodeOptions) -> Result<Frame, Er
     if !pic.is_complete() {
         return Err(Error::Invalid("picture is incomplete"));
     }
-    Ok(recon.finish(options.skip_loop_filters))
+    let sps = pic.sps;
+    let frame = recon.finish(options.skip_loop_filters);
+    let check = match &hash {
+        Some(expected) if !options.skip_loop_filters => {
+            if expected.compute_like(&frame) != *expected {
+                return Err(Error::HashMismatch(expected.kind()));
+            }
+            HashCheck::Verified(expected.kind())
+        }
+        _ => HashCheck::NotChecked,
+    };
+    Ok((frame.cropped(sps), check))
 }

@@ -144,7 +144,7 @@ impl SliceHeader {
                 let num_sets = sps.st_rps_num_delta_pocs.len();
                 let short_term_ref_pic_set_sps_flag = r.flag()?;
                 if !short_term_ref_pic_set_sps_flag {
-                    skip_st_ref_pic_set(&mut r, num_sets, &sps.st_rps_num_delta_pocs)?;
+                    skip_st_ref_pic_set(&mut r, num_sets, &sps.st_rps_num_delta_pocs, true)?;
                 } else if num_sets > 1 {
                     let bits = usize::BITS - (num_sets - 1).leading_zeros();
                     r.skip(bits as usize)?; // short_term_ref_pic_set_idx

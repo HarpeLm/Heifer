@@ -201,16 +201,18 @@ impl ScalingList {
 /// Reads one `st_ref_pic_set(stRpsIdx)` (§7.3.7) and returns its `NumDeltaPocs`.
 /// Contents are discarded: they only matter for inter prediction.
 ///
-/// `num_delta_pocs` holds `NumDeltaPocs` of the SPS sets. `idx == num_delta_pocs.len()` means
-/// the set is coded in a slice header, where `delta_idx_minus1` selects the reference set.
+/// `num_delta_pocs` holds `NumDeltaPocs` of the sets decoded so far. In a slice header
+/// (`in_slice_header`), `delta_idx_minus1` selects the reference set; in the SPS it is always
+/// the previous set.
 pub(crate) fn skip_st_ref_pic_set(
     r: &mut BitReader<'_>,
     idx: usize,
     num_delta_pocs: &[u32],
+    in_slice_header: bool,
 ) -> Result<u32, Error> {
     let inter_ref_pic_set_prediction_flag = idx != 0 && r.flag()?;
     if inter_ref_pic_set_prediction_flag {
-        let delta_idx = if idx == num_delta_pocs.len() {
+        let delta_idx = if in_slice_header {
             r.ue_max(idx as u32 - 1, "delta_idx_minus1")? as usize + 1
         } else {
             1
@@ -566,7 +568,7 @@ impl Sps {
         let num_short_term_ref_pic_sets = r.ue_max(64, "num_short_term_ref_pic_sets")? as usize;
         let mut num_delta_pocs = Vec::with_capacity(num_short_term_ref_pic_sets);
         for i in 0..num_short_term_ref_pic_sets {
-            let n = skip_st_ref_pic_set(&mut r, i, &num_delta_pocs)?;
+            let n = skip_st_ref_pic_set(&mut r, i, &num_delta_pocs, false)?;
             num_delta_pocs.push(n);
         }
         let long_term_ref_pics_present_flag = r.flag()?;

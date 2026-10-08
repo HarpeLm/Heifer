@@ -1,3 +1,4 @@
 target/
 tests/fixtures/*
 !tests/fixtures/.gitkeep
+tests/conformance/

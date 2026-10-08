@@ -68,29 +68,36 @@ contexts! {
     RES_SCALE_SIGN_FLAG: [154, 154],
 }
 
-/// All CABAC contexts of an I slice.
+/// All CABAC contexts of an I slice, plus the Rice parameter statistics, which are saved and
+/// restored together with them (§9.3.2.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Contexts(pub [ContextModel; ctx::COUNT]);
+pub struct Contexts {
+    /// Context variables, indexed by the offsets in [`ctx`].
+    pub models: [ContextModel; ctx::COUNT],
+    /// `StatCoeff[sbType]` for persistent Rice adaptation (range extension).
+    pub stat_coeff: [u8; 4],
+}
 
 impl Contexts {
     /// Initializes every context for the given `SliceQpY` (§9.3.2.2).
     pub fn new(slice_qp_y: i32) -> Self {
-        Self(core::array::from_fn(|i| {
-            ContextModel::new(INIT_VALUES[i], slice_qp_y)
-        }))
+        Self {
+            models: core::array::from_fn(|i| ContextModel::new(INIT_VALUES[i], slice_qp_y)),
+            stat_coeff: [0; 4],
+        }
     }
 }
 
 impl core::ops::Index<usize> for Contexts {
     type Output = ContextModel;
     fn index(&self, i: usize) -> &ContextModel {
-        &self.0[i]
+        &self.models[i]
     }
 }
 
 impl core::ops::IndexMut<usize> for Contexts {
     fn index_mut(&mut self, i: usize) -> &mut ContextModel {
-        &mut self.0[i]
+        &mut self.models[i]
     }
 }
 

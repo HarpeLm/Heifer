@@ -337,6 +337,7 @@ fn reconstruction_matches_ffmpeg_without_loop_filters() {
             &stream,
             DecodeOptions {
                 skip_loop_filters: true,
+                ..Default::default()
             },
         )
         .unwrap();
