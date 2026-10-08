@@ -92,13 +92,21 @@ impl ContextModel {
 /// Reads RBSP data (emulation prevention bytes already removed). Bits past the end of the
 /// data are read as zeros, as can legitimately happen at the very end of a slice; reading far
 /// beyond is reported as an error by [`ArithmeticDecoder::check_overrun`].
+///
+/// `ivlOffset` is kept scaled by `1 << 7` in `value`, with up to seven stream bits read ahead
+/// below it: data is fetched a byte at a time and renormalization is a single shift.
+/// Comparing `value` with `range << 7` is the same as comparing `ivlOffset` with `range`,
+/// since the bits read ahead are below its resolution.
 #[derive(Debug, Clone)]
 pub struct ArithmeticDecoder<'a> {
     data: &'a [u8],
-    /// Position of the next bit to read.
-    pos: usize,
+    /// Next byte of `data` to fetch.
+    next: usize,
     range: u32,
-    offset: u32,
+    /// `ivlOffset << 7`, plus the bits read ahead.
+    value: u32,
+    /// Minus one minus the number of bits read ahead; a byte is fetched when it reaches 0.
+    bits_needed: i32,
 }
 
 impl<'a> ArithmeticDecoder<'a> {
@@ -106,68 +114,92 @@ impl<'a> ArithmeticDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, Error> {
         let mut d = Self {
             data,
-            pos: 0,
+            next: 0,
             range: 510,
-            offset: 0,
+            value: 0,
+            bits_needed: -8,
         };
-        for _ in 0..9 {
-            d.offset = (d.offset << 1) | d.read_bit();
-        }
-        if d.offset >= 510 {
+        d.value = (d.fetch() << 8) | d.fetch();
+        if d.value >> 7 >= 510 {
             return Err(Error::Invalid("CABAC initial offset must be < 510"));
         }
         Ok(d)
     }
 
-    #[inline]
-    fn read_bit(&mut self) -> u32 {
-        let bit = self
-            .data
-            .get(self.pos / 8)
-            .map_or(0, |b| u32::from(b >> (7 - self.pos % 8)) & 1);
-        self.pos += 1;
-        bit
+    /// Next byte, or zero past the end of the data.
+    #[inline(always)]
+    fn fetch(&mut self) -> u32 {
+        let byte = self.data.get(self.next).copied().unwrap_or(0);
+        self.next += 1;
+        u32::from(byte)
     }
 
-    #[inline]
-    fn renormalize(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.read_bit();
+    /// Number of bits of the data consumed by `ivlOffset` so far.
+    fn bit_position(&self) -> usize {
+        (self.next * 8).saturating_sub((-self.bits_needed - 1) as usize)
+    }
+
+    /// Shifts one more bit into `ivlOffset`.
+    #[inline(always)]
+    fn shift_one(&mut self) {
+        self.value <<= 1;
+        self.bits_needed += 1;
+        if self.bits_needed == 0 {
+            self.bits_needed = -8;
+            self.value |= self.fetch();
         }
     }
 
     /// Decodes one bin with a context (`DecodeDecision`, §9.3.4.3.2).
-    #[inline]
+    #[inline(always)]
     pub fn decode(&mut self, ctx: &mut ContextModel) -> u8 {
-        let q = ((self.range >> 6) & 3) as usize;
-        let lps = u32::from(RANGE_TAB_LPS[usize::from(ctx.state)][q]);
-        self.range -= lps;
-        let bin = if self.offset >= self.range {
-            self.offset -= self.range;
-            self.range = lps;
-            1 - ctx.mps
-        } else {
+        let state = usize::from(ctx.state);
+        let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
+        let range = self.range - lps;
+        let scaled = range << 7;
+        if self.value < scaled {
+            // Most probable symbol: the range loses at most one bit.
+            ctx.state = (ctx.state + 1).min(62);
+            if range < 256 {
+                self.range = range << 1;
+                self.shift_one();
+            } else {
+                self.range = range;
+            }
             ctx.mps
-        };
-        ctx.update(bin);
-        self.renormalize();
-        bin
-    }
-
-    /// Decodes one equiprobable bin (`DecodeBypass`, §9.3.4.3.4).
-    #[inline]
-    pub fn decode_bypass(&mut self) -> u8 {
-        self.offset = (self.offset << 1) | self.read_bit();
-        if self.offset >= self.range {
-            self.offset -= self.range;
-            1
         } else {
-            0
+            // Least probable symbol: the new range is `lps` (at most 240), renormalized at once.
+            self.value -= scaled;
+            let shift = lps.leading_zeros() - 23;
+            self.range = lps << shift;
+            self.value <<= shift;
+            self.bits_needed += shift as i32;
+            if self.bits_needed >= 0 {
+                self.value |= self.fetch() << self.bits_needed;
+                self.bits_needed -= 8;
+            }
+            let bin = 1 - ctx.mps;
+            if ctx.state == 0 {
+                ctx.mps = bin;
+            }
+            ctx.state = TRANS_IDX_LPS[state];
+            bin
         }
     }
 
+    /// Decodes one equiprobable bin (`DecodeBypass`, §9.3.4.3.4).
+    #[inline(always)]
+    pub fn decode_bypass(&mut self) -> u8 {
+        self.shift_one();
+        let scaled = self.range << 7;
+        // Bypass bins are random, so a branch would be mispredicted half of the time.
+        let bit = u32::from(self.value >= scaled);
+        self.value -= scaled & bit.wrapping_neg();
+        bit as u8
+    }
+
     /// Decodes `n` bypass bins as an unsigned integer, most significant first (`n <= 32`).
+    #[inline]
     pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
         (0..n).fold(0, |acc, _| (acc << 1) | u32::from(self.decode_bypass()))
     }
@@ -179,10 +211,13 @@ impl<'a> ArithmeticDecoder<'a> {
     /// [`ArithmeticDecoder::aligned_position_after_terminate`] to find the following data.
     pub fn decode_terminate(&mut self) -> u8 {
         self.range -= 2;
-        if self.offset >= self.range {
+        if self.value >= self.range << 7 {
             1
         } else {
-            self.renormalize();
+            if self.range < 256 {
+                self.range <<= 1;
+                self.shift_one();
+            }
             0
         }
     }
@@ -194,12 +229,12 @@ impl<'a> ArithmeticDecoder<'a> {
     /// written by the encoder's flush, i.e. the stop bit (§9.3.4.3.5). The following data
     /// starts at the next byte boundary.
     pub fn aligned_position_after_terminate(&self) -> usize {
-        self.pos.div_ceil(8)
+        self.bit_position().div_ceil(8)
     }
 
     /// Returns an error if the engine read clearly beyond the end of the data.
     pub fn check_overrun(&self) -> Result<(), Error> {
-        if self.pos > self.data.len() * 8 + 16 {
+        if self.bit_position() > self.data.len() * 8 + 16 {
             Err(Error::UnexpectedEof)
         } else {
             Ok(())

@@ -291,15 +291,18 @@ struct Parser<'p, 'a> {
 
 /// Helpers to decode bins with a context index.
 impl Parser<'_, '_> {
+    #[inline(always)]
     fn bin(&mut self, i: usize) -> u8 {
         let c: &mut ContextModel = &mut self.ctx[i];
         self.engine.decode(c)
     }
 
+    #[inline(always)]
     fn flag(&mut self, i: usize) -> bool {
         self.bin(i) == 1
     }
 
+    #[inline(always)]
     fn bypass(&mut self) -> u8 {
         self.engine.decode_bypass()
     }
