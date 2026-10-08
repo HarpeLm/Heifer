@@ -18,7 +18,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 1.6 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.65 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -174,25 +174,26 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 55 ms (ffmpeg 57), iPhone 12 MP 102 ms (ffmpeg 96), 48 MP 480 ms (ffmpeg 583), Galaxy 200 MP 1.6 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 33 ms (ffmpeg 57), iPhone 12 MP 42 ms (ffmpeg 96), 48 MP 203 ms (ffmpeg 571), Galaxy 200 MP 0.65 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 55 ms | 242 ms | 57 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 102 ms | 454 ms | 96 ms |
-| 8000×6000, 48 MP | 480 ms | 2.4 s | 583 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 1.6 s | 5.7 s | fails |
-| In the browser (WebAssembly, 1 thread), 1280×854 | ~260 ms | | |
+| Xiaomi, 5 MP | 33 ms | 130 ms | 57 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 42 ms | 208 ms | 96 ms |
+| 8000×6000, 48 MP | 203 ms | 1.2 s | 571 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.65 s | 2.7 s | fails |
+| In the browser (WebAssembly, 1 thread), 1280×854 | ~115 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 452 ms on 1 thread to 102 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 207 ms on 1 thread to 39 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 452 ms with 1 thread down to 102 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 207 ms with 1 thread down to 39 ms with 10" width="100%">
 </picture>
 
-Heifer is on par with ffmpeg on multi-tile photos. Single-image decoding is not optimised yet; there is room for improvement.
+On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
+slower than ffmpeg; SIMD versions of the hot loops are planned.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 
@@ -226,7 +227,7 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 ## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
-- [ ] **Next**: HDR gain maps (Apple / ISO 21496-1), ICC colour management, faster single-image decoding
+- [ ] **Next**: HDR gain maps (Apple / ISO 21496-1), ICC colour management, SIMD for faster single-threaded decoding
 - [ ] **Encoder**: HEIF writing, minimal HEVC intra encoder, then better compression, 10-bit and alpha
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1 — 2026-10-08
+
+Faster decoding, with bit-identical output.
+
+- About 2.2× faster single-threaded and 2.4× faster on 10 cores (12 MP iPhone photo: 454 → 208 ms
+  on one thread, 102 → 42 ms on ten). In the browser, a 1280×854 photo decodes in ~115 ms instead
+  of ~260 ms.
+- Inverse transform without allocations, using only the non-zero coefficients and an even/odd
+  decomposition of the DCT.
+- Intra prediction without allocations; neighbour availability computed once per 4×4 block.
+- Table-based YCbCr → RGB conversion, cache-friendly rotation, fewer image copies.
+- Fuzzing now runs almost continuously on CI.
+
 ## 0.1.0 — 2026-10-08
 
 First release: a pure-Rust HEIF/HEIC decoder.
