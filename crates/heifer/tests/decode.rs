@@ -1,0 +1,79 @@
+//! End-to-end decoding of real HEIC files. Run `scripts/fetch-fixtures.sh` first; missing
+//! files are skipped.
+
+use heifer_isobmff::HeifFile;
+
+fn load(name: &str) -> Option<Vec<u8>> {
+    let path = format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    let data = std::fs::read(&path).ok();
+    if data.is_none() {
+        eprintln!("skipping: {path} not found (run scripts/fetch-fixtures.sh)");
+    }
+    data
+}
+
+#[test]
+fn decodes_all_fixtures() {
+    for (name, w, h, alpha) in [
+        ("single_image.heic", 1440, 960, false),
+        ("grid.heic", 960, 640, false),
+        ("alpha.heic", 1440, 960, false),
+        ("collection.heic", 1440, 960, false),
+        ("burst.heic", 1280, 720, false),
+        ("libheif_example.heic", 1280, 854, false),
+    ] {
+        let Some(bytes) = load(name) else { continue };
+        let img = heifer::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!((img.width, img.height), (w, h), "{name}");
+        assert_eq!(img.has_alpha, alpha, "{name}");
+        assert_eq!(img.data.len(), (w * h * 4) as usize);
+        assert_eq!(img.to_rgb8().len(), (w * h * 3) as usize);
+    }
+}
+
+#[test]
+fn grid_tiles_are_placed_in_order() {
+    let Some(bytes) = load("grid.heic") else {
+        return;
+    };
+    let file = HeifFile::parse(&bytes).unwrap();
+    let canvas = heifer::decode(&bytes).unwrap();
+    let tiles = file.referenced_items(file.primary_id, b"dimg");
+    for (i, &tile_id) in tiles.iter().enumerate() {
+        let tile = heifer::decode_item(&file, tile_id, 0).unwrap();
+        let (x0, y0) = ((i as u32 % 2) * tile.width, (i as u32 / 2) * tile.height);
+        assert_eq!(
+            canvas.crop(x0, y0, tile.width, tile.height),
+            tile,
+            "tile {i}"
+        );
+    }
+}
+
+#[test]
+fn alpha_auxiliary_image_is_attached() {
+    let Some(bytes) = load("alpha.heic") else {
+        return;
+    };
+    let file = HeifFile::parse(&bytes).unwrap();
+    // Item 1005 has an alpha plane (item 1008); the primary overlay composites it.
+    let with_alpha = heifer::decode_item(&file, 1005, 0).unwrap();
+    assert!(with_alpha.has_alpha);
+    let alphas: Vec<u16> = with_alpha.data.chunks(4).map(|p| p[3]).collect();
+    assert!(alphas.contains(&0), "fully transparent pixels expected");
+    // The coded alpha reaches 234 (limited range 16..=235), i.e. 254 once expanded.
+    assert!(
+        alphas.iter().any(|&a| a >= 254),
+        "nearly opaque pixels expected"
+    );
+}
+
+#[test]
+fn truncated_files_return_errors() {
+    let Some(bytes) = load("single_image.heic") else {
+        return;
+    };
+    for len in [0, 10, 100, 600, bytes.len() / 2] {
+        assert!(heifer::decode(&bytes[..len]).is_err(), "length {len}");
+    }
+}

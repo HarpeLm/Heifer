@@ -1,16 +1,32 @@
 # heifer
 
-Pure-Rust HEIF/HEIC image **decoder and encoder**. No C dependencies, `#![forbid(unsafe_code)]`, WebAssembly-ready.
+Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
 
-> **Status: early development.** HEVC image items decode **bit-exactly against ffmpeg**, in-loop filters
-> included. Grid assembly and RGB output are next.
+> **Status: early development.** Complete HEIC files decode to RGB(A): HEVC decoding is **bit-exact
+> against ffmpeg**, and grids, overlays, alpha and transforms are supported. Tested on 8-bit 4:2:0 sample
+> files only — real iPhone photos and 10-bit/HDR are not validated yet.
 
 ## Why
 
 HEIC is the default photo format on iPhones. In Rust, reading it usually means binding to `libheif` (C/C++),
 and there is no pure-Rust encoder at all. heifer aims to be a safe, portable, well-tested alternative.
 
-## What works today
+## Usage
+
+```rust
+let bytes = std::fs::read("photo.heic")?;
+let image = heifer::decode(&bytes)?;           // primary image, alpha, crop/rotation/mirror applied
+let rgba: Vec<u8> = image.to_rgba8();           // or to_rgb8(); image.data holds 16-bit samples
+println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
+```
+
+Convert a file from the command line:
+
+```sh
+cargo run --release -p heifer --example heic2png -- photo.heic photo.png
+```
+
+### Lower-level APIs
 
 ```rust
 use heifer_isobmff::HeifFile;
@@ -36,7 +52,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 
 | Crate | Role | State |
 |---|---|---|
-| `heifer` | Public API | placeholder |
+| `heifer` | Public API: `decode()`, grids, overlays, alpha, transforms, YCbCr → RGB | ✅ |
 | `heifer-isobmff` | HEIF container: boxes, items, properties, references, grids | ✅ reading |
 | `heifer-hevc-dec` | HEVC intra decoder | ✅ bit-exact vs ffmpeg (8-bit 4:2:0 tested) |
 | `heifer-hevc-enc` | HEVC intra encoder | 🚧 CABAC encoder only |
@@ -46,8 +62,10 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 - [ ] **Phase 1 — Decoder**
   - [x] Parse container: `ftyp`, `meta`, `iinf`, `iloc`, `iref`, `iprp`/`ipco`/`ipma`, `idat`, grids, rotation/mirror, alpha
   - [x] Extract HEVC bitstreams (Annex B) for each image item
-  - [ ] Overlays (`iovl`), EXIF/XMP access, `iloc` construction method 2
-  - [ ] HEVC intra decoding
+  - [x] Grid assembly, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`
+  - [x] YCbCr → RGB (BT.601/709/2020, full/limited range; `colr` nclx, else HEVC VUI)
+  - [ ] EXIF/XMP access, ICC profiles, `iloc` construction method 2, bilinear chroma upsampling
+  - [x] HEVC intra decoding
     - [x] Bit reader, Exp-Golomb codes, NAL units, emulation prevention
     - [x] VPS, SPS (VUI, HRD, scaling lists, range extension), PPS (tiles, deblocking)
     - [x] Slice segment header (I slices, entry points, dependent slices)
@@ -77,10 +95,14 @@ cargo run -p heifer-isobmff --example info -- tests/fixtures/grid.heic --extract
 cargo run -p heifer-hevc-dec --example params -- tile.h265                 # parameter sets, slice headers
 cargo run -p heifer-hevc-dec --example parse -- tile.h265                  # full syntax parse statistics
 cargo run --release -p heifer-hevc-dec --example decode -- tile.h265 tile.yuv   # raw planar YUV
+cargo run --release -p heifer --example heic2png -- tests/fixtures/grid.heic grid.png
 ```
 
 Decoding is checked against `ffmpeg -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`
 (and with `-skip_loop_filter all` / `--no-filters` to check reconstruction alone).
+
+RGB output is compared with `ffmpeg -i file.heic -pix_fmt rgb24 ref.png` (≈ 53 dB PSNR; the remaining
+difference comes from chroma upsampling and rounding).
 
 Header parsing is checked against `ffmpeg -i tile.h265 -c copy -bsf:v trace_headers -f null -`:
 the `params` example prints fields with the same names as the specification and ffmpeg.

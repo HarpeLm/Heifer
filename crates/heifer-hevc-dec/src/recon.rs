@@ -20,6 +20,10 @@ pub struct Frame {
     pub bit_depth: [u8; 2],
     /// `chroma_format_idc` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
     pub chroma_format: u8,
+    /// `video_full_range_flag` from the VUI (false when the VUI is absent).
+    pub full_range: bool,
+    /// `matrix_coeffs` from the VUI (2 = unspecified when absent).
+    pub matrix_coeffs: u8,
 }
 
 impl Frame {
@@ -45,6 +49,8 @@ impl Frame {
             ],
             bit_depth: [sps.bit_depth_luma, sps.bit_depth_chroma],
             chroma_format: sps.chroma_format_idc,
+            full_range: sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag),
+            matrix_coeffs: sps.vui.as_ref().map_or(2, |v| v.matrix_coeffs),
         }
     }
 
