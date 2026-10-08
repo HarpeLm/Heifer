@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-10-08
 
 - **HDR photos**: Apple HDR gain maps (iPhone). `decode_hdr` returns linear-light RGB with the
   gain map applied, matching Apple's decoder (ImageIO) within 0.3% on average; `read_gain_map`
