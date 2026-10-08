@@ -11,6 +11,9 @@ on:
         description: "Fuzzing duration (e.g. 30m, 2h; GitHub limits jobs to 6h)"
         default: "50m"
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
