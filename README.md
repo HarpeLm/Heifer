@@ -1,79 +1,37 @@
+<div align="center">
+
 # Heifer
 
-Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
+**A pure-Rust HEIF/HEIC image decoder.**<br>
+No C dependencies · no `unsafe` code · runs everywhere Rust runs, including the browser.
 
-**[Try it in your browser](https://harpelm.github.io/Heifer/)** — HEIC photos decoded by heifer compiled to
-WebAssembly (≈ 250 KB); your file never leaves your device.
+[![crates.io](https://img.shields.io/crates/v/heifer.svg)](https://crates.io/crates/heifer)
+[![docs.rs](https://img.shields.io/docsrs/heifer)](https://docs.rs/heifer)
+[![CI](https://github.com/HarpeLm/Heifer/actions/workflows/ci.yml/badge.svg)](https://github.com/HarpeLm/Heifer/actions/workflows/ci.yml)
+[![Fuzz](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **Status: early development.** Complete HEIC files decode to RGB(A), with grids, overlays, alpha and
-> transforms. The HEVC decoder is validated against the official conformance bitstreams, and real
-> iPhone, Samsung and Xiaomi photos decode correctly (see below). HDR gain maps and ICC profiles are
-> not applied yet.
+**[▶ Try it in your browser](https://harpelm.github.io/Heifer/)** — drop a `.heic` photo; it is decoded locally by heifer compiled to WebAssembly.
 
-## Conformance
+</div>
 
-The first picture of 66 official HEVC conformance bitstreams (ITU-T H.265.1: Main, Main 10 and Range
-Extensions, 8 to 12 bits, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, slices...):
+---
 
-| Check | Result |
-|---|---|
-| Identical to ffmpeg, sample for sample | **62 / 62** comparable streams |
-| Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **41** streams, including 3 that ffmpeg cannot decode |
-| Not supported | 1 (extended precision / CABAC bypass alignment, 16-bit video tools) |
+HEIC is the default photo format on iPhones and many Android phones. In Rust, reading it has meant
+binding to libheif and libde265 (C/C++). **Heifer** is an independent implementation of HEIF and HEVC
+written entirely in safe Rust, validated against the official conformance bitstreams.
 
-## Real-world files
+## Highlights
 
-43 real and synthetic HEIC/HEIF files from [pillow-heif](https://github.com/bigcat88/pillow_heif)'s test
-suite (`scripts/fetch-real.sh`, not committed):
+- ✅ **Correct** — identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
+- 📱 **Real photos** — iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi.
+- 🛡️ **Safe** — `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed every night.
+- ⚡ **Fast enough** — grid tiles decoded in parallel: a 12 MP iPhone photo in about 100 ms.
+- 🧩 **Complete** — alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
+- 🖼️ **Plays well with others** — optional [`image`](https://crates.io/crates/image) integration: `image::open("photo.heic")`.
+- 🌐 **Portable** — compiles to WebAssembly (≈ 200 KB).
 
-| File | Content | Result |
-|---|---|---|
-| iPhone photo | 4032×3024, 48-tile grid, HDR gain map, depth map | ≈ 61 dB vs ffmpeg, ~100 ms |
-| iPhone photo | rotated 270° | ≈ 60 dB, correct orientation |
-| iPhone 15 Pro spatial photo | stereo pair | ≈ 62 dB |
-| Samsung 200 MP | 12240×16320, 768 tiles | decoded in ~2 s (ffmpeg fails) |
-| Xiaomi, Samsung, 8000×6000 | grids, gain maps | 58–62 dB |
-| 8/10/12-bit gray, RGB, RGBA | odd sizes, alpha | ✓ |
-| corrupted / truncated | | clean errors, no panic |
-
-Remaining differences with ffmpeg are in heifer's favour (it honours `ispe`/grid crops and the primary
-item). Phone "HDR" photos are 8-bit images plus a gain map: heifer decodes the base image; applying the
-gain map (ISO 21496-1) is not implemented.
-
-## Fuzzing
-
-Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets, with HEIF and HEVC dictionaries,
-seeded with the sample files, the conformance bitstreams and libheif's fuzzing corpus:
-
-| Target | Checks |
-|---|---|
-| `decode` | full HEIC decoding never panics, hangs or exhausts memory |
-| `container` | container parsing and item data access |
-| `hevc` | HEVC decoding, including picture hash verification |
-| `parallel` | parallel and sequential decoding give identical results |
-| `cabac` | the CABAC encoder and decoder round-trip any bin sequence |
-
-Fuzzing found a memory exhaustion bug (overlapping `iloc` extents), now fixed and covered by a test,
-and led to configurable size limits (`max_pixels`). It runs every night on GitHub Actions
-(`.github/workflows/fuzz.yml`) and can run locally for hours:
-
-```sh
-./scripts/fetch-fuzz-corpus.sh   # libheif's fuzzing corpus as extra seeds (not committed)
-./scripts/fuzz.sh 8h             # all targets in parallel on all cores; Ctrl+C to stop
-```
-
-WebAssembly demo (`rustup target add wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli --version 0.2.129`):
-
-```sh
-./scripts/build-demo.sh && python3 -m http.server -d demo/web 8000   # http://localhost:8000
-```
-
-## Why
-
-HEIC is the default photo format on iPhones. In Rust, reading it usually means binding to `libheif` (C/C++),
-and there is no pure-Rust encoder at all. heifer aims to be a safe, portable, well-tested alternative.
-
-## Usage
+## Quick start
 
 ```toml
 [dependencies]
@@ -82,140 +40,189 @@ heifer = "0.1"
 
 ```rust
 let bytes = std::fs::read("photo.heic")?;
-let image = heifer::decode(&bytes)?;           // primary image, alpha, crop/rotation/mirror applied
-let rgba: Vec<u8> = image.to_rgba8();           // or to_rgb8(); image.data holds 16-bit samples
-println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
+let image = heifer::decode(&bytes)?;    // primary image, with alpha, crop/rotation/mirror applied
 
-// Grid tiles are decoded in parallel on all cores (no dependency: std threads).
-// Limit or disable it with options:
-let image = heifer::decode_with_options(&bytes, &heifer::Options { max_threads: 1 })?;
+println!("{}×{}, {}-bit, alpha: {}", image.width, image.height, image.bit_depth, image.has_alpha);
+let rgba: Vec<u8> = image.to_rgba8();   // or to_rgb8(); image.data keeps 16-bit samples
 ```
 
-Metadata, without decoding pixels:
+### Metadata
+
+Read EXIF, XMP and the ICC profile without decoding pixels:
 
 ```rust
 let meta = heifer::read_metadata(&bytes)?;
 if let Some(exif) = meta.exif_fields() {
-    println!("{:?} {:?} {:?}", exif.make(), exif.model(), exif.date_time());
+    println!("{:?} {:?} taken {:?}", exif.make(), exif.model(), exif.date_time());
 }
-let icc: Option<Vec<u8>> = meta.icc_profile;   // also meta.exif (raw TIFF), meta.xmp
+let icc: Option<Vec<u8>> = meta.icc_profile;   // also meta.exif (raw TIFF) and meta.xmp
 ```
 
-With the [`image`](https://crates.io/crates/image) crate (`heifer = { version = "0.1", features = ["image"] }`):
+### With the `image` crate
+
+```toml
+heifer = { version = "0.1", features = ["image"] }
+```
 
 ```rust
 heifer::image_crate::register_image_decoder_hooks();
-let img = image::open("photo.heic")?;          // .heic/.heif/.hif, and content detection
+let img = image::open("photo.heic")?;   // .heic / .heif / .hif, plus content detection
 ```
 
-Convert a file from the command line:
+`HeifDecoder` implements `image::ImageDecoder` (8- and 16-bit RGB/RGBA, EXIF/XMP/ICC). The HEIF
+orientation is already applied, so it is never applied twice.
+
+### Options
+
+```rust
+let options = heifer::Options {
+    max_threads: 1,            // 0 = all cores (default); grid tiles are decoded in parallel
+    max_pixels: 50_000_000,    // reject larger images (default: 2^28 pixels)
+};
+let image = heifer::decode_with_options(&bytes, &options)?;
+```
+
+### Command line
 
 ```sh
-cargo run --release -p heifer --example heic2png -- photo.heic photo.png [--threads N]
+cargo run --release -p heifer --example heic2png -- photo.heic photo.png
+cargo run --release -p heifer --example metadata -- photo.heic
 ```
 
-### Lower-level APIs
+## What is supported
 
-```rust
-use heifer_isobmff::HeifFile;
-
-let bytes = std::fs::read("photo.heic")?;
-let file = HeifFile::parse(&bytes)?;
-let primary = file.primary_item()?;              // e.g. a `grid` of `hvc1` tiles
-let size = file.image_size(primary.id)?;         // Some((4032, 3024))
-let tiles = file.referenced_items(primary.id, b"dimg");
-let hevc = file.hevc_bitstream(tiles[0])?;       // Annex B stream, decodable by ffmpeg
-```
-
-Decoding one HEVC image item to pixels:
-
-```rust
-use heifer_hevc_dec::decoder::{decode_picture, DecodeOptions};
-
-let frame = decode_picture(&hevc, DecodeOptions::default())?;
-let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u16 samples
-```
-
-## Crates
-
-| Crate | Role | State |
+| | Supported | Not yet |
 |---|---|---|
-| `heifer` | Public API: `decode()`, grids, overlays, alpha, transforms, YCbCr → RGB | ✅ |
-| `heifer-isobmff` | HEIF container: boxes, items, properties, references, grids | ✅ reading |
-| `heifer-hevc-dec` | HEVC intra decoder, picture hash verification | ✅ conformance-tested (8–12 bit, all chroma formats) |
-| `heifer-hevc-enc` | HEVC intra encoder | 🚧 CABAC encoder only |
+| **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images | `iloc` construction method 2 |
+| **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles, HDR gain maps |
+| **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
+| **Encoding** | — | planned (see [roadmap](#roadmap)) |
+
+## Quality
+
+### HEVC conformance
+
+The first picture of 66 official conformance bitstreams (ITU-T H.265.1) covering Main, Main 10 and
+the Range Extensions:
+
+| Check | Result |
+|---|---|
+| Identical to ffmpeg, sample for sample | **62 / 62** comparable streams |
+| Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **41** streams, including 3 that ffmpeg cannot decode |
+| Not supported | 1 (16-bit extended precision tools) |
+
+### Real-world photos
+
+| Photo | Content | Result |
+|---|---|---|
+| iPhone 13 Pro | 4032×3024, 48-tile grid, HDR gain map, depth map | ≈ 61 dB vs ffmpeg |
+| iPhone 8 Plus | rotated 270° | correct orientation |
+| iPhone 15 Pro | spatial (stereo) photo | ≈ 62 dB |
+| Samsung Galaxy S24 Ultra | 200 MP, 768 tiles | decoded (ffmpeg fails) |
+| Xiaomi, Sony, others | grids, 8/10/12-bit, alpha | ✓ |
+| Corrupted / truncated files | | clean errors, never a panic |
+
+The remaining differences with ffmpeg are in heifer's favour: it honours the declared image sizes and
+grid crops, and decodes the file's primary image rather than the largest one.
+
+### Fuzzing
+
+Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets with HEIF/HEVC dictionaries run
+every night on GitHub Actions: full decoding, container parsing, HEVC decoding, a parallel-vs-sequential
+differential check and a CABAC round trip. Fuzzing already found and fixed a memory exhaustion bug.
+
+## Performance
+
+Measured on a 10-core Apple Silicon Mac (release build):
+
+| Image | Time |
+|---|---|
+| iPhone photo, 4032×3024 (48 tiles) | ~100 ms |
+| 8000×6000 | ~550 ms |
+| Samsung 200 MP (768 tiles) | ~2 s |
+| In the browser (WebAssembly, single thread), 1280×854 | ~260 ms |
+
+Single-image decoding is not optimised yet; there is room for improvement.
+
+## Architecture
+
+```text
+heifer               decode(), read_metadata(), image crate integration
+├── heifer-isobmff   HEIF container: boxes, items, properties, grids, metadata
+└── heifer-hevc-dec  HEVC decoder: CABAC, intra prediction, transforms, deblocking, SAO
+    heifer-hevc-enc  HEVC encoder (work in progress: CABAC encoder)
+```
+
+The lower-level crates can be used directly, for example to extract an HEVC stream:
+
+```rust
+let file = heifer_isobmff::HeifFile::parse(&bytes)?;
+let tiles = file.referenced_items(file.primary_id, b"dimg");
+let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hevc-dec or ffmpeg
+```
 
 ## Roadmap
 
-- [ ] **Phase 1 — Decoder**
-  - [x] Parse container: `ftyp`, `meta`, `iinf`, `iloc`, `iref`, `iprp`/`ipco`/`ipma`, `idat`, grids, rotation/mirror, alpha
-  - [x] Extract HEVC bitstreams (Annex B) for each image item
-  - [x] Grid assembly (tiles decoded in parallel), overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`
-  - [x] YCbCr → RGB (BT.601/709/2020, full/limited range; `colr` nclx, else HEVC VUI)
-  - [x] EXIF, XMP and ICC profile access (+ minimal EXIF reader)
-  - [ ] Applying ICC profiles, `iloc` construction method 2, bilinear chroma upsampling
-  - [x] HEVC intra decoding
-    - [x] Bit reader, Exp-Golomb codes, NAL units, emulation prevention
-    - [x] VPS, SPS (VUI, HRD, scaling lists, range extension), PPS (tiles, deblocking)
-    - [x] Slice segment header (I slices, entry points, dependent slices)
-    - [x] CABAC entropy decoding (+ encoder, verified by round-trip)
-    - [x] Coding tree syntax: SAO, quadtree, intra modes, transform tree, residuals, QP, PCM, tiles, WPP
-    - [x] Intra prediction, scaling, inverse DCT/DST — bit-exact vs ffmpeg (`-skip_loop_filter all`)
-    - [x] Deblocking filter, SAO — bit-exact vs ffmpeg
-    - [x] 10/12-bit, 4:0:0, 4:2:2, 4:4:4, unequal luma/chroma bit depths
-    - [x] Range extension tools: cross-component prediction, implicit RDPCM, transform-skip rotation/contexts, persistent Rice adaptation
-    - [x] Decoded picture hash SEI (MD5, CRC, checksum) verification
-    - [x] Validated on official HEVC conformance bitstreams
-    - [ ] Extended precision processing, CABAC bypass alignment (16-bit profiles)
-  - [x] Real-world HEIC corpus (iPhone, Samsung, Xiaomi photos) compared with ffmpeg
-  - [ ] HDR gain maps (Apple / ISO 21496-1), ICC profiles
-  - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
-  - [x] Fuzzing (5 targets, dictionaries, nightly CI) and size limits against malicious files
-  - [x] `image` crate integration (feature `image`), WebAssembly browser demo
-- [ ] **Phase 2 — Encoder**
-  - [ ] Write HEIF container
-  - [ ] Minimal HEVC intra encoder (fixed block size, DC prediction, fixed QP) producing valid files
-  - [ ] All 35 intra modes, block-size decisions, rate-distortion optimisation
-  - [ ] 10-bit, alpha, HDR
+- [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
+- [ ] **Next**: HDR gain maps (Apple / ISO 21496-1), ICC colour management, faster single-image decoding
+- [ ] **Encoder**: HEIF writing, minimal HEVC intra encoder, then better compression, 10-bit and alpha
+
+See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## Development
 
-```sh
-./scripts/fetch-fixtures.sh   # downloads sample HEIC files into tests/fixtures/ (not committed)
-./scripts/fetch-real.sh       # real-world photos from pillow-heif (not committed)
-cargo test --workspace
+<details>
+<summary>Building, testing and validating</summary>
 
-# Inspect a file
-cargo run -p heifer-isobmff --example dump -- tests/fixtures/grid.heic     # box tree
-cargo run -p heifer-isobmff --example info -- tests/fixtures/grid.heic     # items and properties
-cargo run -p heifer-isobmff --example info -- tests/fixtures/grid.heic --extract 1002 tile.h265
-cargo run -p heifer-hevc-dec --example params -- tile.h265                 # parameter sets, slice headers
-cargo run -p heifer-hevc-dec --example parse -- tile.h265                  # full syntax parse statistics
-cargo run --release -p heifer-hevc-dec --example decode -- tile.h265 tile.yuv   # raw planar YUV
-cargo run --release -p heifer --example heic2png -- tests/fixtures/grid.heic grid.png
+```sh
+./scripts/fetch-fixtures.sh      # sample HEIC files (not committed)
+./scripts/fetch-real.sh          # real-world photos from pillow-heif's test suite (not committed)
+cargo test --workspace --all-features
 ```
 
-Conformance bitstreams (not committed, ~23 MB download from itu.int):
+**Inspecting files**
+
+```sh
+cargo run -p heifer-isobmff --example dump -- photo.heic                       # box tree
+cargo run -p heifer-isobmff --example info -- photo.heic --extract 1002 t.h265 # items, HEVC stream
+cargo run -p heifer-hevc-dec --example params -- t.h265                        # parameter sets
+cargo run --release -p heifer-hevc-dec --example decode -- t.h265 t.yuv        # raw YUV
+```
+
+**Conformance** (≈ 23 MB from itu.int, not committed)
 
 ```sh
 ./scripts/fetch-conformance.sh
-cargo test --release -p heifer-hevc-dec --test conformance      # checks reference picture hashes
+cargo test --release -p heifer-hevc-dec --test conformance   # reference picture hashes
 cargo build --release -p heifer-hevc-dec --example decode
-./scripts/conformance.py                                        # compares with ffmpeg
+./scripts/conformance.py                                     # comparison with ffmpeg
 ```
 
-Decoding is checked against `ffmpeg -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`
-(and with `-skip_loop_filter all` / `--no-filters` to check reconstruction alone).
+**Fuzzing** (nightly toolchain and `cargo install cargo-fuzz`)
 
-RGB output is compared with `ffmpeg -i file.heic -pix_fmt rgb24 ref.png` (≈ 53 dB PSNR; the remaining
-difference comes from chroma upsampling and rounding).
+```sh
+./scripts/fetch-fuzz-corpus.sh   # libheif's fuzzing corpus as extra seeds
+./scripts/fuzz.sh 8h             # all targets on all cores; Ctrl+C to stop
+```
 
-Header parsing is checked against `ffmpeg -i tile.h265 -c copy -bsf:v trace_headers -f null -`:
-the `params` example prints fields with the same names as the specification and ffmpeg.
+**WebAssembly demo** (`rustup target add wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli --version 0.2.129`)
+
+```sh
+./scripts/build-demo.sh && python3 -m http.server -d demo/web 8000
+```
+
+</details>
+
+## Acknowledgements
+
+Validation relies on the ITU-T HEVC conformance bitstreams, the test files of
+[pillow-heif](https://github.com/bigcat88/pillow_heif) and [Nokia's HEIF samples](https://github.com/nokiatech/heif),
+the fuzzing corpus of [libheif](https://github.com/strukturag/libheif), and [ffmpeg](https://ffmpeg.org) as a reference decoder.
 
 ## Patents
 
-HEVC is covered by patents. This project is a clean-room implementation for research and interoperability;
+HEVC is covered by patents. Heifer is an independent implementation for research and interoperability;
 users are responsible for complying with applicable patent licensing in their jurisdiction.
 
 ## License
