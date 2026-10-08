@@ -259,12 +259,18 @@ fn decode_grid(
     let mut canvas = Image::filled(grid.output_width, grid.output_height, bit_depth, [0; 4]);
     let (canvas_w, canvas_h) = (canvas.width, canvas.height);
     let stride = canvas_w as usize * 4;
-    // One lock per row of tiles: tiles of different rows are written concurrently.
-    let bands: Vec<std::sync::Mutex<&mut [u16]>> = canvas
-        .data
-        .chunks_mut(th as usize * stride)
-        .map(std::sync::Mutex::new)
-        .collect();
+    // Each tile gets its own row segments of the canvas, so tiles are written concurrently.
+    let mut segments: Vec<Vec<&mut [u16]>> = (0..tiles.len()).map(|_| Vec::new()).collect();
+    for (y, row) in canvas.data.chunks_exact_mut(stride).enumerate() {
+        let first = y / th as usize * columns as usize;
+        for (column, segment) in row.chunks_mut(tw as usize * 4).enumerate() {
+            if let Some(rows) = segments.get_mut(first + column) {
+                rows.push(segment);
+            }
+        }
+    }
+    let segments: Vec<std::sync::Mutex<Vec<&mut [u16]>>> =
+        segments.into_iter().map(std::sync::Mutex::new).collect();
     let has_alpha = std::sync::atomic::AtomicBool::new(false);
     // Plain tiles are converted straight into the canvas, without an intermediate image.
     let plain = first_tile.is_none()
@@ -308,15 +314,12 @@ fn decode_grid(
                 "grid tiles have different sizes or bit depths",
             ));
         }
-        let mut band = bands[i / columns as usize]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let out = &mut band[x0 as usize * 4..];
+        let mut out = segments[i].lock().unwrap_or_else(|e| e.into_inner());
         match (tile, frame) {
             (Some(tile), _) => {
                 // Copy rows (no blending): tiles are opaque unless they carry alpha.
                 for (dst, src) in out
-                    .chunks_mut(stride)
+                    .iter_mut()
                     .zip(tile.data.chunks_exact(tw as usize * 4))
                     .take(h)
                 {
@@ -326,7 +329,7 @@ fn decode_grid(
                     has_alpha.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            (None, Some((frame, params))) => frame_to_rgba_into(&frame, params, out, stride, w, h),
+            (None, Some((frame, params))) => frame_to_rgba_into(&frame, params, &mut out, w, h),
             (None, None) => unreachable!("checked above"),
         }
         Ok(())
@@ -370,7 +373,7 @@ fn decode_grid(
             return Err(e);
         }
     }
-    drop(bands);
+    drop(segments);
     canvas.has_alpha = has_alpha.into_inner();
     Ok(canvas)
 }

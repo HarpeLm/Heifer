@@ -40,14 +40,8 @@ fn kr_kb(matrix: u16) -> (f64, f64) {
 pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
     let (w, h) = (frame.widths[0], frame.heights[0]);
     let mut data = vec![0; w as usize * h as usize * 4];
-    frame_to_rgba_into(
-        frame,
-        params,
-        &mut data,
-        w as usize * 4,
-        w as usize,
-        h as usize,
-    );
+    let mut rows: Vec<&mut [u16]> = data.chunks_exact_mut(w as usize * 4).collect();
+    frame_to_rgba_into(frame, params, &mut rows, w as usize, h as usize);
     Image {
         width: w,
         height: h,
@@ -58,13 +52,12 @@ pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
 }
 
 /// Like [`frame_to_rgba`], but writes the top-left `width`×`height` pixels of `frame` (clamped
-/// to its size) into `out`, whose rows start `stride` samples apart (4 samples per pixel), so
+/// to its size) into the rows `out` (4 samples per pixel, each row at least `width` pixels), so
 /// that grid tiles can be converted in place in the final image.
 pub fn frame_to_rgba_into(
     frame: &Frame,
     params: ColorParams,
-    out: &mut [u16],
-    stride: usize,
+    out: &mut [&mut [u16]],
     width: usize,
     height: usize,
 ) {
@@ -75,7 +68,7 @@ pub fn frame_to_rgba_into(
     let out_depth = bd_y.max(bd_c);
     let max_out = f64::from((1u32 << out_depth) - 1);
     let alpha = (1u32 << out_depth) as u16 - 1;
-    let rows = out.chunks_mut(stride).take(height).enumerate();
+    let rows = out.iter_mut().take(height).enumerate();
     let luma_row = |y: usize| &frame.planes[0][y * w..y * w + width];
 
     if frame.widths[1] == 0 {
