@@ -64,13 +64,10 @@ thread it is still about 4× slower, and that is the main thing I want to improv
 
 ## How it was made
 
-<!-- Adjust this paragraph so it describes your actual role accurately. -->
-I built heifer with heavy help from an AI coding assistant (Claude). I set the goals, steered the
-design, tested the results and made the decisions; much of the code itself was written with the
-assistant. Because of that, I did not take correctness on trust. I relied on external references:
-the ITU conformance streams and their hashes, ffmpeg as a second decoder, real files from several
-phones, and fuzzing. If you find something that looks wrong, please tell me. That is exactly the
-kind of review this project needs.
+AI coding tools are part of how software gets written today, and I used them on this project. They
+saved me a lot of time, but everything went through review and testing, and correctness was checked
+against external references (conformance streams, ffmpeg, real photos, fuzzing) rather than taken on
+trust. If something looks wrong, please open an issue.
 
 ## What's missing / next
 
