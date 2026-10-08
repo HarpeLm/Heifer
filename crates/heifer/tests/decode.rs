@@ -96,3 +96,64 @@ fn parallel_and_sequential_decoding_match() {
         assert_eq!(parallel, sequential, "max_threads = {threads}");
     }
 }
+
+/// Real-world files from pillow-heif's test suite (`scripts/fetch-real.sh`).
+fn load_real(name: &str) -> Option<Vec<u8>> {
+    load(&format!("real/{name}"))
+}
+
+#[test]
+fn real_world_photos() {
+    // (file, width, height, alpha): sizes checked against the files' ispe/clap/irot and
+    // compared with ffmpeg (≈ 60 dB PSNR).
+    for (name, w, h, alpha) in [
+        ("heif_other__pug.heic", 4032, 3024, false), // iPhone, 48 tiles, HDR gain map
+        ("heif_other__arrow.heic", 3024, 4032, false), // rotated 270°
+        ("heif_other__spatial_photo.heic", 2560, 2560, false), // iPhone spatial (stereo) photo
+        ("heif_special__xiaomi.heic", 2592, 1944, false), // Android
+        ("heif_special__aux_YCbCr.heic", 4000, 1848, false), // Samsung, gain map
+        ("benchmarks__image_large.heic", 8000, 6000, false),
+        ("heif_other__invalid_id.heic", 1197, 1227, false), // grid output crop
+        ("heif_other__empty_icc.heic", 1025, 900, false),   // primary item, not the largest
+        ("heif__RGBA_10__128x128.heif", 128, 128, true),
+        ("heif__RGB_12__29x100.heif", 29, 100, false), // odd size: ispe crop
+        ("heif__L_10__128x128.heif", 128, 128, false), // monochrome 10-bit
+    ] {
+        let Some(bytes) = load_real(name) else {
+            continue;
+        };
+        let img = heifer::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            (img.width, img.height, img.has_alpha),
+            (w, h, alpha),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn high_bit_depth_is_preserved() {
+    for (name, depth) in [
+        ("heif__RGB_10__128x128.heif", 10),
+        ("heif__RGB_12__128x128.heif", 12),
+    ] {
+        let Some(bytes) = load_real(name) else {
+            continue;
+        };
+        assert_eq!(heifer::decode(&bytes).unwrap().bit_depth, depth, "{name}");
+    }
+}
+
+#[test]
+fn broken_real_files_return_errors() {
+    for name in [
+        "heif_corrupted__corrupted.heic",
+        "heif_corrupted__empty.heic",
+        "heif_truncated__truncated.heic",
+    ] {
+        let Some(bytes) = load_real(name) else {
+            continue;
+        };
+        assert!(heifer::decode(&bytes).is_err(), "{name}");
+    }
+}

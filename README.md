@@ -3,8 +3,9 @@
 Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
 
 > **Status: early development.** Complete HEIC files decode to RGB(A), with grids, overlays, alpha and
-> transforms. The HEVC decoder is validated against the official conformance bitstreams (see below).
-> Real iPhone photos (large grids, HDR) are not validated yet.
+> transforms. The HEVC decoder is validated against the official conformance bitstreams, and real
+> iPhone, Samsung and Xiaomi photos decode correctly (see below). HDR gain maps and ICC profiles are
+> not applied yet.
 
 ## Conformance
 
@@ -16,6 +17,25 @@ Extensions, 8 to 12 bits, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scalin
 | Identical to ffmpeg, sample for sample | **62 / 62** comparable streams |
 | Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **41** streams, including 3 that ffmpeg cannot decode |
 | Not supported | 1 (extended precision / CABAC bypass alignment, 16-bit video tools) |
+
+## Real-world files
+
+43 real and synthetic HEIC/HEIF files from [pillow-heif](https://github.com/bigcat88/pillow_heif)'s test
+suite (`scripts/fetch-real.sh`, not committed):
+
+| File | Content | Result |
+|---|---|---|
+| iPhone photo | 4032×3024, 48-tile grid, HDR gain map, depth map | ≈ 61 dB vs ffmpeg, ~100 ms |
+| iPhone photo | rotated 270° | ≈ 60 dB, correct orientation |
+| iPhone 15 Pro spatial photo | stereo pair | ≈ 62 dB |
+| Samsung 200 MP | 12240×16320, 768 tiles | decoded in ~2 s (ffmpeg fails) |
+| Xiaomi, Samsung, 8000×6000 | grids, gain maps | 58–62 dB |
+| 8/10/12-bit gray, RGB, RGBA | odd sizes, alpha | ✓ |
+| corrupted / truncated | | clean errors, no panic |
+
+Remaining differences with ffmpeg are in heifer's favour (it honours `ispe`/grid crops and the primary
+item). Phone "HDR" photos are 8-bit images plus a gain map: heifer decodes the base image; applying the
+gain map (ISO 21496-1) is not implemented.
 
 ## Why
 
@@ -93,7 +113,8 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
     - [x] Decoded picture hash SEI (MD5, CRC, checksum) verification
     - [x] Validated on official HEVC conformance bitstreams
     - [ ] Extended precision processing, CABAC bypass alignment (16-bit profiles)
-  - [ ] Real-world HEIC corpus (iPhone/Android photos, HDR) + comparison against libheif
+  - [x] Real-world HEIC corpus (iPhone, Samsung, Xiaomi photos) compared with ffmpeg
+  - [ ] HDR gain maps (Apple / ISO 21496-1), ICC profiles
   - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
   - [ ] Fuzzing, WebAssembly, `image` crate integration
 - [ ] **Phase 2 — Encoder**
@@ -106,6 +127,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 
 ```sh
 ./scripts/fetch-fixtures.sh   # downloads sample HEIC files into tests/fixtures/ (not committed)
+./scripts/fetch-real.sh       # real-world photos from pillow-heif (not committed)
 cargo test --workspace
 
 # Inspect a file
