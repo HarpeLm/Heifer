@@ -58,7 +58,10 @@ impl Frame {
     pub fn cropped(&self, sps: &Sps) -> Self {
         let (sw, sh) = sps.chroma_subsampling();
         let [l, r, t, b] = sps.conf_win_offsets;
-        let mut out = self.clone();
+        let mut out = Self {
+            planes: Default::default(),
+            ..*self
+        };
         for c in 0..3 {
             if self.widths[c] == 0 {
                 continue;
@@ -68,14 +71,12 @@ impl Frame {
             let w = self.widths[c] - (l + r) * fx;
             let h = self.heights[c] - (t + b) * fy;
             let src_w = self.widths[c] as usize;
-            out.planes[c] = (y0..y0 + h)
-                .flat_map(|y| {
-                    let row = y as usize * src_w;
-                    self.planes[c][row + x0 as usize..row + (x0 + w) as usize]
-                        .iter()
-                        .copied()
-                })
-                .collect();
+            let mut plane = Vec::with_capacity(w as usize * h as usize);
+            for y in y0..y0 + h {
+                let row = y as usize * src_w + x0 as usize;
+                plane.extend_from_slice(&self.planes[c][row..row + w as usize]);
+            }
+            out.planes[c] = plane;
             out.widths[c] = w;
             out.heights[c] = h;
         }
@@ -101,7 +102,7 @@ const DCT_C: [i32; 33] = [
 ];
 
 /// `transMatrix` coefficient for frequency `k` and position `n` of the 32-point DCT (§8.6.4.2).
-fn dct_coef(k: usize, n: usize) -> i32 {
+const fn dct_coef(k: usize, n: usize) -> i32 {
     if k == 0 {
         return 64;
     }
@@ -114,8 +115,20 @@ fn dct_coef(k: usize, n: usize) -> i32 {
     }
 }
 
-static DCT32: std::sync::LazyLock<[[i32; 32]; 32]> =
-    std::sync::LazyLock::new(|| core::array::from_fn(|k| core::array::from_fn(|n| dct_coef(k, n))));
+/// The 32-point DCT matrix, `DCT32[k][n]`; smaller sizes use every `32 / size`-th row.
+const DCT32: [[i32; 32]; 32] = {
+    let mut m = [[0; 32]; 32];
+    let mut k = 0;
+    while k < 32 {
+        let mut n = 0;
+        while n < 32 {
+            m[k][n] = dct_coef(k, n);
+            n += 1;
+        }
+        k += 1;
+    }
+    m
+};
 
 /// 4×4 DST-VII used for intra luma 4×4 blocks (8-317).
 const DST4: [[i32; 4]; 4] = [
@@ -125,18 +138,25 @@ const DST4: [[i32; 4]; 4] = [
     [55, -84, 74, -29],
 ];
 
-/// Inverse 1-D transform of `n` coefficients with stride.
-fn inverse_1d(input: &[i32], output: &mut [i32], n: usize, dst: bool) {
-    let step = 32 / n;
-    for (i, out) in output.iter_mut().enumerate().take(n) {
-        let mut s: i64 = 0;
-        for (k, &c) in input.iter().enumerate().take(n) {
-            if c != 0 {
-                let m = if dst { DST4[k][i] } else { DCT32[k * step][i] };
-                s += i64::from(m) * i64::from(c);
-            }
+/// Inverse 1-D transform: `output[i] = Σ_k M[k][i] · input[k]`, with `output.len()` points.
+///
+/// `input` may be shorter than the transform size when its tail is known to be zero. Inputs are
+/// clipped to 16 bits and coefficients are at most 90, so the sums fit in `i32`.
+fn inverse_1d(input: &[i32], output: &mut [i32], dst: bool) {
+    let n = output.len();
+    output.fill(0);
+    for (k, &c) in input.iter().enumerate() {
+        if c == 0 {
+            continue;
         }
-        *out = s.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let row: &[i32] = if dst {
+            &DST4[k]
+        } else {
+            &DCT32[k * (32 / n)][..n]
+        };
+        for (o, &m) in output.iter_mut().zip(row) {
+            *o += m * c;
+        }
     }
 }
 
@@ -156,6 +176,9 @@ pub struct Reconstructor<'a> {
     slice_cr_qp_offset: i32,
     /// Luma residual of the current transform unit, for cross-component prediction (4:4:4).
     luma_residual: Vec<i32>,
+    /// Scratch buffers reused across transform blocks (prediction, residual, dequantized
+    /// coefficients, intermediate transform), 32×32 each.
+    scratch: Vec<i32>,
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
     /// Deferred error (the sink interface cannot return errors).
@@ -180,6 +203,7 @@ impl<'a> Reconstructor<'a> {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
             luma_residual: vec![0; 32 * 32],
+            scratch: vec![0; 4 * 32 * 32],
             error: None,
         }
     }
@@ -291,8 +315,9 @@ impl<'a> Reconstructor<'a> {
         // p[-1][-1] ... index 4n = p[2n-1][-1] (right end of the top row), as in the
         // substitution order of §8.4.4.2.2.
         let total = 4 * n + 1;
-        let mut refs = vec![0i32; total];
-        let mut avail = vec![false; total];
+        let mut refs = [0i32; 4 * 32 + 1];
+        let mut avail = [false; 4 * 32 + 1];
+        let (refs, avail) = (&mut refs[..total], &mut avail[..total]);
         let pos = |i: usize| -> (i64, i64) {
             if i < 2 * n {
                 (i64::from(x0) - 1, i64::from(y0) + (2 * n - 1 - i) as i64)
@@ -301,9 +326,20 @@ impl<'a> Reconstructor<'a> {
             }
         };
         let mut any = false;
+        // Availability only changes between 4×4 luma blocks: reuse it within a block.
+        let mut cached: Option<((i64, i64), bool)> = None;
         for i in 0..total {
             let (xc, yc) = pos(i);
-            let ok = self.available(xl, yl, xc * i64::from(sw), yc * i64::from(sh));
+            let (xn, yn) = (xc * i64::from(sw), yc * i64::from(sh));
+            let key = (xn >> 2, yn >> 2);
+            let ok = match cached {
+                Some((k, ok)) if k == key => ok,
+                _ => {
+                    let ok = self.available(xl, yl, xn, yn);
+                    cached = Some((key, ok));
+                    ok
+                }
+            };
             if ok {
                 refs[i] = i32::from(plane[yc as usize * stride + xc as usize]);
                 avail[i] = true;
@@ -345,13 +381,15 @@ impl<'a> Reconstructor<'a> {
                 let bi_int = self.sps.strong_intra_smoothing_enabled_flag
                     && c == 0
                     && n == 32
-                    && (corner + top(&refs, n2 - 1) - 2 * top(&refs, n as i32 - 1)).abs()
+                    && (corner + top(refs, n2 - 1) - 2 * top(refs, n as i32 - 1)).abs()
                         < (1 << (bit_depth - 5))
-                    && (corner + left(&refs, n2 - 1) - 2 * left(&refs, n as i32 - 1)).abs()
+                    && (corner + left(refs, n2 - 1) - 2 * left(refs, n as i32 - 1)).abs()
                         < (1 << (bit_depth - 5));
-                let mut f = refs.clone();
+                let mut f = [0i32; 4 * 32 + 1];
+                let f = &mut f[..total];
+                f.copy_from_slice(refs);
                 if bi_int {
-                    let (l63, t63) = (left(&refs, 63), top(&refs, 63));
+                    let (l63, t63) = (left(refs, 63), top(refs, 63));
                     for y in 0..63 {
                         f[(63 - y) as usize] = ((63 - y) * corner + (y + 1) * l63 + 32) >> 6;
                     }
@@ -363,7 +401,7 @@ impl<'a> Reconstructor<'a> {
                         f[i] = (refs[i - 1] + 2 * refs[i] + refs[i + 1] + 2) >> 2;
                     }
                 }
-                refs = f;
+                refs.copy_from_slice(f);
             }
         }
 
@@ -373,12 +411,12 @@ impl<'a> Reconstructor<'a> {
         match mode {
             0 => {
                 // Planar.
-                let (tr, bl) = (top(&refs, n_i), left(&refs, n_i));
+                let (tr, bl) = (top(refs, n_i), left(refs, n_i));
                 for y in 0..n_i {
                     for x in 0..n_i {
-                        pred[(y * n_i + x) as usize] = ((n_i - 1 - x) * left(&refs, y)
+                        pred[(y * n_i + x) as usize] = ((n_i - 1 - x) * left(refs, y)
                             + (x + 1) * tr
-                            + (n_i - 1 - y) * top(&refs, x)
+                            + (n_i - 1 - y) * top(refs, x)
                             + (y + 1) * bl
                             + n_i)
                             >> (log2n + 1);
@@ -387,16 +425,16 @@ impl<'a> Reconstructor<'a> {
             }
             1 => {
                 // DC.
-                let sum: i32 = (0..n_i).map(|i| top(&refs, i) + left(&refs, i)).sum();
+                let sum: i32 = (0..n_i).map(|i| top(refs, i) + left(refs, i)).sum();
                 let dc = (sum + n_i) >> (log2n + 1);
                 pred[..n * n].fill(dc);
                 if boundary_filters {
-                    pred[0] = (left(&refs, 0) + 2 * dc + top(&refs, 0) + 2) >> 2;
+                    pred[0] = (left(refs, 0) + 2 * dc + top(refs, 0) + 2) >> 2;
                     for x in 1..n_i {
-                        pred[x as usize] = (top(&refs, x) + 3 * dc + 2) >> 2;
+                        pred[x as usize] = (top(refs, x) + 3 * dc + 2) >> 2;
                     }
                     for y in 1..n_i {
-                        pred[(y * n_i) as usize] = (left(&refs, y) + 3 * dc + 2) >> 2;
+                        pred[(y * n_i) as usize] = (left(refs, y) + 3 * dc + 2) >> 2;
                     }
                 }
             }
@@ -404,19 +442,19 @@ impl<'a> Reconstructor<'a> {
                 let angle = INTRA_PRED_ANGLE[usize::from(mode) - 2];
                 let vertical = mode >= 18;
                 // ref[] with offset n so that negative indices are representable.
-                let mut r = vec![0i32; 3 * n + 1];
+                let mut r = [0i32; 3 * 32 + 1];
                 let main = |i: i32| {
                     if vertical {
-                        top(&refs, i - 1)
+                        top(refs, i - 1)
                     } else {
-                        left(&refs, i - 1)
+                        left(refs, i - 1)
                     }
                 };
                 let side = |i: i32| {
                     if vertical {
-                        left(&refs, i - 1)
+                        left(refs, i - 1)
                     } else {
-                        top(&refs, i - 1)
+                        top(refs, i - 1)
                     }
                 };
                 for x in 0..=n_i {
@@ -456,12 +494,12 @@ impl<'a> Reconstructor<'a> {
                     if mode == 26 {
                         for y in 0..n_i {
                             pred[(y * n_i) as usize] =
-                                (top(&refs, 0) + ((left(&refs, y) - corner) >> 1)).clamp(0, max);
+                                (top(refs, 0) + ((left(refs, y) - corner) >> 1)).clamp(0, max);
                         }
                     } else if mode == 10 {
                         for x in 0..n_i {
                             pred[x as usize] =
-                                (left(&refs, 0) + ((top(&refs, x) - corner) >> 1)).clamp(0, max);
+                                (left(refs, 0) + ((top(refs, x) - corner) >> 1)).clamp(0, max);
                         }
                     }
                 }
@@ -530,7 +568,15 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Computes the residual of a block from its coefficients (§8.6.2 to §8.6.4).
-    fn residual(&self, tb: &TransformBlock<'_>, coeffs: &[i32], out: &mut [i32]) {
+    /// `d` and `tmp` are scratch buffers of at least `n * n` values.
+    fn residual(
+        &self,
+        tb: &TransformBlock<'_>,
+        coeffs: &[i32],
+        out: &mut [i32],
+        d: &mut [i32],
+        tmp: &mut [i32],
+    ) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         if tb.transquant_bypass {
@@ -582,7 +628,8 @@ impl<'a> Reconstructor<'a> {
             .as_ref()
             .or(self.sps.scaling_list.as_ref());
         let flat = list.is_none() || (tb.transform_skip && n > 4);
-        let mut d = vec![0i32; n * n];
+        let d = &mut d[..n * n];
+        d.fill(0);
         for y in 0..n {
             for x in 0..n {
                 let level = coeffs[y * n + x];
@@ -603,32 +650,40 @@ impl<'a> Reconstructor<'a> {
         let bd_shift2 = 20 - bit_depth;
         if tb.transform_skip {
             let ts_shift = 5 + i32::from(tb.log2_size);
-            for (o, &v) in out.iter_mut().zip(&d) {
+            for (o, &v) in out.iter_mut().zip(d.iter()) {
                 *o = ((v << ts_shift) + (1 << (bd_shift2 - 1))) >> bd_shift2;
             }
             self.rotate_and_rdpcm(tb, &mut out[..n * n]);
             return;
         }
 
-        // Inverse transform (§8.6.4.2): columns, clip, then rows.
+        // Inverse transform (§8.6.4.2): columns, clip, then rows. Only the leading non-zero part
+        // of each column, and the columns up to the last non-zero one, are transformed.
         let dst = c == 0 && n == 4;
-        let mut tmp = vec![0i32; n * n];
-        let mut col = vec![0i32; n];
-        let mut res = vec![0i32; n];
+        let tmp = &mut tmp[..n * n];
+        tmp.fill(0);
+        let mut col = [0i32; 32];
+        let mut res = [0i32; 32];
+        let mut cols = 0;
         for x in 0..n {
+            let mut len = 0;
             for y in 0..n {
                 col[y] = d[y * n + x];
+                if col[y] != 0 {
+                    len = y + 1;
+                }
             }
-            if col.iter().all(|&v| v == 0) {
+            if len == 0 {
                 continue;
             }
-            inverse_1d(&col, &mut res, n, dst);
+            cols = x + 1;
+            inverse_1d(&col[..len], &mut res[..n], dst);
             for y in 0..n {
                 tmp[y * n + x] = ((res[y] + 64) >> 7).clamp(-32768, 32767);
             }
         }
         for y in 0..n {
-            inverse_1d(&tmp[y * n..(y + 1) * n], &mut res, n, dst);
+            inverse_1d(&tmp[y * n..y * n + cols], &mut res[..n], dst);
             for x in 0..n {
                 out[y * n + x] = (res[x] + (1 << (bd_shift2 - 1))) >> bd_shift2;
             }
@@ -638,20 +693,17 @@ impl<'a> Reconstructor<'a> {
     fn transform_block_impl(&mut self, tb: &TransformBlock<'_>) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
-        let mut pred = vec![0i32; n * n];
-        self.predict(
-            c,
-            tb.x,
-            tb.y,
-            n,
-            tb.intra_mode,
-            tb.transquant_bypass,
-            &mut pred,
-        );
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let (pred, rest) = scratch.split_at_mut(32 * 32);
+        let (residual, rest) = rest.split_at_mut(32 * 32);
+        let (d, tmp) = rest.split_at_mut(32 * 32);
+        let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
+        self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred);
 
-        let mut residual = vec![0i32; n * n];
         if let Some(coeffs) = tb.coeffs {
-            self.residual(tb, coeffs, &mut residual);
+            self.residual(tb, coeffs, residual, d, tmp);
+        } else {
+            residual.fill(0);
         }
         if c == 0
             && self
@@ -659,7 +711,7 @@ impl<'a> Reconstructor<'a> {
                 .range_extension
                 .cross_component_prediction_enabled_flag
         {
-            self.luma_residual[..n * n].copy_from_slice(&residual);
+            self.luma_residual[..n * n].copy_from_slice(residual);
         }
         if c > 0 && tb.res_scale_val != 0 {
             let (bd_y, bd_c) = (
@@ -680,6 +732,7 @@ impl<'a> Reconstructor<'a> {
                 plane[row + x] = (pred[y * n + x] + residual[y * n + x]).clamp(0, max) as u16;
             }
         }
+        self.scratch = scratch;
         if c == 0 {
             self.mark_decoded(tb.x, tb.y, n as u32, n as u32);
             self.mark_edges(tb.x, tb.y, n as u32, n as u32);

@@ -83,6 +83,40 @@ pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
     let c_mid = f64::from(1u32 << (bd_c - 1));
     let to_out = |v: f64| (v * max_out).round().clamp(0.0, max_out) as u16;
 
+    if params.matrix != 0 {
+        // Same arithmetic as the generic loop below, with the per-sample terms looked up in
+        // tables (one entry per possible sample value), so the result is identical.
+        let lut = |bits: u8, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
+            (0..1u32 << bits).map(|v| f(f64::from(v))).collect()
+        };
+        let yn_lut = lut(bd_y, &|v| (v - y_off) / y_scale);
+        let r_lut = lut(bd_c, &|v| 2.0 * (1.0 - kr) * ((v - c_mid) / c_scale));
+        let b_lut = lut(bd_c, &|v| 2.0 * (1.0 - kb) * ((v - c_mid) / c_scale));
+        let at = |t: &[f64], v: u16| t[usize::from(v).min(t.len() - 1)];
+        let xcs: Vec<usize> = (0..w).map(|x| (x / sx).min(cw - 1) as usize).collect();
+        data.resize(w as usize * h as usize * 4, alpha);
+        for (y, out_row) in data.chunks_exact_mut(w as usize * 4).enumerate() {
+            let yc = (y as u32 / sy).min(chh - 1) as usize;
+            let luma = &frame.planes[0][y * w as usize..(y + 1) * w as usize];
+            let cb_row = &frame.planes[1][yc * cw as usize..(yc + 1) * cw as usize];
+            let cr_row = &frame.planes[2][yc * cw as usize..(yc + 1) * cw as usize];
+            for ((px, &yv), &xc) in out_row.chunks_exact_mut(4).zip(luma).zip(&xcs) {
+                let yn = at(&yn_lut, yv);
+                let r = yn + at(&r_lut, cr_row[xc]);
+                let b = yn + at(&b_lut, cb_row[xc]);
+                let g = (yn - kr * r - kb * b) / kg;
+                px[..3].copy_from_slice(&[to_out(r), to_out(g), to_out(b)]);
+            }
+        }
+        return Image {
+            width: w,
+            height: h,
+            bit_depth: out_depth,
+            has_alpha: false,
+            data,
+        };
+    }
+
     for y in 0..h {
         let yc = (y / sy).min(chh - 1) as usize;
         for x in 0..w {

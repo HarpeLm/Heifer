@@ -18,11 +18,7 @@ pub struct Image {
 impl Image {
     /// Creates an image filled with one RGBA colour.
     pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [u16; 4]) -> Self {
-        let n = width as usize * height as usize;
-        let mut data = Vec::with_capacity(n * 4);
-        for _ in 0..n {
-            data.extend_from_slice(&rgba);
-        }
+        let data = rgba.repeat(width as usize * height as usize);
         Self {
             width,
             height,
@@ -64,12 +60,21 @@ impl Image {
         ]
     }
 
+    /// Builds a `width`×`height` image whose pixel (x, y) is the pixel `src(x, y)` of `self`.
+    /// Works in 32×32 tiles so that rotations stay cache-friendly.
     fn remap(&self, width: u32, height: u32, src: impl Fn(u32, u32) -> (u32, u32)) -> Self {
-        let mut data = Vec::with_capacity(width as usize * height as usize * 4);
-        for y in 0..height {
-            for x in 0..width {
-                let (sx, sy) = src(x, y);
-                data.extend_from_slice(&self.pixel(sx, sy));
+        const TILE: u32 = 32;
+        let mut data = vec![0u16; width as usize * height as usize * 4];
+        for ty in (0..height).step_by(TILE as usize) {
+            for tx in (0..width).step_by(TILE as usize) {
+                for y in ty..(ty + TILE).min(height) {
+                    for x in tx..(tx + TILE).min(width) {
+                        let (sx, sy) = src(x, y);
+                        let i = (sy as usize * self.width as usize + sx as usize) * 4;
+                        let o = (y as usize * width as usize + x as usize) * 4;
+                        data[o..o + 4].copy_from_slice(&self.data[i..i + 4]);
+                    }
+                }
             }
         }
         Self {
