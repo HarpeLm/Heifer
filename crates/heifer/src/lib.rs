@@ -24,8 +24,9 @@ pub use heifer_isobmff;
 pub use image::Image;
 pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
 
-use color::{ColorParams, frame_to_rgba};
+use color::{ColorParams, frame_to_rgba, frame_to_rgba_into};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+use heifer_hevc_dec::recon::Frame;
 use heifer_isobmff::boxes::{ColorInfo, Property};
 use heifer_isobmff::{HeifFile, ItemId};
 
@@ -158,12 +159,21 @@ fn color_params(
         .unwrap_or_else(|| ColorParams::from_frame(frame)))
 }
 
+/// Decodes the HEVC picture of a coded image item.
+fn decode_hvc1_frame(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Frame, Error> {
+    let hevc_options = DecodeOptions {
+        max_pixels: options.max_pixels(),
+        ..Default::default()
+    };
+    Ok(decode_picture(&file.hevc_bitstream(id)?, hevc_options)?)
+}
+
 fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Image, Error> {
     let hevc_options = DecodeOptions {
         max_pixels: options.max_pixels(),
         ..Default::default()
     };
-    let frame = decode_picture(&file.hevc_bitstream(id)?, hevc_options)?;
+    let frame = decode_hvc1_frame(file, id, options)?;
     let mut image = frame_to_rgba(&frame, color_params(file, id, &frame)?);
     if let Some((w, h)) = file.image_size(id)?
         && (w, h) != (image.width, image.height)
@@ -246,32 +256,83 @@ fn decode_grid(
             size
         }
     };
-    let canvas = std::sync::Mutex::new(Image::filled(
-        grid.output_width,
-        grid.output_height,
-        bit_depth,
-        [0; 4],
-    ));
-    let place = |i: usize, tile: &Image| -> Result<(), Error> {
-        if (tile.width, tile.height, tile.bit_depth) != (tw, th, bit_depth) {
+    let mut canvas = Image::filled(grid.output_width, grid.output_height, bit_depth, [0; 4]);
+    let (canvas_w, canvas_h) = (canvas.width, canvas.height);
+    let stride = canvas_w as usize * 4;
+    // One lock per row of tiles: tiles of different rows are written concurrently.
+    let bands: Vec<std::sync::Mutex<&mut [u16]>> = canvas
+        .data
+        .chunks_mut(th as usize * stride)
+        .map(std::sync::Mutex::new)
+        .collect();
+    let has_alpha = std::sync::atomic::AtomicBool::new(false);
+    // Plain tiles are converted straight into the canvas, without an intermediate image.
+    let plain = first_tile.is_none()
+        && tiles
+            .iter()
+            .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
+    let place = |i: usize, tile: Option<&Image>| -> Result<(), Error> {
+        let (x0, y0) = ((i as u32 % columns) * tw, (i as u32 / columns) * th);
+        let (w, h) = (
+            tw.min(canvas_w.saturating_sub(x0)) as usize,
+            th.min(canvas_h.saturating_sub(y0)) as usize,
+        );
+        let tile_image;
+        let tile = match tile {
+            Some(t) => Some(t),
+            None if plain => None,
+            None => {
+                tile_image = decode_item_with(file, tiles[i], depth + 1, options)?;
+                Some(&tile_image)
+            }
+        };
+        let frame = match tile {
+            Some(_) => None,
+            None => {
+                let frame = decode_hvc1_frame(file, tiles[i], options)?;
+                let params = color_params(file, tiles[i], &frame)?;
+                Some((frame, params))
+            }
+        };
+        let size_ok = match (tile, &frame) {
+            (Some(t), _) => (t.width, t.height, t.bit_depth) == (tw, th, bit_depth),
+            (None, Some((f, _))) => {
+                f.widths[0] >= tw
+                    && f.heights[0] >= th
+                    && f.bit_depth[0].max(f.bit_depth[1]) == bit_depth
+            }
+            (None, None) => false,
+        };
+        if !size_ok {
             return Err(Error::Invalid(
                 "grid tiles have different sizes or bit depths",
             ));
         }
-        let (x0, y0) = ((i as u32 % columns) * tw, (i as u32 / columns) * th);
-        let mut canvas = canvas.lock().unwrap_or_else(|e| e.into_inner());
-        // Copy rows (no blending): tiles are opaque unless they carry alpha.
-        let w = tw.min(canvas.width.saturating_sub(x0)) as usize;
-        for y in 0..th.min(canvas.height.saturating_sub(y0)) {
-            let s = (y * tw) as usize * 4;
-            let d = ((y0 + y) * canvas.width + x0) as usize * 4;
-            canvas.data[d..d + w * 4].copy_from_slice(&tile.data[s..s + w * 4]);
+        let mut band = bands[i / columns as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let out = &mut band[x0 as usize * 4..];
+        match (tile, frame) {
+            (Some(tile), _) => {
+                // Copy rows (no blending): tiles are opaque unless they carry alpha.
+                for (dst, src) in out
+                    .chunks_mut(stride)
+                    .zip(tile.data.chunks_exact(tw as usize * 4))
+                    .take(h)
+                {
+                    dst[..w * 4].copy_from_slice(&src[..w * 4]);
+                }
+                if tile.has_alpha {
+                    has_alpha.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            (None, Some((frame, params))) => frame_to_rgba_into(&frame, params, out, stride, w, h),
+            (None, None) => unreachable!("checked above"),
         }
-        canvas.has_alpha |= tile.has_alpha;
         Ok(())
     };
-    let start = if let Some(tile) = first_tile {
-        place(0, &tile)?;
+    let start = if let Some(tile) = &first_tile {
+        place(0, Some(tile))?;
         1
     } else {
         0
@@ -280,8 +341,8 @@ fn decode_grid(
     // Tiles are independent HEVC streams: decode them on several threads.
     let threads = options.threads().min(tiles.len() - start);
     if threads <= 1 {
-        for (i, &tile_id) in tiles.iter().enumerate().skip(start) {
-            place(i, &decode_item_with(file, tile_id, depth + 1, options)?)?;
+        for i in start..tiles.len() {
+            place(i, None)?;
         }
     } else {
         let next = std::sync::atomic::AtomicUsize::new(start);
@@ -294,9 +355,7 @@ fn decode_grid(
                         if i >= tiles.len() {
                             break;
                         }
-                        let result = decode_item_with(file, tiles[i], depth + 1, options)
-                            .and_then(|t| place(i, &t));
-                        if let Err(e) = result {
+                        if let Err(e) = place(i, None) {
                             error
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -311,7 +370,23 @@ fn decode_grid(
             return Err(e);
         }
     }
-    Ok(canvas.into_inner().unwrap_or_else(|e| e.into_inner()))
+    drop(bands);
+    canvas.has_alpha = has_alpha.into_inner();
+    Ok(canvas)
+}
+
+/// Whether `id` is a coded image without transformative properties or alpha plane, so that
+/// its decoded picture can be used as is.
+fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
+    if file.item(id)?.item_type.0 != *b"hvc1" || !file.referencing_items(id, b"auxl").is_empty() {
+        return Ok(false);
+    }
+    Ok(!file.item_properties(id)?.any(|p| {
+        matches!(
+            p,
+            Property::CleanAperture { .. } | Property::Rotation(_) | Property::Mirror(_)
+        )
+    }))
 }
 
 fn decode_overlay(

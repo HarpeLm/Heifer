@@ -44,6 +44,9 @@ pub struct TransformBlock<'a> {
     pub intra_mode: u8,
     /// `TransCoeffLevel`, row-major (`[y * size + x]`), or `None` when the block has no residual.
     pub coeffs: Option<&'a [i32]>,
+    /// Number of columns and rows, from the top-left corner, that contain all the non-zero
+    /// coefficients of `coeffs` (both at least 1 when `coeffs` is present).
+    pub coeff_bounds: (u8, u8),
     /// `transform_skip_flag`.
     pub transform_skip: bool,
     /// `cu_transquant_bypass_flag` of the coding unit.
@@ -241,6 +244,7 @@ pub fn decode_slice_segment(
         current_qg: None,
         cu_transquant_bypass: false,
         coeffs: vec![0; 32 * 32],
+        coeff_bounds: (0, 0, 0),
         sao_luma: header.slice_sao_luma_flag,
         sao_chroma: header.slice_sao_chroma_flag,
         cu_chroma_qp_offset_enabled: header.cu_chroma_qp_offset_enabled_flag,
@@ -277,6 +281,9 @@ struct Parser<'p, 'a> {
     current_qg: Option<(u32, u32)>,
     cu_transquant_bypass: bool,
     coeffs: Vec<i32>,
+    /// Block size, columns and rows of the coefficients written in `coeffs` by the last
+    /// `residual_coding`: everything outside is zero.
+    coeff_bounds: (usize, usize, usize),
     sao_luma: bool,
     sao_chroma: bool,
     cu_chroma_qp_offset_enabled: bool,
@@ -1088,6 +1095,7 @@ impl Parser<'_, '_> {
         let n = 1usize << (2 * b.log2_size);
         let transform_skip = cbf && self.residual_coding(b.log2_size, b.c_idx, b.intra_mode)?;
         let coeffs = std::mem::take(&mut self.coeffs);
+        let (cols, rows) = (self.coeff_bounds.1, self.coeff_bounds.2);
         sink.transform_block(&TransformBlock {
             c_idx: b.c_idx,
             x: b.x,
@@ -1095,6 +1103,7 @@ impl Parser<'_, '_> {
             log2_size: b.log2_size,
             intra_mode: b.intra_mode,
             coeffs: cbf.then(|| &coeffs[..n]),
+            coeff_bounds: (cols as u8, rows as u8),
             transform_skip,
             transquant_bypass: self.cu_transquant_bypass,
             qp_y: b.qp_y,
@@ -1105,11 +1114,21 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
+    /// Zeroes the coefficients written by the last `residual_coding`, and only those.
+    fn clear_coeffs(&mut self) {
+        let (size, cols, rows) = self.coeff_bounds;
+        for row in self.coeffs.chunks_exact_mut(size.max(1)).take(rows) {
+            row[..cols].fill(0);
+        }
+        self.coeff_bounds = (size, 0, 0);
+    }
+
     /// `residual_coding()` (§7.3.8.11). Fills `self.coeffs[..size²]` and returns
     /// `transform_skip_flag`.
     fn residual_coding(&mut self, log2_size: u8, c_idx: u8, intra_mode: u8) -> Result<bool, Error> {
         let size = 1usize << log2_size;
-        self.coeffs[..size * size].fill(0);
+        self.clear_coeffs();
+        self.coeff_bounds.0 = size;
         let luma = c_idx == 0;
 
         let transform_skip = self.pps.transform_skip_enabled_flag
@@ -1361,6 +1380,8 @@ impl Parser<'_, '_> {
                     }
                 }
                 self.coeffs[yc * size + xc] = level;
+                self.coeff_bounds.1 = self.coeff_bounds.1.max(xc + 1);
+                self.coeff_bounds.2 = self.coeff_bounds.2.max(yc + 1);
             }
         }
         Ok(transform_skip)

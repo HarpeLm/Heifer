@@ -18,7 +18,13 @@ pub struct Image {
 impl Image {
     /// Creates an image filled with one RGBA colour.
     pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [u16; 4]) -> Self {
-        let data = rgba.repeat(width as usize * height as usize);
+        let n = width as usize * height as usize;
+        // An all-zero image is allocated zeroed by the system, which costs nothing upfront.
+        let data = if rgba == [0; 4] {
+            vec![0; n * 4]
+        } else {
+            rgba.repeat(n)
+        };
         Self {
             width,
             height,
@@ -35,18 +41,32 @@ impl Image {
 
     /// Converts to 8-bit RGBA, rounding higher bit depths.
     pub fn to_rgba8(&self) -> Vec<u8> {
-        let max = u32::from(self.max_value());
-        self.data
-            .iter()
-            .map(|&v| ((u32::from(v) * 255 + max / 2) / max) as u8)
-            .collect()
+        if self.bit_depth == 8 {
+            return self.data.iter().map(|&v| v as u8).collect();
+        }
+        let lut = self.to_8bit_table();
+        self.data.iter().map(|&v| lut[usize::from(v)]).collect()
     }
 
     /// Converts to 8-bit RGB, dropping alpha.
     pub fn to_rgb8(&self) -> Vec<u8> {
-        self.to_rgba8()
-            .chunks_exact(4)
-            .flat_map(|p| [p[0], p[1], p[2]])
+        let lut = self.to_8bit_table();
+        let mut out = Vec::with_capacity(self.data.len() / 4 * 3);
+        for p in self.data.chunks_exact(4) {
+            out.extend([
+                lut[usize::from(p[0])],
+                lut[usize::from(p[1])],
+                lut[usize::from(p[2])],
+            ]);
+        }
+        out
+    }
+
+    /// 8-bit value of every possible sample, rounded.
+    fn to_8bit_table(&self) -> Vec<u8> {
+        let max = u32::from(self.max_value());
+        (0..=max)
+            .map(|v| ((v * 255 + max / 2) / max) as u8)
             .collect()
     }
 

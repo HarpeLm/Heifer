@@ -4,7 +4,7 @@
 use crate::Error;
 use crate::filters::{self, FilterInfo, SliceFilterParams};
 use crate::params::{Pps, ScalingList, Sps};
-use crate::scan::{CtbLayout, ScanType, scan_order};
+use crate::scan::CtbLayout;
 use crate::syntax::{CodingUnit, SaoParams, Sink, TransformBlock};
 
 /// A decoded picture: three planes of samples (only the first one for monochrome).
@@ -203,6 +203,32 @@ fn inverse_2d<const N: usize>(
         }
     }
 }
+
+/// Position in the up-right diagonal scan of each raster position of an `N`×`N` block, for
+/// looking up scaling list coefficients (stored in scan order).
+const fn diagonal_index<const N: usize, const NN: usize>() -> [u8; NN] {
+    let mut index = [0u8; NN];
+    let (mut i, mut x, mut y) = (0, 0usize, 0usize);
+    // §6.5.3: walk the anti-diagonals from bottom-left to top-right.
+    while i < NN {
+        while y < N && x < N {
+            index[y * N + x] = i as u8;
+            i += 1;
+            if y == 0 {
+                break;
+            }
+            y -= 1;
+            x += 1;
+        }
+        let d = x + y + 1;
+        y = if d < N { d } else { N - 1 };
+        x = d - y;
+    }
+    index
+}
+
+const DIAGONAL_INDEX_4: [u8; 16] = diagonal_index::<4, 16>();
+const DIAGONAL_INDEX_8: [u8; 64] = diagonal_index::<8, 64>();
 
 /// Reconstructs a picture from the blocks emitted by the parser.
 #[derive(Debug)]
@@ -523,13 +549,7 @@ impl<'a> Reconstructor<'a> {
                 }
                 // j runs along the prediction direction: rows for vertical modes. Rows are
                 // computed contiguously (vectorizable), then transposed for horizontal modes.
-                let mut buf = [0i32; 32 * 32];
-                let lines = if vertical {
-                    &mut *pred
-                } else {
-                    &mut buf[..n * n]
-                };
-                for (j, line) in lines.chunks_exact_mut(n).enumerate() {
+                for (j, line) in pred.chunks_exact_mut(n).enumerate() {
                     let j = j as i32;
                     let idx = ((j + 1) * angle) >> 5;
                     let fact = ((j + 1) * angle) & 31;
@@ -543,9 +563,9 @@ impl<'a> Reconstructor<'a> {
                     }
                 }
                 if !vertical {
-                    for (y, row) in pred.chunks_exact_mut(n).enumerate() {
-                        for (x, o) in row.iter_mut().enumerate() {
-                            *o = buf[x * n + y];
+                    for y in 0..n {
+                        for x in y + 1..n {
+                            pred.swap(y * n + x, x * n + y);
                         }
                     }
                 }
@@ -577,24 +597,14 @@ impl<'a> Reconstructor<'a> {
     ) -> i32 {
         let size_id = usize::from(log2_size - 2);
         if size_id == 0 {
-            let scan = scan_order(2, ScanType::Diagonal);
-            let i = scan
-                .iter()
-                .position(|&(sx, sy)| usize::from(sx) == x && usize::from(sy) == y)
-                .unwrap();
-            return i32::from(list.lists[0][matrix_id][i]);
+            return i32::from(list.lists[0][matrix_id][usize::from(DIAGONAL_INDEX_4[y * 4 + x])]);
         }
         let ratio = 1usize << (size_id - 1); // 1 for 8×8, 2 for 16×16, 4 for 32×32
         if size_id >= 2 && x == 0 && y == 0 {
             return i32::from(list.dc[size_id - 2][matrix_id]);
         }
         let (xs, ys) = (x / ratio, y / ratio);
-        let scan = scan_order(3, ScanType::Diagonal);
-        let i = scan
-            .iter()
-            .position(|&(sx, sy)| usize::from(sx) == xs && usize::from(sy) == ys)
-            .unwrap();
-        i32::from(list.lists[size_id][matrix_id][i])
+        i32::from(list.lists[size_id][matrix_id][usize::from(DIAGONAL_INDEX_8[ys * 8 + xs])])
     }
 
     /// Range extension tools for blocks coded without transform (transform skip or
@@ -681,26 +691,40 @@ impl<'a> Reconstructor<'a> {
             .as_ref()
             .or(self.sps.scaling_list.as_ref());
         let flat = list.is_none() || (tb.transform_skip && n > 4);
+        // Only the rectangle holding the non-zero coefficients is scaled, padded with zeros to
+        // the width the transform reads; transform skip uses the whole block.
+        let (cols, rows) = if tb.transform_skip {
+            (n, n)
+        } else {
+            let (c, r) = tb.coeff_bounds;
+            (usize::from(c).clamp(1, n), usize::from(r).clamp(1, n))
+        };
+        let width = if tb.transform_skip {
+            n
+        } else {
+            (cols.div_ceil(8) * 8).min(n)
+        };
         let d = &mut d[..n * n];
-        d.fill(0);
-        // Bounding box of the non-zero coefficients: the transform only needs that part.
-        let (mut max_x, mut max_y) = (0, 0);
-        for y in 0..n {
-            for x in 0..n {
-                let level = coeffs[y * n + x];
-                if level == 0 {
-                    continue;
-                }
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-                let m = if flat {
-                    16
+        let rnd = 1i64 << (bd_shift - 1);
+        for (y, (src, dst)) in coeffs
+            .chunks_exact(n)
+            .zip(d.chunks_exact_mut(n))
+            .take(rows)
+            .enumerate()
+        {
+            dst[cols..width].fill(0);
+            for (x, (&level, o)) in src[..cols].iter().zip(&mut dst[..cols]).enumerate() {
+                *o = if level == 0 {
+                    0
                 } else {
-                    Self::scaling_factor(list.unwrap(), tb.log2_size, c, x, y)
+                    let m = if flat {
+                        16
+                    } else {
+                        Self::scaling_factor(list.unwrap(), tb.log2_size, c, x, y)
+                    };
+                    ((i64::from(level) * i64::from(m) * scale + rnd) >> bd_shift)
+                        .clamp(-32768, 32767) as i32
                 };
-                let v =
-                    (i64::from(level) * i64::from(m) * scale + (1 << (bd_shift - 1))) >> bd_shift;
-                d[y * n + x] = v.clamp(-32768, 32767) as i32;
             }
         }
 
@@ -714,17 +738,16 @@ impl<'a> Reconstructor<'a> {
             return;
         }
 
-        // Inverse transform (§8.6.4.2): columns, clip, then rows. Coefficients outside the
-        // bounding box are zero, so only its columns, and their first `max_y + 1` values, are used.
+        // Inverse transform (§8.6.4.2): columns, clip, then rows, over the non-zero rectangle.
         let dst = c == 0 && n == 4;
         let rnd2 = 1 << (bd_shift2 - 1);
-        if max_x == 0 && max_y == 0 && !dst {
+        if cols == 1 && rows == 1 && !dst {
             // DC only: every DCT basis row 0 coefficient is 64, so the residual is constant.
             let t = ((64 * d[0] + 64) >> 7).clamp(-32768, 32767);
             out[..n * n].fill((64 * t + rnd2) >> bd_shift2);
             return;
         }
-        let (rows, cols, out) = (max_y + 1, max_x + 1, &mut out[..n * n]);
+        let out = &mut out[..n * n];
         match n {
             4 if dst => inverse_2d(&DST4, d, rows, cols, bd_shift2, out),
             4 => inverse_2d(&DCT4, d, rows, cols, bd_shift2, out),
@@ -848,5 +871,21 @@ impl Sink for Reconstructor<'_> {
 
     fn sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
         self.filter_info.sao[(ctb_y * self.layout.width + ctb_x) as usize] = *params;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{ScanType, scan_order};
+
+    #[test]
+    fn diagonal_index_matches_scan_order() {
+        for (log2, table) in [(2u8, &DIAGONAL_INDEX_4[..]), (3, &DIAGONAL_INDEX_8[..])] {
+            let n = 1usize << log2;
+            for (i, &(x, y)) in scan_order(log2, ScanType::Diagonal).iter().enumerate() {
+                assert_eq!(usize::from(table[usize::from(y) * n + usize::from(x)]), i);
+            }
+        }
     }
 }

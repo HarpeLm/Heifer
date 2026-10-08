@@ -39,31 +39,59 @@ fn kr_kb(matrix: u16) -> (f64, f64) {
 /// nearest neighbour.
 pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
     let (w, h) = (frame.widths[0], frame.heights[0]);
+    let mut data = vec![0; w as usize * h as usize * 4];
+    frame_to_rgba_into(
+        frame,
+        params,
+        &mut data,
+        w as usize * 4,
+        w as usize,
+        h as usize,
+    );
+    Image {
+        width: w,
+        height: h,
+        bit_depth: frame.bit_depth[0].max(frame.bit_depth[1]),
+        has_alpha: false,
+        data,
+    }
+}
+
+/// Like [`frame_to_rgba`], but writes the top-left `width`×`height` pixels of `frame` (clamped
+/// to its size) into `out`, whose rows start `stride` samples apart (4 samples per pixel), so
+/// that grid tiles can be converted in place in the final image.
+pub fn frame_to_rgba_into(
+    frame: &Frame,
+    params: ColorParams,
+    out: &mut [u16],
+    stride: usize,
+    width: usize,
+    height: usize,
+) {
+    let (w, h) = (frame.widths[0] as usize, frame.heights[0] as usize);
+    let (width, height) = (width.min(w), height.min(h));
     let bd_y = frame.bit_depth[0];
     let bd_c = frame.bit_depth[1];
     let out_depth = bd_y.max(bd_c);
     let max_out = f64::from((1u32 << out_depth) - 1);
-    let mut data = Vec::with_capacity(w as usize * h as usize * 4);
     let alpha = (1u32 << out_depth) as u16 - 1;
+    let rows = out.chunks_mut(stride).take(height).enumerate();
+    let luma_row = |y: usize| &frame.planes[0][y * w..y * w + width];
 
     if frame.widths[1] == 0 {
         // Monochrome.
         let scale = max_out / f64::from((1u32 << bd_y) - 1);
-        for &v in &frame.planes[0] {
-            let g = (f64::from(v) * scale).round() as u16;
-            data.extend_from_slice(&[g, g, g, alpha]);
+        for (y, out_row) in rows {
+            for (px, &v) in out_row[..width * 4].chunks_exact_mut(4).zip(luma_row(y)) {
+                let g = (f64::from(v) * scale).round() as u16;
+                px.copy_from_slice(&[g, g, g, alpha]);
+            }
         }
-        return Image {
-            width: w,
-            height: h,
-            bit_depth: out_depth,
-            has_alpha: false,
-            data,
-        };
+        return;
     }
 
     let (cw, chh) = (frame.widths[1], frame.heights[1]);
-    let (sx, sy) = (w / cw.max(1), h / chh.max(1));
+    let (sx, sy) = (frame.widths[0] / cw.max(1), frame.heights[0] / chh.max(1));
     let (kr, kb) = kr_kb(params.matrix);
     let kg = 1.0 - kr - kb;
 
@@ -81,71 +109,81 @@ pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
         }
     };
     let c_mid = f64::from(1u32 << (bd_c - 1));
-    let to_out = |v: f64| (v * max_out).round().clamp(0.0, max_out) as u16;
+    let cwu = cw as usize;
+    let xcs: Vec<usize> = (0..width as u32)
+        .map(|x| (x / sx).min(cw - 1) as usize)
+        .collect();
+    let chroma_rows = |y: usize| {
+        let yc = (y as u32 / sy).min(chh - 1) as usize;
+        (
+            yc,
+            &frame.planes[1][yc * cwu..(yc + 1) * cwu],
+            &frame.planes[2][yc * cwu..(yc + 1) * cwu],
+        )
+    };
 
     if params.matrix != 0 {
-        // Same arithmetic as the generic loop below, with the per-sample terms looked up in
-        // tables (one entry per possible sample value), so the result is identical.
-        let lut = |bits: u8, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
-            (0..1u32 << bits).map(|v| f(f64::from(v))).collect()
+        // Fixed point with FRAC fractional bits: per-sample terms come from tables, then each
+        // pixel is three additions. Chroma terms are computed once per chroma sample.
+        const FRAC: u32 = 14;
+        let scale = max_out * f64::from(1u32 << FRAC);
+        let fixed = |bits: u8, f: &dyn Fn(f64) -> f64| -> Vec<i32> {
+            (0..1u32 << bits)
+                .map(|v| (f(f64::from(v)) * scale).round() as i32)
+                .collect()
         };
-        let yn_lut = lut(bd_y, &|v| (v - y_off) / y_scale);
-        let r_lut = lut(bd_c, &|v| 2.0 * (1.0 - kr) * ((v - c_mid) / c_scale));
-        let b_lut = lut(bd_c, &|v| 2.0 * (1.0 - kb) * ((v - c_mid) / c_scale));
-        let at = |t: &[f64], v: u16| t[usize::from(v).min(t.len() - 1)];
-        let xcs: Vec<usize> = (0..w).map(|x| (x / sx).min(cw - 1) as usize).collect();
-        data.resize(w as usize * h as usize * 4, alpha);
-        for (y, out_row) in data.chunks_exact_mut(w as usize * 4).enumerate() {
-            let yc = (y as u32 / sy).min(chh - 1) as usize;
-            let luma = &frame.planes[0][y * w as usize..(y + 1) * w as usize];
-            let cb_row = &frame.planes[1][yc * cw as usize..(yc + 1) * cw as usize];
-            let cr_row = &frame.planes[2][yc * cw as usize..(yc + 1) * cw as usize];
-            for ((px, &yv), &xc) in out_row.chunks_exact_mut(4).zip(luma).zip(&xcs) {
-                let yn = at(&yn_lut, yv);
-                let r = yn + at(&r_lut, cr_row[xc]);
-                let b = yn + at(&b_lut, cb_row[xc]);
-                let g = (yn - kr * r - kb * b) / kg;
-                px[..3].copy_from_slice(&[to_out(r), to_out(g), to_out(b)]);
+        let cn = |v: f64| (v - c_mid) / c_scale;
+        let y_lut = fixed(bd_y, &|v| (v - y_off) / y_scale);
+        let r_lut = fixed(bd_c, &|v| 2.0 * (1.0 - kr) * cn(v));
+        let b_lut = fixed(bd_c, &|v| 2.0 * (1.0 - kb) * cn(v));
+        // g = (y - kr r - kb b) / kg = y - (kr (r - y) + kb (b - y)) / kg
+        let gr_lut = fixed(bd_c, &|v| kr * 2.0 * (1.0 - kr) * cn(v) / kg);
+        let gb_lut = fixed(bd_c, &|v| kb * 2.0 * (1.0 - kb) * cn(v) / kg);
+        let at = |t: &[i32], v: u16| t[usize::from(v).min(t.len() - 1)];
+        let max = (1i32 << out_depth) - 1;
+        let to_out = |v: i32| ((v + (1 << (FRAC - 1))) >> FRAC).clamp(0, max) as u16;
+        let (mut rc, mut gc, mut bc) = (vec![0; cwu], vec![0; cwu], vec![0; cwu]);
+        let mut current_chroma_row = usize::MAX;
+        for (y, out_row) in rows {
+            let (yc, cb_row, cr_row) = chroma_rows(y);
+            if yc != current_chroma_row {
+                current_chroma_row = yc;
+                for (i, (&cb, &cr)) in cb_row.iter().zip(cr_row).enumerate() {
+                    rc[i] = at(&r_lut, cr);
+                    bc[i] = at(&b_lut, cb);
+                    gc[i] = at(&gr_lut, cr) + at(&gb_lut, cb);
+                }
+            }
+            let pixels = out_row[..width * 4]
+                .chunks_exact_mut(4)
+                .zip(luma_row(y))
+                .zip(&xcs);
+            for ((px, &yv), &xc) in pixels {
+                let yf = at(&y_lut, yv);
+                px.copy_from_slice(&[
+                    to_out(yf + rc[xc]),
+                    to_out(yf - gc[xc]),
+                    to_out(yf + bc[xc]),
+                    alpha,
+                ]);
             }
         }
-        return Image {
-            width: w,
-            height: h,
-            bit_depth: out_depth,
-            has_alpha: false,
-            data,
-        };
+        return;
     }
 
-    for y in 0..h {
-        let yc = (y / sy).min(chh - 1) as usize;
-        for x in 0..w {
-            let xc = (x / sx).min(cw - 1) as usize;
-            let yv = f64::from(frame.planes[0][(y * w + x) as usize]);
-            let cb = f64::from(frame.planes[1][yc * cw as usize + xc]);
-            let cr = f64::from(frame.planes[2][yc * cw as usize + xc]);
-            let (r, g, b) = if params.matrix == 0 {
-                // Identity: planes are G, B, R.
-                let s = max_out / f64::from((1u32 << bd_y) - 1);
-                ((cr * s) / max_out, (yv * s) / max_out, (cb * s) / max_out)
-            } else {
-                let yn = (yv - y_off) / y_scale;
-                let cbn = (cb - c_mid) / c_scale;
-                let crn = (cr - c_mid) / c_scale;
-                let r = yn + 2.0 * (1.0 - kr) * crn;
-                let b = yn + 2.0 * (1.0 - kb) * cbn;
-                let g = (yn - kr * r - kb * b) / kg;
-                (r, g, b)
-            };
-            data.extend_from_slice(&[to_out(r), to_out(g), to_out(b), alpha]);
+    // Identity matrix: planes are G, B, R.
+    let s = max_out / f64::from((1u32 << bd_y) - 1);
+    let to_out = |v: f64| (v * s).round().clamp(0.0, max_out) as u16;
+    for (y, out_row) in rows {
+        let (_, cb_row, cr_row) = chroma_rows(y);
+        let pixels = out_row[..width * 4]
+            .chunks_exact_mut(4)
+            .zip(luma_row(y))
+            .zip(&xcs);
+        for ((px, &g), &xc) in pixels {
+            let (b, r) = (f64::from(cb_row[xc]), f64::from(cr_row[xc]));
+            px.copy_from_slice(&[to_out(r), to_out(f64::from(g)), to_out(b), alpha]);
         }
-    }
-    Image {
-        width: w,
-        height: h,
-        bit_depth: out_depth,
-        has_alpha: false,
-        data,
     }
 }
 
