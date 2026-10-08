@@ -121,5 +121,11 @@ pub fn decode_picture_checked(
         }
         _ => HashCheck::NotChecked,
     };
-    Ok((frame.cropped(sps), check))
+    // Most pictures have no conformance window: avoid copying them.
+    let frame = if sps.conf_win_offsets == [0; 4] {
+        frame
+    } else {
+        frame.cropped(sps)
+    };
+    Ok((frame, check))
 }

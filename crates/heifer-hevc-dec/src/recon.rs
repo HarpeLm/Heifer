@@ -144,19 +144,28 @@ const DST4: [[i32; 4]; 4] = [
 /// clipped to 16 bits and coefficients are at most 90, so the sums fit in `i32`.
 fn inverse_1d(input: &[i32], output: &mut [i32], dst: bool) {
     let n = output.len();
-    output.fill(0);
-    for (k, &c) in input.iter().enumerate() {
-        if c == 0 {
-            continue;
+    if dst {
+        output.fill(0);
+        for (k, &c) in input.iter().enumerate().filter(|&(_, &c)| c != 0) {
+            for (o, &m) in output.iter_mut().zip(&DST4[k]) {
+                *o += m * c;
+            }
         }
-        let row: &[i32] = if dst {
-            &DST4[k]
-        } else {
-            &DCT32[k * (32 / n)][..n]
-        };
-        for (o, &m) in output.iter_mut().zip(row) {
-            *o += m * c;
+        return;
+    }
+    // DCT rows are symmetric for even frequencies and antisymmetric for odd ones: compute the
+    // first half of each part, then out[i] = even[i] + odd[i] and out[n-1-i] = even[i] - odd[i].
+    let half = n / 2;
+    let (mut even, mut odd) = ([0i32; 16], [0i32; 16]);
+    for (k, &c) in input.iter().enumerate().filter(|&(_, &c)| c != 0) {
+        let acc = if k % 2 == 0 { &mut even } else { &mut odd };
+        for (a, &m) in acc[..half].iter_mut().zip(&DCT32[k * (32 / n)][..half]) {
+            *a += m * c;
         }
+    }
+    for i in 0..half {
+        output[i] = even[i] + odd[i];
+        output[n - 1 - i] = even[i] - odd[i];
     }
 }
 
@@ -630,12 +639,16 @@ impl<'a> Reconstructor<'a> {
         let flat = list.is_none() || (tb.transform_skip && n > 4);
         let d = &mut d[..n * n];
         d.fill(0);
+        // Bounding box of the non-zero coefficients: the transform only needs that part.
+        let (mut max_x, mut max_y) = (0, 0);
         for y in 0..n {
             for x in 0..n {
                 let level = coeffs[y * n + x];
                 if level == 0 {
                     continue;
                 }
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
                 let m = if flat {
                     16
                 } else {
@@ -657,35 +670,32 @@ impl<'a> Reconstructor<'a> {
             return;
         }
 
-        // Inverse transform (§8.6.4.2): columns, clip, then rows. Only the leading non-zero part
-        // of each column, and the columns up to the last non-zero one, are transformed.
+        // Inverse transform (§8.6.4.2): columns, clip, then rows. Coefficients outside the
+        // bounding box are zero, so only its columns, and their first `max_y + 1` values, are used.
         let dst = c == 0 && n == 4;
+        let rnd2 = 1 << (bd_shift2 - 1);
+        if max_x == 0 && max_y == 0 && !dst {
+            // DC only: every DCT basis row 0 coefficient is 64, so the residual is constant.
+            let t = ((64 * d[0] + 64) >> 7).clamp(-32768, 32767);
+            out[..n * n].fill((64 * t + rnd2) >> bd_shift2);
+            return;
+        }
         let tmp = &mut tmp[..n * n];
-        tmp.fill(0);
         let mut col = [0i32; 32];
         let mut res = [0i32; 32];
-        let mut cols = 0;
-        for x in 0..n {
-            let mut len = 0;
-            for y in 0..n {
+        for x in 0..=max_x {
+            for y in 0..=max_y {
                 col[y] = d[y * n + x];
-                if col[y] != 0 {
-                    len = y + 1;
-                }
             }
-            if len == 0 {
-                continue;
-            }
-            cols = x + 1;
-            inverse_1d(&col[..len], &mut res[..n], dst);
+            inverse_1d(&col[..=max_y], &mut res[..n], dst);
             for y in 0..n {
                 tmp[y * n + x] = ((res[y] + 64) >> 7).clamp(-32768, 32767);
             }
         }
         for y in 0..n {
-            inverse_1d(&tmp[y * n..y * n + cols], &mut res[..n], dst);
+            inverse_1d(&tmp[y * n..=y * n + max_x], &mut res[..n], dst);
             for x in 0..n {
-                out[y * n + x] = (res[x] + (1 << (bd_shift2 - 1))) >> bd_shift2;
+                out[y * n + x] = (res[x] + rnd2) >> bd_shift2;
             }
         }
     }
