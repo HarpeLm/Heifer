@@ -170,16 +170,30 @@ differential check and a CABAC round trip. Fuzzing already found and fixed a mem
 
 ## <img src="docs/icons/gauge.svg" width="24" height="24" align="top"> Performance
 
-Measured on a 10-core Apple Silicon Mac (release build):
+Decode time on a 10-core Apple Silicon Mac (release build, median of several runs), compared with
+`ffmpeg` decoding the same file:
 
-| Image | Time |
-|---|---|
-| iPhone photo, 4032×3024 (48 tiles) | ~100 ms |
-| 8000×6000 | ~550 ms |
-| Samsung 200 MP (768 tiles) | ~2 s |
-| In the browser (WebAssembly, single thread), 1280×854 | ~260 ms |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 55 ms (ffmpeg 57), iPhone 12 MP 102 ms (ffmpeg 96), 48 MP 480 ms (ffmpeg 583), Galaxy 200 MP 1.6 s (ffmpeg fails)" width="100%">
+</picture>
 
-Single-image decoding is not optimised yet; there is room for improvement.
+| Image | heifer | heifer, 1 thread | ffmpeg |
+|---|---|---|---|
+| Xiaomi, 5 MP | 55 ms | 242 ms | 57 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 102 ms | 454 ms | 96 ms |
+| 8000×6000, 48 MP | 480 ms | 2.4 s | 583 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 1.6 s | 5.7 s | fails |
+| In the browser (WebAssembly, 1 thread), 1280×854 | ~260 ms | | |
+
+Grid tiles are decoded in parallel; the iPhone photo scales from 452 ms on 1 thread to 102 ms on 10:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 452 ms with 1 thread down to 102 ms with 10" width="100%">
+</picture>
+
+Heifer is on par with ffmpeg on multi-tile photos. Single-image decoding is not optimised yet; there is room for improvement.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 
