@@ -138,34 +138,69 @@ const DST4: [[i32; 4]; 4] = [
     [55, -84, 74, -29],
 ];
 
-/// Inverse 1-D transform: `output[i] = Σ_k M[k][i] · input[k]`, with `output.len()` points.
+/// The `N`-point DCT matrix: rows `k * 32 / N` of [`DCT32`], first `N` columns.
+const fn dct_matrix<const N: usize>() -> [[i32; N]; N] {
+    let mut m = [[0; N]; N];
+    let mut k = 0;
+    while k < N {
+        let mut n = 0;
+        while n < N {
+            m[k][n] = DCT32[k * (32 / N)][n];
+            n += 1;
+        }
+        k += 1;
+    }
+    m
+}
+
+const DCT4: [[i32; 4]; 4] = dct_matrix();
+const DCT8: [[i32; 8]; 8] = dct_matrix();
+const DCT16: [[i32; 16]; 16] = dct_matrix();
+
+/// 2-D inverse transform (§8.6.4.2) of an `N`×`N` block of scaled coefficients `d` whose
+/// non-zero values all lie in the top-left `rows`×`cols` corner: a vertical pass with clipping
+/// to 16 bits, then a horizontal pass shifted by `bd_shift`.
 ///
-/// `input` may be shorter than the transform size when its tail is known to be zero. Inputs are
-/// clipped to 16 bits and coefficients are at most 90, so the sums fit in `i32`.
-fn inverse_1d(input: &[i32], output: &mut [i32], dst: bool) {
-    let n = output.len();
-    if dst {
-        output.fill(0);
-        for (k, &c) in input.iter().enumerate().filter(|&(_, &c)| c != 0) {
-            for (o, &m) in output.iter_mut().zip(&DST4[k]) {
-                *o += m * c;
+/// Both passes accumulate whole contiguous rows of fixed size, which the compiler vectorizes.
+/// Inputs are 16-bit and coefficients at most 90 in magnitude, so the sums fit in `i32`.
+fn inverse_2d<const N: usize>(
+    m: &[[i32; N]; N],
+    d: &[i32],
+    rows: usize,
+    cols: usize,
+    bd_shift: i32,
+    out: &mut [i32],
+) {
+    // Vertical pass, on the first `width` columns (a multiple of 8 covering `cols`; the
+    // coefficients past `cols` are zero).
+    let width = (cols.div_ceil(8) * 8).min(N);
+    let mut tmp = [[0i32; N]; N];
+    for (y, t) in tmp.iter_mut().enumerate() {
+        let mut acc = [0i32; N];
+        for (k, row) in d.chunks_exact(N).take(rows).enumerate() {
+            let c = m[k][y];
+            for (a, &v) in acc[..width].iter_mut().zip(&row[..width]) {
+                *a += c * v;
             }
         }
-        return;
-    }
-    // DCT rows are symmetric for even frequencies and antisymmetric for odd ones: compute the
-    // first half of each part, then out[i] = even[i] + odd[i] and out[n-1-i] = even[i] - odd[i].
-    let half = n / 2;
-    let (mut even, mut odd) = ([0i32; 16], [0i32; 16]);
-    for (k, &c) in input.iter().enumerate().filter(|&(_, &c)| c != 0) {
-        let acc = if k % 2 == 0 { &mut even } else { &mut odd };
-        for (a, &m) in acc[..half].iter_mut().zip(&DCT32[k * (32 / n)][..half]) {
-            *a += m * c;
+        for (t, &a) in t[..width].iter_mut().zip(&acc[..width]) {
+            *t = ((a + 64) >> 7).clamp(-32768, 32767);
         }
     }
-    for i in 0..half {
-        output[i] = even[i] + odd[i];
-        output[n - 1 - i] = even[i] - odd[i];
+    // Horizontal pass: only the first `cols` intermediate values can be non-zero.
+    let rnd = 1 << (bd_shift - 1);
+    for (t, o) in tmp.iter().zip(out.chunks_exact_mut(N)) {
+        let mut acc = [0i32; N];
+        for (&c, mk) in t[..cols].iter().zip(m) {
+            if c != 0 {
+                for (a, &v) in acc.iter_mut().zip(mk) {
+                    *a += c * v;
+                }
+            }
+        }
+        for (o, &a) in o.iter_mut().zip(&acc) {
+            *o = (a + rnd) >> bd_shift;
+        }
     }
 }
 
@@ -186,7 +221,7 @@ pub struct Reconstructor<'a> {
     /// Luma residual of the current transform unit, for cross-component prediction (4:4:4).
     luma_residual: Vec<i32>,
     /// Scratch buffers reused across transform blocks (prediction, residual, dequantized
-    /// coefficients, intermediate transform), 32×32 each.
+    /// coefficients), 32×32 each.
     scratch: Vec<i32>,
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
@@ -212,7 +247,7 @@ impl<'a> Reconstructor<'a> {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
             luma_residual: vec![0; 32 * 32],
-            scratch: vec![0; 4 * 32 * 32],
+            scratch: vec![0; 3 * 32 * 32],
             error: None,
         }
     }
@@ -421,11 +456,15 @@ impl<'a> Reconstructor<'a> {
             0 => {
                 // Planar.
                 let (tr, bl) = (top(refs, n_i), left(refs, n_i));
-                for y in 0..n_i {
-                    for x in 0..n_i {
-                        pred[(y * n_i + x) as usize] = ((n_i - 1 - x) * left(refs, y)
+                let tops: [i32; 32] = core::array::from_fn(|x| top(refs, (x as i32).min(n_i - 1)));
+                for (y, row) in pred.chunks_exact_mut(n).enumerate() {
+                    let y = y as i32;
+                    let l = left(refs, y);
+                    for (x, (o, &t)) in row.iter_mut().zip(&tops).enumerate() {
+                        let x = x as i32;
+                        *o = ((n_i - 1 - x) * l
                             + (x + 1) * tr
-                            + (n_i - 1 - y) * top(refs, x)
+                            + (n_i - 1 - y) * t
                             + (y + 1) * bl
                             + n_i)
                             >> (log2n + 1);
@@ -482,20 +521,32 @@ impl<'a> Reconstructor<'a> {
                         r[(x + n_i) as usize] = main(x);
                     }
                 }
-                for j in 0..n_i {
+                // j runs along the prediction direction: rows for vertical modes. Rows are
+                // computed contiguously (vectorizable), then transposed for horizontal modes.
+                let mut buf = [0i32; 32 * 32];
+                let lines = if vertical {
+                    &mut *pred
+                } else {
+                    &mut buf[..n * n]
+                };
+                for (j, line) in lines.chunks_exact_mut(n).enumerate() {
+                    let j = j as i32;
                     let idx = ((j + 1) * angle) >> 5;
                     let fact = ((j + 1) * angle) & 31;
-                    for i in 0..n_i {
-                        let a = r[(i + idx + 1 + n_i) as usize];
-                        let v = if fact != 0 {
-                            let b = r[(i + idx + 2 + n_i) as usize];
-                            ((32 - fact) * a + fact * b + 16) >> 5
-                        } else {
-                            a
-                        };
-                        // j runs along the prediction direction: rows for vertical modes.
-                        let (x, y) = if vertical { (i, j) } else { (j, i) };
-                        pred[(y * n_i + x) as usize] = v;
+                    let src = &r[(idx + 1 + n_i) as usize..];
+                    if fact == 0 {
+                        line.copy_from_slice(&src[..n]);
+                    } else {
+                        for ((o, &a), &b) in line.iter_mut().zip(src).zip(&src[1..]) {
+                            *o = ((32 - fact) * a + fact * b + 16) >> 5;
+                        }
+                    }
+                }
+                if !vertical {
+                    for (y, row) in pred.chunks_exact_mut(n).enumerate() {
+                        for (x, o) in row.iter_mut().enumerate() {
+                            *o = buf[x * n + y];
+                        }
                     }
                 }
                 if boundary_filters {
@@ -577,15 +628,8 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Computes the residual of a block from its coefficients (§8.6.2 to §8.6.4).
-    /// `d` and `tmp` are scratch buffers of at least `n * n` values.
-    fn residual(
-        &self,
-        tb: &TransformBlock<'_>,
-        coeffs: &[i32],
-        out: &mut [i32],
-        d: &mut [i32],
-        tmp: &mut [i32],
-    ) {
+    /// `d` is a scratch buffer of at least `n * n` values.
+    fn residual(&self, tb: &TransformBlock<'_>, coeffs: &[i32], out: &mut [i32], d: &mut [i32]) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         if tb.transquant_bypass {
@@ -680,23 +724,13 @@ impl<'a> Reconstructor<'a> {
             out[..n * n].fill((64 * t + rnd2) >> bd_shift2);
             return;
         }
-        let tmp = &mut tmp[..n * n];
-        let mut col = [0i32; 32];
-        let mut res = [0i32; 32];
-        for x in 0..=max_x {
-            for y in 0..=max_y {
-                col[y] = d[y * n + x];
-            }
-            inverse_1d(&col[..=max_y], &mut res[..n], dst);
-            for y in 0..n {
-                tmp[y * n + x] = ((res[y] + 64) >> 7).clamp(-32768, 32767);
-            }
-        }
-        for y in 0..n {
-            inverse_1d(&tmp[y * n..=y * n + max_x], &mut res[..n], dst);
-            for x in 0..n {
-                out[y * n + x] = (res[x] + rnd2) >> bd_shift2;
-            }
+        let (rows, cols, out) = (max_y + 1, max_x + 1, &mut out[..n * n]);
+        match n {
+            4 if dst => inverse_2d(&DST4, d, rows, cols, bd_shift2, out),
+            4 => inverse_2d(&DCT4, d, rows, cols, bd_shift2, out),
+            8 => inverse_2d(&DCT8, d, rows, cols, bd_shift2, out),
+            16 => inverse_2d(&DCT16, d, rows, cols, bd_shift2, out),
+            _ => inverse_2d(&DCT32, d, rows, cols, bd_shift2, out),
         }
     }
 
@@ -706,12 +740,12 @@ impl<'a> Reconstructor<'a> {
         let mut scratch = std::mem::take(&mut self.scratch);
         let (pred, rest) = scratch.split_at_mut(32 * 32);
         let (residual, rest) = rest.split_at_mut(32 * 32);
-        let (d, tmp) = rest.split_at_mut(32 * 32);
+        let d = &mut rest[..32 * 32];
         let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
         self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred);
 
         if let Some(coeffs) = tb.coeffs {
-            self.residual(tb, coeffs, residual, d, tmp);
+            self.residual(tb, coeffs, residual, d);
         } else {
             residual.fill(0);
         }
@@ -736,10 +770,14 @@ impl<'a> Reconstructor<'a> {
         let max = (1i32 << self.frame.bit_depth[usize::from(c > 0)]) - 1;
         let stride = self.frame.widths[c] as usize;
         let plane = &mut self.frame.planes[c];
-        for y in 0..n {
+        for (y, (p, r)) in pred
+            .chunks_exact(n)
+            .zip(residual.chunks_exact(n))
+            .enumerate()
+        {
             let row = (tb.y as usize + y) * stride + tb.x as usize;
-            for x in 0..n {
-                plane[row + x] = (pred[y * n + x] + residual[y * n + x]).clamp(0, max) as u16;
+            for ((o, &p), &r) in plane[row..row + n].iter_mut().zip(p).zip(r) {
+                *o = (p + r).clamp(0, max) as u16;
             }
         }
         self.scratch = scratch;
