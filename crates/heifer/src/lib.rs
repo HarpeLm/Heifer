@@ -12,11 +12,15 @@
 
 pub mod color;
 pub mod image;
+#[cfg(feature = "image")]
+pub mod image_crate;
+pub mod metadata;
 
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
 pub use image::Image;
+pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
 
 use color::{ColorParams, frame_to_rgba};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};

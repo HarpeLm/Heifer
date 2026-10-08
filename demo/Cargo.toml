@@ -1,0 +1,22 @@
+[package]
+name = "heifer-demo"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Browser demo: decode HEIC files with heifer compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+heifer = { path = "../crates/heifer" }
+wasm-bindgen = "=0.2.129"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Kept out of the main workspace (built only for wasm32).
+[workspace]

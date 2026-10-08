@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heifer · HEIC in your browser</title>
+<style>
+  :root { --bg: #f7f7f5; --fg: #1c1c1a; --muted: #6b6b66; --line: #d8d8d2; --accent: #3a6ea5; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ececea; --muted: #9a9a94; --line: #34342f; --accent: #7aa7d9; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  #drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; }
+  #drop.over { border-color: var(--accent); }
+  #status { margin: 16px 0; color: var(--muted); min-height: 1.5em; }
+  canvas { max-width: 100%; height: auto; border-radius: 8px; display: none; }
+  button { margin-top: 12px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--fg); cursor: pointer; display: none; }
+  footer { margin-top: 32px; color: var(--muted); font-size: .9rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>heifer</h1>
+  <p class="lead">Decode HEIC photos in your browser with a pure-Rust decoder compiled to WebAssembly. Your file never leaves your device.</p>
+  <label id="drop">Drop a .heic file here, or click to choose one
+    <input id="file" type="file" accept=".heic,.heif,.hif,image/heic,image/heif" hidden>
+  </label>
+  <div id="status">Loading the decoder…</div>
+  <canvas id="canvas"></canvas>
+  <button id="save">Download as PNG</button>
+  <footer>Source: <a href="https://github.com/HarpeLm/Heifer">github.com/HarpeLm/Heifer</a></footer>
+</main>
+<script type="module">
+  import init, { decode } from "./pkg/heifer_demo.js";
+  const status = document.getElementById("status");
+  const canvas = document.getElementById("canvas");
+  const save = document.getElementById("save");
+  const drop = document.getElementById("drop");
+  let name = "image";
+  await init();
+  status.textContent = "Ready.";
+
+  async function handle(file) {
+    if (!file) return;
+    name = file.name.replace(/\.[^.]+$/, "");
+    status.textContent = `Decoding ${file.name}…`;
+    await new Promise(requestAnimationFrame); // let the message render
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const t0 = performance.now();
+    try {
+      const img = decode(bytes);
+      const ms = Math.round(performance.now() - t0);
+      canvas.width = img.width; canvas.height = img.height;
+      canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(img.rgba), img.width, img.height), 0, 0);
+      canvas.style.display = save.style.display = "block";
+      status.textContent = `${img.width}×${img.height} · ${img.info} · decoded in ${ms} ms`;
+      img.free();
+    } catch (e) {
+      status.textContent = `Could not decode this file: ${e.message ?? e}`;
+    }
+  }
+
+  document.getElementById("file").addEventListener("change", e => handle(e.target.files[0]));
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
+  save.addEventListener("click", () => canvas.toBlob(b => {
+    const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = `${name}.png`; a.click();
+  }, "image/png"));
+</script>
+</body>
+</html>

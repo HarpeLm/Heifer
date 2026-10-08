@@ -22,6 +22,8 @@ pub struct Item {
     pub name: String,
     /// Whether the item is hidden (e.g. grid tiles).
     pub hidden: bool,
+    /// MIME content type, for `mime` items (e.g. `application/rdf+xml` for XMP).
+    pub content_type: Option<String>,
     /// Associated properties (indices into [`HeifFile::properties`]).
     pub properties: Vec<PropertyAssociation>,
     /// Where the item data is stored, if it has any.
@@ -120,6 +122,7 @@ impl<'a> HeifFile<'a> {
                 item_type: info.item_type,
                 name: info.name,
                 hidden: info.hidden,
+                content_type: info.content_type,
             })
             .collect();
 
@@ -247,6 +250,82 @@ impl<'a> HeifFile<'a> {
                     }),
                 }
             }
+        }
+    }
+
+    /// Metadata items of type `item_type` describing `image` (`cdsc` references). When none
+    /// describes `image` itself and it is a derived image, items describing its first input
+    /// (e.g. the first tile of a grid) are used.
+    fn metadata_items(&self, image: ItemId, accept: impl Fn(&Item) -> bool) -> Vec<ItemId> {
+        let find = |id: ItemId| -> Vec<ItemId> {
+            self.referencing_items(id, b"cdsc")
+                .into_iter()
+                .filter(|&m| self.item(m).is_ok_and(&accept))
+                .collect()
+        };
+        let direct = find(image);
+        if !direct.is_empty() {
+            return direct;
+        }
+        self.referenced_items(image, b"dimg")
+            .first()
+            .map_or_else(Vec::new, |&first| find(first))
+    }
+
+    /// EXIF metadata of an image, as TIFF data (starting with `II*\0` or `MM\0*`).
+    ///
+    /// Note: HEIF orientation is given by the `irot`/`imir` properties; an EXIF orientation tag,
+    /// if present, is informative only and must not be applied on top of them.
+    pub fn exif(&self, image: ItemId) -> Result<Option<Vec<u8>>, Error> {
+        for id in self.metadata_items(image, |i| i.item_type.0 == *b"Exif") {
+            let data = self.item_data(id)?;
+            // ExifDataBlock: exif_tiff_header_offset (u32), then the data.
+            let Some(offset) = data
+                .get(..4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+            else {
+                continue;
+            };
+            let Some(mut tiff) = offset.checked_add(4).and_then(|start| data.get(start..)) else {
+                continue;
+            };
+            // Some writers keep the JPEG APP1 "Exif\0\0" prefix.
+            if tiff.starts_with(b"Exif\0\0") {
+                tiff = &tiff[6..];
+            }
+            if tiff.starts_with(b"II*\0") || tiff.starts_with(b"MM\0*") {
+                return Ok(Some(tiff.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// XMP metadata of an image (an XML packet), from a `mime` item of type
+    /// `application/rdf+xml`.
+    pub fn xmp(&self, image: ItemId) -> Result<Option<Vec<u8>>, Error> {
+        let accept = |i: &Item| {
+            i.item_type.0 == *b"mime" && i.content_type.as_deref() == Some("application/rdf+xml")
+        };
+        match self.metadata_items(image, accept).first() {
+            Some(&id) => Ok(Some(self.item_data(id)?.into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Embedded ICC profile of an image (`colr` property of type `prof`/`rICC`). For a grid
+    /// without its own profile, the profile of its first tile is returned. Empty profiles are
+    /// ignored.
+    pub fn icc_profile(&self, image: ItemId) -> Result<Option<&[u8]>, Error> {
+        let own = self.item_properties(image)?.find_map(|p| match p {
+            Property::Color(boxes::ColorInfo::Icc(icc)) if !icc.is_empty() => Some(icc.as_slice()),
+            _ => None,
+        });
+        if own.is_some() {
+            return Ok(own);
+        }
+        match self.referenced_items(image, b"dimg").first() {
+            Some(&first) if first != image => self.icc_profile(first),
+            _ => Ok(None),
         }
     }
 

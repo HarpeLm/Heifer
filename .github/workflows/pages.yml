@@ -1,0 +1,44 @@
+name: Demo
+
+# Builds the WebAssembly demo and publishes it on GitHub Pages.
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "demo/**", "scripts/build-demo.sh", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - name: Install wasm-opt
+        run: sudo apt-get install -y binaryen
+      - run: ./scripts/build-demo.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

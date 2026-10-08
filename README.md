@@ -2,6 +2,9 @@
 
 Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
 
+**[Try it in your browser](https://harpelm.github.io/Heifer/)** — HEIC photos decoded by heifer compiled to
+WebAssembly (≈ 250 KB); your file never leaves your device.
+
 > **Status: early development.** Complete HEIC files decode to RGB(A), with grids, overlays, alpha and
 > transforms. The HEVC decoder is validated against the official conformance bitstreams, and real
 > iPhone, Samsung and Xiaomi photos decode correctly (see below). HDR gain maps and ICC profiles are
@@ -59,12 +62,23 @@ and led to configurable size limits (`max_pixels`). It runs every night on GitHu
 ./scripts/fuzz.sh 8h             # all targets in parallel on all cores; Ctrl+C to stop
 ```
 
+WebAssembly demo (`rustup target add wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli --version 0.2.129`):
+
+```sh
+./scripts/build-demo.sh && python3 -m http.server -d demo/web 8000   # http://localhost:8000
+```
+
 ## Why
 
 HEIC is the default photo format on iPhones. In Rust, reading it usually means binding to `libheif` (C/C++),
 and there is no pure-Rust encoder at all. heifer aims to be a safe, portable, well-tested alternative.
 
 ## Usage
+
+```toml
+[dependencies]
+heifer = "0.1"
+```
 
 ```rust
 let bytes = std::fs::read("photo.heic")?;
@@ -75,6 +89,23 @@ println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
 // Grid tiles are decoded in parallel on all cores (no dependency: std threads).
 // Limit or disable it with options:
 let image = heifer::decode_with_options(&bytes, &heifer::Options { max_threads: 1 })?;
+```
+
+Metadata, without decoding pixels:
+
+```rust
+let meta = heifer::read_metadata(&bytes)?;
+if let Some(exif) = meta.exif_fields() {
+    println!("{:?} {:?} {:?}", exif.make(), exif.model(), exif.date_time());
+}
+let icc: Option<Vec<u8>> = meta.icc_profile;   // also meta.exif (raw TIFF), meta.xmp
+```
+
+With the [`image`](https://crates.io/crates/image) crate (`heifer = { version = "0.1", features = ["image"] }`):
+
+```rust
+heifer::image_crate::register_image_decoder_hooks();
+let img = image::open("photo.heic")?;          // .heic/.heif/.hif, and content detection
 ```
 
 Convert a file from the command line:
@@ -121,7 +152,8 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
   - [x] Extract HEVC bitstreams (Annex B) for each image item
   - [x] Grid assembly (tiles decoded in parallel), overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`
   - [x] YCbCr → RGB (BT.601/709/2020, full/limited range; `colr` nclx, else HEVC VUI)
-  - [ ] EXIF/XMP access, ICC profiles, `iloc` construction method 2, bilinear chroma upsampling
+  - [x] EXIF, XMP and ICC profile access (+ minimal EXIF reader)
+  - [ ] Applying ICC profiles, `iloc` construction method 2, bilinear chroma upsampling
   - [x] HEVC intra decoding
     - [x] Bit reader, Exp-Golomb codes, NAL units, emulation prevention
     - [x] VPS, SPS (VUI, HRD, scaling lists, range extension), PPS (tiles, deblocking)
@@ -139,7 +171,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
   - [ ] HDR gain maps (Apple / ISO 21496-1), ICC profiles
   - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
   - [x] Fuzzing (5 targets, dictionaries, nightly CI) and size limits against malicious files
-  - [ ] WebAssembly, `image` crate integration
+  - [x] `image` crate integration (feature `image`), WebAssembly browser demo
 - [ ] **Phase 2 — Encoder**
   - [ ] Write HEIF container
   - [ ] Minimal HEVC intra encoder (fixed block size, DC prediction, fixed QP) producing valid files

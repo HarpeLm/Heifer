@@ -164,3 +164,85 @@ fn broken_real_files_return_errors() {
         assert!(heifer::decode(&bytes).is_err(), "{name}");
     }
 }
+
+#[test]
+fn metadata_of_real_photos() {
+    // (file, make, model, date, orientation, gps, has xmp, has icc)
+    for (name, make, model, date, orientation, gps, xmp, icc) in [
+        (
+            "heif_other__pug.heic",
+            "Apple",
+            "iPhone 13 Pro",
+            "2023:02:21 14:33:08",
+            Some(1),
+            true,
+            true,
+            true,
+        ),
+        (
+            "heif_other__arrow.heic",
+            "Apple",
+            "iPhone 8 Plus",
+            "2018:07:31 14:52:07",
+            Some(6),
+            false,
+            false,
+            true,
+        ),
+        (
+            "heif_special__200MP.heic",
+            "samsung",
+            "Galaxy S24 Ultra",
+            "2025:01:19 14:53:27",
+            Some(6),
+            true,
+            true,
+            true,
+        ),
+        (
+            "heif_other__L_exif_xmp_iptc.heic",
+            "SONY",
+            "ILCE-7SM3",
+            "2020:09:14 11:09:34",
+            None,
+            false,
+            true,
+            false,
+        ),
+    ] {
+        let Some(bytes) = load_real(name) else {
+            continue;
+        };
+        let meta = heifer::read_metadata(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let exif = meta
+            .exif_fields()
+            .unwrap_or_else(|| panic!("{name}: no EXIF"));
+        assert_eq!(exif.make(), Some(make), "{name}");
+        assert_eq!(exif.model(), Some(model), "{name}");
+        assert_eq!(exif.date_time(), Some(date), "{name}");
+        assert_eq!(exif.orientation(), orientation, "{name}");
+        assert_eq!(exif.has_gps(), gps, "{name}");
+        assert_eq!(meta.xmp.is_some(), xmp, "{name}");
+        assert_eq!(meta.icc_profile.is_some(), icc, "{name}");
+        if let Some(x) = &meta.xmp {
+            assert!(
+                x.windows(9).any(|w| w == b"x:xmpmeta"),
+                "{name}: XMP is not an XMP packet"
+            );
+        }
+        if let Some(icc) = &meta.icc_profile {
+            assert_eq!(&icc[36..40], b"acsp", "{name}: invalid ICC profile");
+        }
+    }
+}
+
+#[test]
+fn files_without_metadata() {
+    let Some(bytes) = load("grid.heic") else {
+        return;
+    };
+    assert_eq!(
+        heifer::read_metadata(&bytes).unwrap(),
+        heifer::Metadata::default()
+    );
+}
