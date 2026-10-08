@@ -44,24 +44,58 @@ pub enum Error {
 const MAX_PIXELS: u64 = 1 << 28;
 const MAX_DEPTH: u32 = 4;
 
+/// Decoding options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Maximum number of threads used to decode grid tiles in parallel. `0` uses all
+    /// available cores; `1` decodes sequentially.
+    pub max_threads: usize,
+}
+
+impl Options {
+    fn threads(&self) -> usize {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if self.max_threads == 0 {
+            available
+        } else {
+            self.max_threads.min(available)
+        }
+    }
+}
+
 /// Decodes the primary image of a HEIF/HEIC file, with its alpha channel if any, and applies
-/// the crop, rotation and mirror transforms stored in the file.
+/// the crop, rotation and mirror transforms stored in the file. Grid tiles are decoded in
+/// parallel on all available cores.
 pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
+    decode_with_options(bytes, &Options::default())
+}
+
+/// Like [`decode`], with options.
+pub fn decode_with_options(bytes: &[u8], options: &Options) -> Result<Image, Error> {
     let file = HeifFile::parse(bytes)?;
-    decode_item(&file, file.primary_id, 0)
+    decode_item_with(&file, file.primary_id, 0, options)
 }
 
 /// Decodes one image item: coded (`hvc1`) or derived (`grid`, `iovl`), then applies its
 /// transformative properties.
 pub fn decode_item(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, Error> {
+    decode_item_with(file, id, depth, &Options::default())
+}
+
+fn decode_item_with(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    depth: u32,
+    options: &Options,
+) -> Result<Image, Error> {
     if depth > MAX_DEPTH {
         return Err(Error::Invalid("derived images nested too deeply"));
     }
     let item = file.item(id)?;
     let mut image = match &item.item_type.0 {
         b"hvc1" => decode_hvc1(file, id)?,
-        b"grid" => decode_grid(file, id, depth)?,
-        b"iovl" => decode_overlay(file, id, depth)?,
+        b"grid" => decode_grid(file, id, depth, options)?,
+        b"iovl" => decode_overlay(file, id, depth, options)?,
         _ => {
             return Err(Error::Unsupported(format!(
                 "image item type `{}`",
@@ -69,7 +103,6 @@ pub fn decode_item(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image,
             )));
         }
     };
-
     // Transformative properties, in association order (clap, then irot, then imir).
     for property in file.item_properties(id)? {
         image = match *property {
@@ -164,58 +197,108 @@ fn check_size(w: u32, h: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn decode_grid(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, Error> {
+fn decode_grid(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    depth: u32,
+    options: &Options,
+) -> Result<Image, Error> {
     let grid = file.grid(id)?;
     let tiles = file.referenced_items(id, b"dimg");
+    let columns = u32::from(grid.columns);
     if tiles.len() != usize::from(grid.rows) * usize::from(grid.columns) {
         return Err(Error::Invalid(
             "grid tile count does not match its rows and columns",
         ));
     }
     check_size(grid.output_width, grid.output_height)?;
-    let mut canvas: Option<Image> = None;
-    let (mut tw, mut th) = (0, 0);
-    for (i, &tile_id) in tiles.iter().enumerate() {
-        let tile = decode_item(file, tile_id, depth + 1)?;
-        let canvas = canvas.get_or_insert_with(|| {
-            (tw, th) = (tile.width, tile.height);
-            Image::filled(
-                grid.output_width,
-                grid.output_height,
-                tile.bit_depth,
-                [0; 4],
-            )
-        });
-        if (tile.width, tile.height) != (tw, th) {
-            return Err(Error::Invalid("grid tiles have different sizes"));
+
+    // Tile size and bit depth come from the tiles' `ispe` and `hvcC` properties, so that all
+    // tiles can be decoded in parallel. Otherwise, decode the first tile to find out.
+    let mut first_tile = None;
+    let (tw, th, bit_depth) = match (file.image_size(tiles[0])?, file.hevc_config(tiles[0])?) {
+        (Some((w, h)), Some(c)) => (w, h, c.bit_depth_luma.max(c.bit_depth_chroma)),
+        _ => {
+            let tile = decode_item_with(file, tiles[0], depth + 1, options)?;
+            let size = (tile.width, tile.height, tile.bit_depth);
+            first_tile = Some(tile);
+            size
         }
-        let (col, row) = (
-            i as u32 % u32::from(grid.columns),
-            i as u32 / u32::from(grid.columns),
-        );
-        let (x0, y0) = (i64::from(col * tw), i64::from(row * th));
-        // Copy (no blending): tiles are opaque unless they carry alpha.
-        for y in 0..th {
-            let cy = y0 + i64::from(y);
-            if cy >= i64::from(canvas.height) {
-                break;
-            }
-            for x in 0..tw {
-                let cx = x0 + i64::from(x);
-                if cx >= i64::from(canvas.width) {
-                    break;
-                }
-                let s = ((y * tw + x) * 4) as usize;
-                let d = ((cy as u32 * canvas.width + cx as u32) * 4) as usize;
-                canvas.data[d..d + 4].copy_from_slice(&tile.data[s..s + 4]);
-            }
+    };
+    let canvas = std::sync::Mutex::new(Image::filled(
+        grid.output_width,
+        grid.output_height,
+        bit_depth,
+        [0; 4],
+    ));
+    let place = |i: usize, tile: &Image| -> Result<(), Error> {
+        if (tile.width, tile.height, tile.bit_depth) != (tw, th, bit_depth) {
+            return Err(Error::Invalid(
+                "grid tiles have different sizes or bit depths",
+            ));
+        }
+        let (x0, y0) = ((i as u32 % columns) * tw, (i as u32 / columns) * th);
+        let mut canvas = canvas.lock().unwrap_or_else(|e| e.into_inner());
+        // Copy rows (no blending): tiles are opaque unless they carry alpha.
+        let w = tw.min(canvas.width.saturating_sub(x0)) as usize;
+        for y in 0..th.min(canvas.height.saturating_sub(y0)) {
+            let s = (y * tw) as usize * 4;
+            let d = ((y0 + y) * canvas.width + x0) as usize * 4;
+            canvas.data[d..d + w * 4].copy_from_slice(&tile.data[s..s + w * 4]);
         }
         canvas.has_alpha |= tile.has_alpha;
+        Ok(())
+    };
+    let start = if let Some(tile) = first_tile {
+        place(0, &tile)?;
+        1
+    } else {
+        0
+    };
+
+    // Tiles are independent HEVC streams: decode them on several threads.
+    let threads = options.threads().min(tiles.len() - start);
+    if threads <= 1 {
+        for (i, &tile_id) in tiles.iter().enumerate().skip(start) {
+            place(i, &decode_item_with(file, tile_id, depth + 1, options)?)?;
+        }
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(start);
+        let error = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= tiles.len() {
+                            break;
+                        }
+                        let result = decode_item_with(file, tiles[i], depth + 1, options)
+                            .and_then(|t| place(i, &t));
+                        if let Err(e) = result {
+                            error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(e);
+                            next.store(tiles.len(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(e);
+        }
     }
-    canvas.ok_or(Error::Invalid("grid without tiles"))
+    Ok(canvas.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn decode_overlay(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, Error> {
+fn decode_overlay(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    depth: u32,
+    options: &Options,
+) -> Result<Image, Error> {
     let data = file.item_data(id)?;
     let inputs = file.referenced_items(id, b"dimg");
     let mut r = data.iter().copied();
@@ -252,7 +335,7 @@ fn decode_overlay(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, 
 
     let images = inputs
         .iter()
-        .map(|&i| decode_item(file, i, depth + 1))
+        .map(|&i| decode_item_with(file, i, depth + 1, options))
         .collect::<Result<Vec<_>, _>>()?;
     let bit_depth = images.iter().map(|i| i.bit_depth).max().unwrap_or(8);
     // canvas_fill_value is given on 16 bits.

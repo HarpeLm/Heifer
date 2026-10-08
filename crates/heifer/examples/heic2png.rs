@@ -1,6 +1,6 @@
 //! Converts a HEIC file to PNG.
 //!
-//! Usage: cargo run --release -p heifer --example heic2png -- <in.heic> <out.png>
+//! Usage: cargo run --release -p heifer --example heic2png -- <in.heic> <out.png> [--threads N]
 //!
 //! The PNG writer is minimal (uncompressed deflate) to avoid dependencies: files are large.
 
@@ -69,11 +69,14 @@ fn encode_png(width: u32, height: u32, channels: usize, pixels: &[u8]) -> Vec<u8
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [input, output] = args.as_slice() else {
-        return Err("usage: heic2png <in.heic> <out.png>".into());
+    let (input, output, max_threads) = match args.as_slice() {
+        [i, o] => (i, o, 0),
+        [i, o, flag, n] if flag == "--threads" => (i, o, n.parse()?),
+        _ => return Err("usage: heic2png <in.heic> <out.png> [--threads N]".into()),
     };
     let start = std::time::Instant::now();
-    let image = heifer::decode(&std::fs::read(input)?)?;
+    let image =
+        heifer::decode_with_options(&std::fs::read(input)?, &heifer::Options { max_threads })?;
     let elapsed = start.elapsed();
     let (channels, pixels) = if image.has_alpha {
         (4, image.to_rgba8())

@@ -18,12 +18,16 @@ let bytes = std::fs::read("photo.heic")?;
 let image = heifer::decode(&bytes)?;           // primary image, alpha, crop/rotation/mirror applied
 let rgba: Vec<u8> = image.to_rgba8();           // or to_rgb8(); image.data holds 16-bit samples
 println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
+
+// Grid tiles are decoded in parallel on all cores (no dependency: std threads).
+// Limit or disable it with options:
+let image = heifer::decode_with_options(&bytes, &heifer::Options { max_threads: 1 })?;
 ```
 
 Convert a file from the command line:
 
 ```sh
-cargo run --release -p heifer --example heic2png -- photo.heic photo.png
+cargo run --release -p heifer --example heic2png -- photo.heic photo.png [--threads N]
 ```
 
 ### Lower-level APIs
@@ -62,7 +66,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 - [ ] **Phase 1 — Decoder**
   - [x] Parse container: `ftyp`, `meta`, `iinf`, `iloc`, `iref`, `iprp`/`ipco`/`ipma`, `idat`, grids, rotation/mirror, alpha
   - [x] Extract HEVC bitstreams (Annex B) for each image item
-  - [x] Grid assembly, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`
+  - [x] Grid assembly (tiles decoded in parallel), overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`
   - [x] YCbCr → RGB (BT.601/709/2020, full/limited range; `colr` nclx, else HEVC VUI)
   - [ ] EXIF/XMP access, ICC profiles, `iloc` construction method 2, bilinear chroma upsampling
   - [x] HEVC intra decoding
@@ -75,6 +79,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
     - [x] Deblocking filter, SAO — bit-exact vs ffmpeg
     - [ ] 10-bit, 4:0:0 (alpha), 4:2:2 / 4:4:4
   - [ ] Real-world test corpus + pixel comparison against libheif
+  - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
   - [ ] Fuzzing, WebAssembly, `image` crate integration
 - [ ] **Phase 2 — Encoder**
   - [ ] Write HEIF container
