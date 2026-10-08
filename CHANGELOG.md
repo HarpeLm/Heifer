@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 — 2026-10-08
+
+About 2× faster than 0.1.3 for `decode` + `to_rgba8`, and faster again on large photos.
+
+- CABAC: `ivlOffset` kept scaled with bytes read ahead (one shift per renormalization) and
+  branchless bypass bins.
+- Grid tiles without transforms or alpha are colour-converted straight into the final image,
+  each tile into its own row segments (no intermediate image, no shared lock).
+- Fixed-point YCbCr → RGB: 116 of 195 million samples of the test files change by 1.
+- `to_rgba8`/`to_rgb8`: plain copy for 8-bit images, lookup table otherwise.
+- Intra reference samples gathered per 4×4 block; angular prediction transposed in place;
+  scaling list factors from a lookup table instead of a search.
+- **Breaking:** `heifer_hevc_dec::syntax::TransformBlock` has a new `coeff_bounds` field;
+  `heifer::color::frame_to_rgba_into` is new.
+
 ## 0.1.3 — 2026-10-08
 
 - **HDR photos**: Apple HDR gain maps (iPhone). `decode_hdr` returns linear-light RGB with the

@@ -18,7 +18,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.6 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.55 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -65,7 +65,7 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 
 ```toml
 [dependencies]
-heifer = "0.1"
+heifer = "0.2"
 ```
 
 Or try the examples on your own photos:
@@ -126,7 +126,7 @@ if let Some(gain) = heifer::read_gain_map(&bytes)? {
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.1", features = ["image"] }
+heifer = { version = "0.2", features = ["image"] }
 ```
 
 ```rust
@@ -191,27 +191,42 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 20 ms (ffmpeg 58), iPhone 12 MP 36 ms (ffmpeg 97), 48 MP 187 ms (ffmpeg 581), Galaxy 200 MP 0.61 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 22 ms (ffmpeg 56), iPhone 12 MP 40 ms (ffmpeg 96), 48 MP 196 ms (ffmpeg 582), Galaxy 200 MP 0.54 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 20 ms | 115 ms | 58 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 36 ms | 187 ms | 97 ms |
-| 8000×6000, 48 MP | 187 ms | 1.0 s | 581 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.61 s | 2.4 s | fails |
+| Xiaomi, 5 MP | 22 ms | 120 ms | 56 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 40 ms | 167 ms | 96 ms |
+| 8000×6000, 48 MP | 196 ms | 0.97 s | 582 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.54 s | 2.1 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 184 ms on 1 thread to 35 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 162 ms on 1 thread to 32 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 184 ms with 1 thread down to 35 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 162 ms with 1 thread down to 32 ms with 10" width="100%">
 </picture>
 
 On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
 slower than ffmpeg. The hot loops are written so that the compiler vectorizes them (NEON, SSE/AVX),
 without any `unsafe` code.
+
+### Other pure-Rust decoders
+
+Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine, decoding to
+8-bit RGBA, on the files of this repository (October 2026, `heic` 0.1.6 and `heic-rs` 0.1.1):
+
+| | heifer | [`heic-rs`](https://crates.io/crates/heic-rs) | [`heic`](https://crates.io/crates/heic) |
+|---|---|---|---|
+| License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | AGPL-3.0 or commercial |
+| Test files decoded (of 53) | 50 | 49 (no `iovl` overlays) | 50 (refuses 200 MP by default) |
+| iPhone colours vs ffmpeg | 61 dB | 27 dB (full-range video decoded as limited range) | 61 dB |
+| Apple HDR gain maps applied | ✓ | – | extraction only |
+| Speed, 12 MP iPhone photo, 1 thread | 165 ms | **128 ms** | 227 ms |
+
+`heic-rs` is currently about 1.3× faster than heifer; heifer is more accurate and complete.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 

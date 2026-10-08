@@ -163,7 +163,7 @@
     <div class="numbers">
       <div><b class="grad">62 / 62</b><span>HEVC conformance streams<br>identical to ffmpeg</span></div>
       <div><b class="grad">41</b><span>streams verified against<br>reference MD5 hashes</span></div>
-      <div><b class="grad">200 MP</b><span>Galaxy S24 Ultra photo<br>decoded in 0.6 s</span></div>
+      <div><b class="grad">200 MP</b><span>Galaxy S24 Ultra photo<br>decoded in 0.55 s</span></div>
       <div><b class="grad">~35 ms</b><span>12 MP iPhone photo<br>on a 10-core Mac</span></div>
     </div>
   </section>
@@ -171,7 +171,7 @@
   <section>
     <h2>Use it in Rust</h2>
 <pre><span class="c"># Cargo.toml</span>
-heifer = <span class="s">"0.1"</span>
+heifer = <span class="s">"0.2"</span>
 
 <span class="k">let</span> bytes = std::fs::<span class="f">read</span>(<span class="s">"photo.heic"</span>)?;
 <span class="k">let</span> image = heifer::<span class="f">decode</span>(&amp;bytes)?;   <span class="c">// rotation, crop and alpha applied</span>
