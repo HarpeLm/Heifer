@@ -16,7 +16,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "heifer"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "heifer-hevc-dec",
  "heifer-hevc-enc",
@@ -34,14 +34,14 @@ dependencies = [
 
 [[package]]
 name = "heifer-hevc-dec"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "heifer-hevc-enc"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "heifer-hevc-dec",
  "thiserror",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-isobmff"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
