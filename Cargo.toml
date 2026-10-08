@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -13,9 +13,9 @@ keywords = ["heic", "heif", "hevc", "image", "decoder"]
 categories = ["multimedia::images", "multimedia::encoding", "parser-implementations"]
 
 [workspace.dependencies]
-heifer-isobmff = { path = "crates/heifer-isobmff", version = "0.1.1" }
-heifer-hevc-dec = { path = "crates/heifer-hevc-dec", version = "0.1.1" }
-heifer-hevc-enc = { path = "crates/heifer-hevc-enc", version = "0.1.1" }
+heifer-isobmff = { path = "crates/heifer-isobmff", version = "0.1.2" }
+heifer-hevc-dec = { path = "crates/heifer-hevc-dec", version = "0.1.2" }
+heifer-hevc-enc = { path = "crates/heifer-hevc-enc", version = "0.1.2" }
 thiserror = "2"
 
 [workspace.lints.rust]

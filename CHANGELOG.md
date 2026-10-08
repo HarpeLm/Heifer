@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 — 2026-10-08
+
+Faster again, still without any `unsafe` code and with bit-identical output.
+
+- The inverse transform works on fixed-size, contiguous rows and the intra prediction writes whole
+  rows, so the compiler vectorizes them (NEON, SSE/AVX, wasm simd128).
+- About 10% faster single-threaded (12 MP iPhone photo: 208 → 187 ms on one thread, 42 → 36 ms on
+  ten). In the browser, a 1280×854 photo decodes in ~80 ms instead of ~115 ms.
+
 ## 0.1.1 — 2026-10-08
 
 Faster decoding, with bit-identical output.

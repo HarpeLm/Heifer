@@ -2,17 +2,17 @@
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
 <text x="24" y="34" font-size="17" font-weight="600" fill="#e6edf3">Parallel grid decoding: iPhone photo, 48 tiles</text>
 <text x="24" y="56" font-size="12.5" fill="#9198a1">Time to decode the full 4032×3024 photo with a given number of threads (lower is better)</text>
-<rect x="24" y="340" width="11" height="11" rx="2" fill="#5b9be0"/><text x="41" y="349.5" font-size="12" fill="#9198a1">heifer (×5.3 faster with 10 threads)</text>
+<rect x="24" y="340" width="11" height="11" rx="2" fill="#5b9be0"/><text x="41" y="349.5" font-size="12" fill="#9198a1">heifer (×5.2 faster with 10 threads)</text>
 <text x="178" y="95.0" font-size="13" text-anchor="end" fill="#e6edf3">1 thread</text>
-<rect x="190" y="85" width="463.0" height="11" rx="2" fill="#5b9be0"/><text x="659.0" y="95" font-size="11.5" fill="#9198a1">207 ms</text>
+<rect x="190" y="85" width="463.0" height="11" rx="2" fill="#5b9be0"/><text x="659.0" y="95" font-size="11.5" fill="#9198a1">184 ms</text>
 <text x="178" y="135.0" font-size="13" text-anchor="end" fill="#e6edf3">2 threads</text>
-<rect x="190" y="125" width="243.0" height="11" rx="2" fill="#5b9be0"/><text x="439.0" y="135" font-size="11.5" fill="#9198a1">108 ms</text>
+<rect x="190" y="125" width="242.4" height="11" rx="2" fill="#5b9be0"/><text x="438.4" y="135" font-size="11.5" fill="#9198a1">96 ms</text>
 <text x="178" y="175.0" font-size="13" text-anchor="end" fill="#e6edf3">4 threads</text>
-<rect x="190" y="165" width="144.2" height="11" rx="2" fill="#5b9be0"/><text x="340.2" y="175" font-size="11.5" fill="#9198a1">64 ms</text>
+<rect x="190" y="165" width="144.9" height="11" rx="2" fill="#5b9be0"/><text x="340.9" y="175" font-size="11.5" fill="#9198a1">58 ms</text>
 <text x="178" y="215.0" font-size="13" text-anchor="end" fill="#e6edf3">6 threads</text>
-<rect x="190" y="205" width="114.5" height="11" rx="2" fill="#5b9be0"/><text x="310.5" y="215" font-size="11.5" fill="#9198a1">51 ms</text>
+<rect x="190" y="205" width="113.8" height="11" rx="2" fill="#5b9be0"/><text x="309.8" y="215" font-size="11.5" fill="#9198a1">45 ms</text>
 <text x="178" y="255.0" font-size="13" text-anchor="end" fill="#e6edf3">8 threads</text>
-<rect x="190" y="245" width="99.0" height="11" rx="2" fill="#5b9be0"/><text x="295.0" y="255" font-size="11.5" fill="#9198a1">44 ms</text>
+<rect x="190" y="245" width="99.2" height="11" rx="2" fill="#5b9be0"/><text x="295.2" y="255" font-size="11.5" fill="#9198a1">40 ms</text>
 <text x="178" y="295.0" font-size="13" text-anchor="end" fill="#e6edf3">10 threads</text>
-<rect x="190" y="285" width="88.0" height="11" rx="2" fill="#5b9be0"/><text x="284.0" y="295" font-size="11.5" fill="#9198a1">39 ms</text>
+<rect x="190" y="285" width="88.7" height="11" rx="2" fill="#5b9be0"/><text x="284.7" y="295" font-size="11.5" fill="#9198a1">35 ms</text>
 </svg>
