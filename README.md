@@ -1,4 +1,4 @@
-# heifer
+# Heifer
 
 Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
 
