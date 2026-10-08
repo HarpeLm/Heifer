@@ -2,6 +2,7 @@
 # Downloads a selection of the official HEVC conformance bitstreams (ITU-T H.265.1)
 # into tests/conformance/. Files are not committed.
 set -euo pipefail
+mkdir -p "$(dirname "$0")/../tests/conformance"
 cd "$(dirname "$0")/../tests/conformance"
 BASE=https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance
 while read -r path; do
