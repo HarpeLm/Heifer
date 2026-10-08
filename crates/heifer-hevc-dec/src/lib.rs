@@ -5,8 +5,10 @@
 pub mod bitreader;
 pub mod cabac;
 pub mod contexts;
+pub mod decoder;
 pub mod nal;
 pub mod params;
+pub mod recon;
 pub mod scan;
 pub mod slice;
 pub mod syntax;

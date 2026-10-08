@@ -305,3 +305,45 @@ fn single_image_coding_tree_counts() {
     assert_eq!(c.cus, 17001);
     assert_eq!(c.blocks, [46239, 17436, 17436]);
 }
+
+/// FNV-1a hash of the 8-bit planar YUV output, as written by `ffmpeg -f rawvideo`.
+fn frame_hash(frame: &heifer_hevc_dec::recon::Frame) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for plane in &frame.planes {
+        for &s in plane {
+            h = (h ^ u64::from(s as u8)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+#[test]
+fn reconstruction_matches_ffmpeg_without_loop_filters() {
+    use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+    // Hashes of `ffmpeg -skip_loop_filter all -i item.h265 -f rawvideo -pix_fmt yuv420p`.
+    for (file, item, expected) in [
+        ("single_image.heic", 1002, 0xb84f_8b57_543f_e03d_u64),
+        ("grid.heic", 1002, 0xeff0_4cd8_c360_9170),
+        ("grid.heic", 1011, 0x1231_d30d_3db7_2c40),
+        ("alpha.heic", 1008, 0xffe9_5588_96d9_c3e7),
+        ("burst.heic", 1366, 0xde85_f256_e857_1e1b),
+        ("libheif_example.heic", 20004, 0xf9d4_8f4d_35ff_8d69),
+        ("libheif_example.heic", 20005, 0xaac9_130c_4e7e_c7dc),
+    ] {
+        let Some(stream) = bitstream(file, item) else {
+            continue;
+        };
+        let frame = decode_picture(
+            &stream,
+            DecodeOptions {
+                skip_loop_filters: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            frame_hash(&frame),
+            expected,
+            "{file} item {item}: differs from ffmpeg"
+        );
+    }
+}

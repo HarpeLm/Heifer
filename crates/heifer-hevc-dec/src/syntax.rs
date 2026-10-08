@@ -241,6 +241,7 @@ pub fn decode_slice_segment(
         qp_y_pred: slice_qp_y,
         last_qp_y: slice_qp_y,
         first_qg_in_substream: true,
+        current_qg: None,
         cu_transquant_bypass: false,
         coeffs: vec![0; 32 * 32],
         sao_luma: header.slice_sao_luma_flag,
@@ -275,6 +276,8 @@ struct Parser<'p, 'a> {
     qp_y_pred: i32,
     last_qp_y: i32,
     first_qg_in_substream: bool,
+    /// Top-left corner of the current quantization group.
+    current_qg: Option<(u32, u32)>,
     cu_transquant_bypass: bool,
     coeffs: Vec<i32>,
     sao_luma: bool,
@@ -540,9 +543,9 @@ impl Parser<'_, '_> {
             log2_size > min_cb
         };
 
-        let log2_min_qg = self.sps.log2_ctb_size - self.pps.diff_cu_qp_delta_depth.unwrap_or(0);
-        if log2_size >= log2_min_qg {
-            self.start_quantization_group(x0, y0);
+        if self.pps.diff_cu_qp_delta_depth.is_some() && log2_size >= self.log2_min_qg() {
+            self.is_cu_qp_delta_coded = false;
+            self.cu_qp_delta_val = 0;
         }
         if self.cu_chroma_qp_offset_enabled {
             let depth = self
@@ -568,10 +571,19 @@ impl Parser<'_, '_> {
         }
     }
 
-    /// Start of a quantization group: QP prediction (§8.6.1).
-    fn start_quantization_group(&mut self, xq: u32, yq: u32) {
-        self.is_cu_qp_delta_coded = false;
-        self.cu_qp_delta_val = 0;
+    /// `Log2MinCuQpDeltaSize`: size of a quantization group.
+    fn log2_min_qg(&self) -> u8 {
+        self.sps.log2_ctb_size - self.pps.diff_cu_qp_delta_depth.unwrap_or(0)
+    }
+
+    /// QP prediction (§8.6.1), done once per quantization group, at its first coding unit.
+    fn predict_qp(&mut self, x_cu: u32, y_cu: u32) {
+        let mask = !((1u32 << self.log2_min_qg()) - 1);
+        let (xq, yq) = (x_cu & mask, y_cu & mask);
+        if self.current_qg == Some((xq, yq)) {
+            return;
+        }
+        self.current_qg = Some((xq, yq));
         let prev = if self.first_qg_in_substream {
             self.slice_qp_y
         } else {
@@ -623,6 +635,7 @@ impl Parser<'_, '_> {
         Picture::fill(|p| &mut p.intra_mode, self.pic, x0, y0, size, 1);
         Picture::fill(|p| &mut p.pcm, self.pic, x0, y0, size, false);
 
+        self.predict_qp(x0, y0);
         self.cu_transquant_bypass =
             self.pps.transquant_bypass_enabled_flag && self.flag(ctx::CU_TRANSQUANT_BYPASS_FLAG);
         // part_mode: one bin, only at the minimum CB size (1 = 2Nx2N, 0 = NxN).

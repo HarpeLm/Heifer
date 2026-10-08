@@ -2,8 +2,8 @@
 
 Pure-Rust HEIF/HEIC image **decoder and encoder**. No C dependencies, `#![forbid(unsafe_code)]`, WebAssembly-ready.
 
-> **Status: early development.** The container and all HEVC headers are parsed and verified against
-> ffmpeg; pixel decoding is not there yet. Not usable for real images today.
+> **Status: early development.** HEVC images decode **bit-exactly against ffmpeg** with in-loop filters
+> disabled. Deblocking/SAO and grid assembly are next; not usable for real photos yet.
 
 ## Why
 
@@ -23,7 +23,14 @@ let tiles = file.referenced_items(primary.id, b"dimg");
 let hevc = file.hevc_bitstream(tiles[0])?;       // Annex B stream, decodable by ffmpeg
 ```
 
-On the HEVC side, `heifer-hevc-dec` splits NAL units and parses the VPS, SPS, PPS and slice headers.
+Decoding one HEVC image item to pixels (in-loop filters not implemented yet):
+
+```rust
+use heifer_hevc_dec::decoder::{decode_picture, DecodeOptions};
+
+let frame = decode_picture(&hevc, DecodeOptions::default())?;
+let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u16 samples
+```
 
 ## Crates
 
@@ -31,8 +38,8 @@ On the HEVC side, `heifer-hevc-dec` splits NAL units and parses the VPS, SPS, PP
 |---|---|---|
 | `heifer` | Public API | placeholder |
 | `heifer-isobmff` | HEIF container: boxes, items, properties, references, grids | ✅ reading |
-| `heifer-hevc-dec` | HEVC intra decoder | 🚧 headers done, CABAC next |
-| `heifer-hevc-enc` | HEVC intra encoder | ⏳ not started |
+| `heifer-hevc-dec` | HEVC intra decoder | 🚧 bit-exact without loop filters |
+| `heifer-hevc-enc` | HEVC intra encoder | 🚧 CABAC encoder only |
 
 ## Roadmap
 
@@ -44,8 +51,9 @@ On the HEVC side, `heifer-hevc-dec` splits NAL units and parses the VPS, SPS, PP
     - [x] Bit reader, Exp-Golomb codes, NAL units, emulation prevention
     - [x] VPS, SPS (VUI, HRD, scaling lists, range extension), PPS (tiles, deblocking)
     - [x] Slice segment header (I slices, entry points, dependent slices)
-    - [ ] CABAC entropy decoding
-    - [ ] Coding tree, intra prediction, transforms
+    - [x] CABAC entropy decoding (+ encoder, verified by round-trip)
+    - [x] Coding tree syntax: SAO, quadtree, intra modes, transform tree, residuals, QP, PCM, tiles, WPP
+    - [x] Intra prediction, scaling, inverse DCT/DST — bit-exact vs ffmpeg (`-skip_loop_filter all`)
     - [ ] Deblocking filter, SAO
     - [ ] 10-bit, 4:0:0 (alpha), 4:2:2 / 4:4:4
   - [ ] Real-world test corpus + pixel comparison against libheif
@@ -67,7 +75,11 @@ cargo run -p heifer-isobmff --example dump -- tests/fixtures/grid.heic     # box
 cargo run -p heifer-isobmff --example info -- tests/fixtures/grid.heic     # items and properties
 cargo run -p heifer-isobmff --example info -- tests/fixtures/grid.heic --extract 1002 tile.h265
 cargo run -p heifer-hevc-dec --example params -- tile.h265                 # parameter sets, slice headers
+cargo run -p heifer-hevc-dec --example parse -- tile.h265                  # full syntax parse statistics
+cargo run --release -p heifer-hevc-dec --example decode -- tile.h265 tile.yuv   # raw planar YUV
 ```
+
+Reconstruction is checked against `ffmpeg -skip_loop_filter all -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`.
 
 Header parsing is checked against `ffmpeg -i tile.h265 -c copy -bsf:v trace_headers -f null -`:
 the `params` example prints fields with the same names as the specification and ffmpeg.
