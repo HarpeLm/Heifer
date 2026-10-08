@@ -84,3 +84,62 @@ fn libheif_example_sps() {
     // conformance window, so the coded height is 856.
     check("libheif_example.heic", 20004, (1, 1280, 856));
 }
+
+fn parameter_sets(file: &str, item: u32) -> Option<heifer_hevc_dec::params::ParameterSets> {
+    let stream = bitstream(file, item)?;
+    let mut sets = heifer_hevc_dec::params::ParameterSets::default();
+    for nal in split_annex_b(&stream) {
+        sets.add(&NalUnit::parse(nal).unwrap()).unwrap();
+    }
+    Some(sets)
+}
+
+#[test]
+fn single_image_parameter_sets() {
+    // Values checked against `ffmpeg -bsf:v trace_headers`.
+    let Some(sets) = parameter_sets("single_image.heic", 1002) else {
+        return;
+    };
+    let (pps, sps) = sets.get(0).unwrap();
+    assert_eq!(sps.profile_tier_level.general_profile_idc, 1);
+    assert_eq!(sps.profile_tier_level.general_level_idc, 186);
+    assert_eq!(sps.output_size(), (1440, 960));
+    assert_eq!(sps.ctb_size(), 64);
+    assert_eq!(sps.pic_size_in_ctbs(), (23, 15));
+    assert_eq!(sps.log2_min_luma_coding_block_size, 3);
+    assert_eq!(
+        (
+            sps.log2_min_luma_transform_block_size,
+            sps.log2_max_luma_transform_block_size
+        ),
+        (2, 5)
+    );
+    assert_eq!(sps.num_short_term_ref_pic_sets, 2);
+    assert!(sps.sample_adaptive_offset_enabled_flag && sps.strong_intra_smoothing_enabled_flag);
+    assert!(sps.vui.is_none());
+    assert!(pps.sign_data_hiding_enabled_flag && pps.cabac_init_present_flag);
+    assert_eq!(pps.init_qp_minus26, 0);
+    assert!(pps.tiles.is_none());
+}
+
+#[test]
+fn libheif_example_parameter_sets() {
+    let Some(sets) = parameter_sets("libheif_example.heic", 20004) else {
+        return;
+    };
+    let (pps, sps) = sets.get(0).unwrap();
+    assert_eq!(
+        (
+            sps.pic_width_in_luma_samples,
+            sps.pic_height_in_luma_samples
+        ),
+        (1280, 856)
+    );
+    assert_eq!(
+        sps.output_size(),
+        (1280, 854),
+        "conformance window crops 2 lines"
+    );
+    assert!(sps.vui.is_some());
+    assert!(pps.diff_cu_qp_delta_depth.is_some());
+}

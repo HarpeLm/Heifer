@@ -4,6 +4,7 @@
 
 pub mod bitreader;
 pub mod nal;
+pub mod params;
 
 /// Errors produced while decoding an HEVC bitstream.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
