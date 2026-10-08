@@ -26,8 +26,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
-      - name: Install wasm-opt
-        run: sudo apt-get install -y binaryen
+      # No wasm-opt here: Ubuntu's binaryen breaks wasm-bindgen's externref table
+      # ("WebAssembly.Table.grow(): failed to grow table") and the decoder never starts.
       - run: ./scripts/build-demo.sh
       - uses: actions/upload-pages-artifact@v3
         with:

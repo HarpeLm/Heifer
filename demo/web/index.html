@@ -130,7 +130,7 @@
     <div class="tag">HEIF / HEIC · <b class="grad">PURE RUST</b></div>
     <h1>Open HEIC photos,<br><span class="grad">right in your browser</span></h1>
     <p class="lead">Heifer is a HEIF/HEIC decoder written in safe Rust and compiled to WebAssembly. Your photo is decoded on your device and never uploaded.</p>
-    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">≈ 200 KB WebAssembly</span><span class="pill">MIT / Apache-2.0</span></div>
+    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">≈ 250 KB WebAssembly</span><span class="pill">MIT / Apache-2.0</span></div>
   </div>
 
   <label id="drop">
@@ -189,13 +189,16 @@ heifer = <span class="s">"0.1"</span>
   const $ = id => document.getElementById(id);
   const status = $("status"), canvas = $("canvas"), save = $("save"), drop = $("drop"), result = $("result"), stats = $("stats");
   let name = "image";
-  await init();
-  status.textContent = "Ready. Nothing is uploaded: decoding happens in this tab.";
+  const ready = init().then(
+    () => { status.textContent = "Ready. Nothing is uploaded: decoding happens in this tab."; },
+    e => { status.className = "error"; status.textContent = `The decoder failed to load: ${e.message ?? e}`; throw e; },
+  );
 
   const stat = (value, label) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
 
   async function handle(file) {
     if (!file) return;
+    try { await ready; } catch { return; }
     name = file.name.replace(/\.[^.]+$/, "");
     status.className = "";
     status.textContent = `Decoding ${file.name}…`;
@@ -219,7 +222,7 @@ heifer = <span class="s">"0.1"</span>
     }
   }
 
-  $("file").addEventListener("change", e => handle(e.target.files[0]));
+  $("file").addEventListener("change", e => { handle(e.target.files[0]); e.target.value = ""; });
   drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
   drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });

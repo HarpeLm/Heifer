@@ -19,7 +19,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
     <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 1.6 s</sub></td>
-    <td align="center" width="25%"><h2>≈ 200 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
+    <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
 
@@ -59,7 +59,7 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed every night.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
-- **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 200 KB).
+- **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
 
