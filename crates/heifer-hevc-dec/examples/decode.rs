@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = DecodeOptions {
         skip_loop_filters: rest.iter().any(|a| a == "--no-filters"),
         verify_hash: true,
+        ..Default::default()
     };
     let (frame, check) = decode_picture_checked(&std::fs::read(input)?, options)?;
     let mut out = Vec::new();

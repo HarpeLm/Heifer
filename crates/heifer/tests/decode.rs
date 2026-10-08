@@ -83,13 +83,20 @@ fn parallel_and_sequential_decoding_match() {
     let Some(bytes) = load("grid.heic") else {
         return;
     };
-    let sequential =
-        heifer::decode_with_options(&bytes, &heifer::Options { max_threads: 1 }).unwrap();
+    let sequential = heifer::decode_with_options(
+        &bytes,
+        &heifer::Options {
+            max_threads: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for threads in [0, 2, 3, 16] {
         let parallel = heifer::decode_with_options(
             &bytes,
             &heifer::Options {
                 max_threads: threads,
+                ..Default::default()
             },
         )
         .unwrap();

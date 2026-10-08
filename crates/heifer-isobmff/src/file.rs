@@ -232,11 +232,20 @@ impl<'a> HeifFile<'a> {
         match loc.extents.as_slice() {
             [single] => Ok(Cow::Borrowed(slice(single)?)),
             extents => {
-                let mut out = Vec::new();
-                for e in extents {
-                    out.extend_from_slice(slice(e)?);
+                // Resolve every extent first: the concatenated data cannot be larger than the
+                // source (overlapping extents could otherwise make a small file expand to
+                // gigabytes).
+                let parts = extents.iter().map(slice).collect::<Result<Vec<_>, _>>()?;
+                let total = parts
+                    .iter()
+                    .try_fold(0usize, |acc, p| acc.checked_add(p.len()));
+                match total {
+                    Some(total) if total <= source.len() => Ok(Cow::Owned(parts.concat())),
+                    _ => Err(Error::InvalidBox {
+                        box_type: FourCC(*b"iloc"),
+                        reason: "item data larger than its source",
+                    }),
                 }
-                Ok(Cow::Owned(out))
             }
         }
     }

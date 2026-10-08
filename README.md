@@ -37,6 +37,28 @@ Remaining differences with ffmpeg are in heifer's favour (it honours `ispe`/grid
 item). Phone "HDR" photos are 8-bit images plus a gain map: heifer decodes the base image; applying the
 gain map (ISO 21496-1) is not implemented.
 
+## Fuzzing
+
+Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets, with HEIF and HEVC dictionaries,
+seeded with the sample files, the conformance bitstreams and libheif's fuzzing corpus:
+
+| Target | Checks |
+|---|---|
+| `decode` | full HEIC decoding never panics, hangs or exhausts memory |
+| `container` | container parsing and item data access |
+| `hevc` | HEVC decoding, including picture hash verification |
+| `parallel` | parallel and sequential decoding give identical results |
+| `cabac` | the CABAC encoder and decoder round-trip any bin sequence |
+
+Fuzzing found a memory exhaustion bug (overlapping `iloc` extents), now fixed and covered by a test,
+and led to configurable size limits (`max_pixels`). It runs every night on GitHub Actions
+(`.github/workflows/fuzz.yml`) and can run locally for hours:
+
+```sh
+./scripts/fetch-fuzz-corpus.sh   # libheif's fuzzing corpus as extra seeds (not committed)
+./scripts/fuzz.sh 8h             # all targets in parallel on all cores; Ctrl+C to stop
+```
+
 ## Why
 
 HEIC is the default photo format on iPhones. In Rust, reading it usually means binding to `libheif` (C/C++),
@@ -116,7 +138,8 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
   - [x] Real-world HEIC corpus (iPhone, Samsung, Xiaomi photos) compared with ffmpeg
   - [ ] HDR gain maps (Apple / ISO 21496-1), ICC profiles
   - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
-  - [ ] Fuzzing, WebAssembly, `image` crate integration
+  - [x] Fuzzing (5 targets, dictionaries, nightly CI) and size limits against malicious files
+  - [ ] WebAssembly, `image` crate integration
 - [ ] **Phase 2 — Encoder**
   - [ ] Write HEIF container
   - [ ] Minimal HEVC intra encoder (fixed block size, DC prediction, fixed QP) producing valid files

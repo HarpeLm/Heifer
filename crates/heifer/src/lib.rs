@@ -50,9 +50,20 @@ pub struct Options {
     /// Maximum number of threads used to decode grid tiles in parallel. `0` uses all
     /// available cores; `1` decodes sequentially.
     pub max_threads: usize,
+    /// Maximum size, in pixels, of any decoded or assembled image (protects against malicious
+    /// files). `0` means the default, 2^28 pixels (e.g. a 16384×16384 image).
+    pub max_pixels: u64,
 }
 
 impl Options {
+    fn max_pixels(&self) -> u64 {
+        if self.max_pixels == 0 {
+            MAX_PIXELS
+        } else {
+            self.max_pixels
+        }
+    }
+
     fn threads(&self) -> usize {
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
         if self.max_threads == 0 {
@@ -93,7 +104,7 @@ fn decode_item_with(
     }
     let item = file.item(id)?;
     let mut image = match &item.item_type.0 {
-        b"hvc1" => decode_hvc1(file, id)?,
+        b"hvc1" => decode_hvc1(file, id, options)?,
         b"grid" => decode_grid(file, id, depth, options)?,
         b"iovl" => decode_overlay(file, id, depth, options)?,
         _ => {
@@ -141,8 +152,12 @@ fn color_params(
         .unwrap_or_else(|| ColorParams::from_frame(frame)))
 }
 
-fn decode_hvc1(file: &HeifFile<'_>, id: ItemId) -> Result<Image, Error> {
-    let frame = decode_picture(&file.hevc_bitstream(id)?, DecodeOptions::default())?;
+fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Image, Error> {
+    let hevc_options = DecodeOptions {
+        max_pixels: options.max_pixels(),
+        ..Default::default()
+    };
+    let frame = decode_picture(&file.hevc_bitstream(id)?, hevc_options)?;
     let mut image = frame_to_rgba(&frame, color_params(file, id, &frame)?);
     if let Some((w, h)) = file.image_size(id)?
         && (w, h) != (image.width, image.height)
@@ -160,7 +175,7 @@ fn decode_hvc1(file: &HeifFile<'_>, id: ItemId) -> Result<Image, Error> {
         if !is_alpha {
             continue;
         }
-        let alpha = decode_picture(&file.hevc_bitstream(aux)?, DecodeOptions::default())?;
+        let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
         if (alpha.widths[0], alpha.heights[0]) != (image.width, image.height)
             && alpha.widths[0] < image.width
         {
@@ -190,8 +205,8 @@ fn decode_hvc1(file: &HeifFile<'_>, id: ItemId) -> Result<Image, Error> {
     Ok(image)
 }
 
-fn check_size(w: u32, h: u32) -> Result<(), Error> {
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > max_pixels {
         return Err(Error::Invalid("image size is zero or too large"));
     }
     Ok(())
@@ -211,7 +226,7 @@ fn decode_grid(
             "grid tile count does not match its rows and columns",
         ));
     }
-    check_size(grid.output_width, grid.output_height)?;
+    check_size(grid.output_width, grid.output_height, options.max_pixels())?;
 
     // Tile size and bit depth come from the tiles' `ispe` and `hvcC` properties, so that all
     // tiles can be decoded in parallel. Otherwise, decode the first tile to find out.
@@ -328,7 +343,7 @@ fn decode_overlay(
         })
     };
     let (w, h) = (field(false)? as u32, field(false)? as u32);
-    check_size(w, h)?;
+    check_size(w, h, options.max_pixels())?;
     let offsets = (0..inputs.len())
         .map(|_| Ok((field(true)?, field(true)?)))
         .collect::<Result<Vec<_>, Error>>()?;

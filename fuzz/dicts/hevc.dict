@@ -1,0 +1,18 @@
+# HEVC Annex B start codes, NAL unit headers and emulation prevention.
+"\x00\x00\x01"
+"\x00\x00\x00\x01"
+"\x00\x00\x03"
+# VPS, SPS, PPS
+"\x40\x01"
+"\x42\x01"
+"\x44\x01"
+# IDR_W_RADL, IDR_N_LP, CRA, BLA slices
+"\x26\x01"
+"\x28\x01"
+"\x2a\x01"
+"\x20\x01"
+# prefix / suffix SEI, decoded picture hash
+"\x4e\x01"
+"\x50\x01"
+"\x84"
+"\xff\xff"

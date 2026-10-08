@@ -1,0 +1,60 @@
+name: Fuzz
+
+# Runs every fuzz target for about 50 minutes every night. The corpus is cached between runs so
+# that fuzzing resumes where it stopped. Crashes make the run fail and are uploaded as artifacts.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Fuzzing duration (e.g. 30m, 2h; GitHub limits jobs to 6h)"
+        default: "50m"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            fuzz/corpus
+            tests/conformance
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Download seed files
+        run: |
+          ./scripts/fetch-fixtures.sh
+          ./scripts/fetch-real.sh
+          ./scripts/fetch-fuzz-corpus.sh
+          ./scripts/fetch-conformance.sh
+
+      - name: Fuzz
+        run: ./scripts/fuzz.sh "${{ github.event.inputs.duration || '50m' }}"
+
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            fuzz/corpus
+            tests/conformance
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            fuzz/artifacts
+            fuzz/logs

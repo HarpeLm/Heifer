@@ -97,3 +97,49 @@ fn truncated_files_never_panic() {
         });
     }
 }
+
+fn bx(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
+    let mut b = ((content.len() + 8) as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(content);
+    b
+}
+
+/// A minimal HEIF file with one `hvc1` item whose `iloc` entry has `extents` extents of
+/// length 0 (meaning "until the end of the file").
+fn file_with_repeated_extents(extents: u16) -> Vec<u8> {
+    let mut iloc = vec![0, 0, 0, 0, 0x44, 0x00, 0, 1, 0, 1, 0, 0];
+    iloc.extend_from_slice(&extents.to_be_bytes());
+    for _ in 0..extents {
+        iloc.extend_from_slice(&[0; 8]); // offset 0, length 0
+    }
+    let mut infe = vec![2, 0, 0, 0, 0, 1, 0, 0];
+    infe.extend_from_slice(b"hvc1\0");
+    let mut iinf = vec![0, 0, 0, 0, 0, 1];
+    iinf.extend(bx(b"infe", &infe));
+    let mut hdlr = vec![0; 8];
+    hdlr.extend_from_slice(b"pict");
+    hdlr.extend_from_slice(&[0; 13]);
+    let mut meta = vec![0, 0, 0, 0];
+    meta.extend(bx(b"hdlr", &hdlr));
+    meta.extend(bx(b"pitm", &[0, 0, 0, 0, 0, 1]));
+    meta.extend(bx(b"iinf", &iinf));
+    meta.extend(bx(b"iloc", &iloc));
+    let mut file = bx(b"ftyp", b"heic\0\0\0\0mif1heic");
+    file.extend(bx(b"meta", &meta));
+    file
+}
+
+#[test]
+fn overlapping_extents_cannot_expand_data() {
+    // Found by fuzzing: thousands of `iloc` extents of length 0 used to copy the whole file
+    // thousands of times (a 5 MB file with 65535 extents would need over 300 GB).
+    let one = file_with_repeated_extents(1);
+    let file = HeifFile::parse(&one).unwrap();
+    assert_eq!(file.item_data(1).unwrap().len(), one.len());
+
+    let many = file_with_repeated_extents(u16::MAX);
+    let file = HeifFile::parse(&many).unwrap();
+    assert!(file.item_data(1).is_err());
+    assert!(file.hevc_bitstream(1).is_err());
+}

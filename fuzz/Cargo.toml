@@ -1,0 +1,53 @@
+[package]
+name = "heifer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+heifer = { path = "../crates/heifer" }
+heifer-isobmff = { path = "../crates/heifer-isobmff" }
+heifer-hevc-dec = { path = "../crates/heifer-hevc-dec" }
+heifer-hevc-enc = { path = "../crates/heifer-hevc-enc" }
+
+# Kept out of the main workspace.
+[workspace]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container"
+path = "fuzz_targets/container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hevc"
+path = "fuzz_targets/hevc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cabac"
+path = "fuzz_targets/cabac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parallel"
+path = "fuzz_targets/parallel.rs"
+test = false
+doc = false
+bench = false

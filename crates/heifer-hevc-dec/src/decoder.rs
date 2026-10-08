@@ -17,7 +17,14 @@ pub struct DecodeOptions {
     /// Check the decoded picture against the hash SEI message, when the stream has one, and
     /// fail with [`Error::HashMismatch`] if it differs.
     pub verify_hash: bool,
+    /// Maximum picture size, in luma samples, accepted before allocating memory (protects
+    /// against malicious streams). `0` means [`DEFAULT_MAX_PIXELS`].
+    pub max_pixels: u64,
 }
+
+/// Default limit on the picture size: 2^27 luma samples (e.g. 16384×8192), well above the
+/// largest HEVC level (8192×4320) and HEIF tiles.
+pub const DEFAULT_MAX_PIXELS: u64 = 1 << 27;
 
 /// Result of the decoded picture hash check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +82,18 @@ pub fn decode_picture_checked(
         }
         let header = SliceHeader::parse(&nal.rbsp, &nal.header, &sets, previous.as_ref())?;
         let (pps, sps) = sets.get(usize::from(header.slice_pic_parameter_set_id))?;
+        let max_pixels = if options.max_pixels == 0 {
+            DEFAULT_MAX_PIXELS
+        } else {
+            options.max_pixels
+        };
+        if u64::from(sps.pic_width_in_luma_samples) * u64::from(sps.pic_height_in_luma_samples)
+            > max_pixels
+        {
+            return Err(Error::Unimplemented(
+                "picture larger than the configured size limit",
+            ));
+        }
         let (pic, recon) =
             state.get_or_insert_with(|| (Picture::new(sps, pps), Reconstructor::new(sps, pps)));
         recon.start_slice(&header);
