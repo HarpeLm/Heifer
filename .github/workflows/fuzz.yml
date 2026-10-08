@@ -1,18 +1,24 @@
 name: Fuzz
 
-# Runs every fuzz target for about 50 minutes every night, each on its own machine. The corpus is cached between runs so
-# that fuzzing resumes where it stopped. Crashes make the run fail and are uploaded as artifacts.
+# Fuzzes almost continuously: every 6 hours, each target runs for 5h15 on its own machine (GitHub
+# limits jobs to 6 hours). The corpus is cached between runs so that fuzzing resumes where it
+# stopped. Crashes make the run fail and are uploaded as artifacts.
 on:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       duration:
         description: "Fuzzing duration (e.g. 30m, 2h; GitHub limits jobs to 6h)"
-        default: "50m"
+        default: "315m"
 
 permissions:
   contents: read
+
+# Never run two fuzzing sessions at once; a new one waits for the previous one to finish.
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
 
 jobs:
   fuzz:
@@ -46,7 +52,7 @@ jobs:
           ./scripts/fetch-conformance.sh
 
       - name: Fuzz
-        run: ./scripts/fuzz.sh "${{ github.event.inputs.duration || '50m' }}" ${{ matrix.target }}
+        run: ./scripts/fuzz.sh "${{ github.event.inputs.duration || '315m' }}" ${{ matrix.target }}
 
       - name: Save corpus
         if: always()
