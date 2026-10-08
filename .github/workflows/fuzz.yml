@@ -18,9 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
+      # Built from source: the prebuilt binary targets musl and fails to build the fuzzers.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       - name: Restore corpus
         uses: actions/cache/restore@v4
