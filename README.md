@@ -2,9 +2,20 @@
 
 Pure-Rust HEIF/HEIC image **decoder** (encoder planned). No C dependencies, `#![forbid(unsafe_code)]`.
 
-> **Status: early development.** Complete HEIC files decode to RGB(A): HEVC decoding is **bit-exact
-> against ffmpeg**, and grids, overlays, alpha and transforms are supported. Tested on 8-bit 4:2:0 sample
-> files only — real iPhone photos and 10-bit/HDR are not validated yet.
+> **Status: early development.** Complete HEIC files decode to RGB(A), with grids, overlays, alpha and
+> transforms. The HEVC decoder is validated against the official conformance bitstreams (see below).
+> Real iPhone photos (large grids, HDR) are not validated yet.
+
+## Conformance
+
+The first picture of 66 official HEVC conformance bitstreams (ITU-T H.265.1: Main, Main 10 and Range
+Extensions, 8 to 12 bits, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, slices...):
+
+| Check | Result |
+|---|---|
+| Identical to ffmpeg, sample for sample | **62 / 62** comparable streams |
+| Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **41** streams, including 3 that ffmpeg cannot decode |
+| Not supported | 1 (extended precision / CABAC bypass alignment, 16-bit video tools) |
 
 ## Why
 
@@ -58,7 +69,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 |---|---|---|
 | `heifer` | Public API: `decode()`, grids, overlays, alpha, transforms, YCbCr → RGB | ✅ |
 | `heifer-isobmff` | HEIF container: boxes, items, properties, references, grids | ✅ reading |
-| `heifer-hevc-dec` | HEVC intra decoder | ✅ bit-exact vs ffmpeg (8-bit 4:2:0 tested) |
+| `heifer-hevc-dec` | HEVC intra decoder, picture hash verification | ✅ conformance-tested (8–12 bit, all chroma formats) |
 | `heifer-hevc-enc` | HEVC intra encoder | 🚧 CABAC encoder only |
 
 ## Roadmap
@@ -77,8 +88,12 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
     - [x] Coding tree syntax: SAO, quadtree, intra modes, transform tree, residuals, QP, PCM, tiles, WPP
     - [x] Intra prediction, scaling, inverse DCT/DST — bit-exact vs ffmpeg (`-skip_loop_filter all`)
     - [x] Deblocking filter, SAO — bit-exact vs ffmpeg
-    - [ ] 10-bit, 4:0:0 (alpha), 4:2:2 / 4:4:4
-  - [ ] Real-world test corpus + pixel comparison against libheif
+    - [x] 10/12-bit, 4:0:0, 4:2:2, 4:4:4, unequal luma/chroma bit depths
+    - [x] Range extension tools: cross-component prediction, implicit RDPCM, transform-skip rotation/contexts, persistent Rice adaptation
+    - [x] Decoded picture hash SEI (MD5, CRC, checksum) verification
+    - [x] Validated on official HEVC conformance bitstreams
+    - [ ] Extended precision processing, CABAC bypass alignment (16-bit profiles)
+  - [ ] Real-world HEIC corpus (iPhone/Android photos, HDR) + comparison against libheif
   - [ ] Faster single-image decoding (allocation-free reconstruction, parallel filters, WPP/tiles)
   - [ ] Fuzzing, WebAssembly, `image` crate integration
 - [ ] **Phase 2 — Encoder**
@@ -101,6 +116,15 @@ cargo run -p heifer-hevc-dec --example params -- tile.h265                 # par
 cargo run -p heifer-hevc-dec --example parse -- tile.h265                  # full syntax parse statistics
 cargo run --release -p heifer-hevc-dec --example decode -- tile.h265 tile.yuv   # raw planar YUV
 cargo run --release -p heifer --example heic2png -- tests/fixtures/grid.heic grid.png
+```
+
+Conformance bitstreams (not committed, ~23 MB download from itu.int):
+
+```sh
+./scripts/fetch-conformance.sh
+cargo test --release -p heifer-hevc-dec --test conformance      # checks reference picture hashes
+cargo build --release -p heifer-hevc-dec --example decode
+./scripts/conformance.py                                        # compares with ffmpeg
 ```
 
 Decoding is checked against `ffmpeg -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`
