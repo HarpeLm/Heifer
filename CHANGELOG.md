@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **HDR photos**: Apple HDR gain maps (iPhone). `decode_hdr` returns linear-light RGB with the
+  gain map applied, matching Apple's decoder (ImageIO) within 0.3% on average; `read_gain_map`
+  gives the gain map and headroom to apply them yourself. `Exif::apple_hdr_headroom` reads the
+  headroom from the Apple MakerNote.
+
 ## 0.1.2 — 2026-10-08
 
 Faster again, still without any `unsafe` code and with bit-identical output.

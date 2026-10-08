@@ -11,11 +11,13 @@
 //! ([`heifer_hevc_dec`], [`heifer_hevc_enc`]).
 
 pub mod color;
+pub mod hdr;
 pub mod image;
 #[cfg(feature = "image")]
 pub mod image_crate;
 pub mod metadata;
 
+pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;

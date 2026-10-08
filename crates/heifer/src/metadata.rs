@@ -56,6 +56,10 @@ mod tag {
     pub const EXIF_IFD: u16 = 0x8769;
     pub const GPS_IFD: u16 = 0x8825;
     pub const DATE_TIME_ORIGINAL: u16 = 0x9003;
+    pub const MAKER_NOTE: u16 = 0x927C;
+    /// Apple MakerNote tags used to compute the HDR headroom.
+    pub const APPLE_HDR_33: u16 = 33;
+    pub const APPLE_HDR_48: u16 = 48;
 }
 
 impl<'a> Exif<'a> {
@@ -140,6 +144,59 @@ impl<'a> Exif<'a> {
             .filter(|s| !s.is_empty())
     }
 
+    /// Value of a rational (`RATIONAL`, `SRATIONAL`) or `FLOAT` tag.
+    fn real(&self, ifd: usize, wanted: u16) -> Option<f64> {
+        let (kind, _, at) = self.find(ifd, wanted)?;
+        match kind {
+            11 => self.u32(at).map(|b| f64::from(f32::from_bits(b))),
+            5 | 10 => {
+                let off = self.u32(at)? as usize;
+                let (n, d) = (self.u32(off)?, self.u32(off.checked_add(4)?)?);
+                let (n, d) = if kind == 10 {
+                    (f64::from(n as i32), f64::from(d as i32))
+                } else {
+                    (f64::from(n), f64::from(d))
+                };
+                (d != 0.0).then(|| n / d)
+            }
+            _ => None,
+        }
+    }
+
+    /// The Apple MakerNote (`Apple iOS` signature), as a reader of its own IFD. Its offsets
+    /// are relative to the start of the MakerNote.
+    fn apple_maker_note(&self) -> Option<Exif<'a>> {
+        let (kind, count, at) = self.find(self.exif_ifd()?, tag::MAKER_NOTE)?;
+        if kind != 7 || count <= 4 {
+            return None;
+        }
+        let start = self.u32(at)? as usize;
+        let data = self.data.get(start..start.checked_add(count as usize)?)?;
+        if !data.starts_with(b"Apple iOS\0") {
+            return None;
+        }
+        let big_endian = match data.get(12..14)? {
+            b"MM" => true,
+            b"II" => false,
+            _ => return None,
+        };
+        Some(Exif {
+            data,
+            big_endian,
+            ifd0: 14,
+        })
+    }
+
+    /// HDR headroom of an Apple photo: the ratio of its brightest white to SDR white, computed
+    /// from MakerNote tags 33 and 48 with Apple's published formula ("Applying Apple HDR effect
+    /// to your photos"). `None` if the photo does not carry both tags.
+    pub fn apple_hdr_headroom(&self) -> Option<f32> {
+        let note = self.apple_maker_note()?;
+        let m33 = note.real(note.ifd0, tag::APPLE_HDR_33)? as f32;
+        let m48 = note.real(note.ifd0, tag::APPLE_HDR_48)? as f32;
+        Some(apple_headroom(m33, m48))
+    }
+
     fn exif_ifd(&self) -> Option<usize> {
         self.long(self.ifd0, tag::EXIF_IFD).map(|v| v as usize)
     }
@@ -179,9 +236,31 @@ impl<'a> Exif<'a> {
     }
 }
 
+/// Apple's headroom formula from MakerNote tags 33 and 48.
+fn apple_headroom(m33: f32, m48: f32) -> f32 {
+    let stops = match (m33 < 1.0, m48 <= 0.01) {
+        (true, true) => -20.0 * m48 + 1.8,
+        (true, false) => -0.101 * m48 + 1.601,
+        (false, true) => -70.0 * m48 + 3.0,
+        (false, false) => -0.303 * m48 + 2.303,
+    };
+    2f32.powf(stops.max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_headroom_formula() {
+        // Values of an iPhone 12 Pro photo: 2.58 stops.
+        assert!((apple_headroom(1.686, 0.006_016) - 5.975).abs() < 1e-3);
+        assert!((apple_headroom(0.5, 0.0) - 2f32.powf(1.8)).abs() < 1e-5);
+        assert!((apple_headroom(0.5, 1.0) - 2f32.powf(1.5)).abs() < 1e-5);
+        assert!((apple_headroom(2.0, 1.0) - 2f32.powf(2.0)).abs() < 1e-5);
+        // Never below 1 (no darkening).
+        assert_eq!(apple_headroom(2.0, 100.0), 1.0);
+    }
 
     /// Little-endian TIFF with IFD0: Make (ASCII, out of line), Orientation = 6.
     fn sample() -> Vec<u8> {

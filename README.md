@@ -107,6 +107,22 @@ if let Some(exif) = meta.exif_fields() {
 let icc: Option<Vec<u8>> = meta.icc_profile;   // also meta.exif (raw TIFF) and meta.xmp
 ```
 
+## <img src="docs/icons/code.svg" width="24" height="24" align="top"> HDR photos
+
+Recent iPhones store an HDR *gain map* next to the normal image. `decode_hdr` applies it and
+returns linear-light RGB where 1.0 is SDR white and highlights go up to the photo's headroom,
+matching Apple's own decoder (within 0.3% on average on an iPhone 12 Pro photo):
+
+```rust
+let hdr = heifer::decode_hdr(&bytes)?;          // f32 RGB, Display P3 primaries for iPhone photos
+println!("headroom {:.2}×", hdr.headroom);      // e.g. 4.00: highlights up to 4× SDR white
+
+// Or apply the gain map yourself, e.g. on the GPU:
+if let Some(gain) = heifer::read_gain_map(&bytes)? {
+    println!("{}×{} gain map, headroom {:.2}", gain.width, gain.height, gain.headroom);
+}
+```
+
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
@@ -127,7 +143,8 @@ orientation is already applied, so it is never applied twice.
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images | `iloc` construction method 2 |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
-| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles, HDR gain maps |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
+| **HDR** | Apple HDR gain maps (iPhone photos), matching Apple's decoder | ISO 21496-1 gain maps (`tmap`) |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | — | planned (see [roadmap](#roadmap)) |
 
@@ -228,7 +245,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 ## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
-- [ ] **Next**: HDR gain maps (Apple / ISO 21496-1), ICC colour management, faster single-threaded decoding
+- [x] **HDR**: Apple gain maps (iPhone photos)
+- [ ] **Next**: ISO 21496-1 gain maps, ICC colour management
 - [ ] **Encoder**: HEIF writing, minimal HEVC intra encoder, then better compression, 10-bit and alpha
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
