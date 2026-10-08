@@ -2,9 +2,10 @@
 //! (§8.6), and adding the residual. In-loop filters (deblocking, SAO) are applied afterwards.
 
 use crate::Error;
+use crate::filters::{self, FilterInfo, SliceFilterParams};
 use crate::params::{Pps, ScalingList, Sps};
 use crate::scan::{CtbLayout, ScanType, scan_order};
-use crate::syntax::{CodingUnit, Sink, TransformBlock};
+use crate::syntax::{CodingUnit, SaoParams, Sink, TransformBlock};
 
 /// A decoded picture: three planes of samples (only the first one for monochrome).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +150,8 @@ pub struct Reconstructor<'a> {
     slice_cr_qp_offset: i32,
     /// Luma residual of the current transform unit, for cross-component prediction (4:4:4).
     luma_residual: Vec<i32>,
+    /// Information for the in-loop filters.
+    filter_info: FilterInfo,
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
 }
@@ -158,10 +161,12 @@ impl<'a> Reconstructor<'a> {
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
         let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
         let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
+        let layout = CtbLayout::new(sps, pps);
         Self {
             sps,
             pps,
-            layout: CtbLayout::new(sps, pps),
+            filter_info: FilterInfo::new(sps, &layout),
+            layout,
             frame: Frame::new(sps),
             decoded: vec![u32::MAX; w4 * h4],
             w4,
@@ -180,6 +185,46 @@ impl<'a> Reconstructor<'a> {
         }
         self.slice_cb_qp_offset = i32::from(header.slice_cb_qp_offset);
         self.slice_cr_qp_offset = i32::from(header.slice_cr_qp_offset);
+        self.filter_info.slices.push(SliceFilterParams {
+            deblocking_disabled: header.slice_deblocking_filter_disabled_flag,
+            beta_offset_div2: header.slice_beta_offset_div2,
+            tc_offset_div2: header.slice_tc_offset_div2,
+            loop_filter_across_slices: header.slice_loop_filter_across_slices_enabled_flag,
+        });
+    }
+
+    /// Applies the in-loop filters (unless `skip_filters`) and returns the picture cropped to
+    /// its conformance window.
+    pub fn finish(mut self, skip_filters: bool) -> Frame {
+        if !skip_filters {
+            filters::deblock(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+            );
+            filters::sao(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+            );
+        }
+        self.frame.cropped(self.sps)
+    }
+
+    /// Marks block edges (left and top) for the deblocking filter.
+    fn mark_edges(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let info = &mut self.filter_info;
+        let (x4, y4) = (x as usize >> 2, y as usize >> 2);
+        for yy in y4..((y + h) as usize).div_ceil(4).min(info.h4) {
+            info.edges[yy * info.w4 + x4] |= 1;
+        }
+        for xx in x4..((x + w) as usize).div_ceil(4).min(info.w4) {
+            info.edges[y4 * info.w4 + xx] |= 2;
+        }
     }
 
     fn mark_decoded(&mut self, x: u32, y: u32, w: u32, h: u32) {
@@ -577,6 +622,7 @@ impl<'a> Reconstructor<'a> {
         }
         if c == 0 {
             self.mark_decoded(tb.x, tb.y, n as u32, n as u32);
+            self.mark_edges(tb.x, tb.y, n as u32, n as u32);
         }
     }
 }
@@ -622,5 +668,24 @@ impl Sink for Reconstructor<'_> {
         self.mark_decoded(cu_x, cu_y, size, size);
     }
 
-    fn coding_unit(&mut self, _cu: &CodingUnit) {}
+    fn coding_unit(&mut self, cu: &CodingUnit) {
+        let size = 1u32 << cu.log2_size;
+        self.mark_edges(cu.x, cu.y, size, size);
+        let no_filter = cu.transquant_bypass
+            || (cu.pcm && self.sps.pcm.is_some_and(|p| p.loop_filter_disabled_flag));
+        let slice = (self.filter_info.slices.len().max(1) - 1) as u16;
+        let info = &mut self.filter_info;
+        for yy in (cu.y as usize >> 2)..((cu.y + size) as usize).div_ceil(4).min(info.h4) {
+            for xx in (cu.x as usize >> 2)..((cu.x + size) as usize).div_ceil(4).min(info.w4) {
+                let i = yy * info.w4 + xx;
+                info.qp_y[i] = cu.qp_y as i8;
+                info.no_filter[i] = no_filter;
+                info.slice[i] = slice;
+            }
+        }
+    }
+
+    fn sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
+        self.filter_info.sao[(ctb_y * self.layout.width + ctb_x) as usize] = *params;
+    }
 }

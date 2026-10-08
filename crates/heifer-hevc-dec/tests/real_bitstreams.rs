@@ -347,3 +347,28 @@ fn reconstruction_matches_ffmpeg_without_loop_filters() {
         );
     }
 }
+
+#[test]
+fn decoding_matches_ffmpeg_with_loop_filters() {
+    use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+    // Hashes of `ffmpeg -i item.h265 -f rawvideo -pix_fmt yuv420p` (deblocking + SAO).
+    for (file, item, expected) in [
+        ("single_image.heic", 1002, 0x3e59_009d_3021_e150_u64),
+        ("grid.heic", 1002, 0x64cb_4c88_43fe_6d72),
+        ("grid.heic", 1011, 0xec6f_46a8_0790_6957),
+        ("alpha.heic", 1008, 0x9b17_559d_182a_d157),
+        ("burst.heic", 1366, 0xbb33_cd57_a78c_c2e7),
+        ("libheif_example.heic", 20004, 0x60f0_97ce_ac23_83f9),
+        ("libheif_example.heic", 20005, 0xe61b_fdd9_b826_f413),
+    ] {
+        let Some(stream) = bitstream(file, item) else {
+            continue;
+        };
+        let frame = decode_picture(&stream, DecodeOptions::default()).unwrap();
+        assert_eq!(
+            frame_hash(&frame),
+            expected,
+            "{file} item {item}: differs from ffmpeg"
+        );
+    }
+}

@@ -2,8 +2,8 @@
 
 Pure-Rust HEIF/HEIC image **decoder and encoder**. No C dependencies, `#![forbid(unsafe_code)]`, WebAssembly-ready.
 
-> **Status: early development.** HEVC images decode **bit-exactly against ffmpeg** with in-loop filters
-> disabled. Deblocking/SAO and grid assembly are next; not usable for real photos yet.
+> **Status: early development.** HEVC image items decode **bit-exactly against ffmpeg**, in-loop filters
+> included. Grid assembly and RGB output are next.
 
 ## Why
 
@@ -23,7 +23,7 @@ let tiles = file.referenced_items(primary.id, b"dimg");
 let hevc = file.hevc_bitstream(tiles[0])?;       // Annex B stream, decodable by ffmpeg
 ```
 
-Decoding one HEVC image item to pixels (in-loop filters not implemented yet):
+Decoding one HEVC image item to pixels:
 
 ```rust
 use heifer_hevc_dec::decoder::{decode_picture, DecodeOptions};
@@ -38,7 +38,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
 |---|---|---|
 | `heifer` | Public API | placeholder |
 | `heifer-isobmff` | HEIF container: boxes, items, properties, references, grids | ✅ reading |
-| `heifer-hevc-dec` | HEVC intra decoder | 🚧 bit-exact without loop filters |
+| `heifer-hevc-dec` | HEVC intra decoder | ✅ bit-exact vs ffmpeg (8-bit 4:2:0 tested) |
 | `heifer-hevc-enc` | HEVC intra encoder | 🚧 CABAC encoder only |
 
 ## Roadmap
@@ -54,7 +54,7 @@ let (y, cb, cr) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);   // u
     - [x] CABAC entropy decoding (+ encoder, verified by round-trip)
     - [x] Coding tree syntax: SAO, quadtree, intra modes, transform tree, residuals, QP, PCM, tiles, WPP
     - [x] Intra prediction, scaling, inverse DCT/DST — bit-exact vs ffmpeg (`-skip_loop_filter all`)
-    - [ ] Deblocking filter, SAO
+    - [x] Deblocking filter, SAO — bit-exact vs ffmpeg
     - [ ] 10-bit, 4:0:0 (alpha), 4:2:2 / 4:4:4
   - [ ] Real-world test corpus + pixel comparison against libheif
   - [ ] Fuzzing, WebAssembly, `image` crate integration
@@ -79,7 +79,8 @@ cargo run -p heifer-hevc-dec --example parse -- tile.h265                  # ful
 cargo run --release -p heifer-hevc-dec --example decode -- tile.h265 tile.yuv   # raw planar YUV
 ```
 
-Reconstruction is checked against `ffmpeg -skip_loop_filter all -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`.
+Decoding is checked against `ffmpeg -i tile.h265 -f rawvideo -pix_fmt yuv420p ref.yuv`
+(and with `-skip_loop_filter all` / `--no-filters` to check reconstruction alone).
 
 Header parsing is checked against `ffmpeg -i tile.h265 -c copy -bsf:v trace_headers -f null -`:
 the `params` example prints fields with the same names as the specification and ffmpeg.

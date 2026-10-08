@@ -6,6 +6,7 @@ pub mod bitreader;
 pub mod cabac;
 pub mod contexts;
 pub mod decoder;
+pub mod filters;
 pub mod nal;
 pub mod params;
 pub mod recon;

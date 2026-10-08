@@ -11,8 +11,6 @@ use crate::syntax::{Picture, decode_slice_segment};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
     /// Skip the in-loop filters (deblocking and SAO). Useful for debugging.
-    ///
-    /// The filters are not implemented yet: pictures are currently always returned unfiltered.
     pub skip_loop_filters: bool,
 }
 
@@ -26,7 +24,6 @@ pub fn decode_picture(stream: &[u8], options: DecodeOptions) -> Result<Frame, Er
     for nal in &nals {
         sets.add(nal)?;
     }
-    let _ = options;
 
     let mut state: Option<(Picture<'_>, Reconstructor<'_>)> = None;
     let mut previous: Option<SliceHeader> = None;
@@ -52,5 +49,5 @@ pub fn decode_picture(stream: &[u8], options: DecodeOptions) -> Result<Frame, Er
     if !pic.is_complete() {
         return Err(Error::Invalid("picture is incomplete"));
     }
-    Ok(recon.frame.cropped(pic.sps))
+    Ok(recon.finish(options.skip_loop_filters))
 }
