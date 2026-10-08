@@ -1,6 +1,6 @@
 <div align="center">
 
-# Heifer
+<img src="docs/images/banner.webp" alt="Heifer: HEIF/HEIC decoder in pure Rust" width="100%">
 
 **A pure-Rust HEIF/HEIC image decoder.**<br>
 No C dependencies · no `unsafe` code · runs everywhere Rust runs, including the browser.
@@ -105,6 +105,11 @@ cargo run --release -p heifer --example metadata -- photo.heic
 
 The first picture of 66 official conformance bitstreams (ITU-T H.265.1) covering Main, Main 10 and
 the Range Extensions:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/conformance-dark.svg">
+  <img src="docs/images/conformance-light.svg" alt="HEVC conformance: 38 streams identical to ffmpeg and hash-verified, 24 identical to ffmpeg, 3 hash-verified that ffmpeg cannot decode, 1 unsupported" width="100%">
+</picture>
 
 | Check | Result |
 |---|---|
