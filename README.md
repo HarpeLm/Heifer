@@ -15,23 +15,54 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
 
 </div>
 
----
+<br>
 
-HEIC is the default photo format on iPhones and many Android phones. In Rust, reading it has meant
-binding to libheif and libde265 (C/C++). **Heifer** is an independent implementation of HEIF and HEVC
-written entirely in safe Rust, validated against the official conformance bitstreams.
+## <img src="docs/icons/problem.svg" width="24" height="24" align="top"> The Problem
 
-## Highlights
+HEIC is the default photo format on iPhones and many Android phones, yet reading it from Rust has meant
+leaning on C and C++.
 
-- ✅ **Correct** — identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
-- 📱 **Real photos** — iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi.
-- 🛡️ **Safe** — `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed every night.
-- ⚡ **Fast enough** — grid tiles decoded in parallel: a 12 MP iPhone photo in about 100 ms.
-- 🧩 **Complete** — alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
-- 🖼️ **Plays well with others** — optional [`image`](https://crates.io/crates/image) integration: `image::open("photo.heic")`.
-- 🌐 **Portable** — compiles to WebAssembly (≈ 200 KB).
+<table width="100%">
+  <tr>
+    <td width="33%" valign="top">
+      <h3 align="center"><img src="docs/icons/chain.svg" width="20" height="20" align="top"> C dependencies</h3>
+      <p align="center">Existing crates bind to libheif and libde265: a system toolchain, painful cross-compilation and static linking.</p>
+    </td>
+    <td width="33%" valign="top">
+      <h3 align="center"><img src="docs/icons/globe-off.svg" width="20" height="20" align="top"> No browser</h3>
+      <p align="center">C bindings do not compile to <code>wasm32-unknown-unknown</code>, so HEIC photos cannot be decoded client-side.</p>
+    </td>
+    <td width="33%" valign="top">
+      <h3 align="center"><img src="docs/icons/unlock.svg" width="20" height="20" align="top"> Untrusted input</h3>
+      <p align="center">Image files come from anywhere. A video-codec-sized C parser is a large attack surface for a photo upload.</p>
+    </td>
+  </tr>
+</table>
 
-## Quick start
+## <img src="docs/icons/solution.svg" width="24" height="24" align="top"> The Solution
+
+**Heifer** is an independent implementation of HEIF and HEVC written entirely in safe Rust, validated
+against the official conformance bitstreams.
+
+- **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
+- **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
+- **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed every night.
+- **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
+- **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 200 KB).
+
+### How it works
+
+```text
+ photo.heic ──▶ container ──▶ HEVC bitstream ──▶ HEVC decoder ──▶ assembly ──▶ RGB(A)
+              (heifer-isobmff)   per tile        (heifer-hevc-dec)   (heifer)
+```
+
+1. **Container**: the ISOBMFF boxes are parsed into items and properties: grids, alpha planes, transforms, metadata.
+2. **Bitstream**: each tile's HEVC data is extracted with its parameter sets.
+3. **Decoding**: CABAC, intra prediction, inverse transforms, deblocking and SAO; grid tiles are decoded in parallel.
+4. **Assembly**: tiles are stitched, alpha attached, YCbCr converted to RGB, and crop/rotation/mirror applied.
+
+## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
 
 ```toml
 [dependencies]
@@ -89,7 +120,7 @@ cargo run --release -p heifer --example heic2png -- photo.heic photo.png
 cargo run --release -p heifer --example metadata -- photo.heic
 ```
 
-## What is supported
+## <img src="docs/icons/layers.svg" width="24" height="24" align="top"> What is supported
 
 | | Supported | Not yet |
 |---|---|---|
@@ -99,7 +130,7 @@ cargo run --release -p heifer --example metadata -- photo.heic
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | — | planned (see [roadmap](#roadmap)) |
 
-## Quality
+## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Quality
 
 ### HEVC conformance
 
@@ -137,7 +168,7 @@ Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets with HEIF/HEV
 every night on GitHub Actions: full decoding, container parsing, HEVC decoding, a parallel-vs-sequential
 differential check and a CABAC round trip. Fuzzing already found and fixed a memory exhaustion bug.
 
-## Performance
+## <img src="docs/icons/gauge.svg" width="24" height="24" align="top"> Performance
 
 Measured on a 10-core Apple Silicon Mac (release build):
 
@@ -150,7 +181,7 @@ Measured on a 10-core Apple Silicon Mac (release build):
 
 Single-image decoding is not optimised yet; there is room for improvement.
 
-## Architecture
+## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 
 ```text
 heifer               decode(), read_metadata(), image crate integration
@@ -167,7 +198,7 @@ let tiles = file.referenced_items(file.primary_id, b"dimg");
 let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hevc-dec or ffmpeg
 ```
 
-## Roadmap
+## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
 - [ ] **Next**: HDR gain maps (Apple / ISO 21496-1), ICC colour management, faster single-image decoding
@@ -175,7 +206,7 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
-## Development
+## <img src="docs/icons/wrench.svg" width="24" height="24" align="top"> Development
 
 <details>
 <summary>Building, testing and validating</summary>
@@ -219,17 +250,21 @@ cargo build --release -p heifer-hevc-dec --example decode
 
 </details>
 
-## Acknowledgements
+## <img src="docs/icons/heart.svg" width="24" height="24" align="top"> Acknowledgements
 
 Validation relies on the ITU-T HEVC conformance bitstreams, the test files of
 [pillow-heif](https://github.com/bigcat88/pillow_heif) and [Nokia's HEIF samples](https://github.com/nokiatech/heif),
 the fuzzing corpus of [libheif](https://github.com/strukturag/libheif), and [ffmpeg](https://ffmpeg.org) as a reference decoder.
 
-## Patents
+## <img src="docs/icons/scale.svg" width="24" height="24" align="top"> Patents
 
 HEVC is covered by patents. Heifer is an independent implementation for research and interoperability;
 users are responsible for complying with applicable patent licensing in their jurisdiction.
 
-## License
+## <img src="docs/icons/scale.svg" width="24" height="24" align="top"> License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+
+---
+
+<p align="center"><sub>Built with 💜 in safe Rust · <a href="https://harpelm.github.io/Heifer/">try the demo</a> · <a href="https://docs.rs/heifer">read the docs</a></sub></p>
