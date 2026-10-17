@@ -123,6 +123,10 @@ if let Some(gain) = heifer::read_gain_map(&bytes)? {
 }
 ```
 
+`decode_hdr` also reads ISO 21496-1 gain maps stored as HEIF `tmap` items, including their
+per-channel gain, gamma, offset, and headroom metadata. ISO gain maps take precedence when both
+formats are present; `read_gain_map` exposes the legacy Apple map.
+
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
@@ -144,7 +148,7 @@ orientation is already applied, so it is never applied twice.
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images | `iloc` construction method 2 |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
-| **HDR** | Apple HDR gain maps (iPhone photos), matching Apple's decoder | ISO 21496-1 gain maps (`tmap`) |
+| **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | — | planned (see [roadmap](#roadmap)) |
 
@@ -261,7 +265,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
 - [x] **HDR**: Apple gain maps (iPhone photos)
-- [ ] **Next**: ISO 21496-1 gain maps, ICC colour management
+- [x] **HDR**: ISO 21496-1 gain maps (`tmap`)
+- [ ] **Next**: ICC colour management
 - [ ] **Encoder**: HEIF writing, minimal HEVC intra encoder, then better compression, 10-bit and alpha
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
