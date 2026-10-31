@@ -97,13 +97,8 @@ pub(crate) struct RdoqScratch {
 
 impl RdoqScratch {
     pub(crate) fn new() -> Self {
-        // pLPS(state) = 0.5 · α^state, with α = (0.01875 / 0.5)^(1/63) (§9.3.3.2.1 design).
-        let alpha = (0.01875f64 / 0.5).powf(1.0 / 63.0);
         Self {
-            bits: core::array::from_fn(|s| {
-                let lps = 0.5 * alpha.powi(s as i32);
-                [-(1.0 - lps).log2() as f32, -lps.log2() as f32]
-            }),
+            bits: crate::estimate::entropy_bits(),
             chosen: vec![0; 1024],
             cost_level: vec![0.0; 1024],
             cost_sig1: vec![0.0; 1024],

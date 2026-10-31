@@ -19,7 +19,8 @@ use heifer_hevc_dec::slice::SliceHeader;
 use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
 
 use crate::Error;
-use crate::cabac::{ArithmeticEncoder, Checkpoint};
+use crate::cabac::ArithmeticEncoder;
+use crate::estimate::{BinLog, LogPoint};
 use crate::params::{NalType, StreamParams, nal_unit};
 use crate::rdo::{RdoqScratch, hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
 use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
@@ -216,7 +217,13 @@ fn encode_with_reconstruction(
     let (ctbs_x, ctbs_y) = (pw.div_ceil(ctb), ph.div_ceil(ctb));
     for cy in 0..ctbs_y {
         for cx in 0..ctbs_x {
+            // Decide the block with estimated rates, then code the chosen bins for real.
+            let contexts = enc.ctx;
             enc.quadtree(cx * ctb, cy * ctb, LOG2_CTB, 0);
+            let decided = enc.ctx;
+            enc.ctx = contexts;
+            enc.log.replay(&mut enc.ctx, &mut enc.cabac);
+            debug_assert_eq!(enc.ctx, decided);
             let last = cy + 1 == ctbs_y && cx + 1 == ctbs_x;
             enc.cabac.encode_terminate(u8::from(last)); // end_of_slice_segment_flag
         }
@@ -282,7 +289,7 @@ impl Plane {
 struct Snapshot {
     /// Whether the block was coded when the snapshot was taken.
     coded: bool,
-    cabac: Checkpoint,
+    log: LogPoint,
     ctx: Contexts,
     /// Reconstructed samples of the block, per component.
     samples: [Vec<u16>; 3],
@@ -292,7 +299,9 @@ struct Snapshot {
 
 struct Encoder<'a> {
     recon: Reconstructor<'a>,
+    /// The arithmetic coder, fed from `log` once each 32×32 block is decided.
     cabac: ArithmeticEncoder,
+    log: BinLog,
     ctx: Contexts,
     src: [Plane; 3],
     chroma: bool,
@@ -370,6 +379,7 @@ impl<'a> Encoder<'a> {
         Self {
             recon,
             cabac: ArithmeticEncoder::new(),
+            log: BinLog::new(),
             ctx: Contexts::new(qp),
             src: [y, cb, cr],
             chroma: planes.chroma.is_some(),
@@ -399,7 +409,7 @@ impl<'a> Encoder<'a> {
     }
 
     fn bin(&mut self, i: usize, bin: bool) {
-        self.cabac.encode(&mut self.ctx[i], u8::from(bin));
+        self.log.encode(&mut self.ctx[i], i, u8::from(bin));
     }
 
     fn grid(&self, x: u32, y: u32) -> usize {
@@ -434,7 +444,7 @@ impl<'a> Encoder<'a> {
             .collect()
     }
 
-    fn snapshot(&self, x0: u32, y0: u32, size: u32, coded: bool, cabac: Checkpoint) -> Snapshot {
+    fn snapshot(&self, x0: u32, y0: u32, size: u32, coded: bool, log: LogPoint) -> Snapshot {
         let mut samples: [Vec<u16>; 3] = Default::default();
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
@@ -455,7 +465,7 @@ impl<'a> Encoder<'a> {
         }
         Snapshot {
             coded,
-            cabac,
+            log,
             ctx: self.ctx,
             samples,
             depth,
@@ -466,7 +476,7 @@ impl<'a> Encoder<'a> {
     fn restore(&mut self, x0: u32, y0: u32, size: u32, s: &Snapshot) {
         // Intra prediction must see the block as the decoder will: coded or not yet.
         self.recon.set_reconstructed(x0, y0, size, size, s.coded);
-        self.cabac.restore(&s.cabac);
+        self.log.restore(&s.log);
         self.ctx = s.ctx;
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
@@ -524,23 +534,17 @@ impl<'a> Encoder<'a> {
             }
         }
         // The whole block first: when it needs no residual, smaller blocks cannot do better.
-        let start_bits = self.cabac.bit_count();
-        let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
+        let start_bits = self.log.bit_count();
+        let start = self.snapshot(x0, y0, size, false, self.log.checkpoint());
         self.split_cu_flag(x0, y0, depth, false);
         let (d_whole, residual) = self.coding_unit(x0, y0, log2_size, depth);
-        let j_whole = d_whole + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
+        let j_whole = d_whole + self.lambda * (self.log.bit_count() - start_bits);
         // Blocks that cost little per pixel are smooth enough: splitting them almost never pays.
         let per_pixel = j_whole / (self.lambda * f64::from(size * size));
         if !residual || per_pixel < split_threshold(log2_size) {
             return d_whole;
         }
-        let whole = self.snapshot(
-            x0,
-            y0,
-            size,
-            true,
-            self.cabac.checkpoint_since(&start.cabac),
-        );
+        let whole = self.snapshot(x0, y0, size, true, self.log.checkpoint_since(&start.log));
 
         self.restore(x0, y0, size, &start);
         self.split_cu_flag(x0, y0, depth, true);
@@ -548,7 +552,7 @@ impl<'a> Encoder<'a> {
             .iter()
             .map(|&(dx, dy)| self.quadtree(x0 + dx, y0 + dy, log2_size - 1, depth + 1))
             .sum();
-        let j_split = d_split + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
+        let j_split = d_split + self.lambda * (self.log.bit_count() - start_bits);
         if j_whole <= j_split {
             self.restore(x0, y0, size, &whole);
             d_whole
@@ -807,8 +811,8 @@ impl<'a> Encoder<'a> {
     fn coding_unit(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> (f64, bool) {
         const MODES_TRIED: usize = 3;
         let size = 1u32 << log2_size;
-        let start_bits = self.cabac.bit_count();
-        let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
+        let start_bits = self.log.bit_count();
+        let start = self.snapshot(x0, y0, size, false, self.log.checkpoint());
         let mpm = self.mpm_candidates(x0, y0);
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
@@ -830,9 +834,9 @@ impl<'a> Encoder<'a> {
             }
             let (d, residual) = enc.code_cu(x0, y0, log2_size, depth, kind, mode);
             *current = Some((kind, mode));
-            let j = d + enc.lambda * (enc.cabac.bit_count() - start_bits) as f64;
+            let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
             if best.as_ref().is_none_or(|b| j < b.0) {
-                let after = enc.cabac.checkpoint_since(&start.cabac);
+                let after = enc.log.checkpoint_since(&start.log);
                 *best = Some((
                     j,
                     d,
@@ -950,14 +954,14 @@ impl<'a> Encoder<'a> {
             match mpm.iter().position(|&m| m == mode) {
                 Some(i) => {
                     // mpm_idx: truncated unary, maximum 2.
-                    self.cabac.encode_bypass(u8::from(i > 0));
+                    self.log.encode_bypass(u8::from(i > 0));
                     if i > 0 {
-                        self.cabac.encode_bypass(u8::from(i > 1));
+                        self.log.encode_bypass(u8::from(i > 1));
                     }
                 }
                 None => {
                     let below = mpm.iter().filter(|&&m| m < mode).count() as u8;
-                    self.cabac.encode_bypass_bits(u32::from(mode - below), 5);
+                    self.log.encode_bypass_bits(u32::from(mode - below), 5);
                 }
             }
         }
@@ -965,7 +969,7 @@ impl<'a> Encoder<'a> {
             // intra_chroma_pred_mode: 0 for "as luma", else 1 and two bypass bits.
             self.bin(ctx::INTRA_CHROMA_PRED_MODE, chroma.0 != 4);
             if chroma.0 != 4 {
-                self.cabac.encode_bypass_bits(u32::from(chroma.0), 2);
+                self.log.encode_bypass_bits(u32::from(chroma.0), 2);
             }
         }
 
@@ -1171,7 +1175,7 @@ impl<'a> Encoder<'a> {
             let sign_hidden = sig_pos[0] - sig_pos[n_sig - 1] > 3;
             let coded_signs = if sign_hidden { n_sig - 1 } else { n_sig };
             for &v in &sig[..coded_signs] {
-                self.cabac.encode_bypass(u8::from(v < 0));
+                self.log.encode_bypass(u8::from(v < 0));
             }
 
             let mut rice = 0u32;
@@ -1218,7 +1222,7 @@ impl<'a> Encoder<'a> {
         }
         for (_, suffix) in parts {
             if let Some((value, n)) = suffix {
-                self.cabac.encode_bypass_bits(value, n);
+                self.log.encode_bypass_bits(value, n);
             }
         }
     }
@@ -1228,11 +1232,10 @@ impl<'a> Encoder<'a> {
         if value < (4 << rice) {
             let prefix = value >> rice;
             for _ in 0..prefix {
-                self.cabac.encode_bypass(1);
+                self.log.encode_bypass(1);
             }
-            self.cabac.encode_bypass(0);
-            self.cabac
-                .encode_bypass_bits(value & ((1 << rice) - 1), rice);
+            self.log.encode_bypass(0);
+            self.log.encode_bypass_bits(value & ((1 << rice) - 1), rice);
         } else {
             let mut prefix = 4;
             while value >= (((2u32 << (prefix - 3)) + 2) << rice) {
@@ -1240,11 +1243,10 @@ impl<'a> Encoder<'a> {
             }
             let base = ((1u32 << (prefix - 3)) + 2) << rice;
             for _ in 0..prefix {
-                self.cabac.encode_bypass(1);
+                self.log.encode_bypass(1);
             }
-            self.cabac.encode_bypass(0);
-            self.cabac
-                .encode_bypass_bits(value - base, prefix - 3 + rice);
+            self.log.encode_bypass(0);
+            self.log.encode_bypass_bits(value - base, prefix - 3 + rice);
         }
     }
 }

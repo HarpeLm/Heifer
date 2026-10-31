@@ -19,6 +19,7 @@
 
 pub mod cabac;
 pub mod encoder;
+mod estimate;
 mod params;
 mod rdo;
 pub mod transform;

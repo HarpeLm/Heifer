@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5 — 2026-10-31
+
+- Encoder: trials estimate their rate instead of coding it. Their bins go to a log that adds
+  up their cost from the context probabilities and updates the contexts like the arithmetic
+  coder; the log of the chosen coding is replayed into the arithmetic coder once each 32×32
+  block is decided. About 10% faster, same compression.
+
 ## 0.3.4 — 2026-10-31
 
 **Faster encoding.** About 1.8× faster on one core and 30% faster on a 10-core Mac (a 12 MP
