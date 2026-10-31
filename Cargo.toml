@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -11,9 +11,9 @@ repository = "https://github.com/HarpeLm/Heifer"
 homepage = "https://github.com/HarpeLm/Heifer"
 
 [workspace.dependencies]
-heifer-isobmff = { path = "crates/heifer-isobmff", version = "0.3.7" }
-heifer-hevc-dec = { path = "crates/heifer-hevc-dec", version = "0.3.7" }
-heifer-hevc-enc = { path = "crates/heifer-hevc-enc", version = "0.3.7" }
+heifer-isobmff = { path = "crates/heifer-isobmff", version = "0.3.8" }
+heifer-hevc-dec = { path = "crates/heifer-hevc-dec", version = "0.3.8" }
+heifer-hevc-enc = { path = "crates/heifer-hevc-enc", version = "0.3.8" }
 thiserror = "2"
 
 [workspace.lints.rust]

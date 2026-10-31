@@ -96,6 +96,8 @@ let image = heifer::decode(&bytes)?;    // primary image, with alpha, crop/rotat
 
 println!("{}×{}, {}-bit, alpha: {}", image.width, image.height, image.bit_depth, image.has_alpha);
 let rgba: Vec<u8> = image.to_rgba8();   // or to_rgb8(); image.data keeps 16-bit samples
+
+let preview = heifer::decode_thumbnail(&bytes)?;   // the embedded thumbnail, if any: much faster
 ```
 
 Limit threads and image size, for example on a server that accepts uploads:
@@ -196,7 +198,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, metadata, `clap`) | 4:4:4, HDR gain maps, lossless |
+| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`) | 4:4:4, HDR gain maps, lossless |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -265,6 +267,10 @@ Grid tiles are decoded in parallel; the iPhone photo scales from 162 ms on 1 thr
 On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
 slower than ffmpeg. The hot loops are written so that the compiler vectorizes them (NEON, SSE/AVX),
 without any `unsafe` code.
+
+**[Benchmarks against every other HEIC decoder and encoder](docs/BENCHMARKS.md)** (heic-rs,
+heic, heic-decoder, zune-heic, still265, ffmpeg, x265, Apple), reproducible with
+`python3 benchmarks/run.py`.
 
 ### Other pure-Rust decoders
 

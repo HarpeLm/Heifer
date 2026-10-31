@@ -287,6 +287,11 @@ fn info(input: &Path) -> Result<(), String> {
         if image.has_alpha { ", alpha" } else { "" },
         human(bytes.len() as u64)
     );
+    for thumb in file.referencing_items(file.primary_id, b"thmb") {
+        if let Ok(Some((w, h))) = file.image_size(thumb) {
+            println!("  thumbnail {w}×{h}");
+        }
+    }
     if heifer::read_gain_map(&bytes).ok().flatten().is_some() {
         println!("  HDR gain map");
     }

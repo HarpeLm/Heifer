@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.8 — 2026-10-31
+
+- **Thumbnails**: images larger than 512 pixels get a thumbnail (`thmb` item, longest side 320
+  pixels, with its alpha plane), as in iPhone photos, which file browsers can show without
+  decoding the whole image. `heifer::decode_thumbnail` reads it; `heifer info` lists it.
+- **Benchmarks**: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) compares heifer with heic-rs,
+  heic, heic-decoder, zune-heic, still265, ffmpeg, x265 and Apple's ImageIO on decoding speed,
+  fidelity and coverage, and on encoding size, quality and speed. `benchmarks/run.py` reproduces
+  it on any Mac.
+
 ## 0.3.7 — 2026-10-31
 
 **Colours as Apple shows them.** Decoded images now match the output of Apple's decoder

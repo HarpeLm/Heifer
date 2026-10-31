@@ -1,0 +1,23 @@
+[package]
+name = "heifer-benchmarks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Compares heifer with other HEIC decoders and encoders (see run.py)"
+
+# Competitors, used only to measure them. Some are GPL or AGPL: this crate is never published
+# and nothing of it ships with heifer.
+[dependencies]
+heifer = { path = "../crates/heifer" }
+heic-rs = "=0.1.4"
+heic = "=0.1.6"
+heic-decoder = "=0.1.1"
+zune-heic = "=0.5.0"
+still265 = "=0.6.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+debug = false
+
+# Kept out of the main workspace.
+[workspace]

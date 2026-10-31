@@ -170,7 +170,20 @@ pub(crate) fn encode_pixels(
         bit_depth,
         pixel,
     };
-    let (mut writer, image) = encode_image(&source, has_alpha, options)?;
+    let mut writer = HeifWriter::new();
+    let image = encode_image(&source, has_alpha, options, &mut writer)?;
+    // A thumbnail, as in iPhone photos: viewers show it without decoding the whole image.
+    if width.max(height) > TILE {
+        let (tw, th, pixels) = thumbnail(&source);
+        let thumb = Source {
+            width: tw,
+            height: th,
+            bit_depth,
+            pixel: |i: usize| pixels[i],
+        };
+        let id = encode_image(&thumb, has_alpha, options, &mut writer)?;
+        writer.add_reference(*b"thmb", id, &[image]);
+    }
     if let Some(m) = metadata {
         if let Some(icc) = &m.icc_profile {
             writer.add_icc_profile(image, icc);
@@ -193,12 +206,44 @@ struct Source<F> {
     pixel: F,
 }
 
-/// Encodes the pixels into a writer; returns it with the ID of the image (picture or grid).
+/// Longest side of thumbnails, in pixels (as in iPhone photos).
+const THUMBNAIL: u32 = 320;
+
+/// A thumbnail of the image: its size and RGBA pixels, each the average of the pixels it
+/// covers.
+fn thumbnail<F: Fn(usize) -> [u16; 4]>(source: &Source<F>) -> (u32, u32, Vec<[u16; 4]>) {
+    let (w, h) = (source.width as usize, source.height as usize);
+    let scale = f64::from(THUMBNAIL) / w.max(h) as f64;
+    let tw = ((w as f64 * scale).round() as usize).max(1);
+    let th = ((h as f64 * scale).round() as usize).max(1);
+    let span = |o: usize, n: usize, t: usize| (o * n / t, ((o + 1) * n / t).max(o * n / t + 1));
+    let mut pixels = Vec::with_capacity(tw * th);
+    for oy in 0..th {
+        let (y0, y1) = span(oy, h, th);
+        for ox in 0..tw {
+            let (x0, x1) = span(ox, w, tw);
+            let mut sum = [0u64; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    for (s, v) in sum.iter_mut().zip((source.pixel)(y * w + x)) {
+                        *s += u64::from(v);
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u64;
+            pixels.push(sum.map(|s| ((s + n / 2) / n) as u16));
+        }
+    }
+    (tw as u32, th as u32, pixels)
+}
+
+/// Encodes the pixels into `writer`; returns the ID of the image (picture or grid).
 fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
     source: &Source<F>,
     has_alpha: bool,
     options: &EncodeOptions,
-) -> Result<(HeifWriter, ItemId), Error> {
+    writer: &mut HeifWriter,
+) -> Result<ItemId, Error> {
     let (width, height) = (source.width, source.height);
     let qp = options.qp();
     let color = EncoderConfig {
@@ -211,18 +256,17 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
         colour: (2, 2, 2),
         ..color
     };
-    let mut writer = HeifWriter::new();
 
     if width <= TILE && height <= TILE {
         let picture = encode_region(source, (0, 0), (width, height), false, &color)?;
-        let image = add_picture(&mut writer, &picture, (width, height), false);
+        let image = add_picture(writer, &picture, (width, height), false);
         if has_alpha {
             // Same coded size as the colour picture, so that both are cropped alike.
             let coded = (picture.width, picture.height);
             let alpha = encode_region(source, (0, 0), coded, true, &alpha)?;
-            add_alpha_picture(&mut writer, image, &alpha, (width, height));
+            add_alpha_picture(writer, image, &alpha, (width, height));
         }
-        return Ok((writer, image));
+        return Ok(image);
     }
 
     let (columns, rows) = (width.div_ceil(TILE), height.div_ceil(TILE));
@@ -234,7 +278,7 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
     let tiles = encode_tiles(source, columns, rows, false, &color, options)?;
     let ids: Vec<ItemId> = tiles
         .iter()
-        .map(|t| add_picture(&mut writer, t, (TILE, TILE), true))
+        .map(|t| add_picture(writer, t, (TILE, TILE), true))
         .collect();
     let grid = writer.add_grid(
         rows as u16,
@@ -249,7 +293,7 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
         let tiles = encode_tiles(source, columns, rows, true, &alpha, options)?;
         let ids: Vec<ItemId> = tiles
             .iter()
-            .map(|t| add_picture(&mut writer, t, (TILE, TILE), true))
+            .map(|t| add_picture(writer, t, (TILE, TILE), true))
             .collect();
         let alpha = writer.add_grid(
             rows as u16,
@@ -263,7 +307,7 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
         writer.add_reference(*b"auxl", alpha, &[grid]);
     }
     writer.set_primary(grid);
-    Ok((writer, grid))
+    Ok(grid)
 }
 
 /// Encodes all the tiles of a grid, in parallel. Returns them row by row.

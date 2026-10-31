@@ -226,3 +226,45 @@ fn deep_images_are_coded_in_10_bits() {
         .max();
     assert!(max_error <= Some(6), "{max_error:?}");
 }
+
+#[test]
+fn large_images_get_a_thumbnail() {
+    let (w, h) = (1100, 700);
+    let rgba = test_image(w, h, true);
+    let heic = encode_rgba8(w, h, &rgba, &EncodeOptions::default()).unwrap();
+    let thumb = heifer::decode_thumbnail(&heic)
+        .unwrap()
+        .expect("a thumbnail");
+    // Longest side 320, same aspect ratio, alpha kept.
+    assert_eq!((thumb.width, thumb.height), (320, 204));
+    assert!(thumb.has_alpha);
+    // It looks like the image: compare with a box-filtered copy of the pixels.
+    let thumb8 = thumb.to_rgba8();
+    let mut sum_error = 0.0;
+    for (i, px) in thumb8.chunks_exact(4).enumerate() {
+        let (tx, ty) = (i % 320, i / 320);
+        let (x, y) = (tx * w as usize / 320 + 1, ty * h as usize / 204 + 1);
+        let src = &rgba[(y * w as usize + x) * 4..][..3];
+        sum_error += px
+            .iter()
+            .zip(src)
+            .map(|(&a, &b)| f64::from(a.abs_diff(b)))
+            .sum::<f64>();
+    }
+    let mean = sum_error / (320.0 * 204.0 * 3.0);
+    assert!(mean < 12.0, "mean error {mean:.1}");
+    // The primary image is unchanged by the thumbnail.
+    assert_eq!(decode(&heic).unwrap().width, w);
+}
+
+#[test]
+fn small_images_have_no_thumbnail() {
+    let heic = encode_rgba8(
+        64,
+        48,
+        &test_image(64, 48, false),
+        &EncodeOptions::default(),
+    )
+    .unwrap();
+    assert!(heifer::decode_thumbnail(&heic).unwrap().is_none());
+}

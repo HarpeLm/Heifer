@@ -102,6 +102,24 @@ pub fn decode_with_options(bytes: &[u8], options: &Options) -> Result<Image, Err
     decode_item_with(&file, file.primary_id, 0, options)
 }
 
+/// Decodes the thumbnail of the primary image (a `thmb` item, such as the 320×240 preview
+/// of iPhone photos), or `None` if the file has none: much faster than decoding the image.
+pub fn decode_thumbnail(bytes: &[u8]) -> Result<Option<Image>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    // The smallest one when there are several.
+    let thumbnails = file.referencing_items(file.primary_id, b"thmb");
+    let smallest = thumbnails.iter().min_by_key(|&&id| {
+        file.image_size(id)
+            .ok()
+            .flatten()
+            .map_or(u64::MAX, |(w, h)| u64::from(w) * u64::from(h))
+    });
+    match smallest {
+        Some(&id) => Ok(Some(decode_item(&file, id, 0)?)),
+        None => Ok(None),
+    }
+}
+
 /// Decodes one image item: coded (`hvc1`) or derived (`grid`, `iovl`), then applies its
 /// transformative properties.
 pub fn decode_item(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, Error> {
