@@ -377,8 +377,16 @@ pub(crate) fn rdoq(
             cost_zero[g]
         };
     }
-    // Coding nothing at all (cbf 0) is decided by the caller from the reconstruction.
-    let Some((_, last)) = best else { return };
+    let Some((cost, last)) = best else { return };
+    // Coding nothing at all (cbf 0) may be cheaper.
+    let cbf = if luma {
+        ctx::CBF_LUMA + 1
+    } else {
+        ctx::CBF_CHROMA
+    };
+    if total_zero_after[0] + lambda * ctx_bits(cbf, false) <= cost + lambda * ctx_bits(cbf, true) {
+        return;
+    }
     for (g, &level) in chosen.iter().enumerate().take(last + 1) {
         let (i, _, _) = index(g);
         let level = level as i32;

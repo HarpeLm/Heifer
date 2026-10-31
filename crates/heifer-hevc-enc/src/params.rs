@@ -1,8 +1,8 @@
 //! Parameter sets, slice header and NAL units of the encoded stream (H.265 §7.3).
 //!
-//! The stream is a single IDR picture with one slice: 8 to 10 bits, 4:2:0 or 4:0:0, CTBs of 32×32,
-//! coding blocks of 8×8 to 32×32 (with 4×4 prediction blocks), transform blocks split once at
-//! most, sign data hiding, deblocking on, SAO off.
+//! The stream is a single IDR picture with one slice: 8 to 10 bits, 4:2:0 or 4:0:0, CTBs of 64×64,
+//! coding blocks of 8×8 to 64×64 (with 4×4 prediction blocks), transform blocks of 4×4 to 32×32
+//! split twice at most, sign data hiding, deblocking and SAO.
 
 /// Writes bits MSB-first, with Exp-Golomb codes.
 #[derive(Debug, Default)]
@@ -183,10 +183,10 @@ impl StreamParams {
         w.ue(bd).ue(bd); // bit_depth_luma_minus8, bit_depth_chroma_minus8
         w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
         w.bit(true).ue(0).ue(0).ue(0); // sub-layer ordering info
-        w.ue(0).ue(2); // coding blocks 8×8 to 32×32
+        w.ue(0).ue(3); // coding blocks 8×8 to 64×64
         w.ue(0).ue(3); // transform blocks 4×4 to 32×32
-        w.ue(0).ue(1); // max_transform_hierarchy_depth_inter / intra
-        w.bit(false).bit(false).bit(false).bit(false); // scaling lists, AMP, SAO, PCM
+        w.ue(0).ue(u32::from(crate::encoder::MAX_TU_DEPTH)); // max_transform_hierarchy_depth_inter / intra
+        w.bit(false).bit(false).bit(true).bit(false); // scaling lists, AMP, SAO, PCM
         w.ue(0).bit(false).bit(false); // no RPS, no long-term pictures, no TMVP
         w.bit(true); // strong_intra_smoothing_enabled_flag
         w.bit(true); // vui_parameters_present_flag
@@ -212,7 +212,7 @@ impl StreamParams {
         w.bit(true).bit(false); // sign_data_hiding, cabac_init_present
         w.ue(0).ue(0); // num_ref_idx_l{0,1}_default_active_minus1
         w.se(self.qp - 26); // init_qp_minus26
-        w.bit(false).bit(false).bit(false); // constrained intra, transform skip, cu_qp_delta
+        w.bit(false).bit(crate::encoder::TRANSFORM_SKIP).bit(false); // constrained intra, transform skip, cu_qp_delta
         w.se(0).se(0).bit(false); // chroma QP offsets, not in slice headers
         w.bit(false).bit(false).bit(false); // weighted pred / bipred, transquant bypass
         w.bit(false).bit(false); // tiles, entropy_coding_sync
@@ -230,6 +230,10 @@ impl StreamParams {
         w.bit(true).bit(false); // first_slice_segment_in_pic, no_output_of_prior_pics
         w.ue(0); // slice_pic_parameter_set_id
         w.ue(2); // slice_type: I
+        w.bit(true); // slice_sao_luma_flag
+        if self.chroma_format != 0 {
+            w.bit(true); // slice_sao_chroma_flag
+        }
         w.se(0); // slice_qp_delta
         w.finish()
     }

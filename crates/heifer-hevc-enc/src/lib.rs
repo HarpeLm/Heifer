@@ -22,6 +22,7 @@ pub mod encoder;
 mod estimate;
 mod params;
 mod rdo;
+mod sao;
 pub mod transform;
 
 /// Errors produced while encoding an image.

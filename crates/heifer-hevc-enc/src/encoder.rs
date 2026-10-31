@@ -5,28 +5,39 @@
 //! identical on both sides by construction. Decisions are made by rate-distortion cost
 //! (`distortion + λ · bits`), with the bits counted by the CABAC encoder itself:
 //!
-//! - coding quadtree: each split is tried against coding the whole block (32, 16 and 8);
-//! - luma prediction mode: a coarse search over the 35 modes by SATD, refined around the best;
-//! - chroma uses the luma mode (`intra_chroma_pred_mode` 4); one transform per coding block.
+//! - coding quadtree: each split is tried against coding the whole block (64 to 8);
+//! - luma prediction modes: a coarse search over the 35 modes by SATD, refined around the best,
+//!   then the best few coded for real (five per block, 4×4 blocks included);
+//! - chroma mode: the two best by SATD coded for real;
+//! - transform tree: split up to twice; 4×4 blocks may skip the transform;
+//! - levels: RDOQ (including coding nothing), sign data hiding; then SAO on the deblocked picture.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
+use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
 use heifer_hevc_dec::recon::Frame;
 use heifer_hevc_dec::recon::{IntraReferences, Reconstructor};
 use heifer_hevc_dec::scan::{ScanType, scan_order};
 use heifer_hevc_dec::slice::SliceHeader;
-use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
+use heifer_hevc_dec::syntax::{CodingUnit, SaoParams, Sink, TransformBlock};
 
 use crate::Error;
 use crate::cabac::ArithmeticEncoder;
-use crate::estimate::{BinLog, LogPoint};
+use crate::estimate::{BinLog, LogPoint, replay};
 use crate::params::{NalType, StreamParams, nal_unit};
 use crate::rdo::{RdoqScratch, hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
+use crate::sao::{self, CtbSao};
 use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
-const LOG2_CTB: u8 = 5;
+const LOG2_CTB: u8 = 6;
+/// Largest transform blocks: 32×32 (64×64 coding units split their transform).
+const LOG2_MAX_TB: u8 = 5;
 const LOG2_MIN_CB: u8 = 3;
+/// `transform_skip_enabled_flag`: 4×4 blocks may skip the transform.
+pub(crate) const TRANSFORM_SKIP: bool = true;
+/// `max_transform_hierarchy_depth_intra`.
+pub(crate) const MAX_TU_DEPTH: u8 = 2;
 
 /// 8-bit planes of the picture to encode.
 #[derive(Debug, Clone, Copy)]
@@ -141,7 +152,7 @@ fn encode_with_reconstruction(
     height: u32,
     planes: Planes16<'_>,
     config: &EncoderConfig,
-) -> Result<(EncodedPicture, Frame, [usize; 3]), Error> {
+) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
         return Err(Error::InvalidInput(
             "picture size must be 1 to 16384 pixels",
@@ -215,24 +226,67 @@ fn encode_with_reconstruction(
     let (pw, ph) = (params.width, params.height);
     let ctb = 1u32 << LOG2_CTB;
     let (ctbs_x, ctbs_y) = (pw.div_ceil(ctb), ph.div_ceil(ctb));
+    // Decide each 32×32 block with estimated rates, keeping the bins of its chosen coding.
+    let mut blocks = Vec::with_capacity((ctbs_x * ctbs_y) as usize);
     for cy in 0..ctbs_y {
         for cx in 0..ctbs_x {
-            // Decide the block with estimated rates, then code the chosen bins for real.
-            let contexts = enc.ctx;
             enc.quadtree(cx * ctb, cy * ctb, LOG2_CTB, 0);
-            let decided = enc.ctx;
-            enc.ctx = contexts;
-            enc.log.replay(&mut enc.ctx, &mut enc.cabac);
-            debug_assert_eq!(enc.ctx, decided);
-            let last = cy + 1 == ctbs_y && cx + 1 == ctbs_x;
-            enc.cabac.encode_terminate(u8::from(last)); // end_of_slice_segment_flag
+            blocks.push(enc.log.take());
         }
     }
     if let Some(e) = enc.recon.error.take() {
         return Err(e.into());
     }
+
+    // Slice data: the SAO parameters of each block, then its bins. SAO has its own contexts,
+    // so the bins decided without it stay valid.
+    let bit_depth = planes.bit_depth;
+    let chroma = planes.chroma.is_some();
+    let write = |sao: &[(CtbSao, SaoParams)]| -> Vec<u8> {
+        let mut ctx = Contexts::new(params.qp);
+        let mut coder = ArithmeticEncoder::new();
+        for (i, bins) in blocks.iter().enumerate() {
+            let (cx, cy) = (i as u32 % ctbs_x, i as u32 / ctbs_x);
+            sao::write(
+                &mut coder,
+                &mut ctx,
+                &sao[i].0,
+                (cx > 0, cy > 0),
+                chroma,
+                bit_depth,
+            );
+            replay(bins, &mut ctx, &mut coder);
+            let last = i + 1 == blocks.len();
+            coder.encode_terminate(u8::from(last)); // end_of_slice_segment_flag
+        }
+        coder.finish()
+    };
+    // SAO is chosen on the picture as the decoder reconstructs it before SAO: decode a first
+    // version without SAO.
+    let off = vec![(CtbSao::Own(SaoParams::default()), SaoParams::default()); blocks.len()];
+    let mut first = header_rbsp.clone();
+    first.extend_from_slice(&write(&off));
+    let mut stream = Vec::new();
+    for nal in parameter_sets
+        .iter()
+        .chain([&nal_unit(NalType::IdrWRadl, &first)])
+    {
+        stream.extend_from_slice(&[0, 0, 0, 1]);
+        stream.extend_from_slice(nal);
+    }
+    let deblocked = decode_picture(&stream, DecodeOptions::default())?;
+    let src = [&enc.src[0], &enc.src[1], &enc.src[2]];
+    let decisions = sao::decide(
+        &deblocked,
+        src.map(|p| &p.samples[..]),
+        src.map(|p| p.width),
+        chroma,
+        ctb as usize,
+        bit_depth,
+        enc.lambda,
+    );
     let mut rbsp = header_rbsp;
-    rbsp.extend_from_slice(&enc.cabac.finish());
+    rbsp.extend_from_slice(&write(&decisions));
 
     let picture = EncodedPicture {
         parameter_sets,
@@ -264,8 +318,59 @@ struct Tb {
     log2_size: u8,
     mode: u8,
     levels: Vec<i32>,
+    /// Whether the residual is coded without transform.
+    transform_skip: bool,
     sse: f64,
 }
+
+impl Tb {
+    fn coded(&self) -> bool {
+        !self.levels.is_empty()
+    }
+}
+
+/// A transform tree: one transform unit, or four smaller trees.
+enum TNode {
+    /// The luma block and, from 8×8 luma up, the chroma blocks.
+    Leaf(Tb, Option<[Tb; 2]>),
+    /// Four quarters and, when they are 4×4 luma blocks, the chroma blocks they share.
+    Split(Vec<TNode>, Option<[Tb; 2]>),
+}
+
+impl TNode {
+    fn chroma(&self) -> &Option<[Tb; 2]> {
+        match self {
+            Self::Leaf(_, chroma) | Self::Split(_, chroma) => chroma,
+        }
+    }
+
+    /// Whether Cb (`k` = 0) or Cr (1) has residual anywhere in the tree.
+    fn chroma_cbf(&self, k: usize) -> bool {
+        self.chroma().as_ref().is_some_and(|c| c[k].coded())
+            || matches!(self, Self::Split(blocks, _) if blocks.iter().any(|b| b.chroma_cbf(k)))
+    }
+
+    fn residual(&self) -> bool {
+        self.chroma_cbf(0)
+            || self.chroma_cbf(1)
+            || match self {
+                Self::Leaf(luma, _) => luma.coded(),
+                Self::Split(blocks, _) => blocks.iter().any(Self::residual),
+            }
+    }
+
+    fn sse(&self) -> f64 {
+        let chroma: f64 = self.chroma().iter().flatten().map(|tb| tb.sse).sum();
+        chroma
+            + match self {
+                Self::Leaf(luma, _) => luma.sse,
+                Self::Split(blocks, _) => blocks.iter().map(Self::sse).sum(),
+            }
+    }
+}
+
+/// Sample, depth and mode buffers of a [`Snapshot`].
+type SnapshotBuffers = ([Vec<u16>; 3], Vec<u8>, Vec<u8>);
 
 /// A source plane, padded to the coded size by repeating the last column and row.
 struct Plane {
@@ -299,8 +404,7 @@ struct Snapshot {
 
 struct Encoder<'a> {
     recon: Reconstructor<'a>,
-    /// The arithmetic coder, fed from `log` once each 32×32 block is decided.
-    cabac: ArithmeticEncoder,
+    /// Bins of the trials, with their estimated rates.
     log: BinLog,
     ctx: Contexts,
     src: [Plane; 3],
@@ -328,10 +432,14 @@ struct Encoder<'a> {
     last_satd: f64,
     /// Modes chosen for a block by `quadtree` before `coding_unit`, to reuse.
     mode_cache: Option<((u32, u32, u8), Vec<u8>)>,
+    /// Transform skip trials and wins.
+    ts_trials: (u32, u32),
+    /// Buffers of snapshots given back, reused by the next ones.
+    pool: Vec<SnapshotBuffers>,
     /// Chroma mode chosen for a luma mode, in the current coding unit.
     chroma_choice: Option<u8>,
-    /// Coding units chosen of each kind, for tests and statistics.
-    kinds: [usize; 3],
+    /// Coding units chosen of each kind, then transform-skipped blocks, for tests.
+    kinds: [usize; 4],
     /// Rate cost of a level made significant or zero, for sign data hiding, in units of the
     /// squared quantization step.
     sdh_rate: f32,
@@ -378,7 +486,6 @@ impl<'a> Encoder<'a> {
         let grid_w = pw / 4;
         Self {
             recon,
-            cabac: ArithmeticEncoder::new(),
             log: BinLog::new(),
             ctx: Contexts::new(qp),
             src: [y, cb, cr],
@@ -398,11 +505,13 @@ impl<'a> Encoder<'a> {
             pred: vec![0; 32 * 32],
             coeffs: vec![0; 32 * 32],
             exact: vec![0.0; 32 * 32],
-            kinds: [0; 3],
+            kinds: [0; 4],
             chroma_choice: None,
             rdoq: RdoqScratch::new(),
             last_satd: 0.0,
             mode_cache: None,
+            pool: Vec::new(),
+            ts_trials: (0, 0),
             // About 3 bits, at λ / step² (step = 2^((Qp′ - 4) / 6)).
             sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp + bd_offset - 4) / 3.0)) as f32,
         }
@@ -431,21 +540,31 @@ impl<'a> Encoder<'a> {
     }
 
     /// Components and their regions (in component samples) covered by a luma block.
-    fn regions(&self, x0: u32, y0: u32, size: u32) -> Vec<(usize, u32, u32, u32)> {
+    fn regions(
+        &self,
+        x0: u32,
+        y0: u32,
+        size: u32,
+    ) -> impl Iterator<Item = (usize, u32, u32, u32)> + use<> {
         let n = if self.chroma { 3 } else { 1 };
-        (0..n)
-            .map(|c| {
-                if c == 0 {
-                    (0, x0, y0, size)
-                } else {
-                    (c, x0 / 2, y0 / 2, size / 2)
-                }
-            })
-            .collect()
+        [
+            (0, x0, y0, size),
+            (1, x0 / 2, y0 / 2, size / 2),
+            (2, x0 / 2, y0 / 2, size / 2),
+        ]
+        .into_iter()
+        .take(n)
     }
 
-    fn snapshot(&self, x0: u32, y0: u32, size: u32, coded: bool, log: LogPoint) -> Snapshot {
-        let mut samples: [Vec<u16>; 3] = Default::default();
+    /// Saves the state of a block, to try another coding of it and come back. The buffers come
+    /// from the ones given back with [`recycle`](Self::recycle).
+    fn snapshot(&mut self, x0: u32, y0: u32, size: u32, coded: bool, log: LogPoint) -> Snapshot {
+        let (mut samples, mut depth, mut modes) = self.pool.pop().unwrap_or_default();
+        for v in &mut samples {
+            v.clear();
+        }
+        depth.clear();
+        modes.clear();
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
             let plane = &self.recon.frame.planes[c];
@@ -454,8 +573,6 @@ impl<'a> Encoder<'a> {
                 samples[c].extend_from_slice(&plane[start..start + n as usize]);
             }
         }
-        let mut depth = Vec::new();
-        let mut modes = Vec::new();
         for y in (y0..y0 + size).step_by(4) {
             for x in (x0..x0 + size).step_by(4) {
                 let i = self.grid(x, y);
@@ -471,6 +588,11 @@ impl<'a> Encoder<'a> {
             depth,
             modes,
         }
+    }
+
+    /// Gives back the buffers of a snapshot no longer needed.
+    fn recycle(&mut self, s: Snapshot) {
+        self.pool.push((s.samples, s.depth, s.modes));
     }
 
     fn restore(&mut self, x0: u32, y0: u32, size: u32, s: &Snapshot) {
@@ -519,12 +641,15 @@ impl<'a> Encoder<'a> {
         }
 
         // Very detailed 32×32 blocks are split without trying them whole: the whole block
-        // almost never wins there (measured), and trying it costs as much as the split.
-        if log2_size == LOG2_CTB {
+        // almost never wins there (measured), and trying it costs as much as the split. 64×64
+        // blocks are predicted in 32×32 transform blocks: their modes are estimated on the
+        // first one.
+        if log2_size >= LOG2_MAX_TB {
             let mpm = self.mpm_candidates(x0, y0);
-            let modes = self.choose_modes(x0, y0, log2_size, mpm, 3);
+            let modes = self.choose_modes(x0, y0, LOG2_MAX_TB, mpm, 3);
             self.mode_cache = Some(((x0, y0, log2_size), modes));
-            if self.last_satd >= 2.0 {
+            let limit = if log2_size > LOG2_MAX_TB { 1.0 } else { 2.0 };
+            if self.last_satd >= limit {
                 self.mode_cache = None;
                 self.split_cu_flag(x0, y0, depth, true);
                 return children
@@ -542,11 +667,13 @@ impl<'a> Encoder<'a> {
         // Blocks that cost little per pixel are smooth enough: splitting them almost never pays.
         let per_pixel = j_whole / (self.lambda * f64::from(size * size));
         if !residual || per_pixel < split_threshold(log2_size) {
+            self.recycle(start);
             return d_whole;
         }
         let whole = self.snapshot(x0, y0, size, true, self.log.checkpoint_since(&start.log));
 
         self.restore(x0, y0, size, &start);
+        self.recycle(start);
         self.split_cu_flag(x0, y0, depth, true);
         let d_split: f64 = children
             .iter()
@@ -555,10 +682,9 @@ impl<'a> Encoder<'a> {
         let j_split = d_split + self.lambda * (self.log.bit_count() - start_bits);
         if j_whole <= j_split {
             self.restore(x0, y0, size, &whole);
-            d_whole
-        } else {
-            d_split
         }
+        self.recycle(whole);
+        if j_whole <= j_split { d_whole } else { d_split }
     }
 
     fn split_cu_flag(&mut self, x0: u32, y0: u32, depth: u8, split: bool) {
@@ -696,7 +822,7 @@ impl<'a> Encoder<'a> {
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.last_satd = costs[0].0 / f64::from(1u32 << (2 * log2_size)) / self.sqrt_lambda;
         // Only modes whose estimate is close to the best one are worth coding for real.
-        let limit = costs[0].0 * 1.1;
+        let limit = costs[0].0 * 1.25;
         costs
             .into_iter()
             .take(count)
@@ -707,20 +833,83 @@ impl<'a> Encoder<'a> {
 
     /// Computes the residual levels of one transform block and reconstructs it.
     fn transform_block(&mut self, c: usize, x: u32, y: u32, log2_size: u8, mode: u8) -> Tb {
-        let n = 1usize << log2_size;
         self.predict(c, x, y, log2_size, mode);
+        let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
+        let levels = self.quantize(c, log2_size, mode, false);
+        let sse = self.reconstruct(c, x, y, log2_size, mode, &levels, false);
+        let tb = Tb {
+            c,
+            log2_size,
+            mode,
+            levels,
+            transform_skip: false,
+            sse: sse as f64 * w,
+        };
+        // Tried while it wins often enough (graphics, text), not on photos where it hardly does.
+        let worth = self.ts_trials.0 < 256 || self.ts_trials.1 * 32 >= self.ts_trials.0;
+        if log2_size != 2 || !tb.coded() || !TRANSFORM_SKIP || !worth {
+            return tb;
+        }
+        // 4×4 blocks can also code the residual without transform, which suits sharp edges
+        // (text, graphics): keep the cheaper in rate and distortion.
+        self.ts_trials.0 += 1;
+        let levels = self.quantize(c, 2, mode, true);
+        if levels.is_empty() {
+            return tb;
+        }
+        let sse = self.reconstruct(c, x, y, 2, mode, &levels, true);
+        let skip = Tb {
+            levels,
+            transform_skip: true,
+            sse: sse as f64 * w,
+            ..tb
+        };
+        if self.tb_cost(&skip) < self.tb_cost(&tb) {
+            self.ts_trials.1 += 1;
+            self.kinds[3] += 1;
+            skip
+        } else {
+            self.reconstruct(c, x, y, 2, mode, &tb.levels, false);
+            tb
+        }
+    }
+
+    /// Rate-distortion cost of a coded transform block: its distortion and the estimated bits of
+    /// its residual.
+    fn tb_cost(&mut self, tb: &Tb) -> f64 {
+        let (point, contexts) = (self.log.checkpoint(), self.ctx);
+        let start = self.log.bit_count();
+        self.residual_coding(tb);
+        let bits = self.log.bit_count() - start;
+        self.log.restore(&point);
+        self.ctx = contexts;
+        tb.sse + self.lambda * bits
+    }
+
+    /// Transforms (unless `transform_skip`) and quantizes the residual in `self.diff`, with
+    /// rate-distortion optimized levels; returns the levels, or nothing when all are zero.
+    fn quantize(&mut self, c: usize, log2_size: u8, mode: u8, transform_skip: bool) -> Vec<i32> {
+        let n = 1usize << log2_size;
         let mut coeffs = std::mem::take(&mut self.coeffs);
         let qp = if c == 0 { self.qp_luma } else { self.qp_c };
-        let dst = c == 0 && log2_size == 2;
-        forward_transform(
-            &self.diff[..n * n],
-            log2_size,
-            dst,
-            self.bit_depth,
-            &mut coeffs[..n * n],
-        );
-        let mut exact = std::mem::take(&mut self.exact);
         let bd = self.bit_depth;
+        if transform_skip {
+            // The scale of the transforms' output: 2^(15 - bit depth - log2 size).
+            let shift = 15 - u32::from(bd) - u32::from(log2_size);
+            for (o, &d) in coeffs[..n * n].iter_mut().zip(&self.diff[..n * n]) {
+                *o = d << shift;
+            }
+        } else {
+            let dst = c == 0 && log2_size == 2;
+            forward_transform(
+                &self.diff[..n * n],
+                log2_size,
+                dst,
+                bd,
+                &mut coeffs[..n * n],
+            );
+        }
+        let mut exact = std::mem::take(&mut self.exact);
         quantize_levels(
             &mut coeffs[..n * n],
             log2_size,
@@ -730,7 +919,8 @@ impl<'a> Encoder<'a> {
         );
         let scan = scan_type(log2_size, c == 0, mode);
         // λ in units of the squared quantization step, 2^((QP - 4) / 3).
-        let lambda = (self.lambda / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
+        let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
+        let lambda = (self.lambda / w / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
         let levels = &mut coeffs[..n * n];
         rdoq(
             levels,
@@ -744,41 +934,58 @@ impl<'a> Encoder<'a> {
         );
         hide_signs(levels, &exact[..n * n], log2_size, scan, self.sdh_rate);
         self.exact = exact;
-        let coded = levels.iter().any(|&v| v != 0);
-        // Reconstruct the block (prediction plus residual, if any) as the decoder will.
-        {
-            let (mut cols, mut rows) = (0, 0);
-            for (i, _) in levels.iter().enumerate().filter(|(_, v)| **v != 0) {
-                cols = cols.max(i % n + 1);
-                rows = rows.max(i / n + 1);
-            }
-            let prediction = std::mem::take(&mut self.pred);
-            self.recon.reconstruct(
-                &TransformBlock {
-                    c_idx: c as u8,
-                    x,
-                    y,
-                    log2_size,
-                    intra_mode: mode,
-                    coeffs: coded.then_some(&*levels),
-                    coeff_bounds: (cols as u8, rows as u8),
-                    transform_skip: false,
-                    transquant_bypass: false,
-                    qp_y: self.qp,
-                    cu_qp_offset: 0,
-                    res_scale_val: 0,
-                },
-                &prediction,
-            );
-            self.pred = prediction;
-        }
-        let levels = if coded {
-            coeffs[..n * n].to_vec()
+        let levels = if levels.iter().any(|&v| v != 0) {
+            levels.to_vec()
         } else {
             Vec::new()
         };
         self.coeffs = coeffs;
+        levels
+    }
 
+    /// Reconstructs a block (the prediction in `self.pred` plus the residual of `levels`, if
+    /// any) as the decoder will; returns its sum of squared errors.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct(
+        &mut self,
+        c: usize,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: u8,
+        levels: &[i32],
+        transform_skip: bool,
+    ) -> i64 {
+        let n = 1usize << log2_size;
+        let (mut cols, mut rows) = (0, 0);
+        for (i, _) in levels.iter().enumerate().filter(|(_, v)| **v != 0) {
+            cols = cols.max(i % n + 1);
+            rows = rows.max(i / n + 1);
+        }
+        let prediction = std::mem::take(&mut self.pred);
+        self.recon.reconstruct(
+            &TransformBlock {
+                c_idx: c as u8,
+                x,
+                y,
+                log2_size,
+                intra_mode: mode,
+                coeffs: (!levels.is_empty()).then_some(levels),
+                coeff_bounds: (cols as u8, rows as u8),
+                transform_skip,
+                transquant_bypass: false,
+                qp_y: self.qp,
+                cu_qp_offset: 0,
+                res_scale_val: 0,
+            },
+            &prediction,
+        );
+        self.pred = prediction;
+        self.block_sse(c, x, y, n)
+    }
+
+    /// Sum of squared errors of a reconstructed block against the source.
+    fn block_sse(&self, c: usize, x: u32, y: u32, n: usize) -> i64 {
         let stride = self.recon.frame.widths[c] as usize;
         let rec = &self.recon.frame.planes[c];
         let src = &self.src[c];
@@ -791,21 +998,22 @@ impl<'a> Encoder<'a> {
                 sse += d * d;
             }
         }
-        Tb {
-            c,
-            log2_size,
-            mode,
-            levels,
-            sse: sse as f64,
-        }
+        sse
     }
 
     /// Chooses the chroma prediction mode of a coding unit whose (first) luma mode is `luma`:
     /// returns `intra_chroma_pred_mode` (4 = same as luma) and the mode it gives.
-    fn choose_chroma_mode(&mut self, xc: u32, yc: u32, log2_size: u8, luma: u8) -> (u8, u8) {
+    fn choose_chroma_mode(
+        &mut self,
+        xc: u32,
+        yc: u32,
+        log2_size: u8,
+        luma: u8,
+        luma_coded: bool,
+    ) -> (u8, u8) {
         let n = 1usize << log2_size;
         let refs = [1, 2].map(|c| self.recon.intra_references(c, xc, yc, n));
-        let mut best = (f64::MAX, 4, luma);
+        let mut costs = Vec::with_capacity(5);
         for syntax in [4u8, 0, 1, 2, 3] {
             let mode = match syntax {
                 4 => luma,
@@ -819,10 +1027,51 @@ impl<'a> Encoder<'a> {
                 self.predict_from(&refs[c - 1], c, xc, yc, log2_size, mode);
                 cost += satd(&self.diff[..n * n], n) as f64;
             }
-            if cost < best.0 {
-                best = (cost, syntax, mode);
+            costs.push((cost, syntax, mode));
+        }
+        costs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let tried = 2;
+        // The best few by SATD are coded (as one transform block per component), and the
+        // cheapest in rate and distortion is kept.
+        let log2_tb = log2_size.min(LOG2_MAX_TB - 1);
+        let (x0, y0, size) = (xc * 2, yc * 2, 2u32 << log2_size);
+        let start = self.snapshot(x0, y0, size, luma_coded, self.log.checkpoint());
+        let contexts = self.ctx;
+        let mut best = (f64::MAX, costs[0].1, costs[0].2);
+        for (i, &(_, syntax, mode)) in costs.iter().take(tried).enumerate() {
+            if i > 0 {
+                self.restore(x0, y0, size, &start);
+            }
+            let bits = self.log.bit_count();
+            self.bin(ctx::INTRA_CHROMA_PRED_MODE, syntax != 4);
+            if syntax != 4 {
+                self.log.encode_bypass_bits(0, 2);
+            }
+            let mut d = 0.0;
+            let step = 1u32 << log2_tb;
+            for y in (yc..yc + (1 << log2_size)).step_by(step as usize) {
+                for x in (xc..xc + (1 << log2_size)).step_by(step as usize) {
+                    for tb in self
+                        .chroma_blocks(x, y, log2_tb, mode)
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.bin(ctx::CBF_CHROMA, tb.coded());
+                        if tb.coded() {
+                            self.residual_coding(&tb);
+                        }
+                        d += tb.sse;
+                    }
+                }
+            }
+            let j = d + self.lambda * (self.log.bit_count() - bits);
+            self.ctx = contexts;
+            if j < best.0 {
+                best = (j, syntax, mode);
             }
         }
+        self.restore(x0, y0, size, &start);
+        self.recycle(start);
         (best.1, best.2)
     }
 
@@ -841,14 +1090,13 @@ impl<'a> Encoder<'a> {
     /// prediction blocks, and keeps the cheapest. Returns the distortion and whether there is
     /// any residual.
     fn coding_unit(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> (f64, bool) {
-        const MODES_TRIED: usize = 3;
         let size = 1u32 << log2_size;
         let start_bits = self.log.bit_count();
         let start = self.snapshot(x0, y0, size, false, self.log.checkpoint());
         let mpm = self.mpm_candidates(x0, y0);
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
-            _ => self.choose_modes(x0, y0, log2_size, mpm, MODES_TRIED),
+            _ => self.choose_modes(x0, y0, log2_size.min(LOG2_MAX_TB), mpm, 5),
         };
         self.chroma_choice = None;
 
@@ -869,14 +1117,10 @@ impl<'a> Encoder<'a> {
             let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
             if best.as_ref().is_none_or(|b| j < b.0) {
                 let after = enc.log.checkpoint_since(&start.log);
-                *best = Some((
-                    j,
-                    d,
-                    kind,
-                    mode,
-                    residual,
-                    enc.snapshot(x0, y0, size, true, after),
-                ));
+                let snapshot = enc.snapshot(x0, y0, size, true, after);
+                if let Some(old) = best.replace((j, d, kind, mode, residual, snapshot)) {
+                    enc.recycle(old.5);
+                }
             }
         };
         for &mode in &modes {
@@ -886,9 +1130,15 @@ impl<'a> Encoder<'a> {
         // A prediction good enough to need no residual, or cheap enough, is not improved by
         // smaller blocks.
         let per_pixel = best.as_ref().map_or(0.0, |b| b.0) / (self.lambda * f64::from(size * size));
-        if *residual && per_pixel >= small_blocks_threshold(log2_size) {
+        if *residual && log2_size <= LOG2_MAX_TB && per_pixel >= small_blocks_threshold(log2_size) {
             let mode = *mode;
             try_kind(self, &mut best, &mut current, CuKind::SplitTransform, mode);
+            // Where split transforms win, the next modes may win with them too.
+            if best.as_ref().is_some_and(|b| b.2 == CuKind::SplitTransform) {
+                for &m in modes.iter().filter(|&&m| m != mode).take(2) {
+                    try_kind(self, &mut best, &mut current, CuKind::SplitTransform, m);
+                }
+            }
             if log2_size == LOG2_MIN_CB {
                 try_kind(self, &mut best, &mut current, CuKind::FourBlocks, mode);
             }
@@ -898,6 +1148,8 @@ impl<'a> Encoder<'a> {
         if current != Some((kind, mode)) {
             self.restore(x0, y0, size, &snapshot);
         }
+        self.recycle(snapshot);
+        self.recycle(start);
         (d, residual)
     }
 
@@ -919,24 +1171,23 @@ impl<'a> Encoder<'a> {
         // Prediction modes and transform blocks, in decoding order: each block is predicted
         // from the ones reconstructed before it.
         let mut parts: Vec<(u8, [u8; 3])> = Vec::new(); // (mode, MPM candidates)
-        let mut leaves: Vec<(Tb, Option<[Tb; 2]>)> = Vec::new(); // luma, chroma
-        let mut small_chroma = None; // chroma of 4×4 luma blocks, coded after the last one
         // intra_chroma_pred_mode and the chroma mode (decided once the first luma mode is).
         let mut chroma = (4u8, mode);
-        if four {
+        let tree = if four {
             let half = size / 2;
+            let mut blocks = Vec::new();
             for i in 0..4u32 {
                 let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
                 let mpm = self.mpm_candidates(x, y);
-                let mode = self.choose_modes(x, y, log2_size - 1, mpm, 1)[0];
-                self.fill_grid(x, y, half, None, Some(mode));
+                let (mode, luma) = self.small_block(x, y, mpm);
                 parts.push((mode, mpm));
-                leaves.push((self.transform_block(0, x, y, log2_size - 1, mode), None));
+                blocks.push(TNode::Leaf(luma, None));
             }
             if self.chroma {
-                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, parts[0].0);
+                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, parts[0].0, true);
             }
-            small_chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
+            let chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
+            TNode::Split(blocks, chroma)
         } else {
             let mpm = self.mpm_candidates(x0, y0);
             self.fill_grid(x0, y0, size, None, Some(mode));
@@ -947,33 +1198,19 @@ impl<'a> Encoder<'a> {
                 chroma = match self.chroma_choice {
                     Some(chosen) => chroma_syntax(chosen, mode),
                     None => {
-                        let choice = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode);
+                        let choice =
+                            self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode, false);
                         self.chroma_choice = Some(choice.1);
                         choice
                     }
                 };
             }
-            if kind == CuKind::Whole {
-                let luma = self.transform_block(0, x0, y0, log2_size, mode);
-                let chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
-                leaves.push((luma, chroma));
+            if kind == CuKind::Whole && log2_size <= LOG2_MAX_TB {
+                self.transform_leaf(x0, y0, log2_size, mode, chroma.1)
             } else {
-                let half = size / 2;
-                for i in 0..4u32 {
-                    let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
-                    let luma = self.transform_block(0, x, y, log2_size - 1, mode);
-                    let chroma = if log2_size - 1 > 2 {
-                        self.chroma_blocks(x / 2, y / 2, log2_size - 2, chroma.1)
-                    } else {
-                        None
-                    };
-                    leaves.push((luma, chroma));
-                }
-                if log2_size - 1 == 2 {
-                    small_chroma = self.chroma_blocks(x0 / 2, y0 / 2, 2, chroma.1);
-                }
+                self.split_tree(x0, y0, log2_size, mode, chroma.1, 1)
             }
-        }
+        };
 
         // Syntax: part_mode, the luma modes, the chroma mode, then the transform tree.
         if log2_size == LOG2_MIN_CB {
@@ -1004,58 +1241,7 @@ impl<'a> Encoder<'a> {
                 self.log.encode_bypass_bits(u32::from(chroma.0), 2);
             }
         }
-
-        let split = kind != CuKind::Whole;
-        if !four {
-            // split_transform_flag (max_transform_hierarchy_depth_intra = 1).
-            self.bin(
-                ctx::SPLIT_TRANSFORM_FLAG + usize::from(5 - log2_size),
-                split,
-            );
-        }
-        let cbf = |tb: &Tb| !tb.levels.is_empty();
-        // Chroma cbfs of the root: is there any chroma residual in the tree? With split
-        // transforms of 8×8 or more, each transform unit then has its own.
-        let any = |k: usize| {
-            small_chroma.as_ref().is_some_and(|c| cbf(&c[k]))
-                || leaves
-                    .iter()
-                    .any(|(_, c)| c.as_ref().is_some_and(|c| cbf(&c[k])))
-        };
-        let (cb_any, cr_any) = (any(0), any(1));
-        if self.chroma {
-            self.bin(ctx::CBF_CHROMA, cb_any);
-            self.bin(ctx::CBF_CHROMA, cr_any);
-        }
-        let mut sse = 0.0;
-        let n_leaves = leaves.len();
-        for (i, (luma, chroma)) in leaves.iter().enumerate() {
-            if split && let Some(chroma) = chroma {
-                if cb_any {
-                    self.bin(ctx::CBF_CHROMA + 1, cbf(&chroma[0]));
-                }
-                if cr_any {
-                    self.bin(ctx::CBF_CHROMA + 1, cbf(&chroma[1]));
-                }
-            }
-            self.bin(ctx::CBF_LUMA + usize::from(!split), cbf(luma));
-            if cbf(luma) {
-                self.residual_coding(&luma.levels, 0, luma.log2_size, luma.mode);
-            }
-            sse += luma.sse;
-            // Chroma of 4×4 luma blocks comes with the last of them.
-            let chroma = match chroma {
-                Some(c) => Some(c),
-                None if i + 1 == n_leaves => small_chroma.as_ref(),
-                None => None,
-            };
-            for tb in chroma.into_iter().flatten() {
-                if cbf(tb) {
-                    self.residual_coding(&tb.levels, tb.c, tb.log2_size, tb.mode);
-                }
-                sse += tb.sse;
-            }
-        }
+        self.write_tree(&tree, log2_size, 0, (true, true), four);
 
         self.recon.coding_unit(&CodingUnit {
             x: x0,
@@ -1066,15 +1252,211 @@ impl<'a> Encoder<'a> {
             pcm: false,
             qp_y: self.qp,
         });
-        (
-            sse,
-            cb_any || cr_any || leaves.iter().any(|(luma, _)| cbf(luma)),
-        )
+        (tree.sse(), tree.residual())
+    }
+
+    /// A 4×4 luma prediction block of an N×N coding unit: tries the few best modes by SATD
+    /// and keeps the one with the cheapest rate-distortion cost (mode, cbf and residual).
+    fn small_block(&mut self, x: u32, y: u32, mpm: [u8; 3]) -> (u8, Tb) {
+        let modes = self.choose_modes(x, y, 2, mpm, 5);
+        let start = (modes.len() > 1).then(|| self.snapshot(x, y, 4, false, self.log.checkpoint()));
+        let mut best: Option<(f64, u8, Tb, Snapshot)> = None;
+        for &mode in &modes {
+            let Some(start) = &start else { break };
+            if best.is_some() {
+                self.restore(x, y, 4, start);
+            }
+            self.fill_grid(x, y, 4, None, Some(mode));
+            let tb = self.transform_block(0, x, y, 2, mode);
+            let contexts = self.ctx;
+            let bits = self.log.bit_count();
+            self.bin(ctx::PREV_INTRA_LUMA_PRED_FLAG, mpm.contains(&mode));
+            match mpm.iter().position(|&m| m == mode) {
+                Some(i) => self.log.encode_bypass_bits(0, 1 + u32::from(i > 0)),
+                None => self.log.encode_bypass_bits(0, 5),
+            }
+            self.bin(ctx::CBF_LUMA, tb.coded());
+            if tb.coded() {
+                self.residual_coding(&tb);
+            }
+            let j = tb.sse + self.lambda * (self.log.bit_count() - bits);
+            self.log.restore(&start.log);
+            self.ctx = contexts;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                let after = self.snapshot(x, y, 4, true, self.log.checkpoint());
+                if let Some(old) = best.replace((j, mode, tb, after)) {
+                    self.recycle(old.3);
+                }
+            }
+        }
+        if let Some(start) = start {
+            self.recycle(start);
+        }
+        match best {
+            Some((_, mode, tb, after)) => {
+                self.restore(x, y, 4, &after);
+                self.recycle(after);
+                (mode, tb)
+            }
+            None => {
+                let mode = modes[0];
+                self.fill_grid(x, y, 4, None, Some(mode));
+                (mode, self.transform_block(0, x, y, 2, mode))
+            }
+        }
+    }
+
+    /// One transform unit: the luma block and, from 8×8 luma up, its chroma blocks.
+    fn transform_leaf(&mut self, x: u32, y: u32, log2_size: u8, mode: u8, chroma: u8) -> TNode {
+        let luma = self.transform_block(0, x, y, log2_size, mode);
+        let chroma = if log2_size > 2 {
+            self.chroma_blocks(x / 2, y / 2, log2_size - 1, chroma)
+        } else {
+            None
+        };
+        TNode::Leaf(luma, chroma)
+    }
+
+    /// A block split into four transform trees at `depth`; 4×4 luma blocks share the chroma
+    /// blocks of their parent.
+    fn split_tree(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        mode: u8,
+        chroma: u8,
+        depth: u8,
+    ) -> TNode {
+        let half = 1u32 << (log2_size - 1);
+        let mut blocks = Vec::with_capacity(4);
+        for i in 0..4u32 {
+            let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
+            blocks.push(self.transform_tree(x, y, log2_size - 1, mode, chroma, depth));
+        }
+        let chroma = if log2_size == 3 {
+            self.chroma_blocks(x0 / 2, y0 / 2, 2, chroma)
+        } else {
+            None
+        };
+        TNode::Split(blocks, chroma)
+    }
+
+    /// A transform tree below the root: one transform unit or, when it has residual worth
+    /// coding more finely and is cheaper that way, four.
+    fn transform_tree(
+        &mut self,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: u8,
+        chroma: u8,
+        depth: u8,
+    ) -> TNode {
+        if log2_size == 2 || depth == MAX_TU_DEPTH {
+            return self.transform_leaf(x, y, log2_size, mode, chroma);
+        }
+        let size = 1u32 << log2_size;
+        let start = self.snapshot(x, y, size, false, self.log.checkpoint());
+        let leaf = self.transform_leaf(x, y, log2_size, mode, chroma);
+        if !leaf.residual() {
+            self.recycle(start);
+            return leaf;
+        }
+        let whole = self.tree_cost(&leaf, log2_size, depth);
+        if whole / (self.lambda * f64::from(size * size)) < small_blocks_threshold(log2_size) {
+            self.recycle(start);
+            return leaf;
+        }
+        let after = self.snapshot(x, y, size, true, self.log.checkpoint());
+        self.restore(x, y, size, &start);
+        self.recycle(start);
+        let split = self.split_tree(x, y, log2_size, mode, chroma, depth + 1);
+        let tree = if self.tree_cost(&split, log2_size, depth) < whole {
+            split
+        } else {
+            self.restore(x, y, size, &after);
+            leaf
+        };
+        self.recycle(after);
+        tree
+    }
+
+    /// The rate-distortion cost of a transform tree, its syntax estimated and then discarded.
+    fn tree_cost(&mut self, tree: &TNode, log2_size: u8, depth: u8) -> f64 {
+        let (point, contexts) = (self.log.checkpoint(), self.ctx);
+        let start = self.log.bit_count();
+        self.write_tree(tree, log2_size, depth, (true, true), false);
+        let bits = self.log.bit_count() - start;
+        self.log.restore(&point);
+        self.ctx = contexts;
+        tree.sse() + self.lambda * bits
+    }
+
+    /// `transform_tree()` (§7.3.8.8) of a coded tree: split flags, cbfs and residuals.
+    /// `parent` holds the chroma cbfs of the parent, `intra_split` whether the coding unit has
+    /// four prediction blocks.
+    fn write_tree(
+        &mut self,
+        tree: &TNode,
+        log2_size: u8,
+        depth: u8,
+        parent: (bool, bool),
+        intra_split: bool,
+    ) {
+        // The split is inferred for 4×4 prediction blocks and blocks larger than 32×32.
+        if (3..=LOG2_MAX_TB).contains(&log2_size)
+            && depth < MAX_TU_DEPTH + u8::from(intra_split)
+            && !(intra_split && depth == 0)
+        {
+            let split = matches!(tree, TNode::Split(..));
+            self.bin(
+                ctx::SPLIT_TRANSFORM_FLAG + usize::from(5 - log2_size),
+                split,
+            );
+        }
+        let cbf = (tree.chroma_cbf(0), tree.chroma_cbf(1));
+        if self.chroma && log2_size > 2 {
+            if depth == 0 || parent.0 {
+                self.bin(ctx::CBF_CHROMA + usize::from(depth), cbf.0);
+            }
+            if depth == 0 || parent.1 {
+                self.bin(ctx::CBF_CHROMA + usize::from(depth), cbf.1);
+            }
+        }
+        let chroma = match tree {
+            TNode::Split(blocks, chroma) => {
+                for block in blocks {
+                    self.write_tree(block, log2_size - 1, depth + 1, cbf, intra_split);
+                }
+                chroma
+            }
+            TNode::Leaf(luma, chroma) => {
+                self.bin(ctx::CBF_LUMA + usize::from(depth == 0), luma.coded());
+                if luma.coded() {
+                    self.residual_coding(luma);
+                }
+                chroma
+            }
+        };
+        // Chroma of 4×4 luma blocks comes after the last of them.
+        for tb in chroma.iter().flatten().filter(|tb| tb.coded()) {
+            self.residual_coding(tb);
+        }
     }
 
     /// `residual_coding()` (§7.3.8.11) of the levels in `self.coeffs[c]`, which has at least one
     /// non-zero level: the mirror of the decoder's parsing.
-    fn residual_coding(&mut self, coeffs: &[i32], c: usize, log2_size: u8, intra_mode: u8) {
+    fn residual_coding(&mut self, tb: &Tb) {
+        let (coeffs, c, log2_size, intra_mode) = (&tb.levels[..], tb.c, tb.log2_size, tb.mode);
+        if TRANSFORM_SKIP && log2_size == 2 {
+            let ctx = if c == 0 {
+                ctx::TRANSFORM_SKIP_FLAG_LUMA
+            } else {
+                ctx::TRANSFORM_SKIP_FLAG_CHROMA
+            };
+            self.bin(ctx, tb.transform_skip);
+        }
         let size = 1usize << log2_size;
         let luma = c == 0;
         let scan = scan_type(log2_size, luma, intra_mode);
@@ -1303,7 +1685,7 @@ fn chroma_syntax(chroma: u8, luma: u8) -> (u8, u8) {
 /// Cost per pixel (in units of λ) of a whole block below which splitting it is not tried:
 /// splits almost never win there (measured on photos and text).
 fn split_threshold(log2_size: u8) -> f64 {
-    if log2_size == LOG2_CTB {
+    if log2_size >= LOG2_MAX_TB {
         1.0 / 16.0
     } else {
         1.0 / 8.0
@@ -1319,6 +1701,10 @@ fn small_blocks_threshold(log2_size: u8) -> f64 {
         _ => 0.044, // 2^-4.5
     }
 }
+
+/// Weight of chroma distortion against luma in rate-distortion decisions: chroma errors weigh
+/// more in RGB than their share of the samples (measured on RGB PSNR, photos and graphics).
+const CHROMA_WEIGHT: f64 = 3.0;
 
 /// Scan order of a block (§7.4.9.11): mode-dependent for small blocks, diagonal otherwise.
 fn scan_type(log2_size: u8, luma: bool, intra_mode: u8) -> ScanType {
@@ -1467,14 +1853,14 @@ mod tests {
     }
 
     thread_local! {
-        static KINDS: std::cell::RefCell<[usize; 3]> = const { std::cell::RefCell::new([0; 3]) };
+        static KINDS: std::cell::RefCell<[usize; 4]> = const { std::cell::RefCell::new([0; 4]) };
     }
 
     #[test]
     fn every_kind_of_coding_unit_round_trips() {
         // The decoder reproduces the reconstruction (checked in `round_trip`) whatever the
-        // encoder chose: make sure it chose every kind of coding unit.
-        KINDS.with(|k| *k.borrow_mut() = [0; 3]);
+        // encoder chose: make sure it chose every kind of coding unit, and transform skip.
+        KINDS.with(|k| *k.borrow_mut() = [0; 4]);
         for qp in [10, 22, 34] {
             round_trip(96, 80, qp, false);
             round_trip(48, 40, qp, true);

@@ -128,13 +128,14 @@ Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Mai
 has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
 into 512×512 tiles that are
 encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
-about 0.7 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 42.0 dB against the
+about 0.9 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 42.0 dB against the
 original, both decoded by Apple (1.0 bit per pixel).
 
 The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
-chooses block sizes (32×32 down to 4×4), transform splits and prediction modes by rate-distortion
-cost, with RDOQ and sign data hiding. At equal quality its files are about the size of those of
-x265's `medium` preset: BD-rate −0.1% on a photo and +0.5% on an image with text (PSNR, 6:1:1).
+chooses block sizes (64×64 down to 4×4), transform splits and prediction modes by rate-distortion
+cost, with RDOQ, sign data hiding, transform skip and SAO. At equal quality its files are 5%
+smaller than those of x265's `medium` preset and 2.7% smaller than `slow` (PSNR, 6:1:1), and
+slightly smaller than still265's Slow preset (0.3 to 0.6%, [benchmarks](docs/BENCHMARKS.md)).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
 
@@ -329,7 +330,9 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **0.3.1**: `image` crate encoder, metadata when encoding
 - [x] **0.3.2**: compression on par with x265 `medium` (4×4 blocks, transform splits, RDOQ, sign data hiding)
 - [x] **0.3.3**: 10-bit encoding (Main 10)
-- [ ] **Next**: HDR gain map encoding, thumbnails
+- [x] **0.3.8**: thumbnails, public benchmarks
+- [x] **0.3.9**: files smaller than x265 `slow` and still265 Slow (SAO, 64×64 blocks, deeper transform trees, transform skip)
+- [ ] **Next**: HDR gain map encoding
 - [ ] ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

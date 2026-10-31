@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.9 — 2026-10-31
+
+**Smaller files.** At equal quality, encoded files are 6 to 7% smaller than with 0.3.8, slightly
+smaller than still265's Slow preset (0.3 to 0.6% on the benchmark images), 5% smaller than x265
+`medium` and 3% smaller than x265 `slow`. Encoding takes about 1.5 times as long (12 MP: 0.9 s on 10 cores).
+
+- SAO (sample adaptive offset), decided on the deblocked picture.
+- 64×64 coding blocks; transform trees split up to twice (32 → 16 → 8, 16 → 8 → 4).
+- More prediction modes coded for real, 4×4 blocks included; chroma mode chosen by
+  rate-distortion cost.
+- Transform skip for 4×4 blocks, tried where it pays (graphics, text: 4% smaller).
+- RDOQ also weighs coding nothing at all; chroma distortion weighs more in decisions, as it does
+  in RGB.
+- Thumbnails are coded at quality 60 at most.
+
 ## 0.3.8 — 2026-10-31
 
 - **Thumbnails**: images larger than 512 pixels get a thumbnail (`thmb` item, longest side 320

@@ -181,7 +181,12 @@ pub(crate) fn encode_pixels(
             bit_depth,
             pixel: |i: usize| pixels[i],
         };
-        let id = encode_image(&thumb, has_alpha, options, &mut writer)?;
+        // A preview needs less quality: at most 60 (QP 32), a few kilobytes.
+        let preview = EncodeOptions {
+            quality: options.quality.min(60),
+            ..*options
+        };
+        let id = encode_image(&thumb, has_alpha, &preview, &mut writer)?;
         writer.add_reference(*b"thmb", id, &[image]);
     }
     if let Some(m) = metadata {

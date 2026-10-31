@@ -109,18 +109,25 @@ impl BinLog {
         self.bits = point.bits;
     }
 
-    /// Codes the logged bins for real, with `contexts` as they were when the log started, and
-    /// empties the log. The contexts end as the logging left them.
-    pub(crate) fn replay(&mut self, contexts: &mut Contexts, coder: &mut ArithmeticEncoder) {
-        for &op in &self.ops {
-            let bin = (op & 1) as u8;
-            if op & BYPASS != 0 {
-                coder.encode_bypass(bin);
-            } else {
-                coder.encode(&mut contexts[usize::from(op >> 1)], bin);
-            }
-        }
-        self.ops.clear();
+    /// Takes the logged bins, emptying the log, to replay them later with [`replay`].
+    pub(crate) fn take(&mut self) -> Vec<u16> {
         self.bits = 0;
+        // A copy, so that the log keeps its capacity.
+        let ops = self.ops.clone();
+        self.ops.clear();
+        ops
+    }
+}
+
+/// Codes logged bins for real, with `contexts` as they were when they were logged. The
+/// contexts end as the logging left them.
+pub(crate) fn replay(ops: &[u16], contexts: &mut Contexts, coder: &mut ArithmeticEncoder) {
+    for &op in ops {
+        let bin = (op & 1) as u8;
+        if op & BYPASS != 0 {
+            coder.encode_bypass(bin);
+        } else {
+            coder.encode(&mut contexts[usize::from(op >> 1)], bin);
+        }
     }
 }
