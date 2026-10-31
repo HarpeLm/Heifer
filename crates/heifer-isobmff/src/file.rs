@@ -208,7 +208,23 @@ impl<'a> HeifFile<'a> {
     }
 
     /// Raw item data, with all extents concatenated.
+    ///
+    /// With construction method 2 (`iloc` version 1 or 2), extents point into the data of the
+    /// items the item references with `iloc` references, which may themselves be built that way.
     pub fn item_data(&self, id: ItemId) -> Result<Cow<'a, [u8]>, Error> {
+        let mut budget = Budget {
+            items: MAX_CONSTRUCTED_ITEMS,
+            bytes: self.data.len().saturating_mul(2),
+        };
+        self.construct_item(id, 0, &mut budget)
+    }
+
+    fn construct_item(
+        &self,
+        id: ItemId,
+        depth: u32,
+        budget: &mut Budget,
+    ) -> Result<Cow<'a, [u8]>, Error> {
         let item = self.item(id)?;
         let Some(loc) = &item.location else {
             return Ok(Cow::Borrowed(&[]));
@@ -216,41 +232,68 @@ impl<'a> HeifFile<'a> {
         let source = match loc.construction_method {
             ConstructionMethod::File => self.data,
             ConstructionMethod::Idat => self.idat.ok_or(Error::MissingBox(FourCC(*b"idat")))?,
-            ConstructionMethod::Item => {
-                return Err(Error::Unimplemented("iloc construction method 2 (item)"));
-            }
-        };
-        let slice = |e: &boxes::Extent| -> Result<&'a [u8], Error> {
-            let start = usize::try_from(e.offset).map_err(|_| Error::UnexpectedEof)?;
-            let end = if e.length == 0 {
-                source.len()
-            } else {
-                usize::try_from(e.length)
-                    .ok()
-                    .and_then(|l| start.checked_add(l))
-                    .ok_or(Error::UnexpectedEof)?
-            };
-            source.get(start..end).ok_or(Error::UnexpectedEof)
+            ConstructionMethod::Item => return self.construct_from_items(id, loc, depth, budget),
         };
         match loc.extents.as_slice() {
-            [single] => Ok(Cow::Borrowed(slice(single)?)),
+            [single] => Ok(Cow::Borrowed(extent_slice(source, single)?)),
             extents => {
-                // Resolve every extent first: the concatenated data cannot be larger than the
-                // source (overlapping extents could otherwise make a small file expand to
-                // gigabytes).
-                let parts = extents.iter().map(slice).collect::<Result<Vec<_>, _>>()?;
-                let total = parts
+                let parts = extents
                     .iter()
-                    .try_fold(0usize, |acc, p| acc.checked_add(p.len()));
-                match total {
-                    Some(total) if total <= source.len() => Ok(Cow::Owned(parts.concat())),
-                    _ => Err(Error::InvalidBox {
-                        box_type: FourCC(*b"iloc"),
-                        reason: "item data larger than its source",
-                    }),
-                }
+                    .map(|e| extent_slice(source, e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                concat(&parts, source.len(), budget).map(Cow::Owned)
             }
         }
+    }
+
+    /// Construction method 2: each extent is a range of the data of one of the items that `id`
+    /// references with `iloc` references (`extent_index`, 1-based).
+    fn construct_from_items(
+        &self,
+        id: ItemId,
+        loc: &ItemLocation,
+        depth: u32,
+        budget: &mut Budget,
+    ) -> Result<Cow<'a, [u8]>, Error> {
+        // Bounds reference cycles, and the work done for items referenced many times over.
+        if depth >= MAX_CONSTRUCTION_DEPTH {
+            return Err(invalid_iloc("item construction nested too deeply"));
+        }
+        budget.items = budget
+            .items
+            .checked_sub(1)
+            .ok_or_else(|| invalid_iloc("too many items constructed from other items"))?;
+
+        let refs = self.referenced_items(id, b"iloc");
+        let source_index = |e: &boxes::Extent| -> Result<usize, Error> {
+            usize::try_from(e.index.max(1) - 1)
+                .ok()
+                .filter(|&i| i < refs.len())
+                .ok_or_else(|| invalid_iloc("extent_index without a matching `iloc` reference"))
+        };
+        // Each source item is constructed once, however many extents use it.
+        let mut sources: Vec<Option<Cow<'a, [u8]>>> = vec![None; refs.len()];
+        for e in &loc.extents {
+            let i = source_index(e)?;
+            if sources[i].is_none() {
+                sources[i] = Some(self.construct_item(refs[i], depth + 1, budget)?);
+            }
+        }
+        let source = |e: &boxes::Extent| -> Result<&[u8], Error> {
+            Ok(sources[source_index(e)?].as_deref().unwrap_or_default())
+        };
+
+        if let [single] = loc.extents.as_slice()
+            && let Some(Cow::Borrowed(data)) = sources[source_index(single)?]
+        {
+            return Ok(Cow::Borrowed(extent_slice(data, single)?));
+        }
+        let parts = loc
+            .extents
+            .iter()
+            .map(|e| extent_slice(source(e)?, e))
+            .collect::<Result<Vec<_>, _>>()?;
+        concat(&parts, self.data.len(), budget).map(Cow::Owned)
     }
 
     /// Metadata items of type `item_type` describing `image` (`cdsc` references). When none
@@ -370,4 +413,50 @@ impl<'a> HeifFile<'a> {
         }
         Ok(out)
     }
+}
+
+/// Maximum nesting of items constructed from other items (construction method 2).
+const MAX_CONSTRUCTION_DEPTH: u32 = 8;
+/// Maximum number of items constructed from other items for one [`HeifFile::item_data`] call.
+const MAX_CONSTRUCTED_ITEMS: u32 = 256;
+
+/// Limits on the work done by one [`HeifFile::item_data`] call.
+struct Budget {
+    /// Items that may still be constructed from other items.
+    items: u32,
+    /// Bytes that may still be copied.
+    bytes: usize,
+}
+
+fn invalid_iloc(reason: &'static str) -> Error {
+    Error::InvalidBox {
+        box_type: FourCC(*b"iloc"),
+        reason,
+    }
+}
+
+/// The bytes of `source` covered by an extent.
+fn extent_slice<'s>(source: &'s [u8], e: &boxes::Extent) -> Result<&'s [u8], Error> {
+    let start = usize::try_from(e.offset).map_err(|_| Error::UnexpectedEof)?;
+    let end = if e.length == 0 {
+        source.len()
+    } else {
+        usize::try_from(e.length)
+            .ok()
+            .and_then(|l| start.checked_add(l))
+            .ok_or(Error::UnexpectedEof)?
+    };
+    source.get(start..end).ok_or(Error::UnexpectedEof)
+}
+
+/// Concatenates extents. The result cannot be larger than `limit` (the size of their source),
+/// so that overlapping extents cannot make a small file expand to gigabytes.
+fn concat(parts: &[&[u8]], limit: usize, budget: &mut Budget) -> Result<Vec<u8>, Error> {
+    let total = parts
+        .iter()
+        .try_fold(0usize, |acc, p| acc.checked_add(p.len()))
+        .filter(|&total| total <= limit && total <= budget.bytes)
+        .ok_or_else(|| invalid_iloc("item data larger than its source"))?;
+    budget.bytes -= total;
+    Ok(parts.concat())
 }

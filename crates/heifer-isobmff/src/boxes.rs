@@ -128,7 +128,7 @@ pub enum ConstructionMethod {
     File,
     /// Offsets are relative to the content of the `idat` box.
     Idat,
-    /// Data comes from another item (rarely used, not supported yet).
+    /// Offsets are relative to the data of other items, the `iloc` references of the item.
     Item,
 }
 
@@ -137,8 +137,11 @@ pub enum ConstructionMethod {
 pub struct Extent {
     /// Absolute offset (base offset already added).
     pub offset: u64,
-    /// Length in bytes. 0 means "until the end of the file / idat".
+    /// Length in bytes. 0 means "until the end of the file / idat / source item".
     pub length: u64,
+    /// `extent_index`: with [`ConstructionMethod::Item`], 1-based index of the source item
+    /// among the item's `iloc` references. 0 when the box does not store it (meaning 1).
+    pub index: u64,
 }
 
 /// One entry of the `iloc` box.
@@ -192,13 +195,17 @@ pub fn parse_item_locations(content: &[u8]) -> Result<Vec<ItemLocation>, Error> 
         let extent_count = r.u16()?;
         let mut extents = Vec::with_capacity(usize::from(extent_count));
         for _ in 0..extent_count {
-            r.uint(index_size)?; // extent_index, only used with construction method 2
+            let index = r.uint(index_size)?;
             let offset = r.uint(offset_size)?;
             let length = r.uint(length_size)?;
             let offset = base_offset
                 .checked_add(offset)
                 .ok_or_else(|| invalid(b"iloc", "offset overflow"))?;
-            extents.push(Extent { offset, length });
+            extents.push(Extent {
+                offset,
+                length,
+                index,
+            });
         }
         items.push(ItemLocation {
             id,
@@ -531,7 +538,8 @@ mod tests {
             locs[0].extents,
             vec![Extent {
                 offset: 105,
-                length: 8
+                length: 8,
+                index: 0,
             }]
         );
     }

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Container**: `iloc` construction method 2: item data built from ranges of other items
+  (`iloc` references), nested or not, with limits against reference cycles and data blow-up.
+- **Breaking:** `heifer_isobmff::boxes::Extent` has a new `index` field (`extent_index`).
+
 ## 0.2.1 — 2026-10-31
 
 - **HDR**: ISO 21496-1 gain maps stored as HEIF `tmap` items (per-channel gain, gamma, offset

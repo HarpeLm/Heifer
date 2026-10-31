@@ -145,7 +145,7 @@ orientation is already applied, so it is never applied twice.
 
 | | Supported | Not yet |
 |---|---|---|
-| **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images | `iloc` construction method 2 |
+| **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
