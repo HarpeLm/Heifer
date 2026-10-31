@@ -8,8 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+documentation = "https://docs.rs/heifer"
+keywords = ["heic", "heif", "hevc", "image", "decoder"]
+categories = ["multimedia::images", "parser-implementations", "wasm"]
 
 [dependencies]
 thiserror.workspace = true

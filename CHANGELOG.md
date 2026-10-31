@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-10-31
+
+- **HDR**: ISO 21496-1 gain maps stored as HEIF `tmap` items (per-channel gain, gamma, offset
+  and headroom). `decode_hdr` uses them in preference to Apple gain maps when both are present.
+- crates.io metadata: documentation links, a README for each crate, and keywords and
+  categories per crate (the decoders are no longer listed under encoding).
+
 ## 0.2.0 — 2026-10-08
 
 About 2× faster than 0.1.3 for `decode` + `to_rgba8`, and faster again on large photos.

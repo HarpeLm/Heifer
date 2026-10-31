@@ -1,14 +1,16 @@
 [package]
 name = "heifer-isobmff"
-description = "ISOBMFF / HEIF container reading and writing (ISO/IEC 14496-12, 23008-12)"
+description = "ISOBMFF / HEIF container parser (ISO/IEC 14496-12, 23008-12)"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+documentation = "https://docs.rs/heifer-isobmff"
+keywords = ["heif", "heic", "isobmff", "mp4", "parser"]
+categories = ["multimedia::images", "parser-implementations"]
 
 [dependencies]
 thiserror.workspace = true

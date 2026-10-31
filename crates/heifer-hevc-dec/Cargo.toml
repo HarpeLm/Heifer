@@ -1,14 +1,16 @@
 [package]
 name = "heifer-hevc-dec"
 description = "Pure-Rust HEVC (H.265) intra decoder for still images"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+documentation = "https://docs.rs/heifer-hevc-dec"
+keywords = ["hevc", "h265", "decoder", "heic", "video"]
+categories = ["multimedia::images", "multimedia::video", "parser-implementations"]
 
 [dependencies]
 thiserror.workspace = true
