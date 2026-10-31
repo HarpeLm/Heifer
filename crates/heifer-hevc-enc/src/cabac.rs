@@ -6,6 +6,20 @@
 
 use heifer_hevc_dec::cabac::{ContextModel, RANGE_TAB_LPS};
 
+/// A saved state of an [`ArithmeticEncoder`].
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    len: usize,
+    last: Option<u8>,
+    bit_pos: u8,
+    low: u32,
+    range: u32,
+    bits_outstanding: u32,
+    first_bit: bool,
+    /// Bytes from this offset on, for checkpoints that replay encoded data.
+    tail: Option<(usize, Vec<u8>)>,
+}
+
 /// The arithmetic encoding engine. Produces RBSP bytes (no emulation prevention).
 #[derive(Debug, Clone)]
 pub struct ArithmeticEncoder {
@@ -127,6 +141,60 @@ impl ArithmeticEncoder {
         } else {
             self.renormalize();
         }
+    }
+
+    /// Number of bits produced so far, counting the bits still held in the registers, for
+    /// rate estimation.
+    pub fn bit_count(&self) -> u64 {
+        let written = self.out.len() as u64 * 8 - u64::from((8 - self.bit_pos) % 8);
+        written + u64::from(self.bits_outstanding) + 10
+    }
+
+    /// Saves the current state, to come back to it with [`restore`](Self::restore).
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            len: self.out.len(),
+            last: self.out.last().copied(),
+            bit_pos: self.bit_pos,
+            low: self.low,
+            range: self.range,
+            bits_outstanding: self.bits_outstanding,
+            first_bit: self.first_bit,
+            tail: None,
+        }
+    }
+
+    /// Like [`checkpoint`](Self::checkpoint), also keeping the bytes written since `since`, so
+    /// that this state can be restored after going back to `since`.
+    pub fn checkpoint_since(&self, since: &Checkpoint) -> Checkpoint {
+        // The last byte of `since` may have been completed since.
+        let start = since.len.saturating_sub(1);
+        Checkpoint {
+            tail: Some((start, self.out[start..].to_vec())),
+            ..self.checkpoint()
+        }
+    }
+
+    /// Goes back to a saved state: everything encoded since is discarded, or, for a checkpoint
+    /// made with [`checkpoint_since`](Self::checkpoint_since), replayed.
+    pub fn restore(&mut self, c: &Checkpoint) {
+        match &c.tail {
+            None => {
+                self.out.truncate(c.len);
+                if let (Some(last), Some(b)) = (c.last, self.out.last_mut()) {
+                    *b = last;
+                }
+            }
+            Some((start, tail)) => {
+                self.out.truncate(*start);
+                self.out.extend_from_slice(tail);
+            }
+        }
+        self.bit_pos = c.bit_pos;
+        self.low = c.low;
+        self.range = c.range;
+        self.bits_outstanding = c.bits_outstanding;
+        self.first_bit = c.first_bit;
     }
 
     /// Pads with zero bits to the next byte boundary and returns the bytes.

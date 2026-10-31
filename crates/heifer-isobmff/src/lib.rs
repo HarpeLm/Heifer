@@ -1,4 +1,4 @@
-//! Reading of the ISOBMFF container used by HEIF/HEIC files.
+//! Reading and writing of the ISOBMFF container used by HEIF/HEIC files.
 //!
 //! Specs: ISO/IEC 14496-12 (ISOBMFF) and ISO/IEC 23008-12 (HEIF).
 //!
@@ -13,6 +13,7 @@ pub mod boxes;
 mod file;
 mod header;
 mod reader;
+pub mod writer;
 
 pub use file::{HeifFile, Item, ItemId};
 pub use header::{BoxHeader, BoxIter, FourCC, RawBox, read_box_header};

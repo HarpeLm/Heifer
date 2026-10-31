@@ -116,7 +116,7 @@ const fn dct_coef(k: usize, n: usize) -> i32 {
 }
 
 /// The 32-point DCT matrix, `DCT32[k][n]`; smaller sizes use every `32 / size`-th row.
-const DCT32: [[i32; 32]; 32] = {
+pub const DCT32: [[i32; 32]; 32] = {
     let mut m = [[0; 32]; 32];
     let mut k = 0;
     while k < 32 {

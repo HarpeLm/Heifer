@@ -1,6 +1,6 @@
 [package]
 name = "heifer-hevc-enc"
-description = "Pure-Rust HEVC (H.265) intra encoder for still images (work in progress: CABAC only)"
+description = "Pure-Rust HEVC (H.265) intra encoder for still images"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/heifer-hevc-enc"
-keywords = ["hevc", "h265", "encoder", "heic", "cabac"]
+keywords = ["hevc", "h265", "encoder", "heic", "video"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]

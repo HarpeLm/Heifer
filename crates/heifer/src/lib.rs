@@ -1,22 +1,27 @@
-//! Pure-Rust HEIF/HEIC image decoder (and, later, encoder).
+//! Pure-Rust HEIF/HEIC image decoder and encoder.
 //!
 //! ```no_run
 //! let bytes = std::fs::read("photo.heic").unwrap();
 //! let image = heifer::decode(&bytes).unwrap();
 //! let rgba: Vec<u8> = image.to_rgba8();
 //! println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
+//!
+//! let heic = heifer::encode(&image, &heifer::EncodeOptions::default()).unwrap();
+//! std::fs::write("copy.heic", heic).unwrap();
 //! ```
 //!
 //! This crate ties together the container ([`heifer_isobmff`]) and the HEVC codec
 //! ([`heifer_hevc_dec`], [`heifer_hevc_enc`]).
 
 pub mod color;
+pub mod encode;
 pub mod hdr;
 pub mod image;
 #[cfg(feature = "image")]
 pub mod image_crate;
 pub mod metadata;
 
+pub use encode::{EncodeOptions, encode, encode_rgb8, encode_rgba8};
 pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
@@ -30,7 +35,7 @@ use heifer_hevc_dec::recon::Frame;
 use heifer_isobmff::boxes::{ColorInfo, Property};
 use heifer_isobmff::{HeifFile, ItemId};
 
-/// Errors produced while decoding a HEIF file.
+/// Errors produced while decoding or encoding a HEIF file.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The HEIF container is invalid.
@@ -39,6 +44,9 @@ pub enum Error {
     /// An HEVC bitstream could not be decoded.
     #[error("HEVC: {0}")]
     Hevc(#[from] heifer_hevc_dec::Error),
+    /// An image could not be encoded.
+    #[error("HEVC encoding: {0}")]
+    Encode(#[from] heifer_hevc_enc::Error),
     /// The file uses a feature heifer does not support yet.
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -121,6 +129,18 @@ fn decode_item_with(
             )));
         }
     };
+    // Alpha plane of a derived image (coded images handle theirs when decoded).
+    if item.item_type.0 != *b"hvc1" {
+        for aux in file.referencing_items(id, b"auxl") {
+            if is_alpha_item(file, aux)? {
+                attach_alpha_image(
+                    &mut image,
+                    &decode_item_with(file, aux, depth + 1, options)?,
+                )?;
+                break;
+            }
+        }
+    }
     // Transformative properties, in association order (clap, then irot, then imir).
     for property in file.item_properties(id)? {
         image = match *property {
@@ -184,11 +204,7 @@ fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Ima
 
     // Alpha channel: an auxiliary image of type alpha referencing this item.
     for aux in file.referencing_items(id, b"auxl") {
-        let is_alpha = file.item_properties(aux)?.any(|p| {
-            matches!(p, Property::AuxiliaryType(t)
-                if t == "urn:mpeg:hevc:2015:auxid:1" || t == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
-        });
-        if !is_alpha {
+        if !is_alpha_item(file, aux)? {
             continue;
         }
         let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
@@ -219,6 +235,34 @@ fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Ima
         break;
     }
     Ok(image)
+}
+
+/// Whether an item is an auxiliary image of type alpha.
+fn is_alpha_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
+    Ok(file.item_properties(id)?.any(|p| {
+        matches!(p, Property::AuxiliaryType(t)
+            if t == "urn:mpeg:hevc:2015:auxid:1" || t == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
+    }))
+}
+
+/// Uses the first channel of a decoded alpha image (e.g. a grid of monochrome tiles) as the
+/// alpha channel of `image`.
+fn attach_alpha_image(image: &mut Image, alpha: &Image) -> Result<(), Error> {
+    if alpha.width < image.width || alpha.height < image.height {
+        return Err(Error::Unsupported(
+            "alpha plane smaller than the image".into(),
+        ));
+    }
+    let (from, to) = (u32::from(alpha.max_value()), u32::from(image.max_value()));
+    for y in 0..image.height as usize {
+        for x in 0..image.width as usize {
+            let a = u32::from(alpha.data[(y * alpha.width as usize + x) * 4]);
+            image.data[(y * image.width as usize + x) * 4 + 3] =
+                ((a * to + from / 2) / from) as u16;
+        }
+    }
+    image.has_alpha = true;
+    Ok(())
 }
 
 fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {

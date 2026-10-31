@@ -1,6 +1,6 @@
 [package]
 name = "heifer"
-description = "Pure-Rust HEIF/HEIC image decoder: no C dependencies, no unsafe code"
+description = "Pure-Rust HEIF/HEIC image decoder and encoder: no C dependencies, no unsafe code"
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
@@ -9,8 +9,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/heifer"
-keywords = ["heic", "heif", "hevc", "image", "decoder"]
-categories = ["multimedia::images", "parser-implementations", "wasm"]
+keywords = ["heic", "heif", "image", "decoder", "encoder"]
+categories = ["multimedia::images", "multimedia::encoding", "parser-implementations", "wasm"]
 
 [dependencies]
 thiserror.workspace = true

@@ -1,10 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-31
 
+**Encoding.** heifer now writes HEIC files, in pure Rust.
+
+- `heifer::encode`, `encode_rgba8` and `encode_rgb8`, with `EncodeOptions` (quality 0–100,
+  threads): 8-bit RGB(A) to YCbCr 4:2:0 (sRGB, BT.601 full range), 512×512 grid tiles encoded in
+  parallel, alpha as a monochrome auxiliary image, any size (odd sizes cropped with `clap`). A 12 MP
+  image takes about 0.4 s on 10 cores. The files are decoded by Apple's ImageIO and by ffmpeg.
+- `heifer-hevc-enc`: HEVC Main intra encoder (`encoder::encode_picture`). Coding blocks of 8×8 to
+  32×32 and the luma mode are chosen by rate-distortion cost; the picture is reconstructed with the
+  decoder's code, so that the decoder reproduces it sample for sample (checked by the tests).
+  `ArithmeticEncoder` gains `bit_count` and checkpoints.
+- `heifer-isobmff`: `writer::HeifWriter` writes HEIF files: HEVC image items, grids, alpha planes,
+  EXIF, `colr`, `pixi`, `clap`, shared properties.
+- Decoding: alpha planes of grid images (an alpha grid referencing the image grid).
 - **Container**: `iloc` construction method 2: item data built from ranges of other items
   (`iloc` references), nested or not, with limits against reference cycles and data blow-up.
-- **Breaking:** `heifer_isobmff::boxes::Extent` has a new `index` field (`extent_index`).
+- New fuzz target `encode` (encode then decode random images), and a `to_heic` example.
+- `heifer_hevc_dec::recon::DCT32` is public.
+- **Breaking:** `heifer_isobmff::boxes::Extent` has a new `index` field (`extent_index`);
+  `heifer::Error` has a new `Encode` variant.
 
 ## 0.2.1 — 2026-10-31
 

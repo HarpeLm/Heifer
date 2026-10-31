@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="docs/images/banner.webp" alt="Heifer: HEIF/HEIC decoder in pure Rust" width="100%">
+<img src="docs/images/banner.webp" alt="Heifer: HEIF/HEIC decoder and encoder in pure Rust" width="100%">
 
-**A pure-Rust HEIF/HEIC image decoder.**<br>
+**A pure-Rust HEIF/HEIC image decoder and encoder.**<br>
 No C dependencies · no `unsafe` code · runs everywhere Rust runs, including the browser.
 
 [![crates.io](https://img.shields.io/crates/v/heifer.svg)](https://crates.io/crates/heifer)
@@ -29,8 +29,8 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
 
 ## <img src="docs/icons/problem.svg" width="24" height="24" align="top"> Why Heifer?
 
-HEIC is the default photo format on iPhones and many Android phones, yet reading it from Rust has meant
-leaning on C and C++.
+HEIC is the default photo format on iPhones and many Android phones, yet reading or writing it from
+Rust has meant leaning on C and C++.
 
 <table width="100%">
   <tr>
@@ -59,19 +59,21 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
+- **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos; checked with Apple's ImageIO and ffmpeg.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
 
 ```toml
 [dependencies]
-heifer = "0.2"
+heifer = "0.3"
 ```
 
 Or try the examples on your own photos:
 
 ```sh
 cargo run --release -p heifer --example heic2png -- photo.heic photo.png
+cargo run --release -p heifer --example to_heic -- photo.png photo.heic 80
 cargo run --release -p heifer --example metadata -- photo.heic
 ```
 
@@ -94,6 +96,25 @@ let options = heifer::Options {
 };
 let image = heifer::decode_with_options(&bytes, &options)?;
 ```
+
+## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Encode a HEIC
+
+```rust
+let options = heifer::EncodeOptions { quality: 80, ..Default::default() };   // 0..=100
+let heic: Vec<u8> = heifer::encode_rgba8(width, height, &rgba, &options)?;    // or encode_rgb8
+std::fs::write("photo.heic", heic)?;
+
+let again = heifer::encode(&heifer::decode(&bytes)?, &options)?;              // re-encode an Image
+```
+
+Images are stored as 8-bit YCbCr 4:2:0 (sRGB, BT.601 full range), split into 512×512 tiles that are
+encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
+about 0.4 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 43.8 dB against the
+original, both decoded by Apple (1.1 bits per pixel).
+
+The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder is young: it codes intra
+pictures with 8×8 to 32×32 blocks and rate-distortion decisions, but not yet the finer tools of mature
+encoders such as x265 (4×4 transforms, RDOQ), so its files are larger at equal quality.
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
 
@@ -130,7 +151,7 @@ formats are present; `read_gain_map` exposes the legacy Apple map.
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.2", features = ["image"] }
+heifer = { version = "0.3", features = ["image"] }
 ```
 
 ```rust
@@ -150,7 +171,7 @@ orientation is already applied, so it is never applied twice.
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | — | planned (see [roadmap](#roadmap)) |
+| **Encoding** | HEIC from 8-bit RGB(A): HEVC Main intra, 4:2:0, alpha, 512×512 grid tiles, any size; HEIF writing (items, grids, alpha, EXIF, `clap`) | 10-bit, 4:4:4, HDR, lossless, metadata from the `image` crate |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -170,9 +191,12 @@ the Range Extensions:
 
 ### Robustness
 
-Five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets with HEIF/HEVC dictionaries run
+Six [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets with HEIF/HEVC dictionaries run
 around the clock on GitHub Actions (5h15 sessions every 6 hours): full decoding, container parsing, HEVC decoding, a parallel-vs-sequential
-differential check and a CABAC round trip. Fuzzing already found and fixed a memory exhaustion bug.
+differential check, a CABAC round trip and an encode-then-decode round trip. Fuzzing already found and fixed a memory exhaustion bug.
+
+The encoder reconstructs pictures with the decoder's own code, and its tests check that the decoder
+reproduces the encoder's reconstruction sample for sample.
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Real-world compatibility
 
@@ -237,6 +261,9 @@ Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine
 ```text
  photo.heic ──▶ container ──▶ HEVC bitstream ──▶ HEVC decoder ──▶ assembly ──▶ RGB(A)
               (heifer-isobmff)   per tile        (heifer-hevc-dec)   (heifer)
+
+ RGB(A) ──▶ YCbCr 4:2:0 tiles ──▶ HEVC encoder ──▶ HEIF writer ──▶ photo.heic
+               (heifer)          (heifer-hevc-enc)  (heifer-isobmff)
 ```
 
 1. **Container**: the ISOBMFF boxes are parsed into items and properties: grids, alpha planes, transforms, metadata.
@@ -247,10 +274,10 @@ Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine
 ### Crates
 
 ```text
-heifer               decode(), read_metadata(), image crate integration
-├── heifer-isobmff   HEIF container: boxes, items, properties, grids, metadata
-└── heifer-hevc-dec  HEVC decoder: CABAC, intra prediction, transforms, deblocking, SAO
-    heifer-hevc-enc  HEVC encoder (work in progress: CABAC encoder)
+heifer               decode(), encode(), read_metadata(), image crate integration
+├── heifer-isobmff   HEIF container: reading and writing of boxes, items, properties, grids
+├── heifer-hevc-dec  HEVC decoder: CABAC, intra prediction, transforms, deblocking, SAO
+└── heifer-hevc-enc  HEVC intra encoder: mode decisions, transforms, CABAC
 ```
 
 The lower-level crates can be used directly, for example to extract an HEVC stream:
@@ -266,8 +293,9 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing
 - [x] **HDR**: Apple gain maps (iPhone photos)
 - [x] **HDR**: ISO 21496-1 gain maps (`tmap`)
-- [ ] **Next**: ICC colour management
-- [ ] **Encoder**: HEIF writing, minimal HEVC intra encoder, then better compression, 10-bit and alpha
+- [x] **0.3 — Encoder**: HEIF writing, HEVC intra encoder, alpha, parallel tiles; `iloc` construction method 2
+- [ ] **Next**: better compression (4×4 transforms, RDOQ), 10-bit and HDR encoding, `image` crate encoder
+- [ ] ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
