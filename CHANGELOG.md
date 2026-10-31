@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.4 — 2026-10-31
+
+**Faster encoding.** About 1.8× faster on one core and 30% faster on a 10-core Mac (a 12 MP
+image in 0.9 s instead of 1.25 s), for files 0.5% larger on average (BD-rate vs x265 `medium`:
+−0.1% on a photo, +0.5% on an image with text).
+
+- Trials that almost never win are skipped, from statistics of the decisions: splitting blocks
+  that already cost little per pixel, coding very detailed 32×32 blocks whole, coding the 2nd
+  and 3rd prediction modes when their estimate is more than 10% worse than the best.
+- The chroma mode is chosen once per coding unit.
+- Mode estimation uses the new `Reconstructor::predict_block` of `heifer-hevc-dec`, which
+  predicts without writing the picture. RDOQ reuses its buffers.
+
 ## 0.3.3 — 2026-10-31
 
 **10-bit HEIC.** Images of more than 8 bits per sample (16-bit PNGs, 10-bit photos decoded by

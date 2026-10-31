@@ -373,6 +373,14 @@ impl<'a> Reconstructor<'a> {
 
     /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (§8.4.4.2).
     #[allow(clippy::too_many_arguments)]
+    /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (in samples of
+    /// that component) with `mode`, from the samples reconstructed so far, into `pred`
+    /// (row-major). Nothing is written to the picture: for encoders comparing modes.
+    pub fn predict_block(&self, c: usize, x0: u32, y0: u32, n: usize, mode: u8, pred: &mut [i32]) {
+        self.predict(c, x0, y0, n, mode, false, pred);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn predict(
         &self,
         c: usize,

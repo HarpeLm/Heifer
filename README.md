@@ -126,13 +126,13 @@ Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Mai
 has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
 into 512×512 tiles that are
 encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
-about 1.6 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 41.7 dB against the
+about 0.9 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 41.7 dB against the
 original, both decoded by Apple (1.0 bit per pixel).
 
 The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
 chooses block sizes (32×32 down to 4×4), transform splits and prediction modes by rate-distortion
-cost, with RDOQ and sign data hiding. At equal quality its files are slightly smaller than those of
-x265's `medium` preset: BD-rate −0.6% on a photo and −0.5% on an image with text (PSNR, 6:1:1).
+cost, with RDOQ and sign data hiding. At equal quality its files are about the size of those of
+x265's `medium` preset: BD-rate −0.1% on a photo and +0.5% on an image with text (PSNR, 6:1:1).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
 

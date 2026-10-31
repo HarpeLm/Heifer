@@ -84,17 +84,37 @@ pub(crate) fn sig_ctx_inc(
     if luma { sig_ctx } else { 27 + sig_ctx }
 }
 
-/// Estimated cost in bits of coding `bin` with a context, from its probability state.
-fn bits(model: &ContextModel, bin: bool) -> f32 {
-    // pLPS(state) = 0.5 · α^state, with α = (0.01875 / 0.5)^(1/63) (§9.3.3.2.1 design).
-    static COST: std::sync::OnceLock<[[f32; 2]; 64]> = std::sync::OnceLock::new();
-    let table = COST.get_or_init(|| {
+/// Buffers and tables of [`rdoq`], allocated once per picture.
+pub(crate) struct RdoqScratch {
+    /// Estimated cost in bits of a bin per context state: [MPS, LPS].
+    bits: [[f32; 2]; 64],
+    chosen: Vec<u32>,
+    cost_level: Vec<f32>,
+    cost_sig1: Vec<f32>,
+    cost_zero: Vec<f32>,
+    zero_after: Vec<f32>,
+}
+
+impl RdoqScratch {
+    pub(crate) fn new() -> Self {
+        // pLPS(state) = 0.5 · α^state, with α = (0.01875 / 0.5)^(1/63) (§9.3.3.2.1 design).
         let alpha = (0.01875f64 / 0.5).powf(1.0 / 63.0);
-        core::array::from_fn(|s| {
-            let lps = 0.5 * alpha.powi(s as i32);
-            [-(1.0 - lps).log2() as f32, -lps.log2() as f32] // [MPS, LPS]
-        })
-    });
+        Self {
+            bits: core::array::from_fn(|s| {
+                let lps = 0.5 * alpha.powi(s as i32);
+                [-(1.0 - lps).log2() as f32, -lps.log2() as f32]
+            }),
+            chosen: vec![0; 1024],
+            cost_level: vec![0.0; 1024],
+            cost_sig1: vec![0.0; 1024],
+            cost_zero: vec![0.0; 1024],
+            zero_after: vec![0.0; 1025],
+        }
+    }
+}
+
+/// Estimated cost in bits of coding `bin` with a context, from its probability state.
+fn bits(table: &[[f32; 2]; 64], model: &ContextModel, bin: bool) -> f32 {
     table[usize::from(model.state.min(63))][usize::from(u8::from(bin) != model.mps)]
 }
 
@@ -125,6 +145,7 @@ pub(crate) fn rdoq(
     scan: ScanType,
     contexts: &Contexts,
     lambda: f32,
+    scratch: &mut RdoqScratch,
 ) {
     let size = 1usize << log2_size;
     let log2_sb = log2_size - 2;
@@ -148,13 +169,19 @@ pub(crate) fn rdoq(
         return;
     };
 
-    let ctx_bits = |i: usize, bin: bool| bits(&contexts[i], bin);
+    let table = scratch.bits;
+    let ctx_bits = |i: usize, bin: bool| bits(&table, &contexts[i], bin);
     // Per scan position: chosen magnitude, cost when coded, cost of the sig flag alone, cost
-    // of zero (error² plus the sig flag).
-    let mut chosen = [0u32; 1024];
-    let mut cost_level = [0f32; 1024];
-    let mut cost_sig1 = [0f32; 1024];
-    let mut cost_zero = [0f32; 1024];
+    // of zero (error² plus the sig flag). Every position up to `last_start` is written below
+    // before being read.
+    let RdoqScratch {
+        chosen,
+        cost_level,
+        cost_sig1,
+        cost_zero,
+        zero_after,
+        ..
+    } = scratch;
     let mut coded_sb = [[false; 8]; 8];
     let mut sb_cost = [0f32; 64]; // chosen cost of each sub-block (with its flag)
     let mut sb_zero = [0f32; 64]; // cost of dropping it
@@ -285,7 +312,7 @@ pub(crate) fn rdoq(
         } else {
             sb_cost[sb] = coded_cost;
         }
-        coded_sb[xs][ys] = range_any(&chosen, sb * 16, sb * 16 + top);
+        coded_sb[xs][ys] = range_any(chosen, sb * 16, sb * 16 + top);
     }
 
     // Last significant position: keep the levels up to it, drop the ones after.
@@ -324,11 +351,11 @@ pub(crate) fn rdoq(
     let mut best: Option<(f32, usize)> = None;
     let mut before = 0.0f32;
     let total_zero_after = {
-        let mut acc = [0f32; 1025];
+        zero_after[last_start + 1] = 0.0;
         for g in (0..=last_start).rev() {
-            acc[g] = acc[g + 1] + magnitude(g).powi(2);
+            zero_after[g] = zero_after[g + 1] + magnitude(g).powi(2);
         }
-        acc
+        &*zero_after
     };
     for g in 0..=last_start {
         if chosen[g] > 0 {

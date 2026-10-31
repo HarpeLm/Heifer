@@ -21,7 +21,7 @@ use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
 use crate::Error;
 use crate::cabac::{ArithmeticEncoder, Checkpoint};
 use crate::params::{NalType, StreamParams, nal_unit};
-use crate::rdo::{hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
+use crate::rdo::{RdoqScratch, hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
 use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
 const LOG2_CTB: u8 = 5;
@@ -311,8 +311,16 @@ struct Encoder<'a> {
     grid_w: usize,
     // Scratch buffers.
     diff: Vec<i32>,
+    pred: Vec<i32>,
     coeffs: Vec<i32>,
     exact: Vec<f32>,
+    rdoq: RdoqScratch,
+    /// Best SATD cost per pixel (in units of √λ) found by the last `choose_modes`.
+    last_satd: f64,
+    /// Modes chosen for a block by `quadtree` before `coding_unit`, to reuse.
+    mode_cache: Option<((u32, u32, u8), Vec<u8>)>,
+    /// Chroma mode chosen for a luma mode, in the current coding unit.
+    chroma_choice: Option<u8>,
     /// Coding units chosen of each kind, for tests and statistics.
     kinds: [usize; 3],
     /// Rate cost of a level made significant or zero, for sign data hiding, in units of the
@@ -377,9 +385,14 @@ impl<'a> Encoder<'a> {
             modes: vec![1; grid_w * (ph / 4)],
             grid_w,
             diff: vec![0; 32 * 32],
+            pred: vec![0; 32 * 32],
             coeffs: vec![0; 32 * 32],
             exact: vec![0.0; 32 * 32],
             kinds: [0; 3],
+            chroma_choice: None,
+            rdoq: RdoqScratch::new(),
+            last_satd: 0.0,
+            mode_cache: None,
             // About 3 bits, at λ / step² (step = 2^((Qp′ - 4) / 6)).
             sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp + bd_offset - 4) / 3.0)) as f32,
         }
@@ -495,15 +508,32 @@ impl<'a> Encoder<'a> {
             return self.coding_unit(x0, y0, log2_size, depth).0;
         }
 
+        // Very detailed 32×32 blocks are split without trying them whole: the whole block
+        // almost never wins there (measured), and trying it costs as much as the split.
+        if log2_size == LOG2_CTB {
+            let mpm = self.mpm_candidates(x0, y0);
+            let modes = self.choose_modes(x0, y0, log2_size, mpm, 3);
+            self.mode_cache = Some(((x0, y0, log2_size), modes));
+            if self.last_satd >= 2.0 {
+                self.mode_cache = None;
+                self.split_cu_flag(x0, y0, depth, true);
+                return children
+                    .iter()
+                    .map(|&(dx, dy)| self.quadtree(x0 + dx, y0 + dy, log2_size - 1, depth + 1))
+                    .sum();
+            }
+        }
         // The whole block first: when it needs no residual, smaller blocks cannot do better.
         let start_bits = self.cabac.bit_count();
         let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
         self.split_cu_flag(x0, y0, depth, false);
         let (d_whole, residual) = self.coding_unit(x0, y0, log2_size, depth);
-        if !residual {
+        let j_whole = d_whole + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
+        // Blocks that cost little per pixel are smooth enough: splitting them almost never pays.
+        let per_pixel = j_whole / (self.lambda * f64::from(size * size));
+        if !residual || per_pixel < split_threshold(log2_size) {
             return d_whole;
         }
-        let j_whole = d_whole + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
         let whole = self.snapshot(
             x0,
             y0,
@@ -569,34 +599,22 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /// Predicts a block with the decoder (a transform block without residual) and returns the
-    /// difference between the source and the prediction in `self.diff`.
+    /// Predicts a block with the decoder's intra prediction, without writing it to the picture,
+    /// and puts the difference between the source and the prediction in `self.diff`.
     fn predict(&mut self, c: usize, x: u32, y: u32, log2_size: u8, mode: u8) {
-        self.recon.transform_block(&TransformBlock {
-            c_idx: c as u8,
-            x,
-            y,
-            log2_size,
-            intra_mode: mode,
-            coeffs: None,
-            coeff_bounds: (0, 0),
-            transform_skip: false,
-            transquant_bypass: false,
-            qp_y: self.qp,
-            cu_qp_offset: 0,
-            res_scale_val: 0,
-        });
         let n = 1usize << log2_size;
-        let stride = self.recon.frame.widths[c] as usize;
-        let pred = &self.recon.frame.planes[c];
+        let mut pred = std::mem::take(&mut self.pred);
+        self.recon
+            .predict_block(c, x, y, n, mode, &mut pred[..n * n]);
         let src = &self.src[c];
         for row in 0..n {
-            let p = (y as usize + row) * stride + x as usize;
             let s = (y as usize + row) * src.width + x as usize;
-            for col in 0..n {
-                self.diff[row * n + col] = src.samples[s + col] - i32::from(pred[p + col]);
+            let (d, p) = (&mut self.diff[row * n..][..n], &pred[row * n..][..n]);
+            for ((d, &p), &v) in d.iter_mut().zip(p).zip(&src.samples[s..s + n]) {
+                *d = v - p;
             }
         }
+        self.pred = pred;
     }
 
     /// The `count` most promising luma intra modes of a block, best first, by SATD and estimated
@@ -627,10 +645,7 @@ impl<'a> Encoder<'a> {
                 mode,
             ));
         };
-        for mode in [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34]
-            .into_iter()
-            .chain(mpm)
-        {
+        for &mode in [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34].iter().chain(&mpm) {
             eval(self, &mut costs, mode);
         }
         let best_angle = costs
@@ -649,7 +664,15 @@ impl<'a> Encoder<'a> {
             }
         }
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        costs.into_iter().take(count).map(|(_, m)| m).collect()
+        self.last_satd = costs[0].0 / f64::from(1u32 << (2 * log2_size)) / self.sqrt_lambda;
+        // Only modes whose estimate is close to the best one are worth coding for real.
+        let limit = costs[0].0 * 1.1;
+        costs
+            .into_iter()
+            .take(count)
+            .take_while(|&(c, _)| c <= limit)
+            .map(|(_, m)| m)
+            .collect()
     }
 
     /// Computes the residual levels of one transform block and reconstructs it.
@@ -687,11 +710,13 @@ impl<'a> Encoder<'a> {
             scan,
             &self.ctx,
             lambda,
+            &mut self.rdoq,
         );
         hide_signs(levels, &exact[..n * n], log2_size, scan, self.sdh_rate);
         self.exact = exact;
         let coded = levels.iter().any(|&v| v != 0);
-        if coded {
+        // Reconstruct the block (prediction plus residual, if any) as the decoder will.
+        {
             let (mut cols, mut rows) = (0, 0);
             for (i, _) in levels.iter().enumerate().filter(|(_, v)| **v != 0) {
                 cols = cols.max(i % n + 1);
@@ -703,7 +728,7 @@ impl<'a> Encoder<'a> {
                 y,
                 log2_size,
                 intra_mode: mode,
-                coeffs: Some(levels),
+                coeffs: coded.then_some(&*levels),
                 coeff_bounds: (cols as u8, rows as u8),
                 transform_skip: false,
                 transquant_bypass: false,
@@ -785,7 +810,11 @@ impl<'a> Encoder<'a> {
         let start_bits = self.cabac.bit_count();
         let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
         let mpm = self.mpm_candidates(x0, y0);
-        let modes = self.choose_modes(x0, y0, log2_size, mpm, MODES_TRIED);
+        let modes = match self.mode_cache.take() {
+            Some((key, modes)) if key == (x0, y0, log2_size) => modes,
+            _ => self.choose_modes(x0, y0, log2_size, mpm, MODES_TRIED),
+        };
+        self.chroma_choice = None;
 
         // (cost, distortion, kind, mode, residual, snapshot after coding)
         let mut best = None;
@@ -818,8 +847,10 @@ impl<'a> Encoder<'a> {
             try_kind(self, &mut best, &mut current, CuKind::Whole, mode);
         }
         let (_, _, _, mode, residual, _) = best.as_ref().expect("a mode was tried");
-        // A prediction good enough to need no residual cannot be improved by smaller blocks.
-        if *residual {
+        // A prediction good enough to need no residual, or cheap enough, is not improved by
+        // smaller blocks.
+        let per_pixel = best.as_ref().map_or(0.0, |b| b.0) / (self.lambda * f64::from(size * size));
+        if *residual && per_pixel >= small_blocks_threshold(log2_size) {
             let mode = *mode;
             try_kind(self, &mut best, &mut current, CuKind::SplitTransform, mode);
             if log2_size == LOG2_MIN_CB {
@@ -875,7 +906,16 @@ impl<'a> Encoder<'a> {
             self.fill_grid(x0, y0, size, None, Some(mode));
             parts.push((mode, mpm));
             if self.chroma {
-                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode);
+                // The chroma mode is chosen once per coding unit, with its first luma mode, and
+                // kept for the other luma modes tried when it can still be signalled.
+                chroma = match self.chroma_choice {
+                    Some(chosen) => chroma_syntax(chosen, mode),
+                    None => {
+                        let choice = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode);
+                        self.chroma_choice = Some(choice.1);
+                        choice
+                    }
+                };
             }
             if kind == CuKind::Whole {
                 let luma = self.transform_block(0, x0, y0, log2_size, mode);
@@ -1206,6 +1246,43 @@ impl<'a> Encoder<'a> {
             self.cabac
                 .encode_bypass_bits(value - base, prefix - 3 + rice);
         }
+    }
+}
+
+/// `intra_chroma_pred_mode` giving chroma mode `chroma` with luma mode `luma`, and the chroma
+/// mode it gives: `chroma` itself when possible, else the luma mode (`intra_chroma_pred_mode` 4).
+fn chroma_syntax(chroma: u8, luma: u8) -> (u8, u8) {
+    if chroma == luma {
+        return (4, luma);
+    }
+    match [0, 26, 10, 1].iter().position(|&m| m == chroma) {
+        Some(i) => (i as u8, chroma),
+        // Mode 34 replaces a listed mode equal to the luma mode.
+        None if chroma == 34 => match [0, 26, 10, 1].iter().position(|&m| m == luma) {
+            Some(i) => (i as u8, 34),
+            None => (4, luma),
+        },
+        None => (4, luma),
+    }
+}
+
+/// Cost per pixel (in units of λ) of a whole block below which splitting it is not tried:
+/// splits almost never win there (measured on photos and text).
+fn split_threshold(log2_size: u8) -> f64 {
+    if log2_size == LOG2_CTB {
+        1.0 / 16.0
+    } else {
+        1.0 / 8.0
+    }
+}
+
+/// Cost per pixel (in units of λ) of a coding unit below which split transforms and 4×4
+/// blocks are not tried.
+fn small_blocks_threshold(log2_size: u8) -> f64 {
+    match log2_size {
+        3 => 0.21,  // 2^-2.25
+        4 => 0.088, // 2^-3.5
+        _ => 0.044, // 2^-4.5
     }
 }
 
