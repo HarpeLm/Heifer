@@ -910,13 +910,18 @@ impl<'a> Encoder<'a> {
             );
         }
         let mut exact = std::mem::take(&mut self.exact);
-        quantize_levels(
+        let has_levels = quantize_levels(
             &mut coeffs[..n * n],
             log2_size,
             qp,
             bd,
             Some(&mut exact[..n * n]),
         );
+        if !has_levels && exact[..n * n].iter().all(|&level| level.abs() < 0.5) {
+            self.exact = exact;
+            self.coeffs = coeffs;
+            return Vec::new();
+        }
         let scan = scan_type(log2_size, c == 0, mode);
         // λ in units of the squared quantization step, 2^((QP - 4) / 3).
         let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
