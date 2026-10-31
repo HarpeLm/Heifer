@@ -1,0 +1,24 @@
+[package]
+name = "heifer-cli"
+description = "Convert HEIC/HEIF photos to and from PNG, JPEG and WebP, in pure Rust"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://github.com/HarpeLm/Heifer/tree/main/crates/heifer-cli"
+keywords = ["heic", "heif", "converter", "cli", "image"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[[bin]]
+name = "heifer"
+path = "src/main.rs"
+
+[dependencies]
+heifer = { path = "../heifer", version = "0.3.1", features = ["image"] }
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "gif"] }
+
+[lints]
+workspace = true

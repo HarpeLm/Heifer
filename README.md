@@ -11,7 +11,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
 [![Fuzz](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**[▶ Try it in your browser](https://harpelm.github.io/Heifer/)** — drop a `.heic` photo; it is decoded locally by heifer compiled to WebAssembly.
+**[▶ Try it in your browser](https://harpelm.github.io/Heifer/)** — drop a `.heic` photo to view it, or a PNG/JPEG to convert it to HEIC; everything runs locally in heifer compiled to WebAssembly.
 
 
 <table>
@@ -63,6 +63,17 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
+
+**Command line**: convert photos without installing libheif or ffmpeg.
+
+```sh
+cargo install heifer-cli
+heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converted
+heifer photo.png photo.heic -q 80       # to HEIC
+heifer info IMG_1234.heic               # size, tiles, camera, date, metadata
+```
+
+**Library**:
 
 ```toml
 [dependencies]
@@ -285,6 +296,7 @@ Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine
 ### Crates
 
 ```text
+heifer-cli           the `heifer` command: conversions to and from HEIC
 heifer               decode(), encode(), read_metadata(), image crate integration
 ├── heifer-isobmff   HEIF container: reading and writing of boxes, items, properties, grids
 ├── heifer-hevc-dec  HEVC decoder: CABAC, intra prediction, transforms, deblocking, SAO

@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Heifer · HEIC in your browser</title>
-<meta name="description" content="Decode HEIC photos in your browser with Heifer, a pure-Rust HEIF/HEIC decoder compiled to WebAssembly. Your file never leaves your device.">
+<meta name="description" content="Open HEIC photos and convert images to HEIC in your browser with Heifer, a pure-Rust HEIF/HEIC decoder and encoder compiled to WebAssembly. Your file never leaves your device.">
 <meta property="og:title" content="Heifer · HEIC in your browser">
-<meta property="og:description" content="A pure-Rust HEIF/HEIC decoder compiled to WebAssembly. No C, no unsafe, nothing uploaded.">
+<meta property="og:description" content="A pure-Rust HEIF/HEIC decoder and encoder compiled to WebAssembly. No C, no unsafe, nothing uploaded.">
 <meta property="og:image" content="https://harpelm.github.io/Heifer/og.webp">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#070a14">
@@ -74,7 +74,11 @@
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px; text-align: center; min-width: 120px; }
   .stat b { display: block; font-size: 1.1rem; }
   .stat span { color: var(--muted); font-size: .8rem; }
-  .actions { text-align: center; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 18px; }
+  .actions .btn { margin-top: 16px; }
+  .quality { display: none; align-items: center; gap: 10px; margin-top: 16px; color: var(--muted); font-size: .92rem; }
+  .quality input { accent-color: var(--violet); width: 160px; }
+  .quality output { color: var(--fg); font-weight: 600; min-width: 2ch; }
 
   section { padding: 56px 0 8px; }
   h2 { text-align: center; font-size: 1.6rem; margin: 0 0 24px; }
@@ -128,24 +132,27 @@
 
   <div class="hero">
     <div class="tag">HEIF / HEIC · <b class="grad">PURE RUST</b></div>
-    <h1>Open HEIC photos,<br><span class="grad">right in your browser</span></h1>
-    <p class="lead">Heifer is a HEIF/HEIC decoder written in safe Rust and compiled to WebAssembly. Your photo is decoded on your device and never uploaded.</p>
-    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">≈ 250 KB WebAssembly</span><span class="pill">MIT / Apache-2.0</span></div>
+    <h1>Open and create HEIC,<br><span class="grad">right in your browser</span></h1>
+    <p class="lead">Heifer is a HEIF/HEIC decoder and encoder written in safe Rust and compiled to WebAssembly. Drop a HEIC to view it, or a PNG or JPEG to convert it to HEIC. Your image never leaves your device.</p>
+    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">Decoder + encoder</span><span class="pill">MIT / Apache-2.0</span></div>
   </div>
 
   <label id="drop">
     <svg viewBox="0 0 24 24" fill="none" stroke="url(#g)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>
-    <strong>Drop a .heic photo here</strong>
-    <small>or click to choose one · iPhone, Samsung, Xiaomi…</small><br>
+    <strong>Drop a HEIC photo, or a PNG / JPEG to convert</strong>
+    <small>or click to choose one · HEIC from iPhone, Samsung, Xiaomi… · PNG, JPEG, WebP to HEIC</small><br>
     <span class="btn">Choose a file</span>
-    <input id="file" type="file" accept=".heic,.heif,.hif,image/heic,image/heif" hidden>
+    <input id="file" type="file" accept=".heic,.heif,.hif,image/heic,image/heif,image/png,image/jpeg,image/webp" hidden>
   </label>
   <p id="status">Loading the decoder…</p>
 
   <div id="result">
     <div class="stats" id="stats"></div>
     <div class="frame"><canvas id="canvas"></canvas></div>
-    <div class="actions"><button class="btn" id="save">Download as PNG</button></div>
+    <div class="actions">
+      <label class="quality" id="quality-box">Quality <input id="quality" type="range" min="20" max="95" step="5" value="80"> <output id="quality-value">80</output></label>
+      <button class="btn" id="save">Download as PNG</button>
+    </div>
   </div>
 
   <section>
@@ -153,6 +160,7 @@
     <div class="grid">
       <div class="card"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><h3>HEVC decoding</h3><p>A from-scratch H.265 intra decoder: 8–12 bit, 4:0:0 to 4:4:4, Range Extensions.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/></svg><h3>Parallel grid tiles</h3><p>iPhone photos are grids of up to 48 tiles, Samsung's 200 MP files have 768. Natively, they are decoded in parallel.</p></div>
+      <div class="card"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg><h3>HEVC encoding</h3><p>A from-scratch H.265 intra encoder with rate-distortion decisions, alpha, and 512×512 tiles like iPhone photos.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg><h3>EXIF / XMP / ICC</h3><p>Metadata is read without decoding pixels. Rotation, crop and mirror are applied for you.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg><h3>No unsafe Rust</h3><p><code>#![forbid(unsafe_code)]</code>, size limits, and continuous fuzzing on CI.</p></div>
     </div>
@@ -171,11 +179,14 @@
   <section>
     <h2>Use it in Rust</h2>
 <pre><span class="c"># Cargo.toml</span>
-heifer = <span class="s">"0.2"</span>
+heifer = <span class="s">"0.3"</span>
 
 <span class="k">let</span> bytes = std::fs::<span class="f">read</span>(<span class="s">"photo.heic"</span>)?;
 <span class="k">let</span> image = heifer::<span class="f">decode</span>(&amp;bytes)?;   <span class="c">// rotation, crop and alpha applied</span>
-<span class="k">let</span> rgba = image.<span class="f">to_rgba8</span>();</pre>
+<span class="k">let</span> rgba = image.<span class="f">to_rgba8</span>();
+
+<span class="k">let</span> heic = heifer::<span class="f">encode</span>(&amp;image, &amp;heifer::EncodeOptions::<span class="f">default</span>())?;
+std::fs::<span class="f">write</span>(<span class="s">"copy.heic"</span>, heic)?;</pre>
   </section>
 
   <footer>
@@ -185,55 +196,127 @@ heifer = <span class="s">"0.2"</span>
 </div>
 
 <script type="module">
-  // Replaced by the commit hash when deployed, so browsers never mix cached and new decoder files.
+  // Replaced by the commit hash when deployed, so browsers never mix cached and new files.
   const VERSION = "dev";
   let decode;
   const $ = id => document.getElementById(id);
   const status = $("status"), canvas = $("canvas"), save = $("save"), drop = $("drop"), result = $("result"), stats = $("stats");
-  let name = "image";
+  const qualityBox = $("quality-box"), quality = $("quality"), qualityValue = $("quality-value");
+  let name = "image", heic = null, source = null; // last encoded file and the image it came from
   const ready = import(`./pkg/heifer_demo.js?v=${VERSION}`).then(m => {
     decode = m.decode;
     return m.default({ module_or_path: `./pkg/heifer_demo_bg.wasm?v=${VERSION}` });
   }).then(
-    () => { status.textContent = "Ready. Nothing is uploaded: decoding happens in this tab."; },
-    e => { status.className = "error"; status.textContent = `The decoder failed to load: ${e.message ?? e}`; throw e; },
+    () => { status.textContent = "Ready. Nothing is uploaded: everything happens in this tab."; },
+    e => { status.className = "error"; status.textContent = `Heifer failed to load: ${e.message ?? e}`; throw e; },
   );
 
+  // Encoding runs in a worker, started on first use.
+  let worker = null;
+  function encodeInWorker(rgba, width, height, q) {
+    worker ??= new Promise((resolve, reject) => {
+      const w = new Worker(`./worker.js?v=${VERSION}`, { type: "module" });
+      w.onmessage = ({ data }) => data.ready && resolve(w);
+      w.onerror = e => reject(new Error(e.message || "the encoder failed to load"));
+    });
+    return worker.then(w => new Promise((resolve, reject) => {
+      w.onmessage = ({ data }) => data.error ? reject(new Error(data.error)) : resolve(data);
+      w.postMessage({ rgba, width, height, quality: q });
+    }));
+  }
+
   const stat = (value, label) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
+  const size = n => n < 1e6 ? `${Math.round(n / 1e3)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+  const fail = msg => { status.className = "error"; status.textContent = msg; };
+
+  function show(img) {
+    canvas.width = img.width; canvas.height = img.height;
+    canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(img.rgba), img.width, img.height), 0, 0);
+    result.style.display = "block";
+  }
+
+  // HEIF files have an `ftyp` box at offset 4.
+  const isHeif = bytes => bytes.length > 12 && String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp";
 
   async function handle(file) {
     if (!file) return;
     try { await ready; } catch { return; }
     name = file.name.replace(/\.[^.]+$/, "");
     status.className = "";
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (isHeif(bytes)) return view(file, bytes);
+    try {
+      const bitmap = await createImageBitmap(file, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+      const c = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d");
+      c.drawImage(bitmap, 0, 0);
+      source = { file, pixels: c.getImageData(0, 0, bitmap.width, bitmap.height) };
+    } catch {
+      return fail(`${file.name} is neither a HEIC file nor an image this browser can read.`);
+    }
+    convert();
+  }
+
+  async function view(file, bytes) {
     status.textContent = `Decoding ${file.name}…`;
     await new Promise(requestAnimationFrame); // let the message render
-    const bytes = new Uint8Array(await file.arrayBuffer());
     const t0 = performance.now();
     try {
       const img = decode(bytes);
       const ms = Math.round(performance.now() - t0);
-      canvas.width = img.width; canvas.height = img.height;
-      canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(img.rgba), img.width, img.height), 0, 0);
+      show(img);
       const mp = (img.width * img.height / 1e6).toFixed(1);
       stats.innerHTML = stat(`${img.width}×${img.height}`, `${mp} MP`) + stat(`${ms} ms`, "decoded in this tab") + stat(img.info, "format");
-      result.style.display = "block";
-      status.textContent = file.name;
       img.free();
+      heic = source = null;
+      qualityBox.style.display = "none";
+      save.textContent = "Download as PNG";
+      status.textContent = file.name;
       result.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {
-      status.className = "error";
-      status.textContent = `Could not decode this file: ${e.message ?? e}`;
+      fail(`Could not decode this file: ${e.message ?? e}`);
     }
+  }
+
+  async function convert() {
+    const { file, pixels } = source;
+    const q = Number(quality.value);
+    status.className = "";
+    status.textContent = `Encoding ${file.name} to HEIC at quality ${q}…`;
+    try {
+      const { heic: bytes, ms } = await encodeInWorker(pixels.data.slice(), pixels.width, pixels.height, q);
+      if (source?.file !== file || Number(quality.value) !== q) return; // superseded
+      heic = bytes;
+      // Show the HEIC as decoded back by heifer: what the file really contains.
+      const img = decode(heic);
+      show(img);
+      img.free();
+      const mp = (pixels.width * pixels.height / 1e6).toFixed(1);
+      stats.innerHTML = stat(`${pixels.width}×${pixels.height}`, `${mp} MP`)
+        + stat(`${size(file.size)} → ${size(heic.length)}`, `${file.type.replace("image/", "").toUpperCase() || "image"} → HEIC`)
+        + stat(`${ms} ms`, "encoded in this tab");
+      qualityBox.style.display = "flex";
+      save.textContent = "Download HEIC";
+      status.textContent = `${name}.heic · shown as decoded from the HEIC file`;
+      result.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      fail(`Could not encode this image: ${e.message ?? e}`);
+    }
+  }
+
+  function download(blob, filename) {
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
   }
 
   $("file").addEventListener("change", e => { handle(e.target.files[0]); e.target.value = ""; });
   drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
   drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
-  save.addEventListener("click", () => canvas.toBlob(b => {
-    const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = `${name}.png`; a.click();
-  }, "image/png"));
+  quality.addEventListener("input", () => { qualityValue.textContent = quality.value; });
+  quality.addEventListener("change", () => source && convert());
+  save.addEventListener("click", () => {
+    if (heic) return download(new Blob([heic], { type: "image/heic" }), `${name}.heic`);
+    canvas.toBlob(b => download(b, `${name}.png`), "image/png");
+  });
 </script>
 </body>
 </html>

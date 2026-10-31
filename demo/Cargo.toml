@@ -3,7 +3,7 @@ name = "heifer-demo"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Browser demo: decode HEIC files with heifer compiled to WebAssembly"
+description = "Browser demo: decode and encode HEIC files with heifer compiled to WebAssembly"
 
 [lib]
 crate-type = ["cdylib"]

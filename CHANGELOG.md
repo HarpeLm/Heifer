@@ -1,5 +1,14 @@
 # Changelog
 
+## heifer-cli 0.3.1 — 2026-10-31
+
+- New `heifer-cli` crate: the `heifer` command converts HEIC/HEIF to and from PNG, JPEG, WebP,
+  TIFF, BMP and GIF, one file or many (`--to jpg -o dir`), keeps EXIF and ICC profiles, writes
+  photos upright, and never overwrites files without `--force`. `heifer info` shows the size,
+  tiles, camera, date and metadata of a file.
+- Web demo: PNG, JPEG and WebP images are converted to HEIC in the browser (in a worker), with a
+  quality slider and the result shown as decoded from the HEIC file.
+
 ## 0.3.1 — 2026-10-31
 
 - `image` crate: `HeifEncoder` implements `image::ImageEncoder`, so that
