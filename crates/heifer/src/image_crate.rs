@@ -6,14 +6,26 @@
 //! ```
 //!
 //! [`HeifDecoder`] can also be used directly with `image::DynamicImage::from_decoder`.
+//!
+//! [`HeifEncoder`] writes HEIC files from any image of the `image` crate:
+//!
+//! ```no_run
+//! let img = image::open("photo.png").unwrap();
+//! let file = std::fs::File::create("photo.heic").unwrap();
+//! img.write_with_encoder(heifer::image_crate::HeifEncoder::new(file)).unwrap();
+//! ```
+//!
+//! (`image::save` and `DynamicImage::save` only know the formats built into `image`.)
 
-use std::io::Read;
+use std::io::{Read, Write};
 
-use image::error::{DecodingError, ImageFormatHint};
+use image::error::{
+    DecodingError, EncodingError, ImageFormatHint, UnsupportedError, UnsupportedErrorKind,
+};
 use image::metadata::Orientation;
-use image::{ColorType, ImageDecoder, ImageError, ImageResult};
+use image::{ColorType, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, ImageResult};
 
-use crate::{Image, Metadata, Options};
+use crate::{EncodeOptions, Image, Metadata, Options};
 
 /// File extensions handled by heifer.
 const EXTENSIONS: [&str; 3] = ["heic", "heif", "hif"];
@@ -146,5 +158,125 @@ impl ImageDecoder for HeifDecoder {
 
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
         (*self).read_image(buf)
+    }
+}
+
+/// Encodes images as HEIC files, for `DynamicImage::write_with_encoder` and the other users of
+/// [`ImageEncoder`].
+///
+/// Accepts 8- and 16-bit grey, grey + alpha, RGB and RGBA images (16-bit samples are rounded to
+/// 8 bits). The ICC profile and EXIF metadata given by `image` are stored in the file; the EXIF
+/// orientation is set to 1, since the pixels are stored as given.
+#[derive(Debug)]
+pub struct HeifEncoder<W: Write> {
+    writer: W,
+    options: EncodeOptions,
+    metadata: Metadata,
+}
+
+impl<W: Write> HeifEncoder<W> {
+    /// An encoder with the default options (quality 80, all cores).
+    pub fn new(writer: W) -> Self {
+        Self::with_options(writer, EncodeOptions::default())
+    }
+
+    /// An encoder with the given quality and threads.
+    pub fn with_options(writer: W, options: EncodeOptions) -> Self {
+        Self {
+            writer,
+            options,
+            metadata: Metadata::default(),
+        }
+    }
+}
+
+fn hint() -> ImageFormatHint {
+    ImageFormatHint::Name("HEIF".into())
+}
+
+impl<W: Write> ImageEncoder for HeifEncoder<W> {
+    fn write_image(
+        mut self,
+        buf: &[u8],
+        width: u32,
+        height: u32,
+        color_type: ExtendedColorType,
+    ) -> ImageResult<()> {
+        use ExtendedColorType as C;
+        let (channels, wide) = match color_type {
+            C::L8 => (1, false),
+            C::La8 => (2, false),
+            C::Rgb8 => (3, false),
+            C::Rgba8 => (4, false),
+            C::L16 => (1, true),
+            C::La16 => (2, true),
+            C::Rgb16 => (3, true),
+            C::Rgba16 => (4, true),
+            _ => {
+                return Err(ImageError::Unsupported(
+                    UnsupportedError::from_format_and_kind(
+                        hint(),
+                        UnsupportedErrorKind::Color(color_type),
+                    ),
+                ));
+            }
+        };
+        let bytes = if wide { 2 } else { 1 };
+        let expected = u64::from(width) * u64::from(height) * channels * bytes;
+        if buf.len() as u64 != expected {
+            return Err(ImageError::Parameter(
+                image::error::ParameterError::from_kind(
+                    image::error::ParameterErrorKind::DimensionMismatch,
+                ),
+            ));
+        }
+        let channels = channels as usize;
+        let sample = |i: usize| -> u8 {
+            if wide {
+                let v = u16::from_ne_bytes([buf[2 * i], buf[2 * i + 1]]);
+                ((u32::from(v) * 255 + 32767) / 65535) as u8
+            } else {
+                buf[i]
+            }
+        };
+        let pixel = |i: usize| -> [u8; 4] {
+            let p = i * channels;
+            match channels {
+                1 => {
+                    let v = sample(p);
+                    [v, v, v, 255]
+                }
+                2 => {
+                    let v = sample(p);
+                    [v, v, v, sample(p + 1)]
+                }
+                3 => [sample(p), sample(p + 1), sample(p + 2), 255],
+                _ => [sample(p), sample(p + 1), sample(p + 2), sample(p + 3)],
+            }
+        };
+        let n = width as usize * height as usize;
+        let has_alpha = channels % 2 == 0 && (0..n).any(|i| pixel(i)[3] != 255);
+        let heic = crate::encode::encode_pixels(
+            width,
+            height,
+            has_alpha,
+            Some(&self.metadata),
+            &self.options,
+            pixel,
+        )
+        .map_err(|e| ImageError::Encoding(EncodingError::new(hint(), e)))?;
+        self.writer.write_all(&heic).map_err(ImageError::IoError)
+    }
+
+    fn set_icc_profile(&mut self, icc_profile: Vec<u8>) -> Result<(), UnsupportedError> {
+        self.metadata.icc_profile = Some(icc_profile);
+        Ok(())
+    }
+
+    fn set_exif_metadata(&mut self, exif: Vec<u8>) -> Result<(), UnsupportedError> {
+        // Some callers keep the `Exif\0\0` prefix of JPEG APP1 segments.
+        let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(&exif);
+        self.metadata.exif = Some(tiff.to_vec());
+        Ok(())
     }
 }

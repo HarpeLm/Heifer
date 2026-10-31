@@ -38,6 +38,19 @@ pub fn item_metadata(file: &HeifFile<'_>, id: ItemId) -> Result<Metadata, Error>
     })
 }
 
+/// A copy of EXIF data whose orientation tag, if any, says "upright" (1): for images whose
+/// pixels are already upright, so that no viewer rotates them again.
+pub(crate) fn exif_upright(exif: &[u8]) -> Vec<u8> {
+    let mut out = exif.to_vec();
+    if let Some(e) = Exif::parse(exif)
+        && let Some(at) = e.orientation_position()
+    {
+        let one = if e.big_endian { [0, 1] } else { [1, 0] };
+        out[at..at + 2].copy_from_slice(&one);
+    }
+    out
+}
+
 /// A minimal, bounds-checked reader for EXIF (TIFF) data.
 #[derive(Debug, Clone, Copy)]
 pub struct Exif<'a> {
@@ -105,6 +118,14 @@ impl<'a> Exif<'a> {
             (self.u16(entry)? == wanted)
                 .then(|| Some((self.u16(entry + 2)?, self.u32(entry + 4)?, entry + 8)))?
         })
+    }
+
+    /// Position of the orientation tag's value in IFD0, if it is a single SHORT.
+    pub(crate) fn orientation_position(&self) -> Option<usize> {
+        match self.find(self.ifd0, tag::ORIENTATION)? {
+            (3, 1, at) => Some(at),
+            _ => None,
+        }
     }
 
     fn short(&self, ifd: usize, wanted: u16) -> Option<u16> {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-10-31
+
+- `image` crate: `HeifEncoder` implements `image::ImageEncoder`, so that
+  `img.write_with_encoder(HeifEncoder::new(file))` writes HEIC files. 8- and 16-bit grey and
+  RGB, with or without alpha; the ICC profile and EXIF set by `image` are stored.
+- `encode_with_metadata`: encoding with EXIF, XMP and the ICC profile, e.g. those of the
+  original file. The EXIF orientation is reset to 1, since decoded pixels are already upright.
+- `heifer-isobmff`: `HeifWriter::add_xmp` and `add_icc_profile`.
+
 ## 0.3.0 — 2026-10-31
 
 **Encoding.** heifer now writes HEIC files, in pure Rust.

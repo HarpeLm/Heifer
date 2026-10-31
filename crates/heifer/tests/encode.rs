@@ -157,3 +157,17 @@ fn rejects_bad_input() {
     assert!(encode_rgba8(2, 2, &[0; 15], &options).is_err());
     assert!(encode_rgb8(2, 2, &[0; 16], &options).is_err());
 }
+
+#[test]
+fn metadata_is_kept() {
+    let rgba = test_image(600, 300, false); // a grid: metadata goes on the grid item
+    let image = decode(&encode_rgba8(600, 300, &rgba, &EncodeOptions::default()).unwrap()).unwrap();
+    let metadata = heifer::Metadata {
+        exif: Some(b"II*\0\x08\0\0\0\0\0".to_vec()),
+        xmp: Some(b"<x:xmpmeta/>".to_vec()),
+        icc_profile: Some(b"icc".to_vec()),
+    };
+    let heic = heifer::encode_with_metadata(&image, &metadata, &EncodeOptions::default()).unwrap();
+    assert_eq!(heifer::read_metadata(&heic).unwrap(), metadata);
+    assert_eq!(decode(&heic).unwrap().width, 600);
+}

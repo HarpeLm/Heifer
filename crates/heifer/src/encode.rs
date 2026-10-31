@@ -18,7 +18,7 @@ use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
 use heifer_isobmff::writer::{ALPHA_URN, HeifWriter, ImageSpec};
 
-use crate::{Error, Image};
+use crate::{Error, Image, Metadata};
 
 /// Size of grid tiles.
 const TILE: u32 = 512;
@@ -69,7 +69,7 @@ pub fn encode_rgba8(
 ) -> Result<Vec<u8>, Error> {
     check_input(width, height, rgba.len(), 4)?;
     let has_alpha = rgba.chunks_exact(4).any(|p| p[3] != 255);
-    encode_pixels(width, height, has_alpha, options, |i| {
+    encode_pixels(width, height, has_alpha, None, options, |i| {
         let p = &rgba[i * 4..i * 4 + 4];
         [p[0], p[1], p[2], p[3]]
     })
@@ -83,7 +83,7 @@ pub fn encode_rgb8(
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     check_input(width, height, rgb.len(), 3)?;
-    encode_pixels(width, height, false, options, |i| {
+    encode_pixels(width, height, false, None, options, |i| {
         let p = &rgb[i * 3..i * 3 + 3];
         [p[0], p[1], p[2], 255]
     })
@@ -92,13 +92,40 @@ pub fn encode_rgb8(
 /// Encodes an [`Image`] (e.g. one decoded by [`decode`](crate::decode)) as a HEIC file.
 /// Samples of more than 8 bits are rounded to 8 bits.
 pub fn encode(image: &Image, options: &EncodeOptions) -> Result<Vec<u8>, Error> {
+    encode_with_metadata(image, &Metadata::default(), options)
+}
+
+/// Like [`encode`], also storing EXIF, XMP and the ICC profile, e.g. those read by
+/// [`read_metadata`](crate::read_metadata) from the original file:
+///
+/// ```no_run
+/// let bytes = std::fs::read("photo.heic").unwrap();
+/// let (image, metadata) = (heifer::decode(&bytes).unwrap(), heifer::read_metadata(&bytes).unwrap());
+/// let options = heifer::EncodeOptions { quality: 60, ..Default::default() };
+/// let smaller = heifer::encode_with_metadata(&image, &metadata, &options).unwrap();
+/// ```
+///
+/// The pixels of a decoded image are already upright: the EXIF orientation tag, if any, is set
+/// to 1 so that no viewer rotates them again.
+pub fn encode_with_metadata(
+    image: &Image,
+    metadata: &Metadata,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
     check_input(image.width, image.height, image.data.len(), 4)?;
     let max = u32::from(image.max_value());
     let to8 = |v: u16| ((u32::from(v) * 255 + max / 2) / max) as u8;
-    encode_pixels(image.width, image.height, image.has_alpha, options, |i| {
-        let p = &image.data[i * 4..i * 4 + 4];
-        [to8(p[0]), to8(p[1]), to8(p[2]), to8(p[3])]
-    })
+    encode_pixels(
+        image.width,
+        image.height,
+        image.has_alpha,
+        Some(metadata),
+        options,
+        |i| {
+            let p = &image.data[i * 4..i * 4 + 4];
+            [to8(p[0]), to8(p[1]), to8(p[2]), to8(p[3])]
+        },
+    )
 }
 
 fn check_input(width: u32, height: u32, len: usize, channels: usize) -> Result<(), Error> {
@@ -121,14 +148,39 @@ const COLOR: ColorInfo = ColorInfo::Nclx {
     full_range: true,
 };
 
-/// Encodes an image given by a function returning the RGBA pixel at an index.
-fn encode_pixels(
+/// Encodes an image given by a function returning the RGBA pixel at an index, with its
+/// metadata.
+pub(crate) fn encode_pixels(
+    width: u32,
+    height: u32,
+    has_alpha: bool,
+    metadata: Option<&Metadata>,
+    options: &EncodeOptions,
+    pixel: impl Fn(usize) -> [u8; 4] + Sync,
+) -> Result<Vec<u8>, Error> {
+    let (mut writer, image) = encode_image(width, height, has_alpha, options, pixel)?;
+    if let Some(m) = metadata {
+        if let Some(icc) = &m.icc_profile {
+            writer.add_icc_profile(image, icc);
+        }
+        if let Some(exif) = &m.exif {
+            writer.add_exif(image, &crate::metadata::exif_upright(exif));
+        }
+        if let Some(xmp) = &m.xmp {
+            writer.add_xmp(image, xmp);
+        }
+    }
+    Ok(writer.finish())
+}
+
+/// Encodes the pixels into a writer; returns it with the ID of the image (picture or grid).
+fn encode_image(
     width: u32,
     height: u32,
     has_alpha: bool,
     options: &EncodeOptions,
     pixel: impl Fn(usize) -> [u8; 4] + Sync,
-) -> Result<Vec<u8>, Error> {
+) -> Result<(HeifWriter, ItemId), Error> {
     let qp = options.qp();
     let color = EncoderConfig {
         qp,
@@ -159,7 +211,7 @@ fn encode_pixels(
             let alpha = encode_region(width, height, (0, 0), coded, &pixel, true, &alpha)?;
             add_alpha_picture(&mut writer, image, &alpha, (width, height));
         }
-        return Ok(writer.finish());
+        return Ok((writer, image));
     }
 
     let (columns, rows) = (width.div_ceil(TILE), height.div_ceil(TILE));
@@ -200,7 +252,7 @@ fn encode_pixels(
         writer.add_reference(*b"auxl", alpha, &[grid]);
     }
     writer.set_primary(grid);
-    Ok(writer.finish())
+    Ok((writer, grid))
 }
 
 /// Encodes all the tiles of a grid, in parallel. Returns them row by row.

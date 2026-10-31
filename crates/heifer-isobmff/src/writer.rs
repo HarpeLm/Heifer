@@ -74,6 +74,8 @@ struct WriterItem {
     hidden: bool,
     /// Indices into `HeifWriter::properties` (1-based in `ipma`), with their `essential` flag.
     properties: Vec<(u16, bool)>,
+    /// MIME type of `mime` items.
+    content_type: Option<&'static str>,
     data: Vec<u8>,
 }
 
@@ -228,6 +230,32 @@ impl HeifWriter {
         id
     }
 
+    /// Adds an XMP packet (a `mime` item of type `application/rdf+xml`) describing `image`.
+    pub fn add_xmp(&mut self, image: ItemId, xmp: &[u8]) -> ItemId {
+        let id = self.add_item(*b"mime", true, Vec::new(), xmp.to_vec());
+        if let Some(item) = self.items.last_mut() {
+            item.content_type = Some("application/rdf+xml");
+        }
+        self.add_reference(*b"cdsc", id, &[image]);
+        id
+    }
+
+    /// Adds an ICC profile (`colr` of type `prof`) to an image or grid item already added.
+    /// Unknown items are ignored.
+    pub fn add_icc_profile(&mut self, item: ItemId, icc: &[u8]) {
+        let index = self.property(colr_box(&ColorInfo::Icc(icc.to_vec())));
+        let properties = &self.properties;
+        if let Some(item) = self.items.iter_mut().find(|i| i.id == item) {
+            // Descriptive properties go before transformative ones such as `clap`.
+            let position = item
+                .properties
+                .iter()
+                .position(|&(i, _)| properties[usize::from(i) - 1][4..8] == *b"clap")
+                .unwrap_or(item.properties.len());
+            item.properties.insert(position, (index, false));
+        }
+    }
+
     /// Adds a reference of type `ref_type` from `from` to `to` (`iref`).
     pub fn add_reference(&mut self, ref_type: [u8; 4], from: ItemId, to: &[ItemId]) {
         self.references.push((ref_type, from, to.to_vec()));
@@ -263,6 +291,7 @@ impl HeifWriter {
             item_type,
             hidden,
             properties,
+            content_type: None,
             data,
         });
         if self.primary.is_none() && item_type == *b"hvc1" && !hidden {
@@ -374,6 +403,10 @@ impl HeifWriter {
                         e.extend_from_slice(&0u16.to_be_bytes()); // item_protection_index
                         e.extend_from_slice(&item.item_type);
                         e.push(0); // empty name
+                        if let Some(content_type) = item.content_type {
+                            e.extend_from_slice(content_type.as_bytes());
+                            e.push(0);
+                        }
                     }));
                 }
             }));
@@ -584,6 +617,8 @@ mod tests {
         });
         let alpha = w.add_alpha(image, &ImageSpec::new(640, 480, config(0), &alpha_slices));
         let exif = w.add_exif(image, b"MM\0*\0\0\0\x08");
+        let xmp = w.add_xmp(image, b"<x:xmpmeta/>");
+        w.add_icc_profile(image, b"icc profile");
         let bytes = w.finish();
 
         let file = HeifFile::parse(&bytes).unwrap();
@@ -607,7 +642,14 @@ mod tests {
         assert!(file.item(alpha).unwrap().hidden);
         assert_eq!(file.referencing_items(image, b"auxl"), vec![alpha]);
         assert_eq!(file.exif(image).unwrap().unwrap(), b"MM\0*\0\0\0\x08");
-        assert_eq!(file.referencing_items(image, b"cdsc"), vec![exif]);
+        assert_eq!(file.referencing_items(image, b"cdsc"), vec![exif, xmp]);
+        assert_eq!(file.xmp(image).unwrap().unwrap(), b"<x:xmpmeta/>");
+        assert_eq!(file.icc_profile(image).unwrap().unwrap(), b"icc profile");
+        // `clap` stays the last property of the image.
+        assert!(matches!(
+            file.item_properties(image).unwrap().last(),
+            Some(Property::CleanAperture { .. })
+        ));
 
         let stream = file.hevc_bitstream(image).unwrap();
         let mut expected = Vec::new();

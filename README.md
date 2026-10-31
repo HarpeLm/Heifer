@@ -29,8 +29,8 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
 
 ## <img src="docs/icons/problem.svg" width="24" height="24" align="top"> Why Heifer?
 
-HEIC is the default photo format on iPhones and many Android phones, yet reading or writing it from
-Rust has meant leaning on C and C++.
+HEIC is the default photo format on iPhones and many Android phones, yet reading and writing it from
+Rust has mostly meant leaning on C and C++.
 
 <table width="100%">
   <tr>
@@ -105,6 +105,10 @@ let heic: Vec<u8> = heifer::encode_rgba8(width, height, &rgba, &options)?;    //
 std::fs::write("photo.heic", heic)?;
 
 let again = heifer::encode(&heifer::decode(&bytes)?, &options)?;              // re-encode an Image
+
+// Keep EXIF, XMP and the ICC profile of the original:
+let meta = heifer::read_metadata(&bytes)?;
+let smaller = heifer::encode_with_metadata(&heifer::decode(&bytes)?, &meta, &options)?;
 ```
 
 Images are stored as 8-bit YCbCr 4:2:0 (sRGB, BT.601 full range), split into 512×512 tiles that are
@@ -157,10 +161,17 @@ heifer = { version = "0.3", features = ["image"] }
 ```rust
 heifer::image_crate::register_image_decoder_hooks();
 let img = image::open("photo.heic")?;   // .heic / .heif / .hif, plus content detection
+
+let file = std::fs::File::create("photo.heic")?;
+img.write_with_encoder(heifer::image_crate::HeifEncoder::new(file))?;   // write a HEIC
 ```
 
 `HeifDecoder` implements `image::ImageDecoder` (8- and 16-bit RGB/RGBA, EXIF/XMP/ICC). The HEIF
 orientation is already applied, so it is never applied twice.
+
+`HeifEncoder` implements `image::ImageEncoder`: 8- and 16-bit grey and RGB, with or without alpha,
+and the ICC profile and EXIF set by `image`. (`image::save` only knows the formats built into
+`image`, so writing goes through `write_with_encoder`.)
 
 ## <img src="docs/icons/layers.svg" width="24" height="24" align="top"> Supported formats / features
 
@@ -171,7 +182,7 @@ orientation is already applied, so it is never applied twice.
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | HEIC from 8-bit RGB(A): HEVC Main intra, 4:2:0, alpha, 512×512 grid tiles, any size; HEIF writing (items, grids, alpha, EXIF, `clap`) | 10-bit, 4:4:4, HDR, lossless, metadata from the `image` crate |
+| **Encoding** | HEIC from 8-bit RGB(A): HEVC Main intra, 4:2:0, alpha, 512×512 grid tiles, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, metadata, `clap`) | 10-bit, 4:4:4, HDR, lossless |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -294,7 +305,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **HDR**: Apple gain maps (iPhone photos)
 - [x] **HDR**: ISO 21496-1 gain maps (`tmap`)
 - [x] **0.3 — Encoder**: HEIF writing, HEVC intra encoder, alpha, parallel tiles; `iloc` construction method 2
-- [ ] **Next**: better compression (4×4 transforms, RDOQ), 10-bit and HDR encoding, `image` crate encoder
+- [x] **0.3.1**: `image` crate encoder, metadata when encoding
+- [ ] **Next**: better compression (4×4 transforms, RDOQ), 10-bit and HDR encoding
 - [ ] ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

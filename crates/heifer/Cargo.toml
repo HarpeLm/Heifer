@@ -20,7 +20,7 @@ heifer-hevc-enc.workspace = true
 image = { version = "0.25.8", default-features = false, optional = true }
 
 [features]
-# Integration with the `image` crate (decoder + hooks for image::open).
+# Integration with the `image` crate (decoder, encoder, hooks for image::open).
 image = ["dep:image"]
 
 [dev-dependencies]
