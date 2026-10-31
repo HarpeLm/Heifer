@@ -131,7 +131,7 @@ pub const DCT32: [[i32; 32]; 32] = {
 };
 
 /// 4×4 DST-VII used for intra luma 4×4 blocks (8-317).
-const DST4: [[i32; 4]; 4] = [
+pub const DST4: [[i32; 4]; 4] = [
     [29, 55, 74, 84],
     [74, 74, 0, -74],
     [84, -29, -74, 55],
@@ -324,6 +324,22 @@ impl<'a> Reconstructor<'a> {
         }
         for xx in x4..((x + w) as usize).div_ceil(4).min(info.w4) {
             info.edges[y4 * info.w4 + xx] |= 2;
+        }
+    }
+
+    /// Marks a luma area as reconstructed or not, which decides whether intra prediction may
+    /// use its samples. For encoders that try several codings of the same area: before trying
+    /// again, the area must be marked as not reconstructed.
+    pub fn set_reconstructed(&mut self, x: u32, y: u32, w: u32, h: u32, reconstructed: bool) {
+        if reconstructed {
+            self.mark_decoded(x, y, w, h);
+        } else {
+            let h4 = self.decoded.len() / self.w4;
+            for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(h4) {
+                for xx in (x as usize >> 2)..((x + w) as usize).div_ceil(4).min(self.w4) {
+                    self.decoded[yy * self.w4 + xx] = u32::MAX;
+                }
+            }
         }
     }
 

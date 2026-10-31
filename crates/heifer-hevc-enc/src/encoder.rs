@@ -21,7 +21,8 @@ use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
 use crate::Error;
 use crate::cabac::{ArithmeticEncoder, Checkpoint};
 use crate::params::{NalType, PROFILE_MAIN, StreamParams, nal_unit};
-use crate::transform::{chroma_qp, forward_dct, quantize, satd};
+use crate::rdo::{hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
+use crate::transform::{chroma_qp, forward_dct, forward_dst4, quantize_exact, satd};
 
 const LOG2_CTB: u8 = 5;
 const LOG2_MIN_CB: u8 = 3;
@@ -96,17 +97,17 @@ pub fn encode_picture(
     planes: Planes<'_>,
     config: &EncoderConfig,
 ) -> Result<EncodedPicture, Error> {
-    encode_with_reconstruction(width, height, planes, config).map(|(picture, _)| picture)
+    encode_with_reconstruction(width, height, planes, config).map(|(picture, ..)| picture)
 }
 
 /// Like [`encode_picture`], also returning the encoder's reconstruction of the picture (coded
-/// size, before the in-loop filters).
+/// size, before the in-loop filters) and how many coding units of each [`CuKind`] it chose.
 fn encode_with_reconstruction(
     width: u32,
     height: u32,
     planes: Planes<'_>,
     config: &EncoderConfig,
-) -> Result<(EncodedPicture, Frame), Error> {
+) -> Result<(EncodedPicture, Frame, [usize; 3]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
         return Err(Error::InvalidInput(
             "picture size must be 1 to 16384 pixels",
@@ -186,7 +187,28 @@ fn encode_with_reconstruction(
         width: params.output_width,
         height: params.output_height,
     };
-    Ok((picture, enc.recon.finish(true)))
+    let kinds = enc.kinds;
+    Ok((picture, enc.recon.finish(true), kinds))
+}
+
+/// The ways a coding unit can be coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CuKind {
+    /// One prediction block, one transform block.
+    Whole,
+    /// One prediction block, four transform blocks of half size.
+    SplitTransform,
+    /// Four 4×4 prediction and transform blocks (8×8 coding units only).
+    FourBlocks,
+}
+
+/// A transform block of one component, with its levels (empty when all are zero).
+struct Tb {
+    c: usize,
+    log2_size: u8,
+    mode: u8,
+    levels: Vec<i32>,
+    sse: f64,
 }
 
 /// A source plane, padded to the coded size by repeating the last column and row.
@@ -209,6 +231,8 @@ impl Plane {
 
 /// Everything needed to go back to an earlier encoder state for one block.
 struct Snapshot {
+    /// Whether the block was coded when the snapshot was taken.
+    coded: bool,
     cabac: Checkpoint,
     ctx: Contexts,
     /// Reconstructed samples of the block, per component.
@@ -229,13 +253,19 @@ struct Encoder<'a> {
     qp_c: i32,
     lambda: f64,
     sqrt_lambda: f64,
-    /// Coding tree depth and luma intra mode of each 8×8 block.
+    /// Coding tree depth and luma intra mode of each 4×4 block.
     depth: Vec<u8>,
     modes: Vec<u8>,
     grid_w: usize,
     // Scratch buffers.
     diff: Vec<i32>,
-    coeffs: [Vec<i32>; 3],
+    coeffs: Vec<i32>,
+    exact: Vec<f32>,
+    /// Coding units chosen of each kind, for tests and statistics.
+    kinds: [usize; 3],
+    /// Rate cost of a level made significant or zero, for sign data hiding, in units of the
+    /// squared quantization step.
+    sdh_rate: f32,
 }
 
 impl<'a> Encoder<'a> {
@@ -273,7 +303,7 @@ impl<'a> Encoder<'a> {
         let qp = params.qp;
         // λ of the HM reference encoder for intra pictures.
         let lambda = 0.57 * 2f64.powf(f64::from(qp - 12) / 3.0);
-        let grid_w = pw / 8;
+        let grid_w = pw / 4;
         Self {
             recon,
             cabac: ArithmeticEncoder::new(),
@@ -286,11 +316,15 @@ impl<'a> Encoder<'a> {
             qp_c: chroma_qp(qp),
             lambda,
             sqrt_lambda: lambda.sqrt(),
-            depth: vec![0; grid_w * (ph / 8)],
-            modes: vec![1; grid_w * (ph / 8)],
+            depth: vec![0; grid_w * (ph / 4)],
+            modes: vec![1; grid_w * (ph / 4)],
             grid_w,
             diff: vec![0; 32 * 32],
-            coeffs: [vec![0; 32 * 32], vec![0; 16 * 16], vec![0; 16 * 16]],
+            coeffs: vec![0; 32 * 32],
+            exact: vec![0.0; 32 * 32],
+            kinds: [0; 3],
+            // About 3 bits, at λ / step² (step = 2^((QP - 4) / 6)).
+            sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32,
         }
     }
 
@@ -299,12 +333,12 @@ impl<'a> Encoder<'a> {
     }
 
     fn grid(&self, x: u32, y: u32) -> usize {
-        (y as usize / 8) * self.grid_w + x as usize / 8
+        (y as usize / 4) * self.grid_w + x as usize / 4
     }
 
     fn fill_grid(&mut self, x0: u32, y0: u32, size: u32, depth: Option<u8>, mode: Option<u8>) {
-        for y in (y0..y0 + size).step_by(8) {
-            for x in (x0..x0 + size).step_by(8) {
+        for y in (y0..y0 + size).step_by(4) {
+            for x in (x0..x0 + size).step_by(4) {
                 let i = self.grid(x, y);
                 if let Some(d) = depth {
                     self.depth[i] = d;
@@ -330,7 +364,7 @@ impl<'a> Encoder<'a> {
             .collect()
     }
 
-    fn snapshot(&self, x0: u32, y0: u32, size: u32, cabac: Checkpoint) -> Snapshot {
+    fn snapshot(&self, x0: u32, y0: u32, size: u32, coded: bool, cabac: Checkpoint) -> Snapshot {
         let mut samples: [Vec<u16>; 3] = Default::default();
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
@@ -342,14 +376,15 @@ impl<'a> Encoder<'a> {
         }
         let mut depth = Vec::new();
         let mut modes = Vec::new();
-        for y in (y0..y0 + size).step_by(8) {
-            for x in (x0..x0 + size).step_by(8) {
+        for y in (y0..y0 + size).step_by(4) {
+            for x in (x0..x0 + size).step_by(4) {
                 let i = self.grid(x, y);
                 depth.push(self.depth[i]);
                 modes.push(self.modes[i]);
             }
         }
         Snapshot {
+            coded,
             cabac,
             ctx: self.ctx,
             samples,
@@ -359,6 +394,8 @@ impl<'a> Encoder<'a> {
     }
 
     fn restore(&mut self, x0: u32, y0: u32, size: u32, s: &Snapshot) {
+        // Intra prediction must see the block as the decoder will: coded or not yet.
+        self.recon.set_reconstructed(x0, y0, size, size, s.coded);
         self.cabac.restore(&s.cabac);
         self.ctx = s.ctx;
         for (c, x, y, n) in self.regions(x0, y0, size) {
@@ -371,8 +408,8 @@ impl<'a> Encoder<'a> {
             }
         }
         let mut k = 0;
-        for y in (y0..y0 + size).step_by(8) {
-            for x in (x0..x0 + size).step_by(8) {
+        for y in (y0..y0 + size).step_by(4) {
+            for x in (x0..x0 + size).step_by(4) {
                 let i = self.grid(x, y);
                 self.depth[i] = s.depth[k];
                 self.modes[i] = s.modes[k];
@@ -398,30 +435,38 @@ impl<'a> Encoder<'a> {
             return d;
         }
         if log2_size == LOG2_MIN_CB {
-            return self.coding_unit(x0, y0, log2_size, depth);
+            return self.coding_unit(x0, y0, log2_size, depth).0;
         }
 
-        // Try the split first: coding the whole block next only looks outside the block, so
-        // the samples left inside by the split do not matter.
+        // The whole block first: when it needs no residual, smaller blocks cannot do better.
         let start_bits = self.cabac.bit_count();
-        let start = self.snapshot(x0, y0, size, self.cabac.checkpoint());
+        let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
+        self.split_cu_flag(x0, y0, depth, false);
+        let (d_whole, residual) = self.coding_unit(x0, y0, log2_size, depth);
+        if !residual {
+            return d_whole;
+        }
+        let j_whole = d_whole + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
+        let whole = self.snapshot(
+            x0,
+            y0,
+            size,
+            true,
+            self.cabac.checkpoint_since(&start.cabac),
+        );
+
+        self.restore(x0, y0, size, &start);
         self.split_cu_flag(x0, y0, depth, true);
         let d_split: f64 = children
             .iter()
             .map(|&(dx, dy)| self.quadtree(x0 + dx, y0 + dy, log2_size - 1, depth + 1))
             .sum();
         let j_split = d_split + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
-        let split = self.snapshot(x0, y0, size, self.cabac.checkpoint_since(&start.cabac));
-
-        self.restore(x0, y0, size, &start);
-        self.split_cu_flag(x0, y0, depth, false);
-        let d_whole = self.coding_unit(x0, y0, log2_size, depth);
-        let j_whole = d_whole + self.lambda * (self.cabac.bit_count() - start_bits) as f64;
-        if j_split < j_whole {
-            self.restore(x0, y0, size, &split);
-            d_split
-        } else {
+        if j_whole <= j_split {
+            self.restore(x0, y0, size, &whole);
             d_whole
+        } else {
+            d_split
         }
     }
 
@@ -497,63 +542,91 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /// Chooses the luma intra mode of a block by SATD and estimated mode bits.
-    fn choose_mode(&mut self, x0: u32, y0: u32, log2_size: u8, mpm: [u8; 3]) -> u8 {
+    /// The `count` most promising luma intra modes of a block, best first, by SATD and estimated
+    /// mode bits: a coarse search over the 35 modes, refined around the best angle, plus the
+    /// most probable modes (cheap to signal).
+    fn choose_modes(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        mpm: [u8; 3],
+        count: usize,
+    ) -> Vec<u8> {
         let n = 1usize << log2_size;
-        let cost = |enc: &mut Self, mode: u8| -> f64 {
+        let mut costs: Vec<(f64, u8)> = Vec::with_capacity(20);
+        let eval = |enc: &mut Self, costs: &mut Vec<(f64, u8)>, mode: u8| {
+            if costs.iter().any(|&(_, m)| m == mode) {
+                return;
+            }
             enc.predict(0, x0, y0, log2_size, mode);
             let bits = match mpm.iter().position(|&m| m == mode) {
                 Some(0) => 2.0,
                 Some(_) => 3.0,
                 None => 6.0,
             };
-            satd(&enc.diff[..n * n], n) as f64 + enc.sqrt_lambda * bits
+            costs.push((
+                satd(&enc.diff[..n * n], n) as f64 + enc.sqrt_lambda * bits,
+                mode,
+            ));
         };
-        let mut best = (f64::MAX, 0u8);
-        for mode in [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34] {
-            let c = cost(self, mode);
-            if c < best.0 {
-                best = (c, mode);
+        for mode in [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34]
+            .into_iter()
+            .chain(mpm)
+        {
+            eval(self, &mut costs, mode);
+        }
+        let best_angle = costs
+            .iter()
+            .filter(|&&(_, m)| m >= 2)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(26, |&(_, m)| m);
+        for mode in [
+            best_angle.saturating_sub(2),
+            best_angle.saturating_sub(1),
+            best_angle + 1,
+            best_angle + 2,
+        ] {
+            if (2..=34).contains(&mode) {
+                eval(self, &mut costs, mode);
             }
         }
-        if best.1 >= 2 {
-            let center = best.1;
-            for mode in [
-                center.saturating_sub(2),
-                center.saturating_sub(1),
-                center + 1,
-                center + 2,
-            ] {
-                if (2..=34).contains(&mode) && mode != center {
-                    let c = cost(self, mode);
-                    if c < best.0 {
-                        best = (c, mode);
-                    }
-                }
-            }
-        }
-        best.1
+        costs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        costs.into_iter().take(count).map(|(_, m)| m).collect()
     }
 
-    /// Computes the residual levels of one block (in `self.coeffs[c]`) and reconstructs it.
-    /// Returns whether it has non-zero levels, and the squared error of the reconstruction.
-    fn transform_block(
-        &mut self,
-        c: usize,
-        x: u32,
-        y: u32,
-        log2_size: u8,
-        mode: u8,
-    ) -> (bool, f64) {
+    /// Computes the residual levels of one transform block and reconstructs it.
+    fn transform_block(&mut self, c: usize, x: u32, y: u32, log2_size: u8, mode: u8) -> Tb {
         let n = 1usize << log2_size;
         self.predict(c, x, y, log2_size, mode);
-        let mut coeffs = std::mem::take(&mut self.coeffs[c]);
+        let mut coeffs = std::mem::take(&mut self.coeffs);
         let qp = if c == 0 { self.qp } else { self.qp_c };
-        forward_dct(&self.diff[..n * n], log2_size, &mut coeffs[..n * n]);
-        let coded = quantize(&mut coeffs[..n * n], log2_size, qp);
+        if c == 0 && log2_size == 2 {
+            forward_dst4(&self.diff[..16], &mut coeffs[..16]);
+        } else {
+            forward_dct(&self.diff[..n * n], log2_size, &mut coeffs[..n * n]);
+        }
+        let mut exact = std::mem::take(&mut self.exact);
+        quantize_exact(&mut coeffs[..n * n], log2_size, qp, &mut exact[..n * n]);
+        let scan = scan_type(log2_size, c == 0, mode);
+        // λ in units of the squared quantization step, 2^((QP - 4) / 3).
+        let lambda = (self.lambda / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
+        let levels = &mut coeffs[..n * n];
+        rdoq(
+            levels,
+            &exact[..n * n],
+            log2_size,
+            c == 0,
+            scan,
+            &self.ctx,
+            lambda,
+        );
+        hide_signs(levels, &exact[..n * n], log2_size, scan, self.sdh_rate);
+        self.exact = exact;
+        let coded = levels.iter().any(|&v| v != 0);
         if coded {
             let (mut cols, mut rows) = (0, 0);
-            for (i, _) in coeffs[..n * n].iter().enumerate().filter(|(_, v)| **v != 0) {
+            for (i, _) in levels.iter().enumerate().filter(|(_, v)| **v != 0) {
                 cols = cols.max(i % n + 1);
                 rows = rows.max(i / n + 1);
             }
@@ -563,7 +636,7 @@ impl<'a> Encoder<'a> {
                 y,
                 log2_size,
                 intra_mode: mode,
-                coeffs: Some(&coeffs[..n * n]),
+                coeffs: Some(levels),
                 coeff_bounds: (cols as u8, rows as u8),
                 transform_skip: false,
                 transquant_bypass: false,
@@ -572,7 +645,12 @@ impl<'a> Encoder<'a> {
                 res_scale_val: 0,
             });
         }
-        self.coeffs[c] = coeffs;
+        let levels = if coded {
+            coeffs[..n * n].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.coeffs = coeffs;
 
         let stride = self.recon.frame.widths[c] as usize;
         let rec = &self.recon.frame.planes[c];
@@ -586,91 +664,277 @@ impl<'a> Encoder<'a> {
                 sse += d * d;
             }
         }
-        (coded, sse as f64)
+        Tb {
+            c,
+            log2_size,
+            mode,
+            levels,
+            sse: sse as f64,
+        }
     }
 
-    /// `coding_unit()` with one 2N×2N prediction block and one transform unit. Returns the
-    /// distortion.
-    fn coding_unit(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> f64 {
+    /// Chooses the chroma prediction mode of a coding unit whose (first) luma mode is `luma`:
+    /// returns `intra_chroma_pred_mode` (4 = same as luma) and the mode it gives.
+    fn choose_chroma_mode(&mut self, xc: u32, yc: u32, log2_size: u8, luma: u8) -> (u8, u8) {
+        let n = 1usize << log2_size;
+        let mut best = (f64::MAX, 4, luma);
+        for syntax in [4u8, 0, 1, 2, 3] {
+            let mode = match syntax {
+                4 => luma,
+                s => {
+                    let m = [0, 26, 10, 1][usize::from(s)];
+                    if m == luma { 34 } else { m }
+                }
+            };
+            let mut cost = self.sqrt_lambda * if syntax == 4 { 1.0 } else { 3.0 };
+            for c in 1..=2 {
+                self.predict(c, xc, yc, log2_size, mode);
+                cost += satd(&self.diff[..n * n], n) as f64;
+            }
+            if cost < best.0 {
+                best = (cost, syntax, mode);
+            }
+        }
+        (best.1, best.2)
+    }
+
+    /// Chroma transform blocks (Cb, Cr) at a chroma position, if the picture has chroma.
+    fn chroma_blocks(&mut self, xc: u32, yc: u32, log2_size: u8, mode: u8) -> Option<[Tb; 2]> {
+        self.chroma.then(|| {
+            [
+                self.transform_block(1, xc, yc, log2_size, mode),
+                self.transform_block(2, xc, yc, log2_size, mode),
+            ]
+        })
+    }
+
+    /// `coding_unit()`: tries the best few prediction modes with one transform for the whole
+    /// block, then the best of them with four transforms, and (for the smallest blocks) four 4×4
+    /// prediction blocks, and keeps the cheapest. Returns the distortion and whether there is
+    /// any residual.
+    fn coding_unit(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> (f64, bool) {
+        const MODES_TRIED: usize = 3;
+        let size = 1u32 << log2_size;
+        let start_bits = self.cabac.bit_count();
+        let start = self.snapshot(x0, y0, size, false, self.cabac.checkpoint());
+        let mpm = self.mpm_candidates(x0, y0);
+        let modes = self.choose_modes(x0, y0, log2_size, mpm, MODES_TRIED);
+
+        // (cost, distortion, kind, mode, residual, snapshot after coding)
+        let mut best = None;
+        let mut current = None; // what the encoder state holds now
+        type Best = Option<(f64, f64, CuKind, u8, bool, Snapshot)>;
+        let try_kind = |enc: &mut Self,
+                        best: &mut Best,
+                        current: &mut Option<(CuKind, u8)>,
+                        kind: CuKind,
+                        mode: u8| {
+            if current.is_some() {
+                enc.restore(x0, y0, size, &start);
+            }
+            let (d, residual) = enc.code_cu(x0, y0, log2_size, depth, kind, mode);
+            *current = Some((kind, mode));
+            let j = d + enc.lambda * (enc.cabac.bit_count() - start_bits) as f64;
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                let after = enc.cabac.checkpoint_since(&start.cabac);
+                *best = Some((
+                    j,
+                    d,
+                    kind,
+                    mode,
+                    residual,
+                    enc.snapshot(x0, y0, size, true, after),
+                ));
+            }
+        };
+        for &mode in &modes {
+            try_kind(self, &mut best, &mut current, CuKind::Whole, mode);
+        }
+        let (_, _, _, mode, residual, _) = best.as_ref().expect("a mode was tried");
+        // A prediction good enough to need no residual cannot be improved by smaller blocks.
+        if *residual {
+            let mode = *mode;
+            try_kind(self, &mut best, &mut current, CuKind::SplitTransform, mode);
+            if log2_size == LOG2_MIN_CB {
+                try_kind(self, &mut best, &mut current, CuKind::FourBlocks, mode);
+            }
+        }
+        let (_, d, kind, mode, residual, snapshot) = best.expect("a mode was tried");
+        self.kinds[kind as usize] += 1;
+        if current != Some((kind, mode)) {
+            self.restore(x0, y0, size, &snapshot);
+        }
+        (d, residual)
+    }
+
+    /// Codes a coding unit of the given kind, with `mode` for 2N×2N prediction; returns its
+    /// distortion and whether it has any residual.
+    fn code_cu(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        kind: CuKind,
+        mode: u8,
+    ) -> (f64, bool) {
         let size = 1u32 << log2_size;
         self.fill_grid(x0, y0, size, Some(depth), None);
-        if log2_size == LOG2_MIN_CB {
-            self.bin(ctx::PART_MODE, true); // PART_2Nx2N
-        }
+        let four = kind == CuKind::FourBlocks;
 
-        let mpm = self.mpm_candidates(x0, y0);
-        let mode = self.choose_mode(x0, y0, log2_size, mpm);
-        match mpm.iter().position(|&m| m == mode) {
-            Some(i) => {
-                self.bin(ctx::PREV_INTRA_LUMA_PRED_FLAG, true);
-                // mpm_idx: truncated unary, maximum 2.
-                self.cabac.encode_bypass(u8::from(i > 0));
-                if i > 0 {
-                    self.cabac.encode_bypass(u8::from(i > 1));
+        // Prediction modes and transform blocks, in decoding order: each block is predicted
+        // from the ones reconstructed before it.
+        let mut parts: Vec<(u8, [u8; 3])> = Vec::new(); // (mode, MPM candidates)
+        let mut leaves: Vec<(Tb, Option<[Tb; 2]>)> = Vec::new(); // luma, chroma
+        let mut small_chroma = None; // chroma of 4×4 luma blocks, coded after the last one
+        // intra_chroma_pred_mode and the chroma mode (decided once the first luma mode is).
+        let mut chroma = (4u8, mode);
+        if four {
+            let half = size / 2;
+            for i in 0..4u32 {
+                let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
+                let mpm = self.mpm_candidates(x, y);
+                let mode = self.choose_modes(x, y, log2_size - 1, mpm, 1)[0];
+                self.fill_grid(x, y, half, None, Some(mode));
+                parts.push((mode, mpm));
+                leaves.push((self.transform_block(0, x, y, log2_size - 1, mode), None));
+            }
+            if self.chroma {
+                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, parts[0].0);
+            }
+            small_chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
+        } else {
+            let mpm = self.mpm_candidates(x0, y0);
+            self.fill_grid(x0, y0, size, None, Some(mode));
+            parts.push((mode, mpm));
+            if self.chroma {
+                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode);
+            }
+            if kind == CuKind::Whole {
+                let luma = self.transform_block(0, x0, y0, log2_size, mode);
+                let chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
+                leaves.push((luma, chroma));
+            } else {
+                let half = size / 2;
+                for i in 0..4u32 {
+                    let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
+                    let luma = self.transform_block(0, x, y, log2_size - 1, mode);
+                    let chroma = if log2_size - 1 > 2 {
+                        self.chroma_blocks(x / 2, y / 2, log2_size - 2, chroma.1)
+                    } else {
+                        None
+                    };
+                    leaves.push((luma, chroma));
+                }
+                if log2_size - 1 == 2 {
+                    small_chroma = self.chroma_blocks(x0 / 2, y0 / 2, 2, chroma.1);
                 }
             }
-            None => {
-                self.bin(ctx::PREV_INTRA_LUMA_PRED_FLAG, false);
-                let below = mpm.iter().filter(|&&m| m < mode).count() as u8;
-                self.cabac.encode_bypass_bits(u32::from(mode - below), 5);
+        }
+
+        // Syntax: part_mode, the luma modes, the chroma mode, then the transform tree.
+        if log2_size == LOG2_MIN_CB {
+            self.bin(ctx::PART_MODE, !four); // 1: PART_2Nx2N, 0: PART_NxN
+        }
+        for &(mode, mpm) in &parts {
+            self.bin(ctx::PREV_INTRA_LUMA_PRED_FLAG, mpm.contains(&mode));
+        }
+        for &(mode, mpm) in &parts {
+            match mpm.iter().position(|&m| m == mode) {
+                Some(i) => {
+                    // mpm_idx: truncated unary, maximum 2.
+                    self.cabac.encode_bypass(u8::from(i > 0));
+                    if i > 0 {
+                        self.cabac.encode_bypass(u8::from(i > 1));
+                    }
+                }
+                None => {
+                    let below = mpm.iter().filter(|&&m| m < mode).count() as u8;
+                    self.cabac.encode_bypass_bits(u32::from(mode - below), 5);
+                }
             }
         }
         if self.chroma {
-            self.bin(ctx::INTRA_CHROMA_PRED_MODE, false); // same mode as luma
+            // intra_chroma_pred_mode: 0 for "as luma", else 1 and two bypass bits.
+            self.bin(ctx::INTRA_CHROMA_PRED_MODE, chroma.0 != 4);
+            if chroma.0 != 4 {
+                self.cabac.encode_bypass_bits(u32::from(chroma.0), 2);
+            }
         }
-        self.fill_grid(x0, y0, size, None, Some(mode));
 
-        // transform_tree() at depth 0, not split: luma, then Cb and Cr of half size.
-        let (cbf_y, d_y) = self.transform_block(0, x0, y0, log2_size, mode);
-        let (mut cbf_cb, mut cbf_cr, mut d_c) = (false, false, 0.0);
+        let split = kind != CuKind::Whole;
+        if !four {
+            // split_transform_flag (max_transform_hierarchy_depth_intra = 1).
+            self.bin(
+                ctx::SPLIT_TRANSFORM_FLAG + usize::from(5 - log2_size),
+                split,
+            );
+        }
+        let cbf = |tb: &Tb| !tb.levels.is_empty();
+        // Chroma cbfs of the root: is there any chroma residual in the tree? With split
+        // transforms of 8×8 or more, each transform unit then has its own.
+        let any = |k: usize| {
+            small_chroma.as_ref().is_some_and(|c| cbf(&c[k]))
+                || leaves
+                    .iter()
+                    .any(|(_, c)| c.as_ref().is_some_and(|c| cbf(&c[k])))
+        };
+        let (cb_any, cr_any) = (any(0), any(1));
         if self.chroma {
-            let d;
-            (cbf_cb, d) = self.transform_block(1, x0 / 2, y0 / 2, log2_size - 1, mode);
-            d_c += d;
-            let d;
-            (cbf_cr, d) = self.transform_block(2, x0 / 2, y0 / 2, log2_size - 1, mode);
-            d_c += d;
-            self.bin(ctx::CBF_CHROMA, cbf_cb);
-            self.bin(ctx::CBF_CHROMA, cbf_cr);
+            self.bin(ctx::CBF_CHROMA, cb_any);
+            self.bin(ctx::CBF_CHROMA, cr_any);
         }
-        self.bin(ctx::CBF_LUMA + 1, cbf_y);
-        if cbf_y {
-            self.residual_coding(0, log2_size, mode);
-        }
-        if cbf_cb {
-            self.residual_coding(1, log2_size - 1, mode);
-        }
-        if cbf_cr {
-            self.residual_coding(2, log2_size - 1, mode);
+        let mut sse = 0.0;
+        let n_leaves = leaves.len();
+        for (i, (luma, chroma)) in leaves.iter().enumerate() {
+            if split && let Some(chroma) = chroma {
+                if cb_any {
+                    self.bin(ctx::CBF_CHROMA + 1, cbf(&chroma[0]));
+                }
+                if cr_any {
+                    self.bin(ctx::CBF_CHROMA + 1, cbf(&chroma[1]));
+                }
+            }
+            self.bin(ctx::CBF_LUMA + usize::from(!split), cbf(luma));
+            if cbf(luma) {
+                self.residual_coding(&luma.levels, 0, luma.log2_size, luma.mode);
+            }
+            sse += luma.sse;
+            // Chroma of 4×4 luma blocks comes with the last of them.
+            let chroma = match chroma {
+                Some(c) => Some(c),
+                None if i + 1 == n_leaves => small_chroma.as_ref(),
+                None => None,
+            };
+            for tb in chroma.into_iter().flatten() {
+                if cbf(tb) {
+                    self.residual_coding(&tb.levels, tb.c, tb.log2_size, tb.mode);
+                }
+                sse += tb.sse;
+            }
         }
 
         self.recon.coding_unit(&CodingUnit {
             x: x0,
             y: y0,
             log2_size,
-            part_nxn: false,
+            part_nxn: four,
             transquant_bypass: false,
             pcm: false,
             qp_y: self.qp,
         });
-        d_y + d_c
+        (
+            sse,
+            cb_any || cr_any || leaves.iter().any(|(luma, _)| cbf(luma)),
+        )
     }
 
     /// `residual_coding()` (§7.3.8.11) of the levels in `self.coeffs[c]`, which has at least one
     /// non-zero level: the mirror of the decoder's parsing.
-    fn residual_coding(&mut self, c: usize, log2_size: u8, intra_mode: u8) {
-        let coeffs = std::mem::take(&mut self.coeffs[c]);
+    fn residual_coding(&mut self, coeffs: &[i32], c: usize, log2_size: u8, intra_mode: u8) {
         let size = 1usize << log2_size;
         let luma = c == 0;
-        let scan = if log2_size == 2 || (log2_size == 3 && luma) {
-            match intra_mode {
-                6..=14 => ScanType::Vertical,
-                22..=30 => ScanType::Horizontal,
-                _ => ScanType::Diagonal,
-            }
-        } else {
-            ScanType::Diagonal
-        };
+        let scan = scan_type(log2_size, luma, intra_mode);
         let log2_sb = log2_size - 2;
         let sb_scan = scan_order(log2_sb, scan);
         let pos_scan = scan_order(2, scan);
@@ -725,9 +989,11 @@ impl<'a> Encoder<'a> {
 
             // Significant positions, in decreasing scan position, and their levels.
             let mut sig = [0i32; 16];
+            let mut sig_pos = [0usize; 16];
             let mut n_sig = 0;
             if i == last_sb {
                 sig[0] = level(i, last_pos);
+                sig_pos[0] = last_pos;
                 n_sig = 1;
             }
             if coded_sb[xs][ys] {
@@ -755,6 +1021,7 @@ impl<'a> Encoder<'a> {
                     // inferred significant (and therefore non-zero).
                     if v != 0 {
                         sig[n_sig] = v;
+                        sig_pos[n_sig] = n;
                         n_sig += 1;
                     }
                 }
@@ -793,7 +1060,10 @@ impl<'a> Encoder<'a> {
                 );
             }
 
-            for &v in &sig[..n_sig] {
+            // Sign data hiding: the sign of the first level follows from the parity.
+            let sign_hidden = sig_pos[0] - sig_pos[n_sig - 1] > 3;
+            let coded_signs = if sign_hidden { n_sig - 1 } else { n_sig };
+            for &v in &sig[..coded_signs] {
                 self.cabac.encode_bypass(u8::from(v < 0));
             }
 
@@ -814,30 +1084,13 @@ impl<'a> Encoder<'a> {
                 }
             }
         }
-        self.coeffs[c] = coeffs;
     }
 
     /// `last_sig_coeff_{x,y}_{prefix,suffix}` for the (scan-swapped) position `last`.
     fn last_sig_coeff(&mut self, last: [u32; 2], log2_size: u8, luma: bool) {
-        let (ctx_offset, ctx_shift) = if luma {
-            (
-                3 * (log2_size - 2) + ((log2_size - 1) >> 2),
-                (log2_size + 1) >> 2,
-            )
-        } else {
-            (15, log2_size - 2)
-        };
+        let (ctx_offset, ctx_shift) = last_ctx(log2_size, luma);
         let c_max = (u32::from(log2_size) << 1) - 1;
-        let split = |pos: u32| -> (u32, Option<(u32, u32)>) {
-            if pos < 4 {
-                return (pos, None);
-            }
-            let n = 31 - pos.leading_zeros() - 1;
-            let b = (pos >> n) - 2;
-            let prefix = 2 * (n + 1) + b;
-            (prefix, Some((pos - ((2 + b) << n), n)))
-        };
-        let parts = last.map(split);
+        let parts = last.map(last_prefix);
         for (k, base) in [ctx::LAST_SIG_COEFF_X_PREFIX, ctx::LAST_SIG_COEFF_Y_PREFIX]
             .into_iter()
             .enumerate()
@@ -889,62 +1142,17 @@ impl<'a> Encoder<'a> {
     }
 }
 
-/// Context increment of `sig_coeff_flag` (§9.3.4.2.5), as in the decoder.
-#[allow(clippy::too_many_arguments)]
-fn sig_ctx_inc(
-    luma: bool,
-    log2_size: u8,
-    xc: usize,
-    yc: usize,
-    xp: u8,
-    yp: u8,
-    prev_csbf: u8,
-    scan: ScanType,
-) -> usize {
-    const CTX_IDX_MAP: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
-    let sig_ctx: usize = if log2_size == 2 {
-        usize::from(CTX_IDX_MAP[(yc << 2) + xc])
-    } else if xc + yc == 0 {
-        0
-    } else {
-        let (xp, yp) = (usize::from(xp), usize::from(yp));
-        let mut s = match prev_csbf {
-            0 => {
-                if xp + yp == 0 {
-                    2
-                } else if xp + yp < 3 {
-                    1
-                } else {
-                    0
-                }
-            }
-            1 => match yp {
-                0 => 2,
-                1 => 1,
-                _ => 0,
-            },
-            2 => match xp {
-                0 => 2,
-                1 => 1,
-                _ => 0,
-            },
-            _ => 2,
-        };
-        if luma {
-            if (xc >> 2) + (yc >> 2) > 0 {
-                s += 3;
-            }
-            s += if log2_size == 3 {
-                if scan == ScanType::Diagonal { 9 } else { 15 }
-            } else {
-                21
-            };
-        } else {
-            s += if log2_size == 3 { 9 } else { 12 };
+/// Scan order of a block (§7.4.9.11): mode-dependent for small blocks, diagonal otherwise.
+fn scan_type(log2_size: u8, luma: bool, intra_mode: u8) -> ScanType {
+    if log2_size == 2 || (log2_size == 3 && luma) {
+        match intra_mode {
+            6..=14 => ScanType::Vertical,
+            22..=30 => ScanType::Horizontal,
+            _ => ScanType::Diagonal,
         }
-        s
-    };
-    if luma { sig_ctx } else { 27 + sig_ctx }
+    } else {
+        ScanType::Diagonal
+    }
 }
 
 #[cfg(test)]
@@ -1022,8 +1230,13 @@ mod tests {
             qp,
             ..EncoderConfig::default()
         };
-        let (picture, recon) =
+        let (picture, recon, kinds) =
             encode_with_reconstruction(w as u32, h as u32, planes, &config).unwrap();
+        KINDS.with(|k| {
+            for (total, n) in k.borrow_mut().iter_mut().zip(kinds) {
+                *total += n;
+            }
+        });
         let stream = picture.annex_b();
 
         // Without in-loop filters, the decoder reproduces the encoder's reconstruction exactly.
@@ -1070,6 +1283,23 @@ mod tests {
             );
         }
         p
+    }
+
+    thread_local! {
+        static KINDS: std::cell::RefCell<[usize; 3]> = const { std::cell::RefCell::new([0; 3]) };
+    }
+
+    #[test]
+    fn every_kind_of_coding_unit_round_trips() {
+        // The decoder reproduces the reconstruction (checked in `round_trip`) whatever the
+        // encoder chose: make sure it chose every kind of coding unit.
+        KINDS.with(|k| *k.borrow_mut() = [0; 3]);
+        for qp in [10, 22, 34] {
+            round_trip(96, 80, qp, false);
+            round_trip(48, 40, qp, true);
+        }
+        let kinds = KINDS.with(|k| *k.borrow());
+        assert!(kinds.iter().all(|&n| n > 0), "{kinds:?}");
     }
 
     #[test]

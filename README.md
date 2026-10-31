@@ -124,12 +124,13 @@ let smaller = heifer::encode_with_metadata(&heifer::decode(&bytes)?, &meta, &opt
 
 Images are stored as 8-bit YCbCr 4:2:0 (sRGB, BT.601 full range), split into 512×512 tiles that are
 encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
-about 0.4 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 43.8 dB against the
-original, both decoded by Apple (1.1 bits per pixel).
+about 1.6 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 41.7 dB against the
+original, both decoded by Apple (1.0 bit per pixel).
 
-The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder is young: it codes intra
-pictures with 8×8 to 32×32 blocks and rate-distortion decisions, but not yet the finer tools of mature
-encoders such as x265 (4×4 transforms, RDOQ), so its files are larger at equal quality.
+The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
+chooses block sizes (32×32 down to 4×4), transform splits and prediction modes by rate-distortion
+cost, with RDOQ and sign data hiding. At equal quality its files are slightly smaller than those of
+x265's `medium` preset: BD-rate −0.6% on a photo and −0.5% on an image with text (PSNR, 6:1:1).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
 
@@ -318,7 +319,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **HDR**: ISO 21496-1 gain maps (`tmap`)
 - [x] **0.3 — Encoder**: HEIF writing, HEVC intra encoder, alpha, parallel tiles; `iloc` construction method 2
 - [x] **0.3.1**: `image` crate encoder, metadata when encoding
-- [ ] **Next**: better compression (4×4 transforms, RDOQ), 10-bit and HDR encoding
+- [x] **0.3.2**: compression on par with x265 `medium` (4×4 blocks, transform splits, RDOQ, sign data hiding)
+- [ ] **Next**: 10-bit and HDR encoding, thumbnails
 - [ ] ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

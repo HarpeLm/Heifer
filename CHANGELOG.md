@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2 — 2026-10-31
+
+**Smaller HEIC files.** At equal quality, the encoder now makes files slightly smaller than x265's
+`medium` preset (BD-rate −0.6% on a photo, −0.5% on an image with text), against +11% and +13%
+before. Encoding is about 4× slower (a 12 MP image in 1.6 s on 10 cores).
+
+- 4×4 prediction blocks in 8×8 coding units, and transform blocks split in four (with the 4×4
+  DST for luma); each coding unit tries these against one transform and keeps the cheapest.
+- The three most promising luma modes are coded for real and compared by rate-distortion cost;
+  the chroma mode is chosen too, instead of always following luma.
+- RDOQ: levels, sub-blocks and the last position chosen with bit costs estimated from the CABAC
+  contexts. Sign data hiding.
+- Coding units that need no residual are not split further.
+- `heifer-hevc-dec`: `Reconstructor::set_reconstructed` (for encoders that try several codings of
+  an area) and the `DST4` matrix are public. `heifer-hevc-enc`: `transform::forward_dst4` and
+  `quantize_exact`, and an `encode_yuv` example for rate-distortion measurements.
+
 ## heifer-cli 0.3.1 — 2026-10-31
 
 - New `heifer-cli` crate: the `heifer` command converts HEIC/HEIF to and from PNG, JPEG, WebP,

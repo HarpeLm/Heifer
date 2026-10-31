@@ -1,7 +1,8 @@
 # heifer-hevc-enc
 
 Pure-Rust HEVC (H.265) intra encoder for still images: Main profile, 8-bit 4:2:0 or monochrome,
-coding blocks of 8×8 to 32×32 chosen by rate-distortion cost, CABAC. No C, no `unsafe`, runs in
+blocks of 4×4 to 32×32, prediction modes and transform splits chosen by rate-distortion cost, RDOQ,
+sign data hiding. At equal quality, its files are slightly smaller than x265's `medium` preset. No C, no `unsafe`, runs in
 WebAssembly. The pictures are reconstructed with the code of
 [`heifer-hevc-dec`](https://crates.io/crates/heifer-hevc-dec), so the decoder reproduces them
 exactly.

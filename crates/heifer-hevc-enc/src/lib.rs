@@ -20,6 +20,7 @@
 pub mod cabac;
 pub mod encoder;
 mod params;
+mod rdo;
 pub mod transform;
 
 /// Errors produced while encoding an image.

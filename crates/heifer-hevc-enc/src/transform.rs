@@ -1,34 +1,66 @@
 //! Forward transform and quantization: the counterparts of the decoder's scaling and inverse
 //! transform (H.265 §8.6.2 to §8.6.4), for 8-bit samples and flat scaling.
 
-use heifer_hevc_dec::recon::DCT32;
+use heifer_hevc_dec::recon::{DCT32, DST4};
+
+/// The `N`-point DCT matrix: rows `k * 32 / N` of [`DCT32`], first `N` columns.
+const fn dct_matrix<const N: usize>() -> [[i32; N]; N] {
+    let mut m = [[0; N]; N];
+    let mut k = 0;
+    while k < N {
+        let mut n = 0;
+        while n < N {
+            m[k][n] = DCT32[k * (32 / N)][n];
+            n += 1;
+        }
+        k += 1;
+    }
+    m
+}
+
+const DCT4: [[i32; 4]; 4] = dct_matrix();
+const DCT8: [[i32; 8]; 8] = dct_matrix();
+const DCT16: [[i32; 16]; 16] = dct_matrix();
 
 /// Forward 2-D DCT of an `n`×`n` residual (`n` = 4..=32), row-major. The output has the scale
 /// that the decoder's inverse transform expects, as in the HM reference encoder.
 pub fn forward_dct(residual: &[i32], log2_size: u8, out: &mut [i32]) {
-    let n = 1usize << log2_size;
-    let step = 32 / n;
-    let bit_depth = 8;
-    // First stage: columns (vertical frequencies), then rows.
-    let shift1 = u32::from(log2_size) + bit_depth - 9;
-    let shift2 = u32::from(log2_size) + 6;
-    let mut tmp = vec![0i32; n * n];
-    for k in 0..n {
-        let basis = &DCT32[k * step];
-        for x in 0..n {
-            let s: i64 = (0..n)
-                .map(|y| i64::from(basis[y]) * i64::from(residual[y * n + x]))
-                .sum();
-            tmp[k * n + x] = ((s + (1 << shift1 >> 1)) >> shift1) as i32;
+    match log2_size {
+        2 => forward(residual, &DCT4, out),
+        3 => forward(residual, &DCT8, out),
+        4 => forward(residual, &DCT16, out),
+        _ => forward(residual, &DCT32, out),
+    }
+}
+
+/// Forward 4×4 DST-VII, used instead of the DCT for 4×4 intra luma blocks.
+pub fn forward_dst4(residual: &[i32], out: &mut [i32]) {
+    forward(residual, &DST4, out);
+}
+
+/// Separable forward transform with `basis[frequency][position]`: columns first, then rows.
+/// The sums fit in `i32`: 8-bit residuals, basis values of at most 90 in magnitude.
+fn forward<const N: usize>(residual: &[i32], basis: &[[i32; N]; N], out: &mut [i32]) {
+    let log2_size = N.trailing_zeros() as i32;
+    let shift1 = log2_size + 8 - 9;
+    let shift2 = log2_size + 6;
+    let mut tmp = [[0i32; N]; N];
+    for (row, b) in tmp.iter_mut().zip(basis) {
+        // Whole rows at once, which the compiler vectorizes.
+        let mut acc = [0i32; N];
+        for (y, &weight) in b.iter().enumerate() {
+            for (a, &r) in acc.iter_mut().zip(&residual[y * N..y * N + N]) {
+                *a += weight * r;
+            }
+        }
+        for (t, a) in row.iter_mut().zip(acc) {
+            *t = (a + (1 << shift1 >> 1)) >> shift1;
         }
     }
-    for k in 0..n {
-        for l in 0..n {
-            let basis = &DCT32[l * step];
-            let s: i64 = (0..n)
-                .map(|x| i64::from(basis[x]) * i64::from(tmp[k * n + x]))
-                .sum();
-            out[k * n + l] = ((s + (1 << (shift2 - 1))) >> shift2) as i32;
+    for (k, row) in tmp.iter().enumerate() {
+        for (l, b) in basis.iter().enumerate() {
+            let s: i32 = b.iter().zip(row).map(|(&w, &t)| w * t).sum();
+            out[k * N + l] = (s + (1 << (shift2 - 1))) >> shift2;
         }
     }
 }
@@ -50,6 +82,19 @@ pub fn quantize(coeffs: &mut [i32], log2_size: u8, qp: i32) -> bool {
         any |= level != 0;
     }
     any
+}
+
+/// Like [`quantize`], also giving the unrounded level of each coefficient (signed, in units of
+/// the quantization step) in `exact`, for rate-distortion refinements of the levels.
+pub fn quantize_exact(coeffs: &mut [i32], log2_size: u8, qp: i32, exact: &mut [f32]) -> bool {
+    let transform_shift = 15 - 8 - i32::from(log2_size);
+    let qbits = 14 + qp / 6 + transform_shift;
+    let unit = 1.0 / f64::from(1u32 << qbits);
+    let scale = QUANT_SCALE[(qp % 6) as usize];
+    for (e, &c) in exact.iter_mut().zip(coeffs.iter()) {
+        *e = (f64::from(c) * scale as f64 * unit) as f32;
+    }
+    quantize(coeffs, log2_size, qp)
 }
 
 /// `QpC` of 4:2:0 chroma for a luma QP (Table 8-10), without chroma QP offsets.

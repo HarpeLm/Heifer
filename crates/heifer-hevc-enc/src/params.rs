@@ -1,7 +1,8 @@
 //! Parameter sets, slice header and NAL units of the encoded stream (H.265 §7.3).
 //!
 //! The stream is a single IDR picture with one slice: 8-bit, 4:2:0 or 4:0:0, CTBs of 32×32,
-//! coding blocks of 8×8 to 32×32, one transform per coding block, deblocking on, SAO off.
+//! coding blocks of 8×8 to 32×32 (with 4×4 prediction blocks), transform blocks split once at
+//! most, sign data hiding, deblocking on, SAO off.
 
 /// Writes bits MSB-first, with Exp-Golomb codes.
 #[derive(Debug, Default)]
@@ -173,7 +174,7 @@ impl StreamParams {
         w.bit(true).ue(0).ue(0).ue(0); // sub-layer ordering info
         w.ue(0).ue(2); // coding blocks 8×8 to 32×32
         w.ue(0).ue(3); // transform blocks 4×4 to 32×32
-        w.ue(0).ue(0); // max_transform_hierarchy_depth_inter / intra
+        w.ue(0).ue(1); // max_transform_hierarchy_depth_inter / intra
         w.bit(false).bit(false).bit(false).bit(false); // scaling lists, AMP, SAO, PCM
         w.ue(0).bit(false).bit(false); // no RPS, no long-term pictures, no TMVP
         w.bit(true); // strong_intra_smoothing_enabled_flag
@@ -197,7 +198,7 @@ impl StreamParams {
         let mut w = BitWriter::default();
         w.ue(0).ue(0); // PPS 0, SPS 0
         w.bit(false).bit(false).bits(0, 3); // dependent slices, output flag, extra header bits
-        w.bit(false).bit(false); // sign_data_hiding, cabac_init_present
+        w.bit(true).bit(false); // sign_data_hiding, cabac_init_present
         w.ue(0).ue(0); // num_ref_idx_l{0,1}_default_active_minus1
         w.se(self.qp - 26); // init_qp_minus26
         w.bit(false).bit(false).bit(false); // constrained intra, transform skip, cu_qp_delta
