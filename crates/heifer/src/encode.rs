@@ -338,35 +338,42 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         return Ok(encode_picture16(size.0, size.1, planes, config)?);
     }
 
-    // BT.601, full range, in 16-bit fixed point. Chroma is the average of each 2×2 block.
+    // BT.601, full range, in 16-bit fixed point.
     let mut y = Vec::with_capacity(w * h);
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let mut cb_sum = vec![0i32; cw * ch];
-    let mut cr_sum = vec![0i32; cw * ch];
+    let mut cb_full = Vec::with_capacity(w * h);
+    let mut cr_full = Vec::with_capacity(w * h);
     for row in 0..h {
         for col in 0..w {
             let [r, g, b, _] = at(col, row).map(i32::from);
             y.push(((19595 * r + 38470 * g + 7471 * b + 32768) >> 16) as u16);
-            let i = (row / 2) * cw + col / 2;
-            cb_sum[i] += -11059 * r - 21709 * g + 32768 * b;
-            cr_sum[i] += 32768 * r - 27439 * g - 5329 * b;
+            cb_full.push(-11059 * r - 21709 * g + 32768 * b);
+            cr_full.push(32768 * r - 27439 * g - 5329 * b);
         }
     }
-    let count = |i: usize| -> i32 {
-        let (cx, cy) = (i % cw, i / cw);
-        ((w - 2 * cx).min(2) * (h - 2 * cy).min(2)) as i32
-    };
+    // 4:2:0 with the chroma samples on the even rows and columns, where Apple's decoder (and
+    // heifer's) puts them: a [1 2 1] filter in both directions around each of them.
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let (mid, max) = (1i64 << (bit_depth - 1), (1i64 << bit_depth) - 1);
-    let chroma = |sums: &[i32]| -> Vec<u16> {
-        sums.iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let n = i64::from(count(i)) << 16;
-                ((i64::from(s) + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16
-            })
-            .collect()
+    let chroma = |full: &[i32]| -> Vec<u16> {
+        let mut out = Vec::with_capacity(cw * ch);
+        for cy in 0..ch {
+            let rows = [(2 * cy).saturating_sub(1), 2 * cy, (2 * cy + 1).min(h - 1)];
+            for cx in 0..cw {
+                let x = 2 * cx;
+                let cols = [x.saturating_sub(1), x, (x + 1).min(w - 1)];
+                let mut sum = 0i64;
+                for (r, wy) in rows.into_iter().zip([1i64, 2, 1]) {
+                    for (c, wx) in cols.into_iter().zip([1i64, 2, 1]) {
+                        sum += wy * wx * i64::from(full[r * w + c]);
+                    }
+                }
+                let n = 16i64 << 16;
+                out.push(((sum + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16);
+            }
+        }
+        out
     };
-    let (cb, cr) = (chroma(&cb_sum), chroma(&cr_sum));
+    let (cb, cr) = (chroma(&cb_full), chroma(&cr_full));
     let planes = Planes16 {
         y: &y,
         chroma: Some((&cb, &cr)),

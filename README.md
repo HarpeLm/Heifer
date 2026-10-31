@@ -126,7 +126,7 @@ Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Mai
 has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
 into 512×512 tiles that are
 encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
-about 0.7 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 41.7 dB against the
+about 0.7 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 42.0 dB against the
 original, both decoded by Apple (1.0 bit per pixel).
 
 The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
@@ -193,7 +193,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
-| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, metadata, `clap`) | 4:4:4, HDR gain maps, lossless |
@@ -227,9 +227,9 @@ reproduces the encoder's reconstruction sample for sample.
 
 | Photo | Content | Result |
 |---|---|---|
-| iPhone 13 Pro | 4032×3024, 48-tile grid, HDR gain map, depth map | ≈ 61 dB vs ffmpeg |
+| iPhone 13 Pro | 4032×3024, 48-tile grid, HDR gain map, depth map | ✓ |
 | iPhone 8 Plus | rotated 270° | correct orientation |
-| iPhone 15 Pro | spatial (stereo) photo | ≈ 62 dB |
+| iPhone 15 Pro | spatial (stereo) photo | ✓ |
 | Samsung Galaxy S24 Ultra | 200 MP, 768 tiles | decoded (ffmpeg fails) |
 | Xiaomi, Sony, others | grids, 8/10/12-bit, alpha | ✓ |
 | Corrupted / truncated files | | clean errors, never a panic |
@@ -275,7 +275,7 @@ Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine
 |---|---|---|---|
 | License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | AGPL-3.0 or commercial |
 | Test files decoded (of 53) | 50 | 49 (no `iovl` overlays) | 50 (refuses 200 MP by default) |
-| iPhone colours vs ffmpeg | 61 dB | 27 dB (full-range video decoded as limited range) | 61 dB |
+| Colours vs Apple's decoder (median of 13 Apple and other files) | **50 dB** | 27 dB (full-range video decoded as limited range) | 40 dB |
 | Apple HDR gain maps applied | ✓ | – | extraction only |
 | Speed, 12 MP iPhone photo, 1 thread | 165 ms | **128 ms** | 227 ms |
 

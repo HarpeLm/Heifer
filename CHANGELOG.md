@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.7 — 2026-10-31
+
+**Colours as Apple shows them.** Decoded images now match the output of Apple's decoder
+(ImageIO) within about 50 dB PSNR on Apple photos, instead of 35 to 48 dB, closer than any other
+decoder measured (ffmpeg, heic-decoder, heic, heic-rs, zune-heic).
+
+- 4:2:0 and 4:2:2 chroma is upsampled bilinearly with the chroma samples on the even luma rows
+  and columns, as Apple's decoder does, instead of by nearest neighbour. About 4% slower on one
+  core.
+- The encoder computes its chroma on the same positions (a [1 2 1] filter in both directions):
+  files are decoded more faithfully by Apple and heifer, 22 to 31% smaller than those of Apple's
+  encoder at equal quality as Apple decodes them (15 to 30% before).
+
 ## 0.3.6 — 2026-10-31
 
 **Faster encoding on each core.** A 12 MP image takes 3.5 s on one core (4.6 s in 0.3.4) and

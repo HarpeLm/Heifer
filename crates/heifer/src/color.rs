@@ -35,8 +35,9 @@ fn kr_kb(matrix: u16) -> (f64, f64) {
     }
 }
 
-/// Converts a decoded frame to an RGBA image (alpha opaque). Chroma is upsampled by
-/// nearest neighbour.
+/// Converts a decoded frame to an RGBA image (alpha opaque). Subsampled chroma is upsampled
+/// bilinearly, with the chroma samples on the even luma rows and columns, as Apple's decoder
+/// does: decoded photos then match what Apple's devices show.
 pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
     let (w, h) = (frame.widths[0], frame.heights[0]);
     let mut data = vec![0; w as usize * h as usize * 4];
@@ -135,30 +136,80 @@ pub fn frame_to_rgba_into(
         let at = |t: &[i32], v: u16| t[usize::from(v).min(t.len() - 1)];
         let max = (1i32 << out_depth) - 1;
         let to_out = |v: i32| ((v + (1 << (FRAC - 1))) >> FRAC).clamp(0, max) as u16;
-        let (mut rc, mut gc, mut bc) = (vec![0; cwu], vec![0; cwu], vec![0; cwu]);
-        let mut current_chroma_row = usize::MAX;
+        // Chroma terms (R, G, B contributions) of one chroma row. The conversion is linear, so
+        // interpolating the terms is interpolating the chroma samples.
+        let row_terms = |yc: usize, t: &mut [[i32; 3]]| {
+            let cb_row = &frame.planes[1][yc * cwu..(yc + 1) * cwu];
+            let cr_row = &frame.planes[2][yc * cwu..(yc + 1) * cwu];
+            for ((t, &cb), &cr) in t.iter_mut().zip(cb_row).zip(cr_row) {
+                *t = [
+                    at(&r_lut, cr),
+                    at(&gr_lut, cr) + at(&gb_lut, cb),
+                    at(&b_lut, cb),
+                ];
+            }
+        };
+        let avg = |a: [i32; 3], b: [i32; 3]| core::array::from_fn(|k| (a[k] + b[k] + 1) >> 1);
+        let last_row = chh as usize - 1;
+        // Terms of the chroma rows above and below the current luma row, and of the luma row.
+        let (mut above, mut below, mut terms) =
+            (vec![[0; 3]; cwu], vec![[0; 3]; cwu], vec![[0; 3]; cwu]);
+        let mut loaded = (usize::MAX, usize::MAX);
         for (y, out_row) in rows {
-            let (yc, cb_row, cr_row) = chroma_rows(y);
-            if yc != current_chroma_row {
-                current_chroma_row = yc;
-                for (i, (&cb, &cr)) in cb_row.iter().zip(cr_row).enumerate() {
-                    rc[i] = at(&r_lut, cr);
-                    bc[i] = at(&b_lut, cb);
-                    gc[i] = at(&gr_lut, cr) + at(&gb_lut, cb);
+            // Vertically: chroma rows sit on even luma rows (4:2:0); odd rows are in between.
+            let j = y / sy as usize;
+            let next = if sy == 2 && y % 2 == 1 {
+                (j + 1).min(last_row)
+            } else {
+                j
+            };
+            if loaded.0 != j {
+                if loaded.1 == j {
+                    std::mem::swap(&mut above, &mut below);
+                } else {
+                    row_terms(j.min(last_row), &mut above);
+                }
+                loaded = (j, usize::MAX);
+            }
+            if next != j && loaded.1 != next {
+                row_terms(next, &mut below);
+                loaded.1 = next;
+            }
+            if next == j {
+                terms.copy_from_slice(&above);
+            } else {
+                for ((t, &a), &b) in terms.iter_mut().zip(&above).zip(&below) {
+                    *t = avg(a, b);
                 }
             }
-            let pixels = out_row[..width * 4]
-                .chunks_exact_mut(4)
-                .zip(luma_row(y))
-                .zip(&xcs);
-            for ((px, &yv), &xc) in pixels {
+            let pixel = |px: &mut [u16], yv: u16, [r, g, b]: [i32; 3]| {
                 let yf = at(&y_lut, yv);
-                px.copy_from_slice(&[
-                    to_out(yf + rc[xc]),
-                    to_out(yf - gc[xc]),
-                    to_out(yf + bc[xc]),
-                    alpha,
-                ]);
+                px.copy_from_slice(&[to_out(yf + r), to_out(yf - g), to_out(yf + b), alpha]);
+            };
+            if sx == 2 {
+                // Horizontally: chroma samples on even columns, odd columns in between.
+                let pairs = out_row[..width * 4]
+                    .chunks_mut(8)
+                    .zip(luma_row(y).chunks(2))
+                    .enumerate();
+                for (i, (px, luma)) in pairs {
+                    let t = terms[i.min(cwu - 1)];
+                    let mut px = px.chunks_exact_mut(4);
+                    if let Some(p) = px.next() {
+                        pixel(p, luma[0], t);
+                    }
+                    if let (Some(p), Some(&yv)) = (px.next(), luma.get(1)) {
+                        pixel(p, yv, avg(t, terms[(i + 1).min(cwu - 1)]));
+                    }
+                }
+            } else {
+                let pixels = out_row[..width * 4]
+                    .chunks_exact_mut(4)
+                    .zip(luma_row(y))
+                    .zip(&xcs);
+                for ((px, &yv), &xc) in pixels {
+                    pixel(px, yv, terms[xc]);
+                }
             }
         }
         return;
