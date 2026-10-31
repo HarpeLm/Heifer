@@ -230,6 +230,15 @@ const fn diagonal_index<const N: usize, const NN: usize>() -> [u8; NN] {
 const DIAGONAL_INDEX_4: [u8; 16] = diagonal_index::<4, 16>();
 const DIAGONAL_INDEX_8: [u8; 64] = diagonal_index::<8, 64>();
 
+/// Reference samples of an intra-predicted block, from
+/// [`Reconstructor::intra_references`].
+#[derive(Debug, Clone)]
+pub struct IntraReferences {
+    samples: [i32; 4 * 32 + 1],
+    c: usize,
+    n: usize,
+}
+
 /// Reconstructs a picture from the blocks emitted by the parser.
 #[derive(Debug)]
 pub struct Reconstructor<'a> {
@@ -371,8 +380,6 @@ impl<'a> Reconstructor<'a> {
             == self.layout.tile_of_rs((y >> l) * w + (x >> l))
     }
 
-    /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (§8.4.4.2).
-    #[allow(clippy::too_many_arguments)]
     /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (in samples of
     /// that component) with `mode`, from the samples reconstructed so far, into `pred`
     /// (row-major). Nothing is written to the picture: for encoders comparing modes.
@@ -380,6 +387,24 @@ impl<'a> Reconstructor<'a> {
         self.predict(c, x0, y0, n, mode, false, pred);
     }
 
+    /// The reference samples of the intra prediction of a block (see
+    /// [`predict_block`](Self::predict_block)), to predict it with several modes at once with
+    /// [`predict_from`](Self::predict_from).
+    pub fn intra_references(&self, c: usize, x0: u32, y0: u32, n: usize) -> IntraReferences {
+        IntraReferences {
+            samples: self.reference_samples(c, x0, y0, n),
+            c,
+            n,
+        }
+    }
+
+    /// Intra prediction with `mode` from reference samples given by
+    /// [`intra_references`](Self::intra_references), into `pred` (row-major).
+    pub fn predict_from(&self, refs: &IntraReferences, mode: u8, pred: &mut [i32]) {
+        self.predict_with(refs.c, refs.n, mode, false, &refs.samples, pred);
+    }
+
+    /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (§8.4.4.2).
     #[allow(clippy::too_many_arguments)]
     fn predict(
         &self,
@@ -391,10 +416,14 @@ impl<'a> Reconstructor<'a> {
         transquant_bypass: bool,
         pred: &mut [i32],
     ) {
-        // disableIntraBoundaryFilter (range extension).
-        let boundary_filters = c == 0
-            && n < 32
-            && !(self.sps.range_extension.implicit_rdpcm_enabled_flag && transquant_bypass);
+        let refs = self.reference_samples(c, x0, y0, n);
+        self.predict_with(c, n, mode, transquant_bypass, &refs, pred);
+    }
+
+    /// Reference samples of a block, substituted where unavailable (§8.4.4.2.2): index 0 =
+    /// p[-1][2n-1] (bottom of the left column) ... index 2n = p[-1][-1] ... index 4n =
+    /// p[2n-1][-1] (right end of the top row).
+    fn reference_samples(&self, c: usize, x0: u32, y0: u32, n: usize) -> [i32; 4 * 32 + 1] {
         let (sw, sh) = if c == 0 {
             (1, 1)
         } else {
@@ -409,9 +438,9 @@ impl<'a> Reconstructor<'a> {
         // p[-1][-1] ... index 4n = p[2n-1][-1] (right end of the top row), as in the
         // substitution order of §8.4.4.2.2.
         let total = 4 * n + 1;
-        let mut refs = [0i32; 4 * 32 + 1];
+        let mut all_refs = [0i32; 4 * 32 + 1];
         let mut avail = [false; 4 * 32 + 1];
-        let (refs, avail) = (&mut refs[..total], &mut avail[..total]);
+        let (refs, avail) = (&mut all_refs[..total], &mut avail[..total]);
         let mut any = false;
         // Availability is decided per 4×4 luma block, i.e. per run of `unit_x` (`unit_y`)
         // samples of this component along the top row (left column).
@@ -471,6 +500,27 @@ impl<'a> Reconstructor<'a> {
                 }
             }
         }
+        all_refs
+    }
+
+    /// Intra prediction from reference samples (§8.4.4.2.3 to §8.4.4.2.6).
+    fn predict_with(
+        &self,
+        c: usize,
+        n: usize,
+        mode: u8,
+        transquant_bypass: bool,
+        all_refs: &[i32; 4 * 32 + 1],
+        pred: &mut [i32],
+    ) {
+        // disableIntraBoundaryFilter (range extension).
+        let boundary_filters = c == 0
+            && n < 32
+            && !(self.sps.range_extension.implicit_rdpcm_enabled_flag && transquant_bypass);
+        let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
+        let total = 4 * n + 1;
+        let mut copy = *all_refs;
+        let refs = &mut copy[..total];
         // p[-1][y] = left(y), p[x][-1] = top(x), with -1 meaning the corner.
         let left = |r: &[i32], y: i32| r[(2 * n as i32 - 1 - y) as usize];
         let top = |r: &[i32], x: i32| r[(2 * n as i32 + 1 + x) as usize];
@@ -799,7 +849,16 @@ impl<'a> Reconstructor<'a> {
         }
     }
 
-    fn transform_block_impl(&mut self, tb: &TransformBlock<'_>) {
+    /// Like [`Sink::transform_block`], with the intra prediction of the block already
+    /// computed (by [`predict_block`](Self::predict_block) or
+    /// [`predict_from`](Self::predict_from)): for encoders, which predict before coding.
+    pub fn reconstruct(&mut self, tb: &TransformBlock<'_>, prediction: &[i32]) {
+        if self.error.is_none() {
+            self.transform_block_impl(tb, Some(prediction));
+        }
+    }
+
+    fn transform_block_impl(&mut self, tb: &TransformBlock<'_>, prediction: Option<&[i32]>) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -807,7 +866,10 @@ impl<'a> Reconstructor<'a> {
         let (residual, rest) = rest.split_at_mut(32 * 32);
         let d = &mut rest[..32 * 32];
         let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
-        self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred);
+        match prediction {
+            Some(p) => pred.copy_from_slice(&p[..n * n]),
+            None => self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred),
+        }
 
         if let Some(coeffs) = tb.coeffs {
             self.residual(tb, coeffs, residual, d);
@@ -856,7 +918,7 @@ impl<'a> Reconstructor<'a> {
 impl Sink for Reconstructor<'_> {
     fn transform_block(&mut self, tb: &TransformBlock<'_>) {
         if self.error.is_none() {
-            self.transform_block_impl(tb);
+            self.transform_block_impl(tb, None);
         }
     }
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.6 — 2026-10-31
+
+**Faster encoding on each core.** A 12 MP image takes 3.5 s on one core (4.6 s in 0.3.4) and
+0.7 s on a 10-core Mac (0.9 s); same files.
+
+- The encoder gathers the reference samples of a block once for all the prediction modes it
+  compares, and reconstructs coded blocks from the prediction it already computed.
+- `heifer-hevc-dec`: `Reconstructor::intra_references`, `predict_from` and `reconstruct`, for
+  encoders; decoding is unchanged (same output, same speed).
+- RDOQ precomputes the scan positions and magnitudes of each block.
+
 ## 0.3.5 — 2026-10-31
 
 - Encoder: trials estimate their rate instead of coding it. Their bins go to a log that adds

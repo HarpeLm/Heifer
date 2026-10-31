@@ -13,7 +13,7 @@ use heifer_hevc_dec::contexts::{Contexts, ctx};
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
 use heifer_hevc_dec::recon::Frame;
-use heifer_hevc_dec::recon::Reconstructor;
+use heifer_hevc_dec::recon::{IntraReferences, Reconstructor};
 use heifer_hevc_dec::scan::{ScanType, scan_order};
 use heifer_hevc_dec::slice::SliceHeader;
 use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
@@ -610,6 +610,31 @@ impl<'a> Encoder<'a> {
         let mut pred = std::mem::take(&mut self.pred);
         self.recon
             .predict_block(c, x, y, n, mode, &mut pred[..n * n]);
+        self.pred = pred;
+        self.diff_from_prediction(c, x, y, n);
+    }
+
+    /// Like [`predict`](Self::predict), from reference samples gathered once for several modes.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_from(
+        &mut self,
+        refs: &IntraReferences,
+        c: usize,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: u8,
+    ) {
+        let n = 1usize << log2_size;
+        let mut pred = std::mem::take(&mut self.pred);
+        self.recon.predict_from(refs, mode, &mut pred[..n * n]);
+        self.pred = pred;
+        self.diff_from_prediction(c, x, y, n);
+    }
+
+    /// `self.diff` = source − `self.pred`, for an `n`×`n` block.
+    fn diff_from_prediction(&mut self, c: usize, x: u32, y: u32, n: usize) {
+        let pred = std::mem::take(&mut self.pred);
         let src = &self.src[c];
         for row in 0..n {
             let s = (y as usize + row) * src.width + x as usize;
@@ -634,11 +659,12 @@ impl<'a> Encoder<'a> {
     ) -> Vec<u8> {
         let n = 1usize << log2_size;
         let mut costs: Vec<(f64, u8)> = Vec::with_capacity(20);
+        let refs = self.recon.intra_references(0, x0, y0, n);
         let eval = |enc: &mut Self, costs: &mut Vec<(f64, u8)>, mode: u8| {
             if costs.iter().any(|&(_, m)| m == mode) {
                 return;
             }
-            enc.predict(0, x0, y0, log2_size, mode);
+            enc.predict_from(&refs, 0, x0, y0, log2_size, mode);
             let bits = match mpm.iter().position(|&m| m == mode) {
                 Some(0) => 2.0,
                 Some(_) => 3.0,
@@ -726,20 +752,25 @@ impl<'a> Encoder<'a> {
                 cols = cols.max(i % n + 1);
                 rows = rows.max(i / n + 1);
             }
-            self.recon.transform_block(&TransformBlock {
-                c_idx: c as u8,
-                x,
-                y,
-                log2_size,
-                intra_mode: mode,
-                coeffs: coded.then_some(&*levels),
-                coeff_bounds: (cols as u8, rows as u8),
-                transform_skip: false,
-                transquant_bypass: false,
-                qp_y: self.qp,
-                cu_qp_offset: 0,
-                res_scale_val: 0,
-            });
+            let prediction = std::mem::take(&mut self.pred);
+            self.recon.reconstruct(
+                &TransformBlock {
+                    c_idx: c as u8,
+                    x,
+                    y,
+                    log2_size,
+                    intra_mode: mode,
+                    coeffs: coded.then_some(&*levels),
+                    coeff_bounds: (cols as u8, rows as u8),
+                    transform_skip: false,
+                    transquant_bypass: false,
+                    qp_y: self.qp,
+                    cu_qp_offset: 0,
+                    res_scale_val: 0,
+                },
+                &prediction,
+            );
+            self.pred = prediction;
         }
         let levels = if coded {
             coeffs[..n * n].to_vec()
@@ -773,6 +804,7 @@ impl<'a> Encoder<'a> {
     /// returns `intra_chroma_pred_mode` (4 = same as luma) and the mode it gives.
     fn choose_chroma_mode(&mut self, xc: u32, yc: u32, log2_size: u8, luma: u8) -> (u8, u8) {
         let n = 1usize << log2_size;
+        let refs = [1, 2].map(|c| self.recon.intra_references(c, xc, yc, n));
         let mut best = (f64::MAX, 4, luma);
         for syntax in [4u8, 0, 1, 2, 3] {
             let mode = match syntax {
@@ -784,7 +816,7 @@ impl<'a> Encoder<'a> {
             };
             let mut cost = self.sqrt_lambda * if syntax == 4 { 1.0 } else { 3.0 };
             for c in 1..=2 {
-                self.predict(c, xc, yc, log2_size, mode);
+                self.predict_from(&refs[c - 1], c, xc, yc, log2_size, mode);
                 cost += satd(&self.diff[..n * n], n) as f64;
             }
             if cost < best.0 {

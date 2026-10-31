@@ -93,6 +93,8 @@ pub(crate) struct RdoqScratch {
     cost_sig1: Vec<f32>,
     cost_zero: Vec<f32>,
     zero_after: Vec<f32>,
+    positions: Vec<(u16, u8, u8)>,
+    magnitudes: Vec<f32>,
 }
 
 impl RdoqScratch {
@@ -104,6 +106,8 @@ impl RdoqScratch {
             cost_sig1: vec![0.0; 1024],
             cost_zero: vec![0.0; 1024],
             zero_after: vec![0.0; 1025],
+            positions: vec![(0, 0, 0); 1024],
+            magnitudes: vec![0.0; 1024],
         }
     }
 }
@@ -148,24 +152,7 @@ pub(crate) fn rdoq(
     let pos_scan = scan_order(2, scan);
     let sb_width = 1usize << log2_sb;
     let n = 1usize << (2 * log2_size);
-    // Coefficient index of each scan position (sub-block · 16 + position).
-    let index = |g: usize| -> (usize, usize, usize) {
-        let (xs, ys) = sb_scan[g / 16];
-        let (xp, yp) = pos_scan[g % 16];
-        let (x, y) = (
-            usize::from(xs) * 4 + usize::from(xp),
-            usize::from(ys) * 4 + usize::from(yp),
-        );
-        (y * size + x, x, y)
-    };
-    levels[..n].fill(0);
-    let magnitude = |g: usize| exact[index(g).0].abs();
-    let Some(last_start) = (0..n).rev().find(|&g| magnitude(g) >= 0.5) else {
-        return;
-    };
-
     let table = scratch.bits;
-    let ctx_bits = |i: usize, bin: bool| bits(&table, &contexts[i], bin);
     // Per scan position: chosen magnitude, cost when coded, cost of the sig flag alone, cost
     // of zero (error² plus the sig flag). Every position up to `last_start` is written below
     // before being read.
@@ -175,8 +162,31 @@ pub(crate) fn rdoq(
         cost_sig1,
         cost_zero,
         zero_after,
+        positions,
+        magnitudes,
         ..
     } = scratch;
+    // Coefficient index and position of each scan position (sub-block · 16 + position), and
+    // its unrounded magnitude.
+    for (sb, &(xs, ys)) in sb_scan.iter().enumerate() {
+        for (p, &(xp, yp)) in pos_scan.iter().enumerate() {
+            let (x, y) = (xs * 4 + xp, ys * 4 + yp);
+            let i = usize::from(y) * size + usize::from(x);
+            positions[sb * 16 + p] = (i as u16, x, y);
+            magnitudes[sb * 16 + p] = exact[i].abs();
+        }
+    }
+    let (positions, magnitudes) = (&*positions, &*magnitudes);
+    let index = |g: usize| -> (usize, usize, usize) {
+        let (i, x, y) = positions[g];
+        (usize::from(i), usize::from(x), usize::from(y))
+    };
+    let magnitude = |g: usize| magnitudes[g];
+    levels[..n].fill(0);
+    let Some(last_start) = magnitudes[..n].iter().rposition(|&m| m >= 0.5) else {
+        return;
+    };
+    let ctx_bits = |i: usize, bin: bool| bits(&table, &contexts[i], bin);
     let mut coded_sb = [[false; 8]; 8];
     let mut sb_cost = [0f32; 64]; // chosen cost of each sub-block (with its flag)
     let mut sb_zero = [0f32; 64]; // cost of dropping it
