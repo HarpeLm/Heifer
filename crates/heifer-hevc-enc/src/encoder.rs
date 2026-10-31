@@ -20,9 +20,9 @@ use heifer_hevc_dec::syntax::{CodingUnit, Sink, TransformBlock};
 
 use crate::Error;
 use crate::cabac::{ArithmeticEncoder, Checkpoint};
-use crate::params::{NalType, PROFILE_MAIN, StreamParams, nal_unit};
+use crate::params::{NalType, StreamParams, nal_unit};
 use crate::rdo::{hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
-use crate::transform::{chroma_qp, forward_dct, forward_dst4, quantize_exact, satd};
+use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
 const LOG2_CTB: u8 = 5;
 const LOG2_MIN_CB: u8 = 3;
@@ -35,6 +35,18 @@ pub struct Planes<'a> {
     /// Chroma planes of 4:2:0 pictures, `ceil(width / 2) × ceil(height / 2)` each; `None` for
     /// monochrome pictures (e.g. alpha planes).
     pub chroma: Option<(&'a [u8], &'a [u8])>,
+}
+
+/// Planes of up to 10 bits per sample, for [`encode_picture16`]: same layout as [`Planes`].
+#[derive(Debug, Clone, Copy)]
+pub struct Planes16<'a> {
+    /// Luma, `width × height`, row-major.
+    pub y: &'a [u16],
+    /// Chroma planes of 4:2:0 pictures, `ceil(width / 2) × ceil(height / 2)` each; `None` for
+    /// monochrome pictures.
+    pub chroma: Option<(&'a [u16], &'a [u16])>,
+    /// Bits per sample: 8 (Main profile) to 10 (Main 10). Samples must fit.
+    pub bit_depth: u8,
 }
 
 /// Encoding parameters.
@@ -97,6 +109,27 @@ pub fn encode_picture(
     planes: Planes<'_>,
     config: &EncoderConfig,
 ) -> Result<EncodedPicture, Error> {
+    let wide = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
+    let (y, chroma) = (
+        wide(planes.y),
+        planes.chroma.map(|(cb, cr)| (wide(cb), wide(cr))),
+    );
+    let planes = Planes16 {
+        y: &y,
+        chroma: chroma.as_ref().map(|(cb, cr)| (&cb[..], &cr[..])),
+        bit_depth: 8,
+    };
+    encode_picture16(width, height, planes, config)
+}
+
+/// Encodes one picture of up to 10 bits per sample as an IDR frame (Main 10 profile above 8
+/// bits). 10-bit coding avoids the banding of smooth gradients, e.g. in skies.
+pub fn encode_picture16(
+    width: u32,
+    height: u32,
+    planes: Planes16<'_>,
+    config: &EncoderConfig,
+) -> Result<EncodedPicture, Error> {
     encode_with_reconstruction(width, height, planes, config).map(|(picture, ..)| picture)
 }
 
@@ -105,7 +138,7 @@ pub fn encode_picture(
 fn encode_with_reconstruction(
     width: u32,
     height: u32,
-    planes: Planes<'_>,
+    planes: Planes16<'_>,
     config: &EncoderConfig,
 ) -> Result<(EncodedPicture, Frame, [usize; 3]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
@@ -115,6 +148,21 @@ fn encode_with_reconstruction(
     }
     if config.qp > 51 {
         return Err(Error::InvalidInput("QP must be 0 to 51"));
+    }
+    if !(8..=10).contains(&planes.bit_depth) {
+        return Err(Error::InvalidInput("bit depth must be 8 to 10"));
+    }
+    let max = (1u16 << planes.bit_depth) - 1;
+    let all = planes.y.iter().chain(
+        planes
+            .chroma
+            .into_iter()
+            .flat_map(|(cb, cr)| cb.iter().chain(cr)),
+    );
+    if all.into_iter().any(|&v| v > max) {
+        return Err(Error::InvalidInput(
+            "sample larger than the bit depth allows",
+        ));
     }
     let (w, h) = (width as usize, height as usize);
     if planes.y.len() != w * h {
@@ -140,6 +188,7 @@ fn encode_with_reconstruction(
         output_width: width.next_multiple_of(unit),
         output_height: height.next_multiple_of(unit),
         chroma_format: u8::from(planes.chroma.is_some()),
+        bit_depth: planes.bit_depth,
         qp: i32::from(config.qp),
         full_range: config.full_range,
         colour: config.colour,
@@ -181,7 +230,7 @@ fn encode_with_reconstruction(
     let picture = EncodedPicture {
         parameter_sets,
         slices: vec![nal_unit(NalType::IdrWRadl, &rbsp)],
-        profile_idc: PROFILE_MAIN,
+        profile_idc: params.profile_idc(),
         level_idc: params.level_idc(),
         chroma_format: params.chroma_format,
         width: params.output_width,
@@ -218,7 +267,7 @@ struct Plane {
 }
 
 impl Plane {
-    fn padded(src: &[u8], w: usize, h: usize, pw: usize, ph: usize) -> Self {
+    fn padded(src: &[u16], w: usize, h: usize, pw: usize, ph: usize) -> Self {
         let mut samples = Vec::with_capacity(pw * ph);
         for y in 0..ph {
             let row = &src[y.min(h - 1) * w..][..w];
@@ -249,8 +298,11 @@ struct Encoder<'a> {
     chroma: bool,
     width: u32,
     height: u32,
+    /// `QpY`, and the quantization parameters `Qp′Y` and `Qp′C` (with `QpBdOffset`).
     qp: i32,
+    qp_luma: i32,
     qp_c: i32,
+    bit_depth: u8,
     lambda: f64,
     sqrt_lambda: f64,
     /// Coding tree depth and luma intra mode of each 4×4 block.
@@ -274,7 +326,7 @@ impl<'a> Encoder<'a> {
         pps: &'a heifer_hevc_dec::params::Pps,
         params: &StreamParams,
         (w, h): (usize, usize),
-        planes: Planes<'_>,
+        planes: Planes16<'_>,
         header: &SliceHeader,
     ) -> Self {
         let (pw, ph) = (params.width as usize, params.height as usize);
@@ -301,8 +353,11 @@ impl<'a> Encoder<'a> {
         let mut recon = Reconstructor::new(sps, pps);
         recon.start_slice(header);
         let qp = params.qp;
-        // λ of the HM reference encoder for intra pictures.
-        let lambda = 0.57 * 2f64.powf(f64::from(qp - 12) / 3.0);
+        let bd_offset = 6 * i32::from(planes.bit_depth - 8);
+        // λ of the HM reference encoder for intra pictures, for distortions measured on
+        // `bit_depth`-bit samples (4× larger per extra bit, squared).
+        let lambda =
+            0.57 * 2f64.powf(f64::from(qp - 12) / 3.0) * 4f64.powi(i32::from(planes.bit_depth - 8));
         let grid_w = pw / 4;
         Self {
             recon,
@@ -313,7 +368,9 @@ impl<'a> Encoder<'a> {
             width: params.width,
             height: params.height,
             qp,
-            qp_c: chroma_qp(qp),
+            qp_luma: qp + bd_offset,
+            qp_c: chroma_qp(qp) + bd_offset,
+            bit_depth: planes.bit_depth,
             lambda,
             sqrt_lambda: lambda.sqrt(),
             depth: vec![0; grid_w * (ph / 4)],
@@ -323,8 +380,8 @@ impl<'a> Encoder<'a> {
             coeffs: vec![0; 32 * 32],
             exact: vec![0.0; 32 * 32],
             kinds: [0; 3],
-            // About 3 bits, at λ / step² (step = 2^((QP - 4) / 6)).
-            sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32,
+            // About 3 bits, at λ / step² (step = 2^((Qp′ - 4) / 6)).
+            sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp + bd_offset - 4) / 3.0)) as f32,
         }
     }
 
@@ -600,14 +657,24 @@ impl<'a> Encoder<'a> {
         let n = 1usize << log2_size;
         self.predict(c, x, y, log2_size, mode);
         let mut coeffs = std::mem::take(&mut self.coeffs);
-        let qp = if c == 0 { self.qp } else { self.qp_c };
-        if c == 0 && log2_size == 2 {
-            forward_dst4(&self.diff[..16], &mut coeffs[..16]);
-        } else {
-            forward_dct(&self.diff[..n * n], log2_size, &mut coeffs[..n * n]);
-        }
+        let qp = if c == 0 { self.qp_luma } else { self.qp_c };
+        let dst = c == 0 && log2_size == 2;
+        forward_transform(
+            &self.diff[..n * n],
+            log2_size,
+            dst,
+            self.bit_depth,
+            &mut coeffs[..n * n],
+        );
         let mut exact = std::mem::take(&mut self.exact);
-        quantize_exact(&mut coeffs[..n * n], log2_size, qp, &mut exact[..n * n]);
+        let bd = self.bit_depth;
+        quantize_levels(
+            &mut coeffs[..n * n],
+            log2_size,
+            qp,
+            bd,
+            Some(&mut exact[..n * n]),
+        );
         let scan = scan_type(log2_size, c == 0, mode);
         // λ in units of the squared quantization step, 2^((QP - 4) / 3).
         let lambda = (self.lambda / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
@@ -1222,9 +1289,12 @@ mod tests {
 
     fn round_trip(w: usize, h: usize, qp: u8, monochrome: bool) -> f64 {
         let (y, cb, cr) = test_picture(w, h, (w * 31 + h) as u32);
-        let planes = Planes {
-            y: &y,
-            chroma: (!monochrome).then_some((&cb[..], &cr[..])),
+        let wide = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
+        let (y16, cb16, cr16) = (wide(&y), wide(&cb), wide(&cr));
+        let planes = Planes16 {
+            y: &y16,
+            chroma: (!monochrome).then_some((&cb16[..], &cr16[..])),
+            bit_depth: 8,
         };
         let config = EncoderConfig {
             qp,
@@ -1326,6 +1396,70 @@ mod tests {
     }
 
     #[test]
+    fn ten_bit_round_trip() {
+        // A smooth 10-bit gradient (which 8 bits would turn into steps), with some texture.
+        let (w, h) = (100usize, 70usize);
+        let sample = |x: usize, y: usize, k: usize| -> u16 {
+            let v = 64 + x * 8 + y * 2 + if (x / 5 + y / 7 + k) % 3 == 0 { 12 } else { 0 };
+            v.min(1023) as u16
+        };
+        let y: Vec<u16> = (0..w * h).map(|i| sample(i % w, i / w, 0)).collect();
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let cb: Vec<u16> = (0..cw * ch)
+            .map(|i| 300 + sample(i % cw, i / cw, 1) / 3)
+            .collect();
+        let cr: Vec<u16> = (0..cw * ch)
+            .map(|i| 700 - sample(i % cw, i / cw, 2) / 4)
+            .collect();
+        for qp in [4u8, 22, 37] {
+            let planes = Planes16 {
+                y: &y,
+                chroma: Some((&cb, &cr)),
+                bit_depth: 10,
+            };
+            let config = EncoderConfig {
+                qp,
+                ..EncoderConfig::default()
+            };
+            let (picture, recon, _) =
+                encode_with_reconstruction(w as u32, h as u32, planes, &config).unwrap();
+            assert_eq!(picture.profile_idc, 2, "Main 10");
+            let stream = picture.annex_b();
+            let options = DecodeOptions {
+                skip_loop_filters: true,
+                verify_hash: false,
+                max_pixels: 0,
+            };
+            let unfiltered = decode_picture(&stream, options).unwrap();
+            assert_eq!(unfiltered.bit_depth, [10, 10]);
+            for c in 0..3 {
+                let (cw, ch) = (
+                    unfiltered.widths[c] as usize,
+                    unfiltered.heights[c] as usize,
+                );
+                assert_eq!(
+                    crop(&unfiltered, c, cw, ch),
+                    crop(&recon, c, cw, ch),
+                    "QP {qp}, component {c}"
+                );
+            }
+            let frame = decode_picture(&stream, DecodeOptions::default()).unwrap();
+            let decoded = crop(&frame, 0, w, h);
+            let mse = decoded
+                .iter()
+                .zip(&y)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum::<f64>()
+                / (w * h) as f64;
+            let psnr = 10.0 * (1023.0f64.powi(2) / mse.max(1e-9)).log10();
+            assert!(
+                psnr > if qp == 4 { 50.0 } else { 36.0 },
+                "QP {qp}: {psnr:.1} dB"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_input() {
         let y = [0u8; 4];
         let planes = Planes {
@@ -1336,5 +1470,18 @@ mod tests {
         assert!(encode_picture(0, 4, planes, &config).is_err());
         assert!(encode_picture(3, 1, planes, &config).is_err());
         assert!(encode_picture(2, 2, planes, &EncoderConfig { qp: 52, ..config }).is_err());
+        let big = [1024u16; 4];
+        let planes16 = Planes16 {
+            y: &big,
+            chroma: None,
+            bit_depth: 10,
+        };
+        assert!(encode_picture16(2, 2, planes16, &config).is_err());
+        let planes16 = Planes16 {
+            y: &big,
+            chroma: None,
+            bit_depth: 12,
+        };
+        assert!(encode_picture16(2, 2, planes16, &config).is_err());
     }
 }

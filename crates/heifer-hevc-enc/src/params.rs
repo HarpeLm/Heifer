@@ -1,6 +1,6 @@
 //! Parameter sets, slice header and NAL units of the encoded stream (H.265 §7.3).
 //!
-//! The stream is a single IDR picture with one slice: 8-bit, 4:2:0 or 4:0:0, CTBs of 32×32,
+//! The stream is a single IDR picture with one slice: 8 to 10 bits, 4:2:0 or 4:0:0, CTBs of 32×32,
 //! coding blocks of 8×8 to 32×32 (with 4×4 prediction blocks), transform blocks split once at
 //! most, sign data hiding, deblocking on, SAO off.
 
@@ -96,16 +96,20 @@ pub(crate) struct StreamParams {
     pub output_height: u32,
     /// 0 = monochrome, 1 = 4:2:0.
     pub chroma_format: u8,
+    /// Bits per sample, 8 to 10.
+    pub bit_depth: u8,
     pub qp: i32,
     pub full_range: bool,
     /// `colour_primaries`, `transfer_characteristics`, `matrix_coeffs` of the VUI.
     pub colour: (u8, u8, u8),
 }
 
-/// `general_profile_idc`: Main.
-pub(crate) const PROFILE_MAIN: u8 = 1;
-
 impl StreamParams {
+    /// `general_profile_idc`: Main (1) for 8 bits, Main 10 (2) above.
+    pub(crate) fn profile_idc(&self) -> u8 {
+        if self.bit_depth > 8 { 2 } else { 1 }
+    }
+
     /// `general_level_idc` (×30): the smallest level whose maximum picture size fits.
     pub(crate) fn level_idc(&self) -> u8 {
         let pixels = u64::from(self.width) * u64::from(self.height);
@@ -125,10 +129,16 @@ impl StreamParams {
     }
 
     fn profile_tier_level(&self, w: &mut BitWriter) {
-        let compat = (1u32 << (31 - u32::from(PROFILE_MAIN))) | (1 << (31 - 2)); // Main, Main 10
+        // Main streams are also Main 10 streams; Main 10 streams are only that.
+        let profile = self.profile_idc();
+        let compat = if profile == 1 {
+            (1u32 << 30) | (1 << 29)
+        } else {
+            1 << 29
+        };
         w.bits(0, 2)
             .bit(false)
-            .bits(u32::from(PROFILE_MAIN), 5)
+            .bits(u32::from(profile), 5)
             .bits(compat, 32);
         // progressive_source, interlaced, non_packed_constraint, frame_only_constraint.
         w.bit(true).bit(false).bit(false).bit(true);
@@ -169,7 +179,8 @@ impl StreamParams {
             let unit = if self.chroma_format == 1 { 2 } else { 1 };
             w.bit(true).ue(0).ue(right / unit).ue(0).ue(bottom / unit);
         }
-        w.ue(0).ue(0); // bit depths 8
+        let bd = u32::from(self.bit_depth - 8);
+        w.ue(bd).ue(bd); // bit_depth_luma_minus8, bit_depth_chroma_minus8
         w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
         w.bit(true).ue(0).ue(0).ue(0); // sub-layer ordering info
         w.ue(0).ue(2); // coding blocks 8×8 to 32×32

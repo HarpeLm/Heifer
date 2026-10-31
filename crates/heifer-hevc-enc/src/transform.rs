@@ -25,24 +25,43 @@ const DCT16: [[i32; 16]; 16] = dct_matrix();
 /// Forward 2-D DCT of an `n`×`n` residual (`n` = 4..=32), row-major. The output has the scale
 /// that the decoder's inverse transform expects, as in the HM reference encoder.
 pub fn forward_dct(residual: &[i32], log2_size: u8, out: &mut [i32]) {
+    forward_transform(residual, log2_size, false, 8, out);
+}
+
+/// Forward transform of an `n`×`n` residual of `bit_depth`-bit samples: the DCT, or the 4×4
+/// DST-VII when `dst` is set (4×4 intra luma blocks).
+pub fn forward_transform(
+    residual: &[i32],
+    log2_size: u8,
+    dst: bool,
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    let bd = i32::from(bit_depth);
     match log2_size {
-        2 => forward(residual, &DCT4, out),
-        3 => forward(residual, &DCT8, out),
-        4 => forward(residual, &DCT16, out),
-        _ => forward(residual, &DCT32, out),
+        2 if dst => forward(residual, &DST4, bd, out),
+        2 => forward(residual, &DCT4, bd, out),
+        3 => forward(residual, &DCT8, bd, out),
+        4 => forward(residual, &DCT16, bd, out),
+        _ => forward(residual, &DCT32, bd, out),
     }
 }
 
 /// Forward 4×4 DST-VII, used instead of the DCT for 4×4 intra luma blocks.
 pub fn forward_dst4(residual: &[i32], out: &mut [i32]) {
-    forward(residual, &DST4, out);
+    forward(residual, &DST4, 8, out);
 }
 
 /// Separable forward transform with `basis[frequency][position]`: columns first, then rows.
-/// The sums fit in `i32`: 8-bit residuals, basis values of at most 90 in magnitude.
-fn forward<const N: usize>(residual: &[i32], basis: &[[i32; N]; N], out: &mut [i32]) {
+/// The sums fit in `i32`: residuals of up to 10 bits, basis values of at most 90 in magnitude.
+fn forward<const N: usize>(
+    residual: &[i32],
+    basis: &[[i32; N]; N],
+    bit_depth: i32,
+    out: &mut [i32],
+) {
     let log2_size = N.trailing_zeros() as i32;
-    let shift1 = log2_size + 8 - 9;
+    let shift1 = log2_size + bit_depth - 9;
     let shift2 = log2_size + 6;
     let mut tmp = [[0i32; N]; N];
     for (row, b) in tmp.iter_mut().zip(basis) {
@@ -71,9 +90,33 @@ const QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 /// Quantizes transform coefficients in place for quantization parameter `qp` (0..=51), with a
 /// dead zone of 1/3 as usual for intra blocks. Returns whether any level is non-zero.
 pub fn quantize(coeffs: &mut [i32], log2_size: u8, qp: i32) -> bool {
-    let transform_shift = 15 - 8 - i32::from(log2_size);
+    quantize_levels(coeffs, log2_size, qp, 8, None)
+}
+
+/// Like [`quantize`], also giving the unrounded level of each coefficient (signed, in units of
+/// the quantization step) in `exact`, for rate-distortion refinements of the levels.
+pub fn quantize_exact(coeffs: &mut [i32], log2_size: u8, qp: i32, exact: &mut [f32]) -> bool {
+    quantize_levels(coeffs, log2_size, qp, 8, Some(exact))
+}
+
+/// Quantization of the coefficients of `bit_depth`-bit samples with `qp` = `Qp′`, the QP plus
+/// `QpBdOffset` (6 per bit above 8). Optionally gives the unrounded levels in `exact`.
+pub fn quantize_levels(
+    coeffs: &mut [i32],
+    log2_size: u8,
+    qp: i32,
+    bit_depth: u8,
+    exact: Option<&mut [f32]>,
+) -> bool {
+    let transform_shift = 15 - i32::from(bit_depth) - i32::from(log2_size);
     let qbits = 14 + qp / 6 + transform_shift;
     let scale = QUANT_SCALE[(qp % 6) as usize];
+    if let Some(exact) = exact {
+        let unit = 1.0 / f64::from(1u32 << qbits);
+        for (e, &c) in exact.iter_mut().zip(coeffs.iter()) {
+            *e = (f64::from(c) * scale as f64 * unit) as f32;
+        }
+    }
     let offset = 171i64 << (qbits - 9);
     let mut any = false;
     for c in coeffs.iter_mut() {
@@ -82,19 +125,6 @@ pub fn quantize(coeffs: &mut [i32], log2_size: u8, qp: i32) -> bool {
         any |= level != 0;
     }
     any
-}
-
-/// Like [`quantize`], also giving the unrounded level of each coefficient (signed, in units of
-/// the quantization step) in `exact`, for rate-distortion refinements of the levels.
-pub fn quantize_exact(coeffs: &mut [i32], log2_size: u8, qp: i32, exact: &mut [f32]) -> bool {
-    let transform_shift = 15 - 8 - i32::from(log2_size);
-    let qbits = 14 + qp / 6 + transform_shift;
-    let unit = 1.0 / f64::from(1u32 << qbits);
-    let scale = QUANT_SCALE[(qp % 6) as usize];
-    for (e, &c) in exact.iter_mut().zip(coeffs.iter()) {
-        *e = (f64::from(c) * scale as f64 * unit) as f32;
-    }
-    quantize(coeffs, log2_size, qp)
 }
 
 /// `QpC` of 4:2:0 chroma for a luma QP (Table 8-10), without chroma QP offsets.

@@ -171,3 +171,58 @@ fn metadata_is_kept() {
     assert_eq!(heifer::read_metadata(&heic).unwrap(), metadata);
     assert_eq!(decode(&heic).unwrap().width, 600);
 }
+
+#[test]
+fn deep_images_are_coded_in_10_bits() {
+    // A smooth 16-bit gradient: 8 bits would leave at most 256 grey levels (visible steps).
+    let (w, h) = (1024u32, 64u32);
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let v = (x * 64) as u16;
+            let a = if y < 32 { 65535 } else { (x * 64) as u16 };
+            data.extend([v, v, v, a]);
+        }
+    }
+    let image = Image {
+        width: w,
+        height: h,
+        bit_depth: 16,
+        has_alpha: true,
+        data,
+    };
+    let options = EncodeOptions {
+        quality: 90,
+        ..EncodeOptions::default()
+    };
+    let heic = encode(&image, &options).unwrap();
+    let file = heifer::heifer_isobmff::HeifFile::parse(&heic).unwrap();
+    let tiles = file.referenced_items(file.primary_id, b"dimg");
+    let config = file.hevc_config(tiles[0]).unwrap().unwrap();
+    assert_eq!(
+        (config.profile_idc, config.bit_depth_luma),
+        (2, 10),
+        "Main 10"
+    );
+
+    let decoded = decode(&heic).unwrap();
+    assert_eq!(
+        (decoded.width, decoded.height, decoded.bit_depth),
+        (w, h, 10)
+    );
+    assert!(decoded.has_alpha);
+    let row: Vec<u16> = (0..w as usize)
+        .map(|x| decoded.data[(10 * w as usize + x) * 4])
+        .collect();
+    let mut levels = row.clone();
+    levels.sort_unstable();
+    levels.dedup();
+    assert!(levels.len() > 600, "{} grey levels", levels.len());
+    // Close to the original (scaled to 10 bits).
+    let max_error = row
+        .iter()
+        .enumerate()
+        .map(|(x, &v)| (i32::from(v) - (x as i32 * 64 * 1023 / 65535)).abs())
+        .max();
+    assert!(max_error <= Some(6), "{max_error:?}");
+}

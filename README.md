@@ -122,7 +122,9 @@ let meta = heifer::read_metadata(&bytes)?;
 let smaller = heifer::encode_with_metadata(&heifer::decode(&bytes)?, &meta, &options)?;
 ```
 
-Images are stored as 8-bit YCbCr 4:2:0 (sRGB, BT.601 full range), split into 512×512 tiles that are
+Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Main 10) when the image
+has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
+into 512×512 tiles that are
 encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
 about 1.6 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 41.7 dB against the
 original, both decoded by Apple (1.0 bit per pixel).
@@ -194,7 +196,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | HEIC from 8-bit RGB(A): HEVC Main intra, 4:2:0, alpha, 512×512 grid tiles, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, metadata, `clap`) | 10-bit, 4:4:4, HDR, lossless |
+| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, metadata, `clap`) | 4:4:4, HDR gain maps, lossless |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -320,7 +322,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **0.3 — Encoder**: HEIF writing, HEVC intra encoder, alpha, parallel tiles; `iloc` construction method 2
 - [x] **0.3.1**: `image` crate encoder, metadata when encoding
 - [x] **0.3.2**: compression on par with x265 `medium` (4×4 blocks, transform splits, RDOQ, sign data hiding)
-- [ ] **Next**: 10-bit and HDR encoding, thumbnails
+- [x] **0.3.3**: 10-bit encoding (Main 10)
+- [ ] **Next**: HDR gain map encoding, thumbnails
 - [ ] ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

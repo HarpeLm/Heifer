@@ -1,8 +1,9 @@
-//! Encoder round trip: any small image, at any quality, must encode to a file that heifer
+//! Encoder round trip: any small image, at any quality and in 8 or 10 bits, must encode to a
+//! file that heifer
 //! decodes back to an image of the same size, and to an HEVC stream that decodes.
 #![no_main]
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
-use heifer_hevc_enc::encoder::{EncoderConfig, Planes, encode_picture};
+use heifer_hevc_enc::encoder::{EncoderConfig, Planes16, encode_picture16};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -15,13 +16,16 @@ fuzz_target!(|data: &[u8]| {
     let sample = |i: usize| pixels[i % pixels.len()];
 
     // The HEVC encoder alone, with every QP, in colour or monochrome.
-    let y: Vec<u8> = (0..n).map(sample).collect();
+    // 8 or 10 bits per sample.
+    let (bit_depth, shift) = if flags & 4 == 0 { (8, 0) } else { (10, 2) };
+    let wide = |i: usize| (u16::from(sample(i)) << shift) | u16::from(sample(i + 3) & 3) * u16::from(shift > 0);
+    let y: Vec<u16> = (0..n).map(wide).collect();
     let cn = (w.div_ceil(2) * h.div_ceil(2)) as usize;
-    let cb: Vec<u8> = (0..cn).map(|i| sample(i * 7 + 1)).collect();
-    let cr: Vec<u8> = (0..cn).map(|i| sample(i * 13 + 2)).collect();
-    let planes = Planes { y: &y, chroma: (flags & 1 == 0).then_some((&cb[..], &cr[..])) };
+    let cb: Vec<u16> = (0..cn).map(|i| wide(i * 7 + 1)).collect();
+    let cr: Vec<u16> = (0..cn).map(|i| wide(i * 13 + 2)).collect();
+    let planes = Planes16 { y: &y, chroma: (flags & 1 == 0).then_some((&cb[..], &cr[..])), bit_depth };
     let config = EncoderConfig { qp: qp % 52, ..EncoderConfig::default() };
-    let picture = encode_picture(w, h, planes, &config).expect("valid input must encode");
+    let picture = encode_picture16(w, h, planes, &config).expect("valid input must encode");
     let frame = decode_picture(&picture.annex_b(), DecodeOptions::default())
         .expect("the encoder's stream must decode");
     assert_eq!((frame.widths[0], frame.heights[0]), (picture.width, picture.height));

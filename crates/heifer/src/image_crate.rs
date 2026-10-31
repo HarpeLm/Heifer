@@ -164,8 +164,8 @@ impl ImageDecoder for HeifDecoder {
 /// Encodes images as HEIC files, for `DynamicImage::write_with_encoder` and the other users of
 /// [`ImageEncoder`].
 ///
-/// Accepts 8- and 16-bit grey, grey + alpha, RGB and RGBA images (16-bit samples are rounded to
-/// 8 bits). The ICC profile and EXIF metadata given by `image` are stored in the file; the EXIF
+/// Accepts 8- and 16-bit grey, grey + alpha, RGB and RGBA images (16-bit images are coded in
+/// 10 bits). The ICC profile and EXIF metadata given by `image` are stored in the file; the EXIF
 /// orientation is set to 1, since the pixels are stored as given.
 #[derive(Debug)]
 pub struct HeifEncoder<W: Write> {
@@ -231,34 +231,37 @@ impl<W: Write> ImageEncoder for HeifEncoder<W> {
             ));
         }
         let channels = channels as usize;
-        let sample = |i: usize| -> u8 {
+        // 16-bit images are coded in 10 bits (no banding), 8-bit ones in 8 bits.
+        let (bit_depth, top) = if wide { (10, 1023u16) } else { (8, 255) };
+        let sample = |i: usize| -> u16 {
             if wide {
                 let v = u16::from_ne_bytes([buf[2 * i], buf[2 * i + 1]]);
-                ((u32::from(v) * 255 + 32767) / 65535) as u8
+                ((u32::from(v) * 1023 + 32767) / 65535) as u16
             } else {
-                buf[i]
+                u16::from(buf[i])
             }
         };
-        let pixel = |i: usize| -> [u8; 4] {
+        let pixel = |i: usize| -> [u16; 4] {
             let p = i * channels;
             match channels {
                 1 => {
                     let v = sample(p);
-                    [v, v, v, 255]
+                    [v, v, v, top]
                 }
                 2 => {
                     let v = sample(p);
                     [v, v, v, sample(p + 1)]
                 }
-                3 => [sample(p), sample(p + 1), sample(p + 2), 255],
+                3 => [sample(p), sample(p + 1), sample(p + 2), top],
                 _ => [sample(p), sample(p + 1), sample(p + 2), sample(p + 3)],
             }
         };
         let n = width as usize * height as usize;
-        let has_alpha = channels % 2 == 0 && (0..n).any(|i| pixel(i)[3] != 255);
+        let has_alpha = channels % 2 == 0 && (0..n).any(|i| pixel(i)[3] != top);
         let heic = crate::encode::encode_pixels(
             width,
             height,
+            bit_depth,
             has_alpha,
             Some(&self.metadata),
             &self.options,

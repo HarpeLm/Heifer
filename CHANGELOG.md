@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.3 — 2026-10-31
+
+**10-bit HEIC.** Images of more than 8 bits per sample (16-bit PNGs, 10-bit photos decoded by
+heifer) are now encoded in 10 bits, HEVC Main 10, instead of being rounded to 8 bits: smooth
+gradients keep their levels instead of turning into steps. Apple's ImageIO and ffmpeg read them
+as 10-bit images.
+
+- `heifer::encode`, `encode_with_metadata` and the `image` crate `HeifEncoder` (16-bit images)
+  encode in 10 bits; 8-bit images are encoded as before.
+- `heifer-hevc-enc`: `encoder::encode_picture16` with `Planes16` (8 to 10 bits),
+  `transform::forward_transform` and `quantize_levels` take a bit depth. The `encode_yuv`
+  example reads `yuv420p10le` files.
+- The `encode` fuzz target covers 10-bit pictures.
+
 ## 0.3.2 — 2026-10-31
 
 **Smaller HEIC files.** At equal quality, the encoder now makes files slightly smaller than x265's
