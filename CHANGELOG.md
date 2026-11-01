@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.13 — 2026-11-01
+
+**Robustness.** Two malformed files that used to panic are now rejected with an error.
+
+- A `grid` whose tile `ispe` declares a zero or impossible size is rejected, and tile placement
+  no longer overflows on 32-bit targets, instead of panicking.
+- An alpha plane with the right width but a smaller height than the image is rejected, instead of
+  being read out of bounds.
+- Regression tests build both files with the writer and check the errors.
+
 ## 0.3.12 — 2026-11-01
 
 - `heifer::image_crate::register_image_decoder_hooks_with_options` registers the `image` crate

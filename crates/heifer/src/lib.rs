@@ -241,9 +241,8 @@ fn decode_hvc1<S: Sample>(
             continue;
         }
         let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
-        if (alpha.widths[0], alpha.heights[0]) != (image.width, image.height)
-            && alpha.widths[0] < image.width
-        {
+        // The alpha plane must cover the image: anything smaller would be read out of bounds.
+        if alpha.widths[0] < image.width || alpha.heights[0] < image.height {
             return Err(Error::Unsupported(
                 "alpha plane smaller than the image".into(),
             ));
@@ -333,6 +332,12 @@ fn decode_grid<S: Sample>(
             size
         }
     };
+    // The tile size comes from the file: reject values no real picture could have, and keep the
+    // row stride within the canvas so that it cannot overflow on 32-bit targets.
+    let tile_pixels = u64::from(tw) * u64::from(th);
+    if tile_pixels == 0 || tile_pixels > options.max_pixels() {
+        return Err(Error::Invalid("grid tile has an invalid size"));
+    }
     let mut canvas = Image::filled(
         grid.output_width,
         grid.output_height,
@@ -341,12 +346,13 @@ fn decode_grid<S: Sample>(
     );
     let (canvas_w, canvas_h) = (canvas.width, canvas.height);
     let stride = canvas_w as usize * 4;
+    let tile_stride = tw.min(canvas_w) as usize * 4;
     // Each tile gets its own row segments of the canvas, so tiles are written concurrently.
     let mut segments: Vec<Vec<&mut [S]>> = (0..tiles.len()).map(|_| Vec::new()).collect();
     for (y, row) in canvas.data.chunks_exact_mut(stride).enumerate() {
-        let first = y / th as usize * columns as usize;
-        for (column, segment) in row.chunks_mut(tw as usize * 4).enumerate() {
-            if let Some(rows) = segments.get_mut(first + column) {
+        let first = (y / th as usize).saturating_mul(columns as usize);
+        for (column, segment) in row.chunks_mut(tile_stride).enumerate() {
+            if let Some(rows) = segments.get_mut(first.saturating_add(column)) {
                 rows.push(segment);
             }
         }
@@ -360,7 +366,8 @@ fn decode_grid<S: Sample>(
             .iter()
             .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
     let place = |i: usize, tile: Option<&Image<S>>| -> Result<(), Error> {
-        let (x0, y0) = ((i as u32 % columns) * tw, (i as u32 / columns) * th);
+        let x0 = (u64::from(i as u32 % columns) * u64::from(tw)).min(u64::from(u32::MAX)) as u32;
+        let y0 = (u64::from(i as u32 / columns) * u64::from(th)).min(u64::from(u32::MAX)) as u32;
         let (w, h) = (
             tw.min(canvas_w.saturating_sub(x0)) as usize,
             th.min(canvas_h.saturating_sub(y0)) as usize,
@@ -402,7 +409,7 @@ fn decode_grid<S: Sample>(
                 // Copy rows (no blending): tiles are opaque unless they carry alpha.
                 for (dst, src) in out
                     .iter_mut()
-                    .zip(tile.data.chunks_exact(tw as usize * 4))
+                    .zip(tile.data.chunks_exact(tile.width as usize * 4))
                     .take(h)
                 {
                     dst[..w * 4].copy_from_slice(&src[..w * 4]);
