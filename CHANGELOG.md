@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.11 — 2026-11-01
+
+**Faster encoding.** About 10% faster than 0.3.10 (12 MP: 0.77 s on 10 cores, 4.0 s on one),
+with the same compression: heifer stays ahead of still265's Slow preset on the benchmark images.
+
+- Whole-block trials estimate their luma distortion from the quantization errors of the levels,
+  in the transform domain, and only the chosen mode is reconstructed.
+- SAO is chosen on the encoder's own deblocked reconstruction, instead of decoding the picture a
+  second time (the decoder gains `Reconstructor::deblocked` and block edge save and restore).
+- 64×64 blocks are tried whole only when quite flat (elsewhere the split wins 96% of the time),
+  and their mode search is shared with their first 32×32 block.
+- Faster SAO statistics; the encoder's bin log reuses its buffers.
+
 ## 0.3.10 — 2026-11-01
 
 **Faster encoding, same files.** Encoding is about 10% faster (12 MP: 0.8 s on 10 cores); the files are

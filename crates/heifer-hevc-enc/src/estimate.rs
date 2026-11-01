@@ -39,6 +39,8 @@ pub(crate) struct LogPoint {
 #[derive(Debug)]
 pub(crate) struct BinLog {
     ops: Vec<u16>,
+    /// Buffers of points given back, reused by the next ones.
+    spare: Vec<Vec<u16>>,
     bits: u64,
     cost: [[u32; 2]; 64],
 }
@@ -48,6 +50,7 @@ impl BinLog {
         let table = entropy_bits();
         Self {
             ops: Vec::with_capacity(1 << 16),
+            spare: Vec::new(),
             bits: 0,
             cost: table.map(|c| c.map(|b| (f64::from(b) * ONE_BIT as f64).round() as u32)),
         }
@@ -91,10 +94,21 @@ impl BinLog {
 
     /// Like [`checkpoint`](Self::checkpoint), keeping the bins logged since `since`, so that
     /// this state can be restored after going back to `since`.
-    pub(crate) fn checkpoint_since(&self, since: &LogPoint) -> LogPoint {
+    pub(crate) fn checkpoint_since(&mut self, since: &LogPoint) -> LogPoint {
+        let mut tail = self.spare.pop().unwrap_or_default();
+        tail.clear();
+        tail.extend_from_slice(&self.ops[since.len..]);
         LogPoint {
-            tail: Some((since.len, self.ops[since.len..].to_vec())),
+            tail: Some((since.len, tail)),
             ..self.checkpoint()
+        }
+    }
+
+    /// Gives back the buffer of a point no longer needed, for the next
+    /// [`checkpoint_since`](Self::checkpoint_since).
+    pub(crate) fn recycle(&mut self, point: LogPoint) {
+        if let Some((_, tail)) = point.tail {
+            self.spare.push(tail);
         }
     }
 

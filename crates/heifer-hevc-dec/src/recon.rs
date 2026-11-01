@@ -327,6 +327,43 @@ impl<'a> Reconstructor<'a> {
         self.frame
     }
 
+    /// The deblocked picture, leaving this one as it is: for encoders that choose SAO parameters
+    /// on it.
+    pub fn deblocked(&self) -> Frame {
+        let mut frame = self.frame.clone();
+        filters::deblock(
+            &mut frame,
+            &self.filter_info,
+            self.sps,
+            self.pps,
+            &self.layout,
+        );
+        frame
+    }
+
+    /// Appends the block edge flags of a luma area to `out`, row by row of 4×4 units, to put
+    /// them back with [`restore_edges`](Self::restore_edges): for encoders that try several
+    /// codings of the same area.
+    pub fn save_edges(&self, x: u32, y: u32, w: u32, h: u32, out: &mut Vec<u8>) {
+        let info = &self.filter_info;
+        let (x0, x1) = (x as usize >> 2, ((x + w) as usize).div_ceil(4).min(info.w4));
+        for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(info.h4) {
+            out.extend_from_slice(&info.edges[yy * info.w4 + x0..yy * info.w4 + x1]);
+        }
+    }
+
+    /// Puts back edge flags saved by [`save_edges`](Self::save_edges) for the same area.
+    pub fn restore_edges(&mut self, x: u32, y: u32, w: u32, h: u32, saved: &[u8]) {
+        let info = &mut self.filter_info;
+        let (x0, x1) = (x as usize >> 2, ((x + w) as usize).div_ceil(4).min(info.w4));
+        let mut k = 0;
+        for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(info.h4) {
+            let row = &mut info.edges[yy * info.w4 + x0..yy * info.w4 + x1];
+            row.copy_from_slice(&saved[k..k + row.len()]);
+            k += row.len();
+        }
+    }
+
     /// Marks block edges (left and top) for the deblocking filter.
     fn mark_edges(&mut self, x: u32, y: u32, w: u32, h: u32) {
         let info = &mut self.filter_info;

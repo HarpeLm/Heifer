@@ -13,7 +13,6 @@
 //! - levels: RDOQ (including coding nothing), sign data hiding; then SAO on the deblocked picture.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
-use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
 use heifer_hevc_dec::recon::Frame;
@@ -263,20 +262,9 @@ fn encode_with_reconstruction(
         }
         coder.finish()
     };
-    // SAO is chosen on the picture as the decoder reconstructs it before SAO: decode a first
-    // version without SAO.
-    let off = vec![(CtbSao::Own(SaoParams::default()), SaoParams::default()); blocks.len()];
-    let mut first = header_rbsp.clone();
-    first.extend_from_slice(&write(&off));
-    let mut stream = Vec::new();
-    for nal in parameter_sets
-        .iter()
-        .chain([&nal_unit(NalType::IdrWRadl, &first)])
-    {
-        stream.extend_from_slice(&[0, 0, 0, 1]);
-        stream.extend_from_slice(nal);
-    }
-    let deblocked = decode_picture(&stream, DecodeOptions::default())?;
+    // SAO is chosen on the picture as the decoder reconstructs it before SAO: the deblocked
+    // reconstruction (its block edges are those of the chosen codings).
+    let deblocked = enc.recon.deblocked();
     let src = [&enc.src[0], &enc.src[1], &enc.src[2]];
     let decisions = sao::decide(
         &deblocked,
@@ -375,7 +363,7 @@ impl TNode {
 }
 
 /// Sample, depth and mode buffers of a [`Snapshot`].
-type SnapshotBuffers = ([Vec<u16>; 3], Vec<u8>, Vec<u8>);
+type SnapshotBuffers = ([Vec<u16>; 3], Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// A source plane, padded to the coded size by repeating the last column and row.
 struct Plane {
@@ -405,6 +393,8 @@ struct Snapshot {
     samples: [Vec<u16>; 3],
     depth: Vec<u8>,
     modes: Vec<u8>,
+    /// Block edge flags of the deblocking filter.
+    edges: Vec<u8>,
 }
 
 struct Encoder<'a> {
@@ -570,12 +560,14 @@ impl<'a> Encoder<'a> {
     /// Saves the state of a block, to try another coding of it and come back. The buffers come
     /// from the ones given back with [`recycle`](Self::recycle).
     fn snapshot(&mut self, x0: u32, y0: u32, size: u32, coded: bool, log: LogPoint) -> Snapshot {
-        let (mut samples, mut depth, mut modes) = self.pool.pop().unwrap_or_default();
+        let (mut samples, mut depth, mut modes, mut edges) = self.pool.pop().unwrap_or_default();
         for v in &mut samples {
             v.clear();
         }
         depth.clear();
         modes.clear();
+        edges.clear();
+        self.recon.save_edges(x0, y0, size, size, &mut edges);
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
             let plane = &self.recon.frame.planes[c];
@@ -598,12 +590,14 @@ impl<'a> Encoder<'a> {
             samples,
             depth,
             modes,
+            edges,
         }
     }
 
     /// Gives back the buffers of a snapshot no longer needed.
     fn recycle(&mut self, s: Snapshot) {
-        self.pool.push((s.samples, s.depth, s.modes));
+        self.log.recycle(s.log);
+        self.pool.push((s.samples, s.depth, s.modes, s.edges));
     }
 
     fn restore(&mut self, x0: u32, y0: u32, size: u32, s: &Snapshot) {
@@ -611,6 +605,7 @@ impl<'a> Encoder<'a> {
         self.recon.set_reconstructed(x0, y0, size, size, s.coded);
         self.log.restore(&s.log);
         self.ctx = s.ctx;
+        self.recon.restore_edges(x0, y0, size, size, &s.edges);
         for (c, x, y, n) in self.regions(x0, y0, size) {
             let stride = self.recon.frame.widths[c] as usize;
             let plane = &mut self.recon.frame.planes[c];
@@ -653,6 +648,7 @@ impl<'a> Encoder<'a> {
 
         // Very detailed 32×32 blocks are split without trying them whole: the whole block
         // almost never wins there (measured), and trying it costs as much as the split. 64×64
+        // blocks are tried whole only when quite flat: elsewhere, the split wins 96% of the time. 64×64
         // blocks are predicted in 32×32 transform blocks: their modes are estimated on the
         // first one.
         if log2_size >= LOG2_MAX_TB {
@@ -671,7 +667,7 @@ impl<'a> Encoder<'a> {
                 self.quadrant_search = Some(((x0, y0), modes.clone(), self.last_satd));
             }
             self.mode_cache = Some(((x0, y0, log2_size), modes));
-            let limit = if log2_size > LOG2_MAX_TB { 1.0 } else { 2.0 };
+            let limit = if log2_size > LOG2_MAX_TB { 0.5 } else { 2.0 };
             if self.last_satd >= limit {
                 self.mode_cache = None;
                 self.split_cu_flag(x0, y0, depth, true);
@@ -693,7 +689,8 @@ impl<'a> Encoder<'a> {
             self.recycle(start);
             return d_whole;
         }
-        let whole = self.snapshot(x0, y0, size, true, self.log.checkpoint_since(&start.log));
+        let after = self.log.checkpoint_since(&start.log);
+        let whole = self.snapshot(x0, y0, size, true, after);
 
         self.restore(x0, y0, size, &start);
         self.recycle(start);
@@ -914,10 +911,12 @@ impl<'a> Encoder<'a> {
         levels: &[i32],
         transform_skip: bool,
     ) -> i64 {
-        if !self.deferred {
+        let n = 1usize << log2_size;
+        // Only luma is estimated: on chroma, whose errors weigh more in RGB, the estimate made
+        // worse choices on graphics (measured).
+        if !self.deferred || c > 0 {
             return self.reconstruct(c, x, y, log2_size, mode, levels, transform_skip);
         }
-        let n = 1usize << log2_size;
         if levels.is_empty() {
             // The reconstruction is the prediction.
             return self.diff[..n * n]

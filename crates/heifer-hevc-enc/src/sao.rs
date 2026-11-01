@@ -31,13 +31,34 @@ fn stats(
         edge: [[(0, 0); 4]; 4],
     };
     let shift = bit_depth - 5;
+    // edgeIdx 0, 1, 2, 3, 4 → categories 0, 1, none (4, ignored), 2, 3 (§8.7.3.2).
+    const CATEGORY: [usize; 5] = [0, 1, 4, 2, 3];
+    let mut edge = [[(0i64, 0i64); 5]; 4];
     for y in y0..y0 + h {
+        // Samples whose neighbours in every direction exist take the fast path.
+        let inner_row = y > 0 && y + 1 < ph;
         for x in x0..x0 + w {
-            let v = i32::from(rec[y * rec_stride + x]);
+            let at = |x: usize, y: usize| i32::from(rec[y * rec_stride + x]);
+            let v = at(x, y);
             let err = i64::from(src[y * src_stride + x] - v);
             let b = &mut s.band[(v >> shift) as usize & 31];
             b.0 += 1;
             b.1 += err;
+            if inner_row && x > 0 && x + 1 < pw {
+                let pairs = [
+                    (at(x - 1, y), at(x + 1, y)),
+                    (at(x, y - 1), at(x, y + 1)),
+                    (at(x - 1, y - 1), at(x + 1, y + 1)),
+                    (at(x + 1, y - 1), at(x - 1, y + 1)),
+                ];
+                for (class, (a, b)) in pairs.into_iter().enumerate() {
+                    let idx = (2 + (v - a).signum() + (v - b).signum()) as usize;
+                    let e = &mut edge[class][CATEGORY[idx]];
+                    e.0 += 1;
+                    e.1 += err;
+                }
+                continue;
+            }
             for (class, (dx, dy)) in [(1i32, 0i32), (0, 1), (1, 1), (-1, 1)]
                 .into_iter()
                 .enumerate()
@@ -51,21 +72,15 @@ fn stats(
                 if ax >= pw || ay >= ph || bx >= pw || by >= ph {
                     continue;
                 }
-                let a = i32::from(rec[ay * rec_stride + ax]);
-                let b = i32::from(rec[by * rec_stride + bx]);
-                // edgeIdx 0, 1, 2, 3, 4 → categories 1, 2, none, 3, 4 (§8.7.3.2).
-                let category = match 2 + (v - a).signum() + (v - b).signum() {
-                    0 => 0,
-                    1 => 1,
-                    3 => 2,
-                    4 => 3,
-                    _ => continue,
-                };
-                let e = &mut s.edge[class][category];
+                let idx = (2 + (v - at(ax, ay)).signum() + (v - at(bx, by)).signum()) as usize;
+                let e = &mut edge[class][CATEGORY[idx]];
                 e.0 += 1;
                 e.1 += err;
             }
         }
+    }
+    for (out, all) in s.edge.iter_mut().zip(&edge) {
+        out.copy_from_slice(&all[..4]);
     }
     s
 }
