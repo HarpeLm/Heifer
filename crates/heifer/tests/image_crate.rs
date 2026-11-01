@@ -152,3 +152,31 @@ fn encoder_stores_icc_and_exif() {
         Some(&b"fake icc"[..])
     );
 }
+
+#[test]
+fn decoder_with_options() {
+    // A 1100×700 image: several grid tiles, decoded on one thread here.
+    let (w, h) = (1100u32, 700u32);
+    let rgba: Vec<u8> = (0..w * h * 4)
+        .map(|i| (i % 4 * 60 + i / 4 % w / 5) as u8)
+        .collect();
+    let heic = heifer::encode_rgba8(w, h, &rgba, &heifer::EncodeOptions::default()).unwrap();
+    let options = heifer::Options {
+        max_threads: 1,
+        ..Default::default()
+    };
+    let dec = heifer::image_crate::HeifDecoder::with_options(&heic[..], &options).unwrap();
+    assert_eq!(dec.dimensions(), (w, h));
+    let img = DynamicImage::from_decoder(dec).unwrap();
+    assert_eq!(
+        img.to_rgb8().into_raw(),
+        heifer::decode(&heic).unwrap().to_rgb8()
+    );
+
+    // Too many pixels for the limit: an error, not a panic.
+    let small = heifer::Options {
+        max_pixels: 1000,
+        ..Default::default()
+    };
+    assert!(heifer::image_crate::HeifDecoder::with_options(&heic[..], &small).is_err());
+}

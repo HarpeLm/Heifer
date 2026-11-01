@@ -183,6 +183,9 @@ let file = std::fs::File::create("photo.heic")?;
 img.write_with_encoder(heifer::image_crate::HeifEncoder::new(file))?;   // write a HEIC
 ```
 
+Applications that already decode several images in parallel can register the hooks with
+`register_image_decoder_hooks_with_options(heifer::Options { max_threads: 1, ..Default::default() })`.
+
 `HeifDecoder` implements `image::ImageDecoder` (8- and 16-bit RGB/RGBA, EXIF/XMP/ICC). The HEIF
 orientation is already applied, so it is never applied twice.
 

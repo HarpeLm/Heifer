@@ -40,11 +40,24 @@ const BRANDS: [&[u8; 4]; 4] = [b"heic", b"heix", b"heim", b"heis"];
 /// After this call, `image::open`, `image::ImageReader` and `image::load_from_memory` decode
 /// HEIC files with heifer.
 pub fn register_image_decoder_hooks() -> bool {
+    register_image_decoder_hooks_with_options(Options::default())
+}
+
+/// Like [`register_image_decoder_hooks`], decoding with `options`: for example
+/// `max_threads: 1` in applications that already decode several images in parallel.
+///
+/// ```no_run
+/// heifer::image_crate::register_image_decoder_hooks_with_options(heifer::Options {
+///     max_threads: 1,
+///     ..Default::default()
+/// });
+/// ```
+pub fn register_image_decoder_hooks_with_options(options: Options) -> bool {
     let mut all = true;
     for ext in EXTENSIONS {
         all &= image::hooks::register_decoding_hook(
             ext.into(),
-            Box::new(|reader| Ok(Box::new(HeifDecoder::new(reader)?))),
+            Box::new(move |reader| Ok(Box::new(HeifDecoder::with_options(reader, &options)?))),
         );
     }
     // Box size (4 bytes, any value) then `ftyp` and the major brand.
@@ -80,12 +93,17 @@ pub struct HeifDecoder {
 
 impl HeifDecoder {
     /// Reads a whole HEIF file and decodes its primary image.
-    pub fn new(mut reader: impl Read) -> ImageResult<Self> {
+    pub fn new(reader: impl Read) -> ImageResult<Self> {
+        Self::with_options(reader, &Options::default())
+    }
+
+    /// Like [`new`](Self::new), with heifer options.
+    pub fn with_options(mut reader: impl Read, options: &Options) -> ImageResult<Self> {
         let mut bytes = Vec::new();
         reader
             .read_to_end(&mut bytes)
             .map_err(ImageError::IoError)?;
-        Self::from_bytes(&bytes, &Options::default())
+        Self::from_bytes(&bytes, options)
     }
 
     /// Decodes a HEIF file held in memory, with heifer options.

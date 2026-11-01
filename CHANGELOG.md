@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.12 — 2026-11-01
+
+- `heifer::image_crate::register_image_decoder_hooks_with_options` registers the `image` crate
+  hooks with decoding options, for example `max_threads: 1` in applications that already decode
+  several images in parallel; `HeifDecoder::with_options` does the same for one decoder.
+
 ## 0.3.11 — 2026-11-01
 
 **Faster encoding.** About 10% faster than 0.3.10 (12 MP: 0.77 s on 10 cores, 4.0 s on one),
