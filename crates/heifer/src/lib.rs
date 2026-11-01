@@ -179,6 +179,7 @@ fn decode_item_with<S: Sample>(
                 horiz_offset,
                 vert_offset,
             } => clean_aperture(&image, width, height, horiz_offset, vert_offset)?,
+            Property::Rotation(0) => image,
             Property::Rotation(q) => image.rotate_ccw(q),
             Property::Mirror(top_bottom) => image.mirror(top_bottom),
             _ => image,
