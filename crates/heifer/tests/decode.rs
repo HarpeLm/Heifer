@@ -32,6 +32,67 @@ fn decodes_all_fixtures() {
 }
 
 #[test]
+fn eight_bit_decoding_matches_the_wide_image_on_8_bit_files() {
+    for name in [
+        "single_image.heic",
+        "grid.heic",
+        "alpha.heic",
+        "libheif_example.heic",
+    ] {
+        let Some(bytes) = load(name) else { continue };
+        let wide = heifer::decode(&bytes).unwrap();
+        let narrow = heifer::decode_rgba8(&bytes, &heifer::Options::default()).unwrap();
+        assert_eq!(
+            (narrow.width, narrow.height),
+            (wide.width, wide.height),
+            "{name}"
+        );
+        assert!(narrow.data == wide.to_rgba8(), "{name}: pixels differ");
+    }
+}
+
+#[test]
+fn mirror_property_exchanges_top_and_bottom_when_coded_0() {
+    let Some(bytes) = load("mirrored.heic") else {
+        return;
+    };
+    let file = HeifFile::parse(&bytes).unwrap();
+    let image = heifer::decode(&bytes).unwrap();
+    let plain = bytes_without_mirror(&bytes);
+    assert_eq!(image, heifer::decode(&plain).unwrap().mirror(true));
+    assert_eq!(file.primary_id, HeifFile::parse(&plain).unwrap().primary_id);
+}
+
+/// The same file with its `imir` property turned into a `free` box of the same size.
+fn bytes_without_mirror(bytes: &[u8]) -> Vec<u8> {
+    let at = bytes.windows(4).position(|w| w == b"imir").unwrap();
+    let mut plain = bytes.to_vec();
+    plain[at..at + 4].copy_from_slice(b"free");
+    plain
+}
+
+#[test]
+fn identity_item_rotates_its_source() {
+    let Some(bytes) = load("iden_rotated.heic") else {
+        return;
+    };
+    let file = HeifFile::parse(&bytes).unwrap();
+    let source = heifer::decode_item(&file, file.referenced_items(file.primary_id, b"dimg")[0], 0);
+    let image = heifer::decode(&bytes).unwrap();
+    assert_eq!((image.width, image.height), (720, 1280));
+    assert_eq!(image, source.unwrap().rotate_ccw(1));
+}
+
+#[test]
+fn identity_item_of_an_identity_item_applies_both() {
+    let Some(bytes) = load("iden_nested.heic") else {
+        return;
+    };
+    let image = heifer::decode(&bytes).unwrap();
+    assert_eq!((image.width, image.height), (150, 150));
+}
+
+#[test]
 fn grid_tiles_are_placed_in_order() {
     let Some(bytes) = load("grid.heic") else {
         return;

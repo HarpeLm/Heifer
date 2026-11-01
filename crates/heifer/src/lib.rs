@@ -26,10 +26,10 @@ pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
-pub use image::Image;
+pub use image::{Image, Sample};
 pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
 
-use color::{ColorParams, frame_to_rgba, frame_to_rgba_into};
+use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
 use heifer_hevc_dec::recon::Frame;
 use heifer_isobmff::boxes::{ColorInfo, Property};
@@ -102,6 +102,13 @@ pub fn decode_with_options(bytes: &[u8], options: &Options) -> Result<Image, Err
     decode_item_with(&file, file.primary_id, 0, options)
 }
 
+/// Like [`decode_with_options`], at 8 bits per sample whatever the coded depth: half the memory,
+/// which counts on large photos.
+pub fn decode_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    decode_item_with(&file, file.primary_id, 0, options)
+}
+
 /// Decodes the thumbnail of the primary image (a `thmb` item, such as the 320×240 preview
 /// of iPhone photos), or `None` if the file has none: much faster than decoding the image.
 pub fn decode_thumbnail(bytes: &[u8]) -> Result<Option<Image>, Error> {
@@ -120,18 +127,18 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Result<Option<Image>, Error> {
     }
 }
 
-/// Decodes one image item: coded (`hvc1`) or derived (`grid`, `iovl`), then applies its
+/// Decodes one image item: coded (`hvc1`) or derived (`grid`, `iovl`, `iden`), then applies its
 /// transformative properties.
 pub fn decode_item(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<Image, Error> {
     decode_item_with(file, id, depth, &Options::default())
 }
 
-fn decode_item_with(
+fn decode_item_with<S: Sample>(
     file: &HeifFile<'_>,
     id: ItemId,
     depth: u32,
     options: &Options,
-) -> Result<Image, Error> {
+) -> Result<Image<S>, Error> {
     if depth > MAX_DEPTH {
         return Err(Error::Invalid("derived images nested too deeply"));
     }
@@ -140,6 +147,10 @@ fn decode_item_with(
         b"hvc1" => decode_hvc1(file, id, options)?,
         b"grid" => decode_grid(file, id, depth, options)?,
         b"iovl" => decode_overlay(file, id, depth, options)?,
+        b"iden" => match file.referenced_items(id, b"dimg")[..] {
+            [source] => decode_item_with(file, source, depth + 1, options)?,
+            _ => return Err(Error::Invalid("iden item without exactly one source")),
+        },
         _ => {
             return Err(Error::Unsupported(format!(
                 "image item type `{}`",
@@ -206,19 +217,22 @@ fn decode_hvc1_frame(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Resu
     Ok(decode_picture(&file.hevc_bitstream(id)?, hevc_options)?)
 }
 
-fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Image, Error> {
+fn decode_hvc1<S: Sample>(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    options: &Options,
+) -> Result<Image<S>, Error> {
     let hevc_options = DecodeOptions {
         max_pixels: options.max_pixels(),
         ..Default::default()
     };
     let frame = decode_hvc1_frame(file, id, options)?;
-    let mut image = frame_to_rgba(&frame, color_params(file, id, &frame)?);
-    if let Some((w, h)) = file.image_size(id)?
-        && (w, h) != (image.width, image.height)
-    {
-        // `ispe` is authoritative; HEVC may code a slightly larger picture.
-        image = image.crop(0, 0, w, h);
-    }
+    // `ispe` is authoritative; HEVC may code a slightly larger picture.
+    let (width, height) = file
+        .image_size(id)?
+        .unwrap_or((frame.widths[0], frame.heights[0]));
+    let params = color_params(file, id, &frame)?;
+    let mut image = frame_to_rgba_sized(&frame, params, width, height);
 
     // Alpha channel: an auxiliary image of type alpha referencing this item.
     for aux in file.referencing_items(id, b"auxl") {
@@ -246,7 +260,7 @@ fn decode_hvc1(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Ima
             for x in 0..image.width as usize {
                 let a = f64::from(alpha.planes[0][y * alpha.widths[0] as usize + x]);
                 let a = ((a - offset) / span * max).round().clamp(0.0, max);
-                image.data[(y * image.width as usize + x) * 4 + 3] = a as u16;
+                image.data[(y * image.width as usize + x) * 4 + 3] = S::from_u16(a as u16);
             }
         }
         image.has_alpha = true;
@@ -265,7 +279,7 @@ fn is_alpha_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
 
 /// Uses the first channel of a decoded alpha image (e.g. a grid of monochrome tiles) as the
 /// alpha channel of `image`.
-fn attach_alpha_image(image: &mut Image, alpha: &Image) -> Result<(), Error> {
+fn attach_alpha_image<S: Sample>(image: &mut Image<S>, alpha: &Image<S>) -> Result<(), Error> {
     if alpha.width < image.width || alpha.height < image.height {
         return Err(Error::Unsupported(
             "alpha plane smaller than the image".into(),
@@ -274,9 +288,9 @@ fn attach_alpha_image(image: &mut Image, alpha: &Image) -> Result<(), Error> {
     let (from, to) = (u32::from(alpha.max_value()), u32::from(image.max_value()));
     for y in 0..image.height as usize {
         for x in 0..image.width as usize {
-            let a = u32::from(alpha.data[(y * alpha.width as usize + x) * 4]);
+            let a = u32::from(alpha.data[(y * alpha.width as usize + x) * 4].to_u16());
             image.data[(y * image.width as usize + x) * 4 + 3] =
-                ((a * to + from / 2) / from) as u16;
+                S::from_u16(((a * to + from / 2) / from) as u16);
         }
     }
     image.has_alpha = true;
@@ -290,12 +304,12 @@ fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn decode_grid(
+fn decode_grid<S: Sample>(
     file: &HeifFile<'_>,
     id: ItemId,
     depth: u32,
     options: &Options,
-) -> Result<Image, Error> {
+) -> Result<Image<S>, Error> {
     let grid = file.grid(id)?;
     let tiles = file.referenced_items(id, b"dimg");
     let columns = u32::from(grid.columns);
@@ -310,19 +324,24 @@ fn decode_grid(
     // tiles can be decoded in parallel. Otherwise, decode the first tile to find out.
     let mut first_tile = None;
     let (tw, th, bit_depth) = match (file.image_size(tiles[0])?, file.hevc_config(tiles[0])?) {
-        (Some((w, h)), Some(c)) => (w, h, c.bit_depth_luma.max(c.bit_depth_chroma)),
+        (Some((w, h)), Some(c)) => (w, h, S::depth(c.bit_depth_luma.max(c.bit_depth_chroma))),
         _ => {
-            let tile = decode_item_with(file, tiles[0], depth + 1, options)?;
+            let tile: Image<S> = decode_item_with(file, tiles[0], depth + 1, options)?;
             let size = (tile.width, tile.height, tile.bit_depth);
             first_tile = Some(tile);
             size
         }
     };
-    let mut canvas = Image::filled(grid.output_width, grid.output_height, bit_depth, [0; 4]);
+    let mut canvas = Image::filled(
+        grid.output_width,
+        grid.output_height,
+        bit_depth,
+        [S::default(); 4],
+    );
     let (canvas_w, canvas_h) = (canvas.width, canvas.height);
     let stride = canvas_w as usize * 4;
     // Each tile gets its own row segments of the canvas, so tiles are written concurrently.
-    let mut segments: Vec<Vec<&mut [u16]>> = (0..tiles.len()).map(|_| Vec::new()).collect();
+    let mut segments: Vec<Vec<&mut [S]>> = (0..tiles.len()).map(|_| Vec::new()).collect();
     for (y, row) in canvas.data.chunks_exact_mut(stride).enumerate() {
         let first = y / th as usize * columns as usize;
         for (column, segment) in row.chunks_mut(tw as usize * 4).enumerate() {
@@ -331,7 +350,7 @@ fn decode_grid(
             }
         }
     }
-    let segments: Vec<std::sync::Mutex<Vec<&mut [u16]>>> =
+    let segments: Vec<std::sync::Mutex<Vec<&mut [S]>>> =
         segments.into_iter().map(std::sync::Mutex::new).collect();
     let has_alpha = std::sync::atomic::AtomicBool::new(false);
     // Plain tiles are converted straight into the canvas, without an intermediate image.
@@ -339,7 +358,7 @@ fn decode_grid(
         && tiles
             .iter()
             .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
-    let place = |i: usize, tile: Option<&Image>| -> Result<(), Error> {
+    let place = |i: usize, tile: Option<&Image<S>>| -> Result<(), Error> {
         let (x0, y0) = ((i as u32 % columns) * tw, (i as u32 / columns) * th);
         let (w, h) = (
             tw.min(canvas_w.saturating_sub(x0)) as usize,
@@ -367,7 +386,7 @@ fn decode_grid(
             (None, Some((f, _))) => {
                 f.widths[0] >= tw
                     && f.heights[0] >= th
-                    && f.bit_depth[0].max(f.bit_depth[1]) == bit_depth
+                    && S::depth(f.bit_depth[0].max(f.bit_depth[1])) == bit_depth
             }
             (None, None) => false,
         };
@@ -454,12 +473,12 @@ fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> 
     }))
 }
 
-fn decode_overlay(
+fn decode_overlay<S: Sample>(
     file: &HeifFile<'_>,
     id: ItemId,
     depth: u32,
     options: &Options,
-) -> Result<Image, Error> {
+) -> Result<Image<S>, Error> {
     let data = file.item_data(id)?;
     let inputs = file.referenced_items(id, b"dimg");
     let mut r = data.iter().copied();
@@ -496,29 +515,29 @@ fn decode_overlay(
 
     let images = inputs
         .iter()
-        .map(|&i| decode_item_with(file, i, depth + 1, options))
+        .map(|&i| decode_item_with::<S>(file, i, depth + 1, options))
         .collect::<Result<Vec<_>, _>>()?;
     let bit_depth = images.iter().map(|i| i.bit_depth).max().unwrap_or(8);
     // canvas_fill_value is given on 16 bits.
     let scale = |v: u16| ((u32::from(v) * ((1u32 << bit_depth) - 1) + 32767) / 65535) as u16;
-    let mut canvas = Image::filled(w, h, bit_depth, fill.map(scale));
+    let mut canvas = Image::filled(w, h, bit_depth, fill.map(|v| S::from_u16(scale(v))));
     canvas.has_alpha = fill[3] != 65535;
     for (img, (x, y)) in images.iter().zip(offsets) {
         canvas.draw(img, x, y);
     }
     let opaque = canvas.max_value();
-    canvas.has_alpha = canvas.data.chunks_exact(4).any(|p| p[3] != opaque);
+    canvas.has_alpha = canvas.data.chunks_exact(4).any(|p| p[3].to_u16() != opaque);
     Ok(canvas)
 }
 
 /// Applies a `clap` (clean aperture) crop, centred as specified by ISO/IEC 14496-12.
-fn clean_aperture(
-    img: &Image,
+fn clean_aperture<S: Sample>(
+    img: &Image<S>,
     width: (u32, u32),
     height: (u32, u32),
     horiz: (i32, u32),
     vert: (i32, u32),
-) -> Result<Image, Error> {
+) -> Result<Image<S>, Error> {
     if width.1 == 0 || height.1 == 0 || horiz.1 == 0 || vert.1 == 0 {
         return Err(Error::Invalid("clap with a zero denominator"));
     }

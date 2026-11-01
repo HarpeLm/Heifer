@@ -1,8 +1,42 @@
 //! Decoded RGBA images and the geometric transforms of HEIF (crop, rotation, mirror).
 
+/// A sample of a decoded image: `u16` keeps the coded bit depth, `u8` takes half the memory.
+pub trait Sample: Copy + Default + PartialEq + Send + Sync {
+    /// Bit depth of an image of these samples, for a picture coded on `coded` bits.
+    fn depth(coded: u8) -> u8;
+    /// A value that fits the depth given by [`Sample::depth`].
+    fn from_u16(value: u16) -> Self;
+    /// The value of this sample.
+    fn to_u16(self) -> u16;
+}
+
+impl Sample for u16 {
+    fn depth(coded: u8) -> u8 {
+        coded
+    }
+    fn from_u16(value: u16) -> Self {
+        value
+    }
+    fn to_u16(self) -> u16 {
+        self
+    }
+}
+
+impl Sample for u8 {
+    fn depth(_coded: u8) -> u8 {
+        8
+    }
+    fn from_u16(value: u16) -> Self {
+        value as u8
+    }
+    fn to_u16(self) -> u16 {
+        u16::from(self)
+    }
+}
+
 /// A decoded image: interleaved RGBA samples at `bit_depth` bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Image {
+pub struct Image<S = u16> {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
@@ -12,16 +46,16 @@ pub struct Image {
     /// Whether the alpha channel carries information (otherwise it is fully opaque).
     pub has_alpha: bool,
     /// RGBA samples, row-major, 4 values per pixel.
-    pub data: Vec<u16>,
+    pub data: Vec<S>,
 }
 
-impl Image {
+impl<S: Sample> Image<S> {
     /// Creates an image filled with one RGBA colour.
-    pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [u16; 4]) -> Self {
+    pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [S; 4]) -> Self {
         let n = width as usize * height as usize;
         // An all-zero image is allocated zeroed by the system, which costs nothing upfront.
-        let data = if rgba == [0; 4] {
-            vec![0; n * 4]
+        let data = if rgba == [S::default(); 4] {
+            vec![S::default(); n * 4]
         } else {
             rgba.repeat(n)
         };
@@ -39,44 +73,13 @@ impl Image {
         ((1u32 << self.bit_depth) - 1) as u16
     }
 
-    /// Converts to 8-bit RGBA, rounding higher bit depths.
-    pub fn to_rgba8(&self) -> Vec<u8> {
-        if self.bit_depth == 8 {
-            return self.data.iter().map(|&v| v as u8).collect();
-        }
-        let lut = self.to_8bit_table();
-        self.data.iter().map(|&v| lut[usize::from(v)]).collect()
-    }
-
-    /// Converts to 8-bit RGB, dropping alpha.
-    pub fn to_rgb8(&self) -> Vec<u8> {
-        let lut = self.to_8bit_table();
-        let mut out = Vec::with_capacity(self.data.len() / 4 * 3);
-        for p in self.data.chunks_exact(4) {
-            out.extend([
-                lut[usize::from(p[0])],
-                lut[usize::from(p[1])],
-                lut[usize::from(p[2])],
-            ]);
-        }
-        out
-    }
-
-    /// 8-bit value of every possible sample, rounded.
-    fn to_8bit_table(&self) -> Vec<u8> {
-        let max = u32::from(self.max_value());
-        (0..=max)
-            .map(|v| ((v * 255 + max / 2) / max) as u8)
-            .collect()
-    }
-
     fn pixel(&self, x: u32, y: u32) -> [u16; 4] {
         let i = (y as usize * self.width as usize + x as usize) * 4;
         [
-            self.data[i],
-            self.data[i + 1],
-            self.data[i + 2],
-            self.data[i + 3],
+            self.data[i].to_u16(),
+            self.data[i + 1].to_u16(),
+            self.data[i + 2].to_u16(),
+            self.data[i + 3].to_u16(),
         ]
     }
 
@@ -84,7 +87,7 @@ impl Image {
     /// Works in 32×32 tiles so that rotations stay cache-friendly.
     fn remap(&self, width: u32, height: u32, src: impl Fn(u32, u32) -> (u32, u32)) -> Self {
         const TILE: u32 = 32;
-        let mut data = vec![0u16; width as usize * height as usize * 4];
+        let mut data = vec![S::default(); width as usize * height as usize * 4];
         for ty in (0..height).step_by(TILE as usize) {
             for tx in (0..width).step_by(TILE as usize) {
                 for y in ty..(ty + TILE).min(height) {
@@ -137,7 +140,7 @@ impl Image {
     }
 
     /// Draws `src` at (`x0`, `y0`) (may be negative or overflow), blending with its alpha.
-    pub fn draw(&mut self, src: &Image, x0: i64, y0: i64) {
+    pub fn draw(&mut self, src: &Self, x0: i64, y0: i64) {
         let max = u32::from(src.max_value());
         let dst_max = u32::from(self.max_value());
         let same_depth = src.bit_depth == self.bit_depth;
@@ -163,17 +166,64 @@ impl Image {
                 let i = (y as usize * self.width as usize + x as usize) * 4;
                 let a = u32::from(s[3]);
                 for (d, &sc) in self.data[i..i + 3].iter_mut().zip(&s[..3]) {
-                    let (fg, bg) = (u32::from(shift_to(sc)), u32::from(*d));
-                    *d = ((fg * a + bg * (max - a) + max / 2) / max) as u16;
+                    let (fg, bg) = (u32::from(shift_to(sc)), u32::from(d.to_u16()));
+                    *d = S::from_u16(((fg * a + bg * (max - a) + max / 2) / max) as u16);
                 }
                 if src.has_alpha {
-                    let ab = u32::from(self.data[i + 3]);
+                    let ab = u32::from(self.data[i + 3].to_u16());
                     let out_a = a + ab * (max - a) / max;
-                    self.data[i + 3] = shift_to(out_a.min(max) as u16);
+                    self.data[i + 3] = S::from_u16(shift_to(out_a.min(max) as u16));
                     self.has_alpha = true;
                 }
             }
         }
+    }
+}
+
+impl Image {
+    /// Converts to 8-bit RGBA, rounding higher bit depths.
+    pub fn to_rgba8(&self) -> Vec<u8> {
+        if self.bit_depth == 8 {
+            return self.data.iter().map(|&v| v as u8).collect();
+        }
+        let lut = self.to_8bit_table();
+        self.data.iter().map(|&v| lut[usize::from(v)]).collect()
+    }
+
+    /// Converts to 8-bit RGB, dropping alpha.
+    pub fn to_rgb8(&self) -> Vec<u8> {
+        let lut = self.to_8bit_table();
+        let mut out = Vec::with_capacity(self.data.len() / 4 * 3);
+        for p in self.data.chunks_exact(4) {
+            out.extend([
+                lut[usize::from(p[0])],
+                lut[usize::from(p[1])],
+                lut[usize::from(p[2])],
+            ]);
+        }
+        out
+    }
+
+    /// 8-bit value of every possible sample, rounded.
+    fn to_8bit_table(&self) -> Vec<u8> {
+        let max = u32::from(self.max_value());
+        (0..=max)
+            .map(|v| ((v * 255 + max / 2) / max) as u8)
+            .collect()
+    }
+}
+
+impl Image<u8> {
+    /// The RGB samples, dropping alpha in place, so the image is not held twice.
+    pub fn into_rgb8(self) -> Vec<u8> {
+        let mut data = self.data;
+        let pixels = data.len() / 4;
+        for i in 1..pixels {
+            data.copy_within(i * 4..i * 4 + 3, i * 3);
+        }
+        data.truncate(pixels * 3);
+        data.shrink_to_fit();
+        data
     }
 }
 
@@ -210,9 +260,21 @@ mod tests {
     }
 
     #[test]
+    fn into_rgb8_drops_alpha_in_place() {
+        let image = Image::<u8> {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            has_alpha: false,
+            data: vec![1, 2, 3, 255, 4, 5, 6, 255],
+        };
+        assert_eq!(image.into_rgb8(), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
     fn draw_with_alpha() {
-        let mut canvas = Image::filled(2, 1, 8, [0, 0, 0, 255]);
-        let mut src = Image::filled(1, 1, 8, [255, 255, 255, 128]);
+        let mut canvas = Image::<u16>::filled(2, 1, 8, [0, 0, 0, 255]);
+        let mut src = Image::<u16>::filled(1, 1, 8, [255, 255, 255, 128]);
         src.has_alpha = true;
         canvas.draw(&src, 1, 0);
         assert_eq!(&canvas.data[4..7], &[128, 128, 128]);

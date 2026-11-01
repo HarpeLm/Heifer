@@ -392,7 +392,7 @@ pub enum Property {
     PixelInfo(Vec<u8>),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
-    /// `imir`: mirroring. `true` = horizontal axis (top-bottom flip), `false` = vertical axis (left-right flip).
+    /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
     Mirror(bool),
     /// `clap`: clean aperture (crop), as fractions.
     CleanAperture {
@@ -440,7 +440,7 @@ impl Property {
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
             b"irot" => Self::Rotation(r.u8()? & 0x03),
-            b"imir" => Self::Mirror(r.u8()? & 0x01 != 0),
+            b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {
                 width: (r.u32()?, r.u32()?),
                 height: (r.u32()?, r.u32()?),

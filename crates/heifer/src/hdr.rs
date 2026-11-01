@@ -105,7 +105,7 @@ pub fn decode_hdr_with_options(
     if let Some(hdr) = iso21496::decode(&file, options, max_headroom)? {
         return Ok(hdr);
     }
-    let sdr = decode_item_with(&file, file.primary_id, 0, options)?;
+    let sdr = decode_item_with::<u16>(&file, file.primary_id, 0, options)?;
     let gain = gain_map(&file, options)?.map(|mut g| {
         g.headroom = g.headroom.min(max_headroom).max(1.0);
         g
@@ -161,7 +161,7 @@ fn gain_map(file: &HeifFile<'_>, options: &Options) -> Result<Option<GainMap>, E
         return Ok(None);
     };
 
-    let image = decode_item_with(file, aux, 1, options)?;
+    let image = decode_item_with::<u16>(file, aux, 1, options)?;
     // Grayscale: the red channel holds the gain map samples, encoded with a 2.2 gamma.
     let max = f32::from(image.max_value());
     let data = image
