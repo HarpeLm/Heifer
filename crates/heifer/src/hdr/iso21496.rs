@@ -145,6 +145,39 @@ fn parse_metadata(data: &[u8]) -> Result<Metadata, Error> {
     })
 }
 
+/// The `tmap` item payload for a monochrome gain map with the given headroom: version 0,
+/// `use_base_colour_space`, no base headroom, no gain below 1, gamma 1 and no offsets.
+pub(crate) fn payload(headroom: f32) -> Result<Vec<u8>, Error> {
+    let log2 = headroom.log2();
+    if !(log2 > 0.0 && log2 < 127.0) {
+        return Err(Error::Invalid("HDR headroom must be greater than 1"));
+    }
+    // Headrooms are rationals; 2^22 keeps the log2 value to about seven decimal digits.
+    let denominator = 1u32 << 22;
+    let numerator = (log2 * denominator as f32).round() as u32;
+    let max = i32::try_from(numerator).map_err(|_| Error::Invalid("HDR headroom is too large"))?;
+    let mut data = Vec::with_capacity(62);
+    data.push(0); // tmap version
+    data.extend_from_slice(&0u16.to_be_bytes()); // minimum gain map metadata version
+    data.extend_from_slice(&0u16.to_be_bytes()); // writer version
+    data.push(0x40); // one channel, use_base_colour_space, reserved bits zero
+    data.extend_from_slice(&0u32.to_be_bytes()); // base headroom 0/1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&numerator.to_be_bytes()); // alternate headroom
+    data.extend_from_slice(&denominator.to_be_bytes());
+    data.extend_from_slice(&0i32.to_be_bytes()); // gain min 0/1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&max.to_be_bytes()); // gain max: the headroom
+    data.extend_from_slice(&denominator.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes()); // gamma 1/1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&0i32.to_be_bytes()); // base offset 0/1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&0i32.to_be_bytes()); // alternate offset 0/1
+    data.extend_from_slice(&1u32.to_be_bytes());
+    Ok(data)
+}
+
 /// Big-endian reader of the `tmap` payload.
 struct Reader<'a> {
     data: &'a [u8],
@@ -447,6 +480,29 @@ mod tests {
         let mut zero_denominator = tmap_payload();
         zero_denominator[18..22].fill(0);
         assert!(parse_metadata(&zero_denominator).is_err());
+    }
+
+    #[test]
+    fn serialises_monochrome_tmap_metadata() {
+        let data = payload(4.0).unwrap();
+        assert_eq!(data.len(), 62);
+        assert_eq!(data[5], 0x40);
+
+        let metadata = parse_metadata(&data).unwrap();
+        assert!(!metadata.multichannel);
+        assert!(metadata.use_base_color_space);
+        assert_eq!(metadata.base_headroom, 0.0);
+        assert!((metadata.alternate_headroom - 2.0).abs() < 1e-6);
+        assert_eq!(metadata.min, [0.0; 3]);
+        assert!((metadata.max[0] - 2.0).abs() < 1e-6);
+        assert_eq!(metadata.gamma, [1.0; 3]);
+        assert_eq!(metadata.base_offset, [0.0; 3]);
+        assert_eq!(metadata.alternate_offset, [0.0; 3]);
+
+        assert!(payload(1.0).is_err());
+        assert!(payload(0.5).is_err());
+        assert!(payload(f32::NAN).is_err());
+        assert!(payload(f32::INFINITY).is_err());
     }
 
     #[test]

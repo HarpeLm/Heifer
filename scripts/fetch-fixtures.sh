@@ -6,7 +6,11 @@ cd "$(dirname "$0")/../tests/fixtures"
 
 NOKIA=https://raw.githubusercontent.com/nokiatech/heif/gh-pages/content/nokia
 CONFORMANCE=https://raw.githubusercontent.com/nokiatech/heif_conformance/master/conformance_files
+# pillow-heif (BSD-3-Clause) test samples, copied by name with `/` replaced by `__`.
+PILLOW=https://raw.githubusercontent.com/bigcat88/pillow_heif/b16be1196dfa465a342d68894696e685ca3655cb
 fetch() { [ -f "$2" ] || curl -fsSL "$1" -o "$2" && echo "ok  $2"; }
+
+mkdir -p real
 
 fetch "$NOKIA/autumn_1440x960.heic"            single_image.heic
 fetch "$NOKIA/grid_960x640.heic"               grid.heic
@@ -17,3 +21,5 @@ fetch "$CONFORMANCE/C042.heic"                 mirrored.heic
 fetch "$CONFORMANCE/C008.heic"                 iden_rotated.heic
 fetch "$CONFORMANCE/C039.heic"                 iden_nested.heic
 fetch https://raw.githubusercontent.com/strukturag/libheif/master/examples/example.heic libheif_example.heic
+# A Samsung photo with an ISO 21496-1 gain map (tmap item).
+fetch "$PILLOW/tests/images/heif_special/aux_YCbCr.heic" real/heif_special__aux_YCbCr.heic

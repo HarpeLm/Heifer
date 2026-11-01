@@ -19,7 +19,7 @@ use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
 use heifer_isobmff::writer::{ALPHA_URN, HeifWriter, ImageSpec};
 
-use crate::{Error, Image, Metadata};
+use crate::{Error, HdrImage, Image, Metadata};
 
 /// Size of grid tiles.
 const TILE: u32 = 512;
@@ -133,6 +133,147 @@ pub fn encode_with_metadata(
     )
 }
 
+/// Encodes an HDR image as a HEIC file with an ISO 21496-1 gain map: `base` is the SDR image
+/// shown by viewers that ignore the gain map, and `hdr` is the linear-light rendition (see
+/// [`HdrImage`]) to reconstruct on HDR displays. Both must have the same size, and `hdr` must
+/// describe the same primaries as `base` (`use_base_colour_space`).
+///
+/// The gain map is a monochrome image at half resolution, stored at `quality`; the declared
+/// headroom is `hdr.headroom`, so values above it are clipped. A headroom of 1 (or less) is an
+/// error: there is nothing to gain.
+pub fn encode_hdr(base: &Image, hdr: &HdrImage, options: &EncodeOptions) -> Result<Vec<u8>, Error> {
+    encode_hdr_with_metadata(base, hdr, &Metadata::default(), options)
+}
+
+/// Like [`encode_hdr`], also storing EXIF, XMP and the ICC profile of the base image.
+pub fn encode_hdr_with_metadata(
+    base: &Image,
+    hdr: &HdrImage,
+    metadata: &Metadata,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
+    check_input(base.width, base.height, base.data.len(), 4)?;
+    if (base.width, base.height) != (hdr.width, hdr.height) {
+        return Err(Error::Invalid(
+            "HDR image size does not match the base image",
+        ));
+    }
+    if hdr.data.len() != base.width as usize * base.height as usize * 3 {
+        return Err(Error::Invalid(
+            "HDR pixel buffer size does not match the image size",
+        ));
+    }
+    // Validates the headroom before any expensive work.
+    let payload = crate::hdr::tmap_payload(hdr.headroom)?;
+
+    let max = u32::from(base.max_value());
+    let bit_depth = if base.bit_depth > 8 { 10 } else { 8 };
+    let target = (1u32 << bit_depth) - 1;
+    let scale = |v: u16| ((u32::from(v) * target + max / 2) / max) as u16;
+    let mut writer = HeifWriter::new();
+    let image = encode_into(
+        &mut writer,
+        base.width,
+        base.height,
+        bit_depth,
+        base.has_alpha,
+        Some(metadata),
+        options,
+        |i| {
+            let p = &base.data[i * 4..i * 4 + 4];
+            [scale(p[0]), scale(p[1]), scale(p[2]), scale(p[3])]
+        },
+    )?;
+
+    let map = gain_map(base, hdr);
+    let (width, height) = (base.width.div_ceil(2), base.height.div_ceil(2));
+    let map = encode_monochrome(&mut writer, width, height, &map, options)?;
+    writer.add_tmap(image, map, base.width, base.height, Some(&COLOR), &payload);
+    Ok(writer.finish())
+}
+
+/// The monochrome gain map of `hdr` relative to `base`, at half resolution: one byte per sample,
+/// where 255 is the headroom. The gain is the brightest channel ratio, averaged in log2 over
+/// each 2×2 block.
+fn gain_map(base: &Image, hdr: &HdrImage) -> Vec<u8> {
+    let (w, h) = (base.width as usize, base.height as usize);
+    let max = base.max_value();
+    let lut: Vec<f32> = (0..=max)
+        .map(|v| crate::hdr::srgb_to_linear(f32::from(v) / f32::from(max)))
+        .collect();
+    let log2_headroom = hdr.headroom.log2();
+    let (mw, mh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut map = Vec::with_capacity(mw * mh);
+    for my in 0..mh {
+        for mx in 0..mw {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for y in 2 * my..(2 * my + 2).min(h) {
+                for x in 2 * mx..(2 * mx + 2).min(w) {
+                    let i = y * w + x;
+                    let base_px = &base.data[i * 4..i * 4 + 3];
+                    let hdr_px = &hdr.data[i * 3..i * 3 + 3];
+                    let mut ratio: f32 = 1.0;
+                    for (&sample, &value) in base_px.iter().zip(hdr_px) {
+                        let sample = lut[usize::from(sample).min(lut.len() - 1)];
+                        // With a black base sample no multiplier can reconstruct a highlight.
+                        let r = if sample > 0.0 {
+                            value.max(0.0) / sample
+                        } else if value > 0.0 {
+                            f32::INFINITY
+                        } else {
+                            1.0
+                        };
+                        ratio = ratio.max(r);
+                    }
+                    sum += ratio.max(1.0).log2().min(log2_headroom);
+                    count += 1;
+                }
+            }
+            let value = sum / count as f32 / log2_headroom;
+            map.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    map
+}
+
+/// Encodes `map` (one byte per sample) as a hidden monochrome image or grid of 512×512 tiles.
+fn encode_monochrome(
+    writer: &mut HeifWriter,
+    width: u32,
+    height: u32,
+    map: &[u8],
+    options: &EncodeOptions,
+) -> Result<ItemId, Error> {
+    let source = Source {
+        width,
+        height,
+        bit_depth: 8,
+        pixel: |i: usize| [0, 0, 0, u16::from(map[i])],
+    };
+    // The gain map shapes every tone: code it with the same quality as the base image.
+    let config = EncoderConfig {
+        qp: options.qp(),
+        ..EncoderConfig::default()
+    };
+    if width <= TILE && height <= TILE {
+        let picture = encode_region(&source, (0, 0), (width, height), true, &config)?;
+        return Ok(add_picture(writer, &picture, (width, height), true));
+    }
+    let (columns, rows) = (width.div_ceil(TILE), height.div_ceil(TILE));
+    if columns > 256 || rows > 256 {
+        return Err(Error::Invalid(
+            "image too large for a grid of 512×512 tiles",
+        ));
+    }
+    let pictures = encode_tiles(&source, columns, rows, true, &config, options)?;
+    let ids: Vec<ItemId> = pictures
+        .iter()
+        .map(|p| add_picture(writer, p, (TILE, TILE), true))
+        .collect();
+    Ok(writer.add_hidden_grid(rows as u16, columns as u16, width, height, &ids, None))
+}
+
 fn check_input(width: u32, height: u32, len: usize, channels: usize) -> Result<(), Error> {
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 1 << 28 {
         return Err(Error::Invalid("image size is zero or too large"));
@@ -164,14 +305,39 @@ pub(crate) fn encode_pixels(
     options: &EncodeOptions,
     pixel: impl Fn(usize) -> [u16; 4] + Sync,
 ) -> Result<Vec<u8>, Error> {
+    let mut writer = HeifWriter::new();
+    encode_into(
+        &mut writer,
+        width,
+        height,
+        bit_depth,
+        has_alpha,
+        metadata,
+        options,
+        pixel,
+    )?;
+    Ok(writer.finish())
+}
+
+/// Encodes an image into `writer`, with a thumbnail and its metadata; returns the image's ID.
+#[allow(clippy::too_many_arguments)]
+fn encode_into(
+    writer: &mut HeifWriter,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    has_alpha: bool,
+    metadata: Option<&Metadata>,
+    options: &EncodeOptions,
+    pixel: impl Fn(usize) -> [u16; 4] + Sync,
+) -> Result<ItemId, Error> {
     let source = Source {
         width,
         height,
         bit_depth,
         pixel,
     };
-    let mut writer = HeifWriter::new();
-    let image = encode_image(&source, has_alpha, options, &mut writer)?;
+    let image = encode_image(&source, has_alpha, options, writer)?;
     // A thumbnail, as in iPhone photos: viewers show it without decoding the whole image.
     if width.max(height) > TILE {
         let (tw, th, pixels) = thumbnail(&source);
@@ -186,7 +352,7 @@ pub(crate) fn encode_pixels(
             quality: options.quality.min(60),
             ..*options
         };
-        let id = encode_image(&thumb, has_alpha, &preview, &mut writer)?;
+        let id = encode_image(&thumb, has_alpha, &preview, writer)?;
         writer.add_reference(*b"thmb", id, &[image]);
     }
     if let Some(m) = metadata {
@@ -200,7 +366,7 @@ pub(crate) fn encode_pixels(
             writer.add_xmp(image, xmp);
         }
     }
-    Ok(writer.finish())
+    Ok(image)
 }
 
 /// The image to encode: its size, bits per sample, and RGBA pixels by index.

@@ -169,6 +169,25 @@ if let Some(gain) = heifer::read_gain_map(&bytes)? {
 per-channel gain, gamma, offset, and headroom metadata. ISO gain maps take precedence when both
 formats are present; `read_gain_map` exposes the legacy Apple map.
 
+The reverse direction writes the same standard form: a monochrome, half-resolution gain map in a
+hidden item, referenced by a `tmap` metadata item, with the base and tone-mapped items grouped as
+alternatives. macOS (ImageIO) reads the result back as HDR, and it is the form recent Samsung
+phones write.
+
+```rust
+// `hdr.data` is linear light in the base image's primaries; `hdr.headroom` is the ratio of
+// HDR white to SDR white (4.0: highlights reach four times SDR white).
+let bytes = heifer::encode_hdr(&base, &hdr, &heifer::EncodeOptions::default())?;
+
+// Or keep EXIF, XMP and the ICC profile of the base image:
+let bytes = heifer::encode_hdr_with_metadata(&base, &hdr, &metadata, &options)?;
+```
+
+`encode_hdr` assumes that `base` is sRGB-encoded, as `encode` tags it, and that `hdr` uses the same
+primaries. It does not convert between colour spaces, and clips values above `hdr.headroom`. The
+gain map is coded at the same `quality` as the base image; the headroom itself is stored as the
+ISO 21496-1 `log2` gain range, so any headroom above 1 works.
+
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
@@ -202,7 +221,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos) | applying ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`) | 4:4:4, HDR gain maps, lossless |
+| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | 4:4:4, lossless |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -335,8 +354,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **0.3.3**: 10-bit encoding (Main 10)
 - [x] **0.3.8**: thumbnails, public benchmarks
 - [x] **0.3.9**: files smaller than x265 `slow` and still265 Slow (SAO, 64×64 blocks, deeper transform trees, transform skip)
-- [ ] **Next**: HDR gain map encoding
-- [ ] ICC colour management
+- [x] **0.3.15**: HDR gain map encoding (ISO 21496-1 `tmap`)
+- [ ] **Next**: ICC colour management
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 

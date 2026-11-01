@@ -16,6 +16,8 @@
 
 mod iso21496;
 
+pub(crate) use iso21496::payload as tmap_payload;
+
 use heifer_isobmff::HeifFile;
 use heifer_isobmff::boxes::Property;
 
@@ -178,7 +180,7 @@ fn gain_map(file: &HeifFile<'_>, options: &Options) -> Result<Option<GainMap>, E
 }
 
 /// sRGB transfer function to linear light.
-fn srgb_to_linear(v: f32) -> f32 {
+pub(crate) fn srgb_to_linear(v: f32) -> f32 {
     if v <= 0.04045 {
         v / 12.92
     } else {

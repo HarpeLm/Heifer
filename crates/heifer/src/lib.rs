@@ -21,7 +21,10 @@ pub mod image;
 pub mod image_crate;
 pub mod metadata;
 
-pub use encode::{EncodeOptions, encode, encode_rgb8, encode_rgba8, encode_with_metadata};
+pub use encode::{
+    EncodeOptions, encode, encode_hdr, encode_hdr_with_metadata, encode_rgb8, encode_rgba8,
+    encode_with_metadata,
+};
 pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;

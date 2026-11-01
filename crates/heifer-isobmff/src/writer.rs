@@ -87,7 +87,11 @@ pub struct HeifWriter {
     properties: Vec<Vec<u8>>,
     /// `iref` entries: type, from, to.
     references: Vec<([u8; 4], ItemId, Vec<ItemId>)>,
+    /// `grpl` entity groups (`altr`), in order.
+    groups: Vec<Vec<ItemId>>,
     primary: Option<ItemId>,
+    /// Whether the file has a `tmap` item, which adds the `tmap` compatible brand.
+    has_tmap: bool,
 }
 
 impl HeifWriter {
@@ -173,6 +177,49 @@ impl HeifWriter {
         color: Option<&ColorInfo>,
         auxiliary_type: Option<&str>,
     ) -> ItemId {
+        self.add_grid_item(
+            rows,
+            columns,
+            width,
+            height,
+            tiles,
+            color,
+            auxiliary_type,
+            auxiliary_type.is_some(),
+            auxiliary_type.is_none(),
+        )
+    }
+
+    /// Adds a hidden `grid` derived image without an auxiliary type, e.g. a gain map. The grid
+    /// does not become the primary item.
+    pub fn add_hidden_grid(
+        &mut self,
+        rows: u16,
+        columns: u16,
+        width: u32,
+        height: u32,
+        tiles: &[ItemId],
+        color: Option<&ColorInfo>,
+    ) -> ItemId {
+        self.add_grid_item(
+            rows, columns, width, height, tiles, color, None, true, false,
+        )
+    }
+
+    /// Builds a `grid` item. `hidden` flags the item, and `primary` makes it the file's image.
+    #[allow(clippy::too_many_arguments)]
+    fn add_grid_item(
+        &mut self,
+        rows: u16,
+        columns: u16,
+        width: u32,
+        height: u32,
+        tiles: &[ItemId],
+        color: Option<&ColorInfo>,
+        auxiliary_type: Option<&str>,
+        hidden: bool,
+        primary: bool,
+    ) -> ItemId {
         let mut properties = vec![(
             self.property(full_box(b"ispe", 0, 0, |b| {
                 b.extend_from_slice(&width.to_be_bytes());
@@ -201,12 +248,50 @@ impl HeifWriter {
             data.extend_from_slice(&(width as u16).to_be_bytes());
             data.extend_from_slice(&(height as u16).to_be_bytes());
         }
-        let id = self.add_item(*b"grid", auxiliary_type.is_some(), properties, data);
+        let id = self.add_item(*b"grid", hidden, properties, data);
         self.add_reference(*b"dimg", id, tiles);
-        if auxiliary_type.is_none() {
+        if primary {
             self.primary = Some(id); // the grid, not its tiles, is the image
         }
         id
+    }
+
+    /// Adds a `tmap` derived image item (an ISO 21496-1 gain map) referencing `base` and `map`,
+    /// and returns its ID. `payload` is the item's data (the tmap payload, version byte first).
+    /// The item takes the size and colour of the base image, is grouped with it in an `altr`
+    /// entity group, and makes `tmap` a compatible brand of the file.
+    pub fn add_tmap(
+        &mut self,
+        base: ItemId,
+        map: ItemId,
+        width: u32,
+        height: u32,
+        color: Option<&ColorInfo>,
+        payload: &[u8],
+    ) -> ItemId {
+        let mut properties = vec![(
+            self.property(full_box(b"ispe", 0, 0, |b| {
+                b.extend_from_slice(&width.to_be_bytes());
+                b.extend_from_slice(&height.to_be_bytes());
+            })),
+            false,
+        )];
+        if let Some(color) = color {
+            properties.push((self.property(colr_box(color)), false));
+        }
+        let id = self.add_item(*b"tmap", false, properties, payload.to_vec());
+        self.add_reference(*b"dimg", id, &[base, map]);
+        // The tone-mapped rendition and the base image are alternates of each other.
+        self.add_alternative_group(&[id, base]);
+        self.has_tmap = true;
+        id
+    }
+
+    /// Adds an `altr` entity group (`grpl`) listing `items` in preference order.
+    pub fn add_alternative_group(&mut self, items: &[ItemId]) {
+        if !items.is_empty() {
+            self.groups.push(items.to_vec());
+        }
     }
 
     /// Adds an alpha plane (a hidden auxiliary image) to `image`.
@@ -314,6 +399,9 @@ impl HeifWriter {
             b.extend_from_slice(b"heic");
             b.extend_from_slice(&0u32.to_be_bytes());
             b.extend_from_slice(b"mif1heic");
+            if self.has_tmap {
+                b.extend_from_slice(b"tmap");
+            }
         });
         // The `iloc` offsets depend on the size of `meta`, which does not depend on their
         // values: write it once with placeholder offsets, then again with the real ones.
@@ -419,6 +507,25 @@ impl HeifWriter {
                             r.extend_from_slice(&(to.len() as u16).to_be_bytes());
                             for &t in to {
                                 id(r, t);
+                            }
+                        }));
+                    }
+                }));
+            }
+
+            if !self.groups.is_empty() {
+                // Entity group IDs share the item ID namespace (ISO/IEC 23008-12): a group
+                // whose ID is an item ID makes decoders such as ImageIO ignore it. Number the
+                // groups after the last item.
+                let first = self.items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+                meta.extend(make_box(b"grpl", |b| {
+                    for (index, group) in self.groups.iter().enumerate() {
+                        b.extend(make_box(b"altr", |g| {
+                            g.extend_from_slice(&0u32.to_be_bytes()); // version 0, flags 0
+                            g.extend_from_slice(&(first + index as u32).to_be_bytes());
+                            g.extend_from_slice(&(group.len() as u32).to_be_bytes());
+                            for &item in group {
+                                g.extend_from_slice(&item.to_be_bytes());
                             }
                         }));
                     }
@@ -597,6 +704,45 @@ mod tests {
         assert_eq!(file.image_size(grid).unwrap(), Some((1500, 1000)));
         // The tiles share one `hvcC` and one `ispe`.
         assert_eq!(file.properties.len(), 4);
+    }
+
+    #[test]
+    fn tmap_round_trips_with_a_hidden_gain_map_grid() {
+        let slices = [vec![0x26, 1, 1]];
+        let mut w = HeifWriter::new();
+        let base = w.add_image(&ImageSpec::new(640, 480, config(1), &slices));
+        let tile_ids: Vec<ItemId> = (0..2)
+            .map(|_| {
+                w.add_image(&ImageSpec {
+                    hidden: true,
+                    ..ImageSpec::new(512, 512, config(0), &slices)
+                })
+            })
+            .collect();
+        let map = w.add_hidden_grid(1, 2, 320, 240, &tile_ids, None);
+        let payload: Vec<u8> = (0..62).collect();
+        let tmap = w.add_tmap(base, map, 640, 480, None, &payload);
+        let bytes = w.finish();
+
+        let file = HeifFile::parse(&bytes).unwrap();
+        assert_eq!(file.primary_id, base);
+        assert!(file.file_type.has_brand(b"tmap"));
+        assert!(!file.item(tmap).unwrap().hidden);
+        assert_eq!(file.referenced_items(tmap, b"dimg"), &[base, map]);
+        assert_eq!(file.image_size(tmap).unwrap(), Some((640, 480)));
+        assert_eq!(file.item_data(tmap).unwrap(), &payload[..]);
+        assert!(file.item(map).unwrap().hidden);
+        assert_eq!(file.image_size(map).unwrap(), Some((320, 240)));
+        assert_eq!(file.referenced_items(map, b"dimg"), &tile_ids[..]);
+        // The tone-mapped item and the base image are alternates, and the group ID does not
+        // collide with an item ID.
+        let at = bytes.windows(4).position(|w| w == b"altr").unwrap();
+        let group_id = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+        let last_item = file.items.iter().map(|item| item.id).max().unwrap();
+        assert!(
+            group_id > last_item,
+            "group {group_id}, last item {last_item}"
+        );
     }
 
     #[test]

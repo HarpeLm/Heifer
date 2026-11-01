@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.15 — 2026-11-01
+
+**New**
+
+- `encode_hdr` and `encode_hdr_with_metadata` write ISO 21496-1 HDR gain maps: a monochrome,
+  half-resolution gain map item referenced by a `tmap` item, an `altr` entity group, and the
+  `tmap` compatible brand. The API is additive; existing signatures are unchanged.
+- `heifer-isobmff` exposes the pieces: `HeifWriter::add_tmap`, `add_hidden_grid` and
+  `add_alternative_group`.
+
+**Correctness**
+
+- Entity group IDs (`grpl`) are numbered after the last item ID, as ISO/IEC 23008-12 requires.
+  ImageIO ignored an `altr` group whose ID was also an item ID, so it did not apply the gain map.
+
+**Tests**
+
+- Round trips of synthetic HDR images, of a half-resolution gain map grid, with metadata, and of
+  invalid inputs, plus a re-encode of a Samsung Galaxy photo carrying a real ISO 21496-1 gain map
+  (fetched by `scripts/fetch-fixtures.sh`).
+- On macOS, ImageIO reports the declared headroom for both the synthetic file and the Samsung
+  re-encode, and decodes them to 10-bit PQ.
+
 ## 0.3.14 — 2026-11-01
 
 Contributed by [@zienag](https://github.com/zienag) in
