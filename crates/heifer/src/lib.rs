@@ -104,6 +104,10 @@ pub fn decode_with_options(bytes: &[u8], options: &Options) -> Result<Image, Err
 
 /// Like [`decode_with_options`], at 8 bits per sample whatever the coded depth: half the memory,
 /// which counts on large photos.
+///
+/// On files coded at 8 bits the result is identical to [`Image::to_rgba8`] on the wide image. On
+/// 10- and 12-bit files the conversion happens at 8 bits rather than after it, so samples can
+/// differ by one.
 pub fn decode_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, Error> {
     let file = HeifFile::parse(bytes)?;
     decode_item_with(&file, file.primary_id, 0, options)
@@ -338,7 +342,7 @@ fn decode_grid<S: Sample>(
     if tile_pixels == 0 || tile_pixels > options.max_pixels() {
         return Err(Error::Invalid("grid tile has an invalid size"));
     }
-    let mut canvas = Image::filled(
+    let mut canvas = Image::filled_samples(
         grid.output_width,
         grid.output_height,
         bit_depth,
@@ -528,7 +532,7 @@ fn decode_overlay<S: Sample>(
     let bit_depth = images.iter().map(|i| i.bit_depth).max().unwrap_or(8);
     // canvas_fill_value is given on 16 bits.
     let scale = |v: u16| ((u32::from(v) * ((1u32 << bit_depth) - 1) + 32767) / 65535) as u16;
-    let mut canvas = Image::filled(w, h, bit_depth, fill.map(|v| S::from_u16(scale(v))));
+    let mut canvas = Image::filled_samples(w, h, bit_depth, fill.map(|v| S::from_u16(scale(v))));
     canvas.has_alpha = fill[3] != 65535;
     for (img, (x, y)) in images.iter().zip(offsets) {
         canvas.draw(img, x, y);

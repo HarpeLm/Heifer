@@ -91,7 +91,12 @@ fn kr_kb(matrix: u16) -> (f64, f64) {
 /// Converts a decoded frame to an RGBA image (alpha opaque). Subsampled chroma is upsampled
 /// bilinearly, with the chroma samples on the even luma rows and columns, as Apple's decoder
 /// does: decoded photos then match what Apple's devices show.
-pub fn frame_to_rgba<S: Sample>(frame: &Frame, params: ColorParams) -> Image<S> {
+pub fn frame_to_rgba(frame: &Frame, params: ColorParams) -> Image {
+    frame_to_rgba_as(frame, params)
+}
+
+/// Like [`frame_to_rgba`], for an image of `S` samples: `u8` halves the memory at 8 bits.
+pub fn frame_to_rgba_as<S: Sample>(frame: &Frame, params: ColorParams) -> Image<S> {
     frame_to_rgba_sized(frame, params, frame.widths[0], frame.heights[0])
 }
 
@@ -331,11 +336,11 @@ mod tests {
             full_range: false,
         };
         assert_eq!(
-            &frame_to_rgba::<u16>(&frame(16, 128, 128), limited).data[..3],
+            &frame_to_rgba(&frame(16, 128, 128), limited).data[..3],
             &[0, 0, 0]
         );
         assert_eq!(
-            &frame_to_rgba::<u16>(&frame(235, 128, 128), limited).data[..3],
+            &frame_to_rgba(&frame(235, 128, 128), limited).data[..3],
             &[255, 255, 255]
         );
         // Pure red in BT.601 full range: Y=76, Cb=85, Cr=255.

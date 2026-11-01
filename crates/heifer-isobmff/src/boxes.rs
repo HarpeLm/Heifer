@@ -515,6 +515,18 @@ mod tests {
         assert!(!f.has_brand(b"avif"));
     }
 
+    /// ISO/IEC 23008-12, 6.5.12: axis 0 mirrors about the horizontal axis (top-bottom), 1 about
+    /// the vertical one (left-right). The property had these two the wrong way round.
+    #[test]
+    fn imir_axis_0_exchanges_top_and_bottom() {
+        let parse = |axis: u8| Property::parse(FourCC(*b"imir"), &[axis]).unwrap();
+        assert_eq!(parse(0), Property::Mirror(true), "axis 0 is top-bottom");
+        assert_eq!(parse(1), Property::Mirror(false), "axis 1 is left-right");
+        // The remaining bits are reserved and must not be taken for the axis.
+        assert_eq!(parse(0xFE), Property::Mirror(true));
+        assert_eq!(parse(0xFF), Property::Mirror(false));
+    }
+
     #[test]
     fn iloc_version1_with_idat() {
         #[rustfmt::skip]

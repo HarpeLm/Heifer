@@ -49,9 +49,16 @@ pub struct Image<S = u16> {
     pub data: Vec<S>,
 }
 
-impl<S: Sample> Image<S> {
+impl Image {
     /// Creates an image filled with one RGBA colour.
-    pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [S; 4]) -> Self {
+    pub fn filled(width: u32, height: u32, bit_depth: u8, rgba: [u16; 4]) -> Self {
+        Self::filled_samples(width, height, bit_depth, rgba)
+    }
+}
+
+impl<S: Sample> Image<S> {
+    /// Like [`Image::filled`], for an image of `S` samples.
+    pub fn filled_samples(width: u32, height: u32, bit_depth: u8, rgba: [S; 4]) -> Self {
         let n = width as usize * height as usize;
         // An all-zero image is allocated zeroed by the system, which costs nothing upfront.
         let data = if rgba == [S::default(); 4] {
@@ -273,12 +280,38 @@ mod tests {
 
     #[test]
     fn draw_with_alpha() {
-        let mut canvas = Image::<u16>::filled(2, 1, 8, [0, 0, 0, 255]);
-        let mut src = Image::<u16>::filled(1, 1, 8, [255, 255, 255, 128]);
+        let mut canvas = Image::filled(2, 1, 8, [0, 0, 0, 255]);
+        let mut src = Image::filled(1, 1, 8, [255, 255, 255, 128]);
         src.has_alpha = true;
         canvas.draw(&src, 1, 0);
         assert_eq!(&canvas.data[4..7], &[128, 128, 128]);
         assert_eq!(&canvas.data[0..3], &[0, 0, 0]);
         canvas.draw(&src, -5, 0); // fully outside: no effect, no panic
+    }
+
+    /// `imir` axis 0 is a top-bottom flip, which is what the decoder asks for.
+    #[test]
+    fn mirror_top_bottom_exchanges_rows() {
+        let image = Image::<u8> {
+            width: 1,
+            height: 2,
+            bit_depth: 8,
+            has_alpha: false,
+            data: vec![1, 1, 1, 255, 2, 2, 2, 255],
+        };
+        let flipped = image.mirror(true);
+        assert_eq!(&flipped.data[..4], &[2, 2, 2, 255]);
+        assert_eq!(&flipped.data[4..], &[1, 1, 1, 255]);
+        // Left-right leaves a one-column image alone.
+        assert_eq!(image.mirror(false), image);
+
+        let row = Image::<u8> {
+            width: 2,
+            height: 1,
+            bit_depth: 8,
+            has_alpha: false,
+            data: vec![1, 1, 1, 255, 2, 2, 2, 255],
+        };
+        assert_eq!(row.mirror(false).data, vec![2, 2, 2, 255, 1, 1, 1, 255]);
     }
 }
