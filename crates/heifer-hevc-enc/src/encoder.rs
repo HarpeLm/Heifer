@@ -317,6 +317,9 @@ enum CuKind {
 /// A transform block of one component, with its levels (empty when all are zero).
 struct Tb {
     c: usize,
+    /// Position, in samples of the component.
+    x: u32,
+    y: u32,
     log2_size: u8,
     mode: u8,
     levels: Vec<i32>,
@@ -434,6 +437,10 @@ struct Encoder<'a> {
     last_satd: f64,
     /// Modes chosen for a block by `quadtree` before `coding_unit`, to reuse.
     mode_cache: Option<((u32, u32, u8), Vec<u8>)>,
+    /// Modes and SATD of the first 32×32 block of the current 64×64 block, at its position.
+    quadrant_search: Option<((u32, u32), Vec<u8>, f64)>,
+    /// Whether transform blocks are coded without being reconstructed (whole-block trials).
+    deferred: bool,
     /// Transform skip trials and wins.
     ts_trials: (u32, u32),
     /// Buffers of snapshots given back, reused by the next ones.
@@ -512,8 +519,10 @@ impl<'a> Encoder<'a> {
             rdoq: RdoqScratch::new(),
             last_satd: 0.0,
             mode_cache: None,
+            quadrant_search: None,
             pool: Vec::new(),
             ts_trials: (0, 0),
+            deferred: false,
             // About 3 bits, at λ / step² (step = 2^((Qp′ - 4) / 6)).
             sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp + bd_offset - 4) / 3.0)) as f32,
         }
@@ -647,8 +656,20 @@ impl<'a> Encoder<'a> {
         // blocks are predicted in 32×32 transform blocks: their modes are estimated on the
         // first one.
         if log2_size >= LOG2_MAX_TB {
-            let mpm = self.mpm_candidates(x0, y0);
-            let modes = self.choose_modes(x0, y0, LOG2_MAX_TB, mpm, 3);
+            // The first 32×32 block of a 64×64 block is searched once for both.
+            let modes = match self.quadrant_search.take() {
+                Some((at, modes, satd)) if at == (x0, y0) && log2_size == LOG2_MAX_TB => {
+                    self.last_satd = satd;
+                    modes
+                }
+                _ => {
+                    let mpm = self.mpm_candidates(x0, y0);
+                    self.choose_modes(x0, y0, LOG2_MAX_TB, mpm, 3)
+                }
+            };
+            if log2_size > LOG2_MAX_TB {
+                self.quadrant_search = Some(((x0, y0), modes.clone(), self.last_satd));
+            }
             self.mode_cache = Some(((x0, y0, log2_size), modes));
             let limit = if log2_size > LOG2_MAX_TB { 1.0 } else { 2.0 };
             if self.last_satd >= limit {
@@ -838,9 +859,11 @@ impl<'a> Encoder<'a> {
         self.predict(c, x, y, log2_size, mode);
         let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
         let levels = self.quantize(c, log2_size, mode, false);
-        let sse = self.reconstruct(c, x, y, log2_size, mode, &levels, false);
+        let sse = self.distortion(c, x, y, log2_size, mode, &levels, false);
         let tb = Tb {
             c,
+            x,
+            y,
             log2_size,
             mode,
             levels,
@@ -859,7 +882,7 @@ impl<'a> Encoder<'a> {
         if levels.is_empty() {
             return tb;
         }
-        let sse = self.reconstruct(c, x, y, 2, mode, &levels, true);
+        let sse = self.distortion(c, x, y, 2, mode, &levels, true);
         let skip = Tb {
             levels,
             transform_skip: true,
@@ -871,8 +894,65 @@ impl<'a> Encoder<'a> {
             self.kinds[3] += 1;
             skip
         } else {
-            self.reconstruct(c, x, y, 2, mode, &tb.levels, false);
+            if !self.deferred {
+                self.reconstruct(c, x, y, 2, mode, &tb.levels, false);
+            }
             tb
+        }
+    }
+
+    /// The sum of squared errors of a block just quantized: from its reconstruction or, in
+    /// deferred trials, estimated in the transform domain without reconstructing it.
+    #[allow(clippy::too_many_arguments)]
+    fn distortion(
+        &mut self,
+        c: usize,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: u8,
+        levels: &[i32],
+        transform_skip: bool,
+    ) -> i64 {
+        if !self.deferred {
+            return self.reconstruct(c, x, y, log2_size, mode, levels, transform_skip);
+        }
+        let n = 1usize << log2_size;
+        if levels.is_empty() {
+            // The reconstruction is the prediction.
+            return self.diff[..n * n]
+                .iter()
+                .map(|&d| i64::from(d) * i64::from(d))
+                .sum();
+        }
+        // The transforms preserve energy: the errors of the levels, in quantization steps.
+        let qp = if c == 0 { self.qp_luma } else { self.qp_c };
+        let step2 = 2f64.powf(f64::from(qp - 4) / 3.0);
+        let error: f64 = self.exact[..n * n]
+            .iter()
+            .zip(levels)
+            .map(|(&e, &l)| (f64::from(e) - f64::from(l)).powi(2))
+            .sum();
+        (error * step2).round() as i64
+    }
+
+    /// Reconstructs the blocks of a tree coded in a deferred trial.
+    fn reconstruct_tree(&mut self, tree: &TNode) {
+        let (blocks, chroma) = match tree {
+            TNode::Leaf(luma, chroma) => (std::slice::from_ref(luma), chroma),
+            TNode::Split(..) => unreachable!("deferred trials code whole blocks"),
+        };
+        for tb in blocks.iter().chain(chroma.iter().flatten()) {
+            self.predict(tb.c, tb.x, tb.y, tb.log2_size, tb.mode);
+            self.reconstruct(
+                tb.c,
+                tb.x,
+                tb.y,
+                tb.log2_size,
+                tb.mode,
+                &tb.levels,
+                tb.transform_skip,
+            );
         }
     }
 
@@ -1110,7 +1190,7 @@ impl<'a> Encoder<'a> {
         // (cost, distortion, kind, mode, residual, snapshot after coding)
         let mut best = None;
         let mut current = None; // what the encoder state holds now
-        type Best = Option<(f64, f64, CuKind, u8, bool, Snapshot)>;
+        type Best = Option<(f64, f64, CuKind, u8, bool, Snapshot, Option<TNode>)>;
         let try_kind = |enc: &mut Self,
                         best: &mut Best,
                         current: &mut Option<(CuKind, u8)>,
@@ -1119,13 +1199,17 @@ impl<'a> Encoder<'a> {
             if current.is_some() {
                 enc.restore(x0, y0, size, &start);
             }
-            let (d, residual) = enc.code_cu(x0, y0, log2_size, depth, kind, mode);
+            // Whole blocks have one transform block per component, which no other block of the
+            // trial predicts from: they are reconstructed only if chosen.
+            enc.deferred = kind == CuKind::Whole && log2_size <= LOG2_MAX_TB;
+            let (d, residual, deferred) = enc.code_cu(x0, y0, log2_size, depth, kind, mode);
+            enc.deferred = false;
             *current = Some((kind, mode));
             let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
             if best.as_ref().is_none_or(|b| j < b.0) {
                 let after = enc.log.checkpoint_since(&start.log);
                 let snapshot = enc.snapshot(x0, y0, size, true, after);
-                if let Some(old) = best.replace((j, d, kind, mode, residual, snapshot)) {
+                if let Some(old) = best.replace((j, d, kind, mode, residual, snapshot, deferred)) {
                     enc.recycle(old.5);
                 }
             }
@@ -1133,7 +1217,7 @@ impl<'a> Encoder<'a> {
         for &mode in &modes {
             try_kind(self, &mut best, &mut current, CuKind::Whole, mode);
         }
-        let (_, _, _, mode, residual, _) = best.as_ref().expect("a mode was tried");
+        let (_, _, _, mode, residual, _, _) = best.as_ref().expect("a mode was tried");
         // A prediction good enough to need no residual, or cheap enough, is not improved by
         // smaller blocks.
         let per_pixel = best.as_ref().map_or(0.0, |b| b.0) / (self.lambda * f64::from(size * size));
@@ -1150,10 +1234,13 @@ impl<'a> Encoder<'a> {
                 try_kind(self, &mut best, &mut current, CuKind::FourBlocks, mode);
             }
         }
-        let (_, d, kind, mode, residual, snapshot) = best.expect("a mode was tried");
+        let (_, d, kind, mode, residual, snapshot, deferred) = best.expect("a mode was tried");
         self.kinds[kind as usize] += 1;
         if current != Some((kind, mode)) {
             self.restore(x0, y0, size, &snapshot);
+        }
+        if let Some(tree) = deferred {
+            self.reconstruct_tree(&tree);
         }
         self.recycle(snapshot);
         self.recycle(start);
@@ -1170,7 +1257,7 @@ impl<'a> Encoder<'a> {
         depth: u8,
         kind: CuKind,
         mode: u8,
-    ) -> (f64, bool) {
+    ) -> (f64, bool, Option<TNode>) {
         let size = 1u32 << log2_size;
         self.fill_grid(x0, y0, size, Some(depth), None);
         let four = kind == CuKind::FourBlocks;
@@ -1259,7 +1346,8 @@ impl<'a> Encoder<'a> {
             pcm: false,
             qp_y: self.qp,
         });
-        (tree.sse(), tree.residual())
+        let (sse, residual) = (tree.sse(), tree.residual());
+        (sse, residual, self.deferred.then_some(tree))
     }
 
     /// A 4×4 luma prediction block of an N×N coding unit: tries the few best modes by SATD
