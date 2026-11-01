@@ -188,7 +188,12 @@ pub fn encode_hdr_with_metadata(
     let map = gain_map(base, hdr);
     let (width, height) = (base.width.div_ceil(2), base.height.div_ceil(2));
     let map = encode_monochrome(&mut writer, width, height, &map, options)?;
-    writer.add_tmap(image, map, base.width, base.height, Some(&COLOR), &payload);
+    let icc = metadata.icc_profile.as_deref();
+    let nclx = icc.is_none().then_some(&COLOR);
+    let tmap = writer.add_tmap(image, map, base.width, base.height, nclx, &payload);
+    if let Some(icc) = icc {
+        writer.add_icc_profile(tmap, icc);
+    }
     Ok(writer.finish())
 }
 
@@ -258,7 +263,14 @@ fn encode_monochrome(
     };
     if width <= TILE && height <= TILE {
         let picture = encode_region(&source, (0, 0), (width, height), true, &config)?;
-        return Ok(add_picture(writer, &picture, (width, height), true));
+        return Ok(add_picture(
+            writer,
+            &picture,
+            (width, height),
+            true,
+            None,
+            None,
+        ));
     }
     let (columns, rows) = (width.div_ceil(TILE), height.div_ceil(TILE));
     if columns > 256 || rows > 256 {
@@ -269,7 +281,7 @@ fn encode_monochrome(
     let pictures = encode_tiles(&source, columns, rows, true, &config, options)?;
     let ids: Vec<ItemId> = pictures
         .iter()
-        .map(|p| add_picture(writer, p, (TILE, TILE), true))
+        .map(|p| add_picture(writer, p, (TILE, TILE), true, None, None))
         .collect();
     Ok(writer.add_hidden_grid(rows as u16, columns as u16, width, height, &ids, None))
 }
@@ -337,7 +349,10 @@ fn encode_into(
         bit_depth,
         pixel,
     };
-    let image = encode_image(&source, has_alpha, options, writer)?;
+    // With an ICC profile the colour space is the profile's: it is attached to every image
+    // item, and no `nclx` is written next to it (as in iPhone photos).
+    let icc = metadata.and_then(|m| m.icc_profile.as_deref());
+    let image = encode_image(&source, has_alpha, icc, options, writer)?;
     // A thumbnail, as in iPhone photos: viewers show it without decoding the whole image.
     if width.max(height) > TILE {
         let (tw, th, pixels) = thumbnail(&source);
@@ -352,13 +367,10 @@ fn encode_into(
             quality: options.quality.min(60),
             ..*options
         };
-        let id = encode_image(&thumb, has_alpha, &preview, writer)?;
+        let id = encode_image(&thumb, has_alpha, icc, &preview, writer)?;
         writer.add_reference(*b"thmb", id, &[image]);
     }
     if let Some(m) = metadata {
-        if let Some(icc) = &m.icc_profile {
-            writer.add_icc_profile(image, icc);
-        }
         if let Some(exif) = &m.exif {
             writer.add_exif(image, &crate::metadata::exif_upright(exif));
         }
@@ -408,10 +420,12 @@ fn thumbnail<F: Fn(usize) -> [u16; 4]>(source: &Source<F>) -> (u32, u32, Vec<[u1
     (tw as u32, th as u32, pixels)
 }
 
-/// Encodes the pixels into `writer`; returns the ID of the image (picture or grid).
+/// Encodes the pixels into `writer`; returns the ID of the image (picture or grid). `icc`, if
+/// given, is attached to every image item and replaces the `nclx` colour information.
 fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
     source: &Source<F>,
     has_alpha: bool,
+    icc: Option<&[u8]>,
     options: &EncodeOptions,
     writer: &mut HeifWriter,
 ) -> Result<ItemId, Error> {
@@ -427,10 +441,11 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
         colour: (2, 2, 2),
         ..color
     };
+    let nclx = icc.is_none().then_some(&COLOR);
 
     if width <= TILE && height <= TILE {
         let picture = encode_region(source, (0, 0), (width, height), false, &color)?;
-        let image = add_picture(writer, &picture, (width, height), false);
+        let image = add_picture(writer, &picture, (width, height), false, nclx, icc);
         if has_alpha {
             // Same coded size as the colour picture, so that both are cropped alike.
             let coded = (picture.width, picture.height);
@@ -449,22 +464,17 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
     let tiles = encode_tiles(source, columns, rows, false, &color, options)?;
     let ids: Vec<ItemId> = tiles
         .iter()
-        .map(|t| add_picture(writer, t, (TILE, TILE), true))
+        .map(|t| add_picture(writer, t, (TILE, TILE), true, nclx, icc))
         .collect();
-    let grid = writer.add_grid(
-        rows as u16,
-        columns as u16,
-        width,
-        height,
-        &ids,
-        Some(&COLOR),
-        None,
-    );
+    let grid = writer.add_grid(rows as u16, columns as u16, width, height, &ids, nclx, None);
+    if let Some(icc) = icc {
+        writer.add_icc_profile(grid, icc);
+    }
     if has_alpha {
         let tiles = encode_tiles(source, columns, rows, true, &alpha, options)?;
         let ids: Vec<ItemId> = tiles
             .iter()
-            .map(|t| add_picture(writer, t, (TILE, TILE), true))
+            .map(|t| add_picture(writer, t, (TILE, TILE), true, None, None))
             .collect();
         let alpha = writer.add_grid(
             rows as u16,
@@ -611,15 +621,18 @@ fn hevc_config(picture: &EncodedPicture) -> HevcConfig {
 }
 
 /// Adds a coded picture of an image of `size` (the picture may be larger: odd sizes are
-/// rounded up in 4:2:0, then cropped with `clap`).
+/// rounded up in 4:2:0, then cropped with `clap`). `color` is written as `nclx` for colour
+/// pictures; `icc` is attached to the item.
 fn add_picture(
     writer: &mut HeifWriter,
     picture: &EncodedPicture,
     size: (u32, u32),
     hidden: bool,
+    color: Option<&ColorInfo>,
+    icc: Option<&[u8]>,
 ) -> ItemId {
-    let color = (picture.chroma_format != 0).then_some(COLOR);
-    writer.add_image(&ImageSpec {
+    let color = color.filter(|_| picture.chroma_format != 0).cloned();
+    let id = writer.add_image(&ImageSpec {
         color,
         hidden,
         crop: (size != (picture.width, picture.height)).then_some(size),
@@ -629,7 +642,11 @@ fn add_picture(
             hevc_config(picture),
             &picture.slices,
         )
-    })
+    });
+    if let Some(icc) = icc {
+        writer.add_icc_profile(id, icc);
+    }
+    id
 }
 
 fn add_alpha_picture(

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.16 — 2026-11-01
+
+**New**
+
+- `decode_srgb`, `decode_srgb_with_options` and `decode_srgb_rgba8` decode the primary image with
+  its samples converted to sRGB. Most iPhone and many camera photos are `Display P3`; shown as
+  sRGB their colours are wrong. The API is additive; existing signatures are unchanged.
+- Matrix/TRC RGB ICC profiles are read and applied: per-channel curves (`curv`, and the parametric
+  `para` types), the colourant matrix (`rXYZ`/`gXYZ`/`bXYZ`), and a Bradford adaptation from the
+  profile's white to D65, then the sRGB transfer. Validated against littleCMS on `Display P3`,
+  `sRGB`, `Adobe RGB`, DCI-P3 and `ITU-2020` profiles (mean ≤ 0.25/255, max ≤ 0.6/255 at 8 bits).
+- When a file carries neither an ICC profile nor `nclx`, the samples are returned as coded, as
+  `decode` does. LUT-based (`A2B0`/`B2A0`) profiles and PQ/HLG transfers (which are HDR, see
+  `decode_hdr`) are refused with `Error::Unsupported`.
+- The `nclx` code points the conversion understands are BT.709, BT.601, BT.2020, DCI-P3 and
+  Display P3 primaries, with sRGB, Rec.709, γ2.2, γ2.8 or linear transfers.
+
+**Correctness**
+
+- Encoding with an ICC profile in the metadata now attaches it to **every** image item (tiles, the
+  grid, the thumbnail and the `tmap` item), as iPhone photos do, and does not write `nclx` next to
+  it. Previously the profile was on one item only, and a `nclx` box claimed sRGB.
+
+**Tests**
+
+- Colour tests: a Display P3 fixture converts (the profile is applied), our own `nclx`-tagged
+  files and files without colour information are left as coded, an sRGB profile round trips, and
+  the profile replaces `nclx` on every item of a grid.
+- Unit tests cross-check the conversion chain against the colourant matrix and the primaries.
+
 ## 0.3.15 — 2026-11-01
 
 **New**

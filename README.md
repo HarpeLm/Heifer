@@ -58,7 +58,8 @@ builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system 
 - **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
-- **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata.
+- **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
+  management to sRGB (`decode_srgb`, from the ICC profile or `nclx`).
 - **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos; checked with Apple's ImageIO and ffmpeg.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
@@ -100,6 +101,18 @@ let rgba: Vec<u8> = image.to_rgba8();   // or to_rgb8(); image.data keeps 16-bit
 let preview = heifer::decode_thumbnail(&bytes)?;   // the embedded thumbnail, if any: much faster
 ```
 
+The code values of `decode` are those of the file's own colour space: most iPhone and many camera
+photos are `Display P3` (tagged with an ICC profile) and would look washed out if shown as sRGB.
+`decode_srgb` converts them, from the ICC profile when there is one and from `nclx` otherwise:
+
+```rust
+let srgb = heifer::decode_srgb(&bytes)?;                               // ICC / nclx applied, in sRGB
+let small = heifer::decode_srgb_rgba8(&bytes, &Default::default())?;   // 8-bit, half the memory
+```
+
+Files in a colour space heifer cannot convert (LUT-based ICC profiles, or PQ/HLG, which are HDR and
+belong to `decode_hdr`) are refused with `Error::Unsupported`.
+
 Limit threads and image size, for example on a server that accepts uploads:
 
 ```rust
@@ -123,6 +136,10 @@ let again = heifer::encode(&heifer::decode(&bytes)?, &options)?;              //
 let meta = heifer::read_metadata(&bytes)?;
 let smaller = heifer::encode_with_metadata(&heifer::decode(&bytes)?, &meta, &options)?;
 ```
+
+When the metadata carries an ICC profile, it is attached to every image item (tiles, grid and
+thumbnail) and no `nclx` colour box is written, as in iPhone photos: the profile is the file's
+colour space. Without one, files are tagged sRGB with `nclx`.
 
 Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Main 10) when the image
 has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
@@ -218,7 +235,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
-| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos) | applying ICC profiles |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC RGB ICC profiles (`Display P3`, `Adobe RGB`, …) converted to sRGB by `decode_srgb` (matched to littleCMS to ≈ 0.2/255) | LUT-based (`A2B0`/`B2A0`) ICC profiles |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | 4:4:4, lossless |
@@ -355,7 +372,8 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 - [x] **0.3.8**: thumbnails, public benchmarks
 - [x] **0.3.9**: files smaller than x265 `slow` and still265 Slow (SAO, 64×64 blocks, deeper transform trees, transform skip)
 - [x] **0.3.15**: HDR gain map encoding (ISO 21496-1 `tmap`)
-- [ ] **Next**: ICC colour management
+- [x] **0.3.16**: ICC colour management (`decode_srgb`; an ICC profile replaces `nclx` when encoding)
+- [ ] **Next**: single-thread decoding speed (still slower than ffmpeg)
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 

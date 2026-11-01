@@ -16,6 +16,7 @@
 pub mod color;
 pub mod encode;
 pub mod hdr;
+mod icc;
 pub mod image;
 #[cfg(feature = "image")]
 pub mod image_crate;
@@ -114,6 +115,73 @@ pub fn decode_with_options(bytes: &[u8], options: &Options) -> Result<Image, Err
 pub fn decode_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, Error> {
     let file = HeifFile::parse(bytes)?;
     decode_item_with(&file, file.primary_id, 0, options)
+}
+
+/// Like [`decode`], with the samples converted to sRGB: from the image's embedded ICC profile
+/// when it has one (as iPhone and many camera photos do, in `Display P3`), otherwise from its
+/// `nclx` colour information. Without either, the samples are returned as coded (as [`decode`]
+/// does).
+///
+/// This is what a viewer without colour management expects. Files in a colour space heifer
+/// cannot convert (LUT-based ICC profiles, or PQ/HLG transfers, which are HDR and belong to
+/// [`decode_hdr`]) are refused with [`Error::Unsupported`].
+pub fn decode_srgb(bytes: &[u8]) -> Result<Image, Error> {
+    decode_srgb_with_options(bytes, &Options::default())
+}
+
+/// Like [`decode_srgb`], with options.
+pub fn decode_srgb_with_options(bytes: &[u8], options: &Options) -> Result<Image, Error> {
+    let file = HeifFile::parse(bytes)?;
+    let id = file.primary_id;
+    let image = decode_item_with(&file, id, 0, options)?;
+    to_srgb(&file, id, image)
+}
+
+/// Like [`decode_srgb`], at 8 bits per sample whatever the coded depth: half the memory, which
+/// counts on large photos (see [`decode_rgba8`] for the caveat on 10- and 12-bit files).
+pub fn decode_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    let id = file.primary_id;
+    let image = decode_item_with(&file, id, 0, options)?;
+    to_srgb(&file, id, image)
+}
+
+/// Converts a decoded image to sRGB from its ICC profile, else from its `nclx` colour
+/// information, else leaves it untouched.
+fn to_srgb<S: Sample>(file: &HeifFile<'_>, id: ItemId, image: Image<S>) -> Result<Image<S>, Error> {
+    if let Some(icc) = file.icc_profile(id)? {
+        return Ok(icc::Profile::parse(icc)?.to_srgb(&image));
+    }
+    match nclx(file, id)? {
+        Some((primaries, transfer)) => icc::from_primaries(&image, primaries, transfer),
+        None => Ok(image),
+    }
+}
+
+/// The `nclx` colour primaries and transfer characteristics of an item, or of the first source
+/// of a derived image (a grid's tiles), following the `dimg` references.
+fn nclx(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
+    let mut current = Some(id);
+    for _ in 0..MAX_DEPTH {
+        let Some(item) = current else { return Ok(None) };
+        let own = file.item_properties(item)?.find_map(|p| match p {
+            Property::Color(ColorInfo::Nclx {
+                primaries,
+                transfer,
+                ..
+            }) => Some((*primaries, *transfer)),
+            _ => None,
+        });
+        if own.is_some() {
+            return Ok(own);
+        }
+        current = file
+            .referenced_items(item, b"dimg")
+            .first()
+            .copied()
+            .filter(|&first| first != item);
+    }
+    Ok(None)
 }
 
 /// Decodes the thumbnail of the primary image (a `thmb` item, such as the 320×240 preview
