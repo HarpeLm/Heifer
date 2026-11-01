@@ -1,0 +1,62 @@
+name: Release
+
+# A pushed tag becomes a GitHub release. The notes are the matching CHANGELOG section, so the two
+# cannot drift, and the tag annotation is the release title:
+#
+#   git tag -a v0.3.15 -m "0.3.15 — what changed"
+#   git push origin v0.3.15
+#
+# `cargo publish` stays manual, in dependency order.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+
+          # The tag annotation is the title; fall back to the commit subject for a lightweight tag.
+          title="$(git for-each-ref "refs/tags/$TAG" --format='%(contents:subject)')"
+          if [ -z "$title" ]; then
+            title="$(git log -1 --format='%s')"
+          fi
+
+          # The section runs from "## <version>" to the next "## " heading.
+          awk -v version="$version" '
+            BEGIN { gsub(/\./, "\\.", version); pattern = "^## " version " " }
+            $0 ~ pattern { found = 1; next }
+            found && /^## / { exit }
+            found && !started && /^[[:space:]]*$/ { next }
+            found { started = 1; print }
+          ' CHANGELOG.md > notes.md
+
+          if [ ! -s notes.md ]; then
+            echo "::warning::No CHANGELOG section for $version"
+            printf 'See [CHANGELOG.md](CHANGELOG.md).\n' > notes.md
+          fi
+
+          {
+            echo
+            echo "---"
+            echo
+            echo 'Install: `cargo add heifer`, or `cargo add heifer --features image` for the `image` crate integration.'
+          } >> notes.md
+
+          gh release create "$TAG" --verify-tag --title "$title" --notes-file notes.md

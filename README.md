@@ -382,6 +382,17 @@ cargo build --release -p heifer-hevc-dec --example decode
 ./scripts/build-demo.sh && python3 -m http.server -d demo/web 8000
 ```
 
+**Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
+
+```sh
+git tag -a v0.3.15 -m "0.3.15 — what changed"
+git push origin v0.3.15
+```
+
+The `Release` workflow creates the GitHub release, with the annotation as title and the matching
+CHANGELOG section as notes. `cargo publish` is still run by hand, in dependency order:
+`heifer-isobmff`, `heifer-hevc-dec`, `heifer-hevc-enc`, `heifer`, `heifer-cli`.
+
 </details>
 
 ## <img src="docs/icons/scale.svg" width="24" height="24" align="top"> License
