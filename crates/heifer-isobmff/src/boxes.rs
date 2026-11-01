@@ -392,7 +392,7 @@ pub enum Property {
     PixelInfo(Vec<u8>),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
-    /// `imir`: mirroring. `true` = horizontal axis (top-bottom flip), `false` = vertical axis (left-right flip).
+    /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
     Mirror(bool),
     /// `clap`: clean aperture (crop), as fractions.
     CleanAperture {
@@ -440,7 +440,7 @@ impl Property {
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
             b"irot" => Self::Rotation(r.u8()? & 0x03),
-            b"imir" => Self::Mirror(r.u8()? & 0x01 != 0),
+            b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {
                 width: (r.u32()?, r.u32()?),
                 height: (r.u32()?, r.u32()?),
@@ -513,6 +513,18 @@ mod tests {
         assert_eq!(f.major_brand, FourCC(*b"mif1"));
         assert!(f.has_brand(b"heic"));
         assert!(!f.has_brand(b"avif"));
+    }
+
+    /// ISO/IEC 23008-12, 6.5.12: axis 0 mirrors about the horizontal axis (top-bottom), 1 about
+    /// the vertical one (left-right). The property had these two the wrong way round.
+    #[test]
+    fn imir_axis_0_exchanges_top_and_bottom() {
+        let parse = |axis: u8| Property::parse(FourCC(*b"imir"), &[axis]).unwrap();
+        assert_eq!(parse(0), Property::Mirror(true), "axis 0 is top-bottom");
+        assert_eq!(parse(1), Property::Mirror(false), "axis 1 is left-right");
+        // The remaining bits are reserved and must not be taken for the axis.
+        assert_eq!(parse(0xFE), Property::Mirror(true));
+        assert_eq!(parse(0xFF), Property::Mirror(false));
     }
 
     #[test]

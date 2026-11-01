@@ -15,6 +15,10 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Tests that need a real file skip silently when it is missing: fetch them so that the
+      # conformance and Nokia cases actually run.
+      - run: ./scripts/fetch-fixtures.sh
+        shell: bash
       - run: cargo test --workspace --all-features
   wasm:
     runs-on: ubuntu-latest
