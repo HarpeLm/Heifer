@@ -4,7 +4,7 @@ heifer decodes untrusted files, so security issues are taken seriously.
 
 ## Supported versions
 
-Security fixes are released for the latest published version (currently 0.1.x).
+Security fixes are released for the latest published version.
 
 ## Reporting a vulnerability
 
