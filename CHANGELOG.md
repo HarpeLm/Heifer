@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.10 — 2026-11-01
+
+**Faster encoding, same files.** Encoding is about 10% faster (12 MP: 0.8 s on 10 cores); the files are
+byte-identical to 0.3.9.
+
+- RDOQ, sign data hiding and residual coding read the scan positions and the significance
+  contexts of each sub-block from tables built once, instead of recomputing them for every
+  block; the cost of the last-position prefixes is computed once per block.
+- Blocks whose coefficients all round to zero skip RDOQ (contributed with GitHub Copilot).
+- Intra prediction skips the tile check in single-tile pictures (decoder and encoder).
+- The seed files of the scheduled fuzzing are fetched from the new location of Nokia's samples.
+
 ## 0.3.9 — 2026-10-31
 
 **Smaller files.** At equal quality, encoded files are 6 to 7% smaller than with 0.3.8, slightly

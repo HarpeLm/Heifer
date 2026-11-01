@@ -26,7 +26,9 @@ use crate::Error;
 use crate::cabac::ArithmeticEncoder;
 use crate::estimate::{BinLog, LogPoint, replay};
 use crate::params::{NalType, StreamParams, nal_unit};
-use crate::rdo::{RdoqScratch, hide_signs, last_ctx, last_prefix, rdoq, sig_ctx_inc};
+use crate::rdo::{
+    RdoqScratch, hide_signs, last_ctx, last_prefix, rdoq, scan_positions, sig_ctx_table,
+};
 use crate::sao::{self, CtbSao};
 use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
@@ -1462,32 +1464,22 @@ impl<'a> Encoder<'a> {
             };
             self.bin(ctx, tb.transform_skip);
         }
-        let size = 1usize << log2_size;
         let luma = c == 0;
         let scan = scan_type(log2_size, luma, intra_mode);
         let log2_sb = log2_size - 2;
         let sb_scan = scan_order(log2_sb, scan);
-        let pos_scan = scan_order(2, scan);
-        let level = |sb: usize, pos: usize| -> i32 {
-            let (xs, ys) = sb_scan[sb];
-            let (xp, yp) = pos_scan[pos];
-            let (x, y) = (
-                usize::from(xs) * 4 + usize::from(xp),
-                usize::from(ys) * 4 + usize::from(yp),
-            );
-            coeffs[y * size + x]
-        };
+        let positions = scan_positions(log2_size, scan);
+        let level =
+            |sb: usize, pos: usize| -> i32 { coeffs[usize::from(positions[sb * 16 + pos].0)] };
 
         // Last significant coefficient, in scan order.
-        let num_sb = 1usize << (2 * log2_sb);
-        let (last_sb, last_pos) = (0..num_sb * 16)
-            .rev()
-            .map(|i| (i / 16, i % 16))
-            .find(|&(sb, pos)| level(sb, pos) != 0)
+        let last_index = positions
+            .iter()
+            .rposition(|&(i, _, _)| coeffs[usize::from(i)] != 0)
             .expect("the block has a non-zero level");
-        let (xs, ys) = sb_scan[last_sb];
-        let (xp, yp) = pos_scan[last_pos];
-        let mut last = [u32::from(xs * 4 + xp), u32::from(ys * 4 + yp)];
+        let (last_sb, last_pos) = (last_index / 16, last_index % 16);
+        let (_, x, y) = positions[last_index];
+        let mut last = [u32::from(x), u32::from(y)];
         if scan == ScanType::Vertical {
             last.swap(0, 1);
         }
@@ -1529,6 +1521,7 @@ impl<'a> Encoder<'a> {
             if coded_sb[xs][ys] {
                 let prev_csbf = u8::from(xs + 1 < sb_width && coded_sb[xs + 1][ys])
                     | (u8::from(ys + 1 < sb_width && coded_sb[xs][ys + 1]) << 1);
+                let sig_ctxs = sig_ctx_table(log2_size, scan, luma, prev_csbf, xs + ys == 0);
                 let start = if i == last_sb {
                     last_pos as i32 - 1
                 } else {
@@ -1538,10 +1531,7 @@ impl<'a> Encoder<'a> {
                     let n = n as usize;
                     let v = level(i, n);
                     if n > 0 || !infer_sb_dc {
-                        let (xp, yp) = pos_scan[n];
-                        let xc = (xs << 2) + usize::from(xp);
-                        let yc = (ys << 2) + usize::from(yp);
-                        let inc = sig_ctx_inc(luma, log2_size, xc, yc, xp, yp, prev_csbf, scan);
+                        let inc = usize::from(sig_ctxs[n]);
                         self.bin(ctx::SIG_COEFF_FLAG + inc, v != 0);
                         if v != 0 {
                             infer_sb_dc = false;

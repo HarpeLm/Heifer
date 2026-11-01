@@ -1,6 +1,6 @@
 # Benchmarks
 
-heifer 0.3.9 against the other HEIC decoders and encoders, measured in October 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
+heifer 0.3.10 against the other HEIC decoders and encoders, measured in November 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
 
 Competitors: `heic-rs` 0.1.4, `heic` 0.1.6, `heic-decoder` 0.1.1, `zune-heic` 0.5.0, `still265` 0.6.0, ffmpeg 9.0.1, and Apple's ImageIO (`sips`, hardware HEVC).
 
@@ -12,23 +12,23 @@ Fidelity: PSNR of the 8-bit RGB output against Apple's decoder (what Apple's app
 
 | Decoder | Files decoded | 1 thread | 10 threads | Fidelity vs Apple (median / worst) |
 |---|---|---|---|---|
-| `heifer` | 13/13 | 951 ms | 215 ms | 50.2 / 49.2 dB |
-| `heic-rs` | 13/13 | 734 ms | 164 ms | 43.9 / 26.4 dB |
-| `heic` | 13/13 | 1174 ms | 1172 ms | 47.0 / 32.6 dB |
-| `heic-decoder` | 13/13 | 891 ms | 231 ms | 48.7 / 39.8 dB |
-| `zune-heic` | 4/13 | 314 ms | 338 ms | 47.2 / 32.6 dB |
-| `zune-heic+hw` | 13/13 | 120 ms | 121 ms | 39.9 / 6.9 dB |
+| `heifer` | 13/13 | 945 ms | 207 ms | 50.2 / 49.2 dB |
+| `heic-rs` | 13/13 | 731 ms | 158 ms | 43.9 / 26.4 dB |
+| `heic` | 13/13 | 1165 ms | 1167 ms | 47.0 / 32.6 dB |
+| `heic-decoder` | 13/13 | 890 ms | 223 ms | 48.7 / 39.8 dB |
+| `zune-heic` | 4/13 | 315 ms | 334 ms | 47.2 / 32.6 dB |
+| `zune-heic+hw` | 13/13 | 117 ms | 118 ms | 39.9 / 6.9 dB |
 
 12 MP photo encoded by Apple (48 tiles):
 
 | Decoder | 1 thread | 10 threads | Fidelity vs Apple |
 |---|---|---|---|
-| `heifer` | 147 ms | 30 ms | 49.2 dB |
-| `heic-rs` | 108 ms | 19 ms | 26.4 dB |
-| `heic` | 180 ms | 175 ms | 47.2 dB |
-| `heic-decoder` | 134 ms | 33 ms | 48.7 dB |
-| `zune-heic` | 113 ms | 124 ms | 47.3 dB |
-| `zune-heic+hw` | 24 ms | 23 ms | 47.3 dB |
+| `heifer` | 145 ms | 28 ms | 49.2 dB |
+| `heic-rs` | 106 ms | 19 ms | 26.4 dB |
+| `heic` | 176 ms | 175 ms | 47.2 dB |
+| `heic-decoder` | 135 ms | 33 ms | 48.7 dB |
+| `zune-heic` | 114 ms | 123 ms | 47.3 dB |
+| `zune-heic+hw` | 23 ms | 23 ms | 47.3 dB |
 
 Failures: `zune-heic` on 38ba6f5cf9.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on 3b6c2d0177.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on 582d81e02d.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on a29a71bd3a.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on be880a5d0e.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on e344de67c7.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on e6036430ec.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on f1de131216.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on gradient10.heic (ERR: NalErrors(ParameterOutOfRange { limit: 8, value: 10, fi).
 
@@ -42,31 +42,31 @@ All encoders produce 4:2:0, except `still265-slow-444` (4:4:4, which hardware de
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 446 ms | 1356 ms |
-| `still265-fast` | +14.3% | wrong colours | 193 ms | same |
-| `still265-slow` | +0.3% | wrong colours | 367 ms | same |
-| `still265-slow-444` | -6.7% | wrong colours | 431 ms | same |
-| `apple` (hardware) | +52.1% | +50.8% | 84 ms | — |
+| `heifer` | reference | reference | 396 ms | 1231 ms |
+| `still265-fast` | +14.3% | wrong colours | 194 ms | same |
+| `still265-slow` | +0.3% | wrong colours | 365 ms | same |
+| `still265-slow-444` | -6.7% | wrong colours | 433 ms | same |
+| `apple` (hardware) | +52.1% | +50.8% | 91 ms | — |
 
 ### graphics
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 87 ms | 223 ms |
-| `still265-fast` | +22.2% | +23.3% | 55 ms | same |
+| `heifer` | reference | reference | 81 ms | 206 ms |
+| `still265-fast` | +22.2% | +23.3% | 56 ms | same |
 | `still265-slow` | +0.6% | -2.3% | 102 ms | same |
-| `still265-slow-444` | no overlap | wrong colours | 135 ms | same |
+| `still265-slow-444` | no overlap | wrong colours | 134 ms | same |
 | `apple` (hardware) | +267.4% | +194.3% | 68 ms | — |
 
 ### photo12
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 924 ms | 4808 ms |
-| `still265-fast` | +14.0% | wrong colours | 631 ms | same |
-| `still265-slow` | +0.6% | wrong colours | 1078 ms | same |
-| `still265-slow-444` | -6.5% | wrong colours | 1307 ms | same |
-| `apple` (hardware) | +39.3% | +35.9% | 201 ms | — |
+| `heifer` | reference | reference | 812 ms | 4331 ms |
+| `still265-fast` | +14.0% | wrong colours | 616 ms | same |
+| `still265-slow` | +0.6% | wrong colours | 1055 ms | same |
+| `still265-slow-444` | -6.5% | wrong colours | 1304 ms | same |
+| `apple` (hardware) | +39.3% | +35.9% | 202 ms | — |
 
 still265 writes a `colr` box that Apple's decoder and ffmpeg do not honour: its files show wrong colours in Apple's apps ("wrong colours" above). still265 runs on one thread; heifer encodes tiles on all cores.
 

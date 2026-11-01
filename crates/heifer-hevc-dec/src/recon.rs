@@ -245,6 +245,8 @@ pub struct Reconstructor<'a> {
     sps: &'a Sps,
     pps: &'a Pps,
     layout: CtbLayout,
+    /// Whether the picture is a single tile: intra prediction then never crosses a tile.
+    single_tile: bool,
     /// The picture being reconstructed (coded size, before cropping).
     pub frame: Frame,
     /// Slice that reconstructed each 4×4 luma block (`u32::MAX` = not yet).
@@ -274,6 +276,7 @@ impl<'a> Reconstructor<'a> {
             sps,
             pps,
             filter_info: FilterInfo::new(sps, &layout),
+            single_tile: layout.col_bd.len() == 2 && layout.row_bd.len() == 2,
             layout,
             frame: Frame::new(sps),
             decoded: vec![u32::MAX; w4 * h4],
@@ -373,6 +376,9 @@ impl<'a> Reconstructor<'a> {
         let (xn, yn) = (xn as u32, yn as u32);
         if self.decoded[(yn as usize >> 2) * self.w4 + (xn as usize >> 2)] != self.slice_addr {
             return false;
+        }
+        if self.single_tile {
+            return true;
         }
         let l = self.sps.log2_ctb_size;
         let w = self.layout.width;

@@ -93,7 +93,6 @@ pub(crate) struct RdoqScratch {
     cost_sig1: Vec<f32>,
     cost_zero: Vec<f32>,
     zero_after: Vec<f32>,
-    positions: Vec<(u16, u8, u8)>,
     magnitudes: Vec<f32>,
 }
 
@@ -106,10 +105,73 @@ impl RdoqScratch {
             cost_sig1: vec![0.0; 1024],
             cost_zero: vec![0.0; 1024],
             zero_after: vec![0.0; 1025],
-            positions: vec![(0, 0, 0); 1024],
             magnitudes: vec![0.0; 1024],
         }
     }
+}
+
+/// Coefficient index and position of each scan position (sub-block · 16 + position) of a block.
+pub(crate) fn scan_positions(log2_size: u8, scan: ScanType) -> &'static [(u16, u8, u8)] {
+    type Tables = [[Vec<(u16, u8, u8)>; 3]; 4];
+    static TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|l| {
+            let log2_size = l as u8 + 2;
+            let size = 1usize << log2_size;
+            [ScanType::Diagonal, ScanType::Horizontal, ScanType::Vertical].map(|scan| {
+                let pos_scan = scan_order(2, scan);
+                scan_order(log2_size - 2, scan)
+                    .iter()
+                    .flat_map(|&(xs, ys)| {
+                        pos_scan.iter().map(move |&(xp, yp)| {
+                            let (x, y) = (xs * 4 + xp, ys * 4 + yp);
+                            ((usize::from(y) * size + usize::from(x)) as u16, x, y)
+                        })
+                    })
+                    .collect()
+            })
+        })
+    });
+    &TABLES[usize::from(log2_size - 2)][scan as usize]
+}
+
+/// [`sig_ctx_inc`] of the 16 scan positions of a sub-block, which depend on the block size, the
+/// scan, the component, the coded sub-block flags on the right and below, and whether the
+/// sub-block is the first one.
+pub(crate) fn sig_ctx_table(
+    log2_size: u8,
+    scan: ScanType,
+    luma: bool,
+    prev_csbf: u8,
+    first: bool,
+) -> &'static [u8; 16] {
+    type Tables = Vec<[u8; 16]>;
+    static TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(|| {
+        let mut tables = Vec::with_capacity(4 * 3 * 2 * 4 * 2);
+        for log2_size in 2..=5u8 {
+            for scan in [ScanType::Diagonal, ScanType::Horizontal, ScanType::Vertical] {
+                for luma in [false, true] {
+                    for prev_csbf in 0..4u8 {
+                        for first in [false, true] {
+                            // Any sub-block other than the first one gives the same contexts.
+                            let xs = usize::from(!first && log2_size > 2);
+                            let pos_scan = scan_order(2, scan);
+                            tables.push(std::array::from_fn(|pos| {
+                                let (xp, yp) = pos_scan[pos];
+                                let (x, y) = (xs * 4 + usize::from(xp), usize::from(yp));
+                                sig_ctx_inc(luma, log2_size, x, y, xp, yp, prev_csbf, scan) as u8
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        tables
+    });
+    let index = (((usize::from(log2_size - 2) * 3 + scan as usize) * 2 + usize::from(luma)) * 4
+        + usize::from(prev_csbf))
+        * 2
+        + usize::from(first);
+    &TABLES[index]
 }
 
 /// Estimated cost in bits of coding `bin` with a context, from its probability state.
@@ -146,47 +208,41 @@ pub(crate) fn rdoq(
     lambda: f32,
     scratch: &mut RdoqScratch,
 ) {
-    let size = 1usize << log2_size;
     let log2_sb = log2_size - 2;
     let sb_scan = scan_order(log2_sb, scan);
-    let pos_scan = scan_order(2, scan);
     let sb_width = 1usize << log2_sb;
     let n = 1usize << (2 * log2_size);
-    let table = scratch.bits;
     // Per scan position: chosen magnitude, cost when coded, cost of the sig flag alone, cost
     // of zero (error² plus the sig flag). Every position up to `last_start` is written below
     // before being read.
     let RdoqScratch {
+        bits: table,
         chosen,
         cost_level,
         cost_sig1,
         cost_zero,
         zero_after,
-        positions,
         magnitudes,
-        ..
     } = scratch;
-    // Coefficient index and position of each scan position (sub-block · 16 + position), and
-    // its unrounded magnitude.
-    for (sb, &(xs, ys)) in sb_scan.iter().enumerate() {
-        for (p, &(xp, yp)) in pos_scan.iter().enumerate() {
-            let (x, y) = (xs * 4 + xp, ys * 4 + yp);
-            let i = usize::from(y) * size + usize::from(x);
-            positions[sb * 16 + p] = (i as u16, x, y);
-            magnitudes[sb * 16 + p] = exact[i].abs();
-        }
+    let positions = scan_positions(log2_size, scan);
+    levels[..n].fill(0);
+    // The last position worth coding, then the unrounded magnitudes up to it.
+    let Some(last_start) = positions[..n]
+        .iter()
+        .rposition(|&(i, _, _)| exact[usize::from(i)].abs() >= 0.5)
+    else {
+        return;
+    };
+    for (m, &(i, _, _)) in magnitudes.iter_mut().zip(&positions[..=last_start]) {
+        *m = exact[usize::from(i)].abs();
     }
-    let (positions, magnitudes) = (&*positions, &*magnitudes);
+    let magnitudes = &*magnitudes;
     let index = |g: usize| -> (usize, usize, usize) {
         let (i, x, y) = positions[g];
         (usize::from(i), usize::from(x), usize::from(y))
     };
     let magnitude = |g: usize| magnitudes[g];
-    levels[..n].fill(0);
-    let Some(last_start) = magnitudes[..n].iter().rposition(|&m| m >= 0.5) else {
-        return;
-    };
-    let ctx_bits = |i: usize, bin: bool| bits(&table, &contexts[i], bin);
+    let ctx_bits = |i: usize, bin: bool| bits(table, &contexts[i], bin);
     let mut coded_sb = [[false; 8]; 8];
     let mut sb_cost = [0f32; 64]; // chosen cost of each sub-block (with its flag)
     let mut sb_zero = [0f32; 64]; // cost of dropping it
@@ -203,6 +259,7 @@ pub(crate) fn rdoq(
         }
         let mut state: u8 = 1; // greater1Ctx within the sub-block
         let (mut count, mut seen_g1, mut rice) = (0usize, false, 0u32);
+        let sig_ctxs = sig_ctx_table(log2_size, scan, luma, prev_csbf, xs + ys == 0);
         let top = if sb == last_start / 16 {
             last_start % 16
         } else {
@@ -210,11 +267,8 @@ pub(crate) fn rdoq(
         };
         for pos in (0..=top).rev() {
             let g = sb * 16 + pos;
-            let (_, x, y) = index(g);
             let e = magnitude(g);
-            let (xp, yp) = pos_scan[pos];
-            let sig_ctx =
-                ctx::SIG_COEFF_FLAG + sig_ctx_inc(luma, log2_size, x, y, xp, yp, prev_csbf, scan);
+            let sig_ctx = ctx::SIG_COEFF_FLAG + usize::from(sig_ctxs[pos]);
             let is_last = g == last_start;
             cost_sig1[g] = if is_last {
                 0.0
@@ -323,33 +377,52 @@ pub(crate) fn rdoq(
     // Last significant position: keep the levels up to it, drop the ones after.
     let (ctx_offset, ctx_shift) = last_ctx(log2_size, luma);
     let c_max = (u32::from(log2_size) << 1) - 1;
+    // Bins of the last position prefixes, per coordinate (x then y, swapped for the vertical
+    // scan). The x part of each coordinate is summed once; the y bins are added to it in the
+    // same order as when coding them.
+    let size = 1usize << log2_size;
+    let prefix_bits = |k: usize, bin: bool, i: usize| {
+        let base = [ctx::LAST_SIG_COEFF_X_PREFIX, ctx::LAST_SIG_COEFF_Y_PREFIX][k];
+        ctx_bits(base + usize::from(ctx_offset) + (i >> ctx_shift), bin)
+    };
+    let mut first_axis = [0f32; 32];
+    let mut ones = [0f32; 10];
+    let mut zeros = [0f32; 10];
+    for (i, (one, zero)) in ones
+        .iter_mut()
+        .zip(&mut zeros)
+        .enumerate()
+        .take(c_max as usize)
+    {
+        (*one, *zero) = (prefix_bits(1, true, i), prefix_bits(1, false, i));
+    }
+    for (coord, total) in first_axis.iter_mut().enumerate().take(size) {
+        let (prefix, suffix) = last_prefix(coord as u32);
+        let mut r = 0.0;
+        for i in 0..prefix.min(c_max) {
+            r += prefix_bits(0, true, i as usize);
+        }
+        if prefix < c_max {
+            r += prefix_bits(0, false, prefix as usize);
+        }
+        *total = r + suffix.map_or(0.0, |(_, bits)| bits as f32);
+    }
     let last_bits = |g: usize| -> f32 {
         let (_, x, y) = index(g);
-        let mut pos = [x as u32, y as u32];
-        if scan == ScanType::Vertical {
-            pos.swap(0, 1);
+        let (a, b) = if scan == ScanType::Vertical {
+            (y, x)
+        } else {
+            (x, y)
+        };
+        let mut r = first_axis[a];
+        let (prefix, suffix) = last_prefix(b as u32);
+        for one in &ones[..prefix.min(c_max) as usize] {
+            r += one;
         }
-        let mut r = 0.0;
-        for (k, base) in [ctx::LAST_SIG_COEFF_X_PREFIX, ctx::LAST_SIG_COEFF_Y_PREFIX]
-            .into_iter()
-            .enumerate()
-        {
-            let (prefix, suffix) = last_prefix(pos[k]);
-            for i in 0..prefix.min(c_max) {
-                r += ctx_bits(
-                    base + usize::from(ctx_offset) + (i as usize >> ctx_shift),
-                    true,
-                );
-            }
-            if prefix < c_max {
-                r += ctx_bits(
-                    base + usize::from(ctx_offset) + (prefix as usize >> ctx_shift),
-                    false,
-                );
-            }
-            r += suffix.map_or(0.0, |(_, bits)| bits as f32);
+        if prefix < c_max {
+            r += zeros[prefix as usize];
         }
-        r
+        r + suffix.map_or(0.0, |(_, bits)| bits as f32)
     };
     // Cost of everything up to and including position g when g is the last one: the sum of the
     // chosen costs before it, its own cost without sig flag, the dropped errors after it.
@@ -410,14 +483,11 @@ pub(crate) fn hide_signs(
     scan: ScanType,
     rate_weight: f32,
 ) {
-    let size = 1usize << log2_size;
-    let sb_scan = scan_order(log2_size - 2, scan);
-    let pos_scan = scan_order(2, scan);
-    for &(xs, ys) in sb_scan {
-        let index: [usize; 16] = core::array::from_fn(|n| {
-            let (xp, yp) = pos_scan[n];
-            (usize::from(ys) * 4 + usize::from(yp)) * size + usize::from(xs) * 4 + usize::from(xp)
-        });
+    for positions in scan_positions(log2_size, scan).chunks_exact(16) {
+        let index: [usize; 16] = core::array::from_fn(|n| usize::from(positions[n].0));
+        if index.iter().all(|&i| levels[i] == 0) {
+            continue;
+        }
         // A few passes: a change can move the first or last level, which changes the rule.
         for _ in 0..4 {
             let first = (0..16).find(|&n| levels[index[n]] != 0);
