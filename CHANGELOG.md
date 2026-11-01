@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.14 — 2026-11-01
+
+Contributed by [@zienag](https://github.com/zienag) in
+[#2](https://github.com/HarpeLm/Heifer/pull/2).
+
+**Correctness**
+
+- `imir` is applied the right way round: code 0 exchanges top and bottom, as ISO/IEC 23008-12
+  6.5.12 specifies. Phones write this property on upright photos, so mirrored ones showed flipped.
+- Chroma is no longer interpolated into the padding past the picture's edge, which left a wrong
+  line along the right and bottom of grid tiles. On a Xiaomi sample the worst error against
+  libheif drops from 185/255 to 5/255.
+- `iden` (identity) items decode, so files whose primary item is a transformed copy of another
+  item now open (C008, C014 and C039 of the conformance set).
+- A coded picture larger than `ispe` is converted at the `ispe` size, without a crop copy.
+
+**New**
+
+- `decode_rgba8` returns `Image<u8>`, half the memory. On 8-bit files the samples are identical
+  to `to_rgba8`; on 10- and 12-bit files they can differ by one.
+- `Image` is generic over its sample type, `u16` by default. `Image::filled_samples` and
+  `frame_to_rgba_as` build the `u8` form; `Image::filled` and `frame_to_rgba` keep their
+  signatures, so existing code compiles unchanged.
+- `Image::<u8>::into_rgb8` drops alpha in place.
+- `irot 0` no longer copies the image.
+
+**Performance**
+
+- Colour conversion runs in plain per-channel loops that the compiler vectorizes: 16% off a
+  12 MP decode.
+
+**Build**
+
+- CI fetches the conformance and Nokia fixtures, so the tests that need them no longer skip.
+
 ## 0.3.13 — 2026-11-01
 
 **Robustness.** Two malformed files that used to panic are now rejected with an error.
