@@ -119,9 +119,10 @@ narrative writes itself.
 
 ## `heifer` API gaps surfaced by these targets
 
-- **Enumerate top-level images** (`HeifFile::top_level_image_ids()`, or `heifer::decode_all`)
-  for `timewall` and `heic-to-dynamic-gnome-wallpaper`. Today possible but low-level
-  (`file.items` + `decode_item`). Additive, small.
+- ~~**Enumerate top-level images** (`HeifFile::top_level_image_ids()`, or `heifer::decode_all`)~~
+  — **done**: `heifer_isobmff::HeifFile::top_level_image_ids()` (plus `is_image_item`), and
+  `heifer::decode_all` / `decode_all_srgb_rgba8` at the top level. This unblocks `timewall`
+  and `heic-to-dynamic-gnome-wallpaper`.
 - **File-type sniffing** (`check_file_type` equivalent) for `timewall::validate_file`. Trivial.
 - Everything else (decode to RGB/RGBA, EXIF/XMP/ICC, encode with metadata, HDR) is already
   covered.

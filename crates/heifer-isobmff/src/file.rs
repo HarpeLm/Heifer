@@ -207,6 +207,41 @@ impl<'a> HeifFile<'a> {
             .collect()
     }
 
+    /// Item IDs of the top-level images, in declaration order: the images meant to be displayed,
+    /// as opposed to their tiles, thumbnails and auxiliary planes.
+    ///
+    /// An item is a top-level image when its type is an image type ([`is_image_item`]), it is not
+    /// hidden, it is not an input of a derived image (a `dimg` reference, e.g. a grid tile), and it
+    /// is not a thumbnail (`thmb`) or an auxiliary image such as an alpha plane (`auxl`).
+    ///
+    /// Most files hold a single image, so the list has one entry. Bursts, "collections" and Apple
+    /// dynamic HEIF hold several. [`HeifFile::primary_id`] is always listed, first when the scan
+    /// above did not already include it first.
+    pub fn top_level_image_ids(&self) -> Vec<ItemId> {
+        let is_input = |id: ItemId| {
+            self.references
+                .iter()
+                .any(|r| r.ref_type.0 == *b"dimg" && r.to.contains(&id))
+        };
+        let is_helper = |id: ItemId| {
+            self.references
+                .iter()
+                .any(|r| r.from == id && (r.ref_type.0 == *b"thmb" || r.ref_type.0 == *b"auxl"))
+        };
+        let mut ids: Vec<ItemId> = self
+            .items
+            .iter()
+            .filter(|i| {
+                !i.hidden && is_image_item(i.item_type) && !is_input(i.id) && !is_helper(i.id)
+            })
+            .map(|i| i.id)
+            .collect();
+        if !ids.contains(&self.primary_id) {
+            ids.insert(0, self.primary_id);
+        }
+        ids
+    }
+
     /// Raw item data, with all extents concatenated.
     ///
     /// With construction method 2 (`iloc` version 1 or 2), extents point into the data of the
@@ -413,6 +448,24 @@ impl<'a> HeifFile<'a> {
         }
         Ok(out)
     }
+}
+
+/// Whether an item type is an image, coded or derived, as opposed to metadata (`Exif`, `mime`)
+/// or another kind of helper.
+///
+/// Covers the standard image item types a HEIF file may hold: `hvc1`/`hev1` (HEVC), `avc1` (AVC),
+/// `av01` (AV1), `jpeg`, `unci` (uncompressed), and the derived `grid`, `iovl` and `iden`.
+pub fn is_image_item(item_type: FourCC) -> bool {
+    let t = &item_type.0;
+    t == b"hvc1"
+        || t == b"hev1"
+        || t == b"avc1"
+        || t == b"av01"
+        || t == b"jpeg"
+        || t == b"unci"
+        || t == b"grid"
+        || t == b"iovl"
+        || t == b"iden"
 }
 
 /// Maximum nesting of items constructed from other items (construction method 2).

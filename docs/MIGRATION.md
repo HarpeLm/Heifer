@@ -23,6 +23,7 @@ one-line rename. This guide keeps the change mechanical.
 
 - [Cargo.toml](#cargotoml)
 - [Decode a file](#decode-a-file)
+- [Multiple images](#multiple-images)
 - [Metadata: EXIF, XMP, ICC](#metadata-exif-xmp-icc)
 - [Encode a file](#encode-a-file)
 - [The `image` crate hooks](#the-image-crate-hooks)
@@ -91,6 +92,39 @@ Decode straight to 8-bit (half the memory) with `decode_rgba8`:
 ```rust
 let image: heifer::Image<u8> = heifer::decode_rgba8(&bytes, &heifer::Options::default())?;
 let rgba: &[u8] = &image.data;              // ready to upload / save
+```
+
+## Multiple images
+
+Some files hold several top-level pictures: bursts, "collections", and Apple dynamic HEIF
+(a still plus its variants). `libheif-rs` enumerates them with `top_level_image_ids` and
+decodes each handle. `heifer` does the same in one call, skipping each picture's
+thumbnails, grid tiles and auxiliary planes:
+
+```rust
+// before — libheif-rs
+let ids = ctx.top_level_image_ids()?;
+for id in ids {
+    let handle = ctx.image_handle(&id)?;
+    let image = lib_heif.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)?;
+    // ...
+}
+```
+
+```rust
+// after — heifer
+let images: Vec<heifer::Image> = heifer::decode_all(&bytes)?;   // one per picture
+```
+
+Most files hold a single image, so `decode_all` returns one image, identical to `decode`.
+For 8-bit sRGB output, use `decode_all_srgb_rgba8(&bytes, &Options::default())`. If you need
+to inspect the item list first, the container exposes it directly:
+
+```rust
+let file = heifer_isobmff::HeifFile::parse(&bytes)?;
+for id in file.top_level_image_ids() {
+    let image = heifer::decode_item(&file, id, 0)?;
+}
 ```
 
 ## Metadata: EXIF, XMP, ICC
@@ -239,6 +273,7 @@ match heifer::decode(&bytes) {
 | `HeifContext::read_from_bytes(bytes)` | `heifer::decode(bytes)` |
 | `ctx.primary_image_handle()` | — (`decode` targets the primary image) |
 | `ctx.image_handle(id)` | `HeifFile::parse` → `heifer::decode_item(...)` (low-level) |
+| `ctx.top_level_image_ids()` / `number_of_top_level_images()` | `heifer::decode_all(&bytes)` (`HeifFile::top_level_image_ids()` for the IDs) |
 | `lib_heif.decode(&handle, ColorSpace::Rgb(_), None)` | `heifer::decode(&bytes)` |
 | `image.planes()` / `.interleaved` / `stride` | `image.data` (interleaved RGBA), `to_rgba8()`, `to_rgb8()` |
 | `handle.metadata_block_ids(b"Exif")` / `handle.metadata(id)` | `heifer::read_metadata(&bytes)` → `.exif` / `.xmp` / `.icc_profile` |
@@ -278,6 +313,7 @@ match heifer::decode(&bytes) {
 | HEIC / HEVC (8–12 bit, alpha, grids, overlays, transforms) | ✓ | ✓ | ready |
 | Apple + ISO 21496-1 HDR gain maps | ✓ | ✓ | ready |
 | EXIF / XMP / ICC | ✓ | ✓ | ready |
+| Multiple top-level images (burst, collection, dynamic HEIF) | ✓ | ✓ (`decode_all`) | ready |
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
 | Uncompressed (ISO/IEC 23001-17) | ✓ | — | not yet |
 | 15/16-bit extended precision tools | ✓ | partial | one conformance stream missing |
@@ -297,7 +333,8 @@ next.
 
 1. `cargo remove libheif-rs libheif-sys` / `cargo add heifer`.
 2. Replace `HeifContext::read_from_file` + `primary_image_handle` + `decode` with one
-   `std::fs::read` + `heifer::decode` (or `decode_srgb` if you expected sRGB).
+   `std::fs::read` + `heifer::decode` (or `decode_srgb` if you expected sRGB, or `decode_all`
+   if the file may hold several images).
 3. Replace `planes()` / `stride` access with `image.data` / `to_rgba8()` / `to_rgb8()`.
 4. Replace metadata block walks with `heifer::read_metadata`.
 5. Replace `encode_image` + `Encoder` with `heifer::encode*`.

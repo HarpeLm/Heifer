@@ -32,6 +32,36 @@ fn decodes_all_fixtures() {
 }
 
 #[test]
+fn decodes_every_top_level_image() {
+    for (name, count, w, h) in [
+        ("single_image.heic", 1, 1440, 960),
+        ("grid.heic", 1, 960, 640),
+        ("burst.heic", 4, 1280, 720),
+        ("collection.heic", 4, 1440, 960),
+    ] {
+        let Some(bytes) = load(name) else { continue };
+        let images = heifer::decode_all(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(images.len(), count, "{name}");
+        for img in &images {
+            assert_eq!((img.width, img.height), (w, h), "{name}");
+        }
+        // The first image is the primary one, byte-identical to `decode`.
+        assert_eq!(images[0], heifer::decode(&bytes).unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn decode_all_srgb_rgba8_matches_the_single_image_path() {
+    let Some(bytes) = load("collection.heic") else {
+        return;
+    };
+    let all = heifer::decode_all_srgb_rgba8(&bytes, &heifer::Options::default()).unwrap();
+    assert_eq!(all.len(), 4);
+    let primary = heifer::decode_srgb_rgba8(&bytes, &heifer::Options::default()).unwrap();
+    assert!(all[0].data == primary.data, "primary image differs");
+}
+
+#[test]
 fn eight_bit_decoding_matches_the_wide_image_on_8_bit_files() {
     for name in [
         "single_image.heic",

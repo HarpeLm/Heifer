@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- `heifer::decode_all` and `decode_all_srgb_rgba8` decode every top-level image of a file, not
+  only the primary one. Bursts, "collections" and Apple dynamic HEIF hold several; each is
+  returned without its thumbnails, grid tiles or auxiliary planes. A single-image file yields
+  one image, identical to `decode`.
+- `heifer_isobmff::HeifFile::top_level_image_ids` and `is_image_item` expose the item list
+  behind it. The API is additive; existing signatures are unchanged.
+
 ## 0.3.17 — 2026-11-02
 
 **Performance**

@@ -1,6 +1,6 @@
 //! Tests on real files. Run `scripts/fetch-fixtures.sh` first; missing files are skipped.
 
-use heifer_isobmff::{FourCC, HeifFile};
+use heifer_isobmff::{FourCC, HeifFile, is_image_item};
 
 fn load(name: &str) -> Option<Vec<u8>> {
     let path = format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -62,6 +62,40 @@ fn alpha_auxiliary_image() {
     let alpha = file.referencing_items(1005, b"auxl");
     assert_eq!(alpha, vec![1008]);
     assert!(file.item(1008).unwrap().hidden);
+}
+
+#[test]
+fn top_level_images_skip_thumbnails_tiles_and_aux() {
+    for (name, expected) in [
+        ("single_image.heic", vec![1002]),
+        ("grid.heic", vec![1012]),
+        ("alpha.heic", vec![1009]),
+        ("collection.heic", vec![1002, 1008, 1014, 1020]),
+        ("burst.heic", vec![1366, 1369, 1372, 1375]),
+    ] {
+        let Some(data) = load(name) else { continue };
+        let file = HeifFile::parse(&data).unwrap();
+        assert_eq!(file.top_level_image_ids(), expected, "{name}");
+        assert_eq!(file.top_level_image_ids()[0], file.primary_id, "{name}");
+        for &id in &expected {
+            assert!(
+                is_image_item(file.item(id).unwrap().item_type),
+                "{name} {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn image_item_types_cover_coded_and_derived_images_only() {
+    for t in [
+        b"hvc1", b"hev1", b"avc1", b"av01", b"jpeg", b"unci", b"grid", b"iovl", b"iden",
+    ] {
+        assert!(is_image_item(FourCC(*t)), "{}", FourCC(*t));
+    }
+    for t in [b"Exif", b"mime", b"tmap", b"hvcC"] {
+        assert!(!is_image_item(FourCC(*t)), "{}", FourCC(*t));
+    }
 }
 
 #[test]

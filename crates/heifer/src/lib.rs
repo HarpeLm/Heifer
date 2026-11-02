@@ -146,6 +146,48 @@ pub fn decode_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, E
     to_srgb(&file, id, image)
 }
 
+/// Decodes every top-level image of a HEIF/HEIC file, not just the primary one.
+///
+/// Most files hold a single image, so the result has one entry, equal to [`decode`]. Files that
+/// hold several (bursts, "collections", Apple dynamic HEIF) yield one image per picture, skipping
+/// their thumbnails, tiles and auxiliary planes; see
+/// [`HeifFile::top_level_image_ids`](heifer_isobmff::HeifFile::top_level_image_ids).
+pub fn decode_all(bytes: &[u8]) -> Result<Vec<Image>, Error> {
+    decode_all_with_options(bytes, &Options::default())
+}
+
+/// Like [`decode_all`], with options.
+pub fn decode_all_with_options(bytes: &[u8], options: &Options) -> Result<Vec<Image>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    decode_all_images(&file, options, false)
+}
+
+/// Like [`decode_all`], at 8 bits per sample and with the samples converted to sRGB, as
+/// [`decode_srgb_rgba8`] does for the primary image. A file in a colour space heifer cannot
+/// convert (a LUT-based ICC profile, or a PQ/HLG transfer) is refused with [`Error::Unsupported`].
+pub fn decode_all_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Vec<Image<u8>>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    decode_all_images(&file, options, true)
+}
+
+fn decode_all_images<S: Sample>(
+    file: &HeifFile<'_>,
+    options: &Options,
+    srgb: bool,
+) -> Result<Vec<Image<S>>, Error> {
+    file.top_level_image_ids()
+        .into_iter()
+        .map(|id| {
+            let image = decode_item_with::<S>(file, id, 0, options)?;
+            if srgb {
+                to_srgb(file, id, image)
+            } else {
+                Ok(image)
+            }
+        })
+        .collect()
+}
+
 /// Converts a decoded image to sRGB from its ICC profile, else from its `nclx` colour
 /// information, else leaves it untouched.
 fn to_srgb<S: Sample>(file: &HeifFile<'_>, id: ItemId, image: Image<S>) -> Result<Image<S>, Error> {
