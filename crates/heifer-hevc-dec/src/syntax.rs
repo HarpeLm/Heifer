@@ -15,6 +15,84 @@ use crate::params::{Pps, Sps};
 use crate::scan::{CtbLayout, ScanType, scan_order};
 use crate::slice::SliceHeader;
 
+/// `ctxIdxMap` for `sig_coeff_flag` in a 4×4 transform block (Table 9-39), by raster position.
+const SIG_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+
+/// `sigCtx` before the size and colour offsets, by `prevCsbf` and raster position `(yP << 2) |
+/// xP` inside the sub-block (clause 9.3.4.2.5).
+const SIG_PATTERN: [[u8; 16]; 4] = [
+    [2, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    [2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0],
+    [2; 16],
+];
+
+/// Every position shares one context under `transform_skip_context_enabled_flag`.
+const SIG_FLAT: [u8; 16] = [0; 16];
+
+/// `sig_coeff_flag` context derivation of one sub-block (clause 9.3.4.2.5).
+///
+/// Everything fixed across the coefficients of the sub-block is settled once here, leaving one
+/// table lookup per coefficient.
+struct SigCtx {
+    table: &'static [u8; 16],
+    add: usize,
+    /// Context of the DC coefficient, where it does not follow the table.
+    dc: Option<usize>,
+}
+
+impl SigCtx {
+    fn new(
+        log2_size: u8,
+        luma: bool,
+        xs: usize,
+        ys: usize,
+        prev_csbf: u8,
+        scan: ScanType,
+        ts_ctx: bool,
+    ) -> Self {
+        let chroma = if luma { 0 } else { 27 };
+        if ts_ctx {
+            return Self {
+                table: &SIG_FLAT,
+                add: if luma { 42 } else { 43 },
+                dc: None,
+            };
+        }
+        if log2_size == 2 {
+            return Self {
+                table: &SIG_MAP_4X4,
+                add: chroma,
+                dc: None,
+            };
+        }
+        let add = if luma {
+            let size = if log2_size == 3 {
+                if scan == ScanType::Diagonal { 9 } else { 15 }
+            } else {
+                21
+            };
+            usize::from(xs + ys > 0) * 3 + size
+        } else {
+            chroma + if log2_size == 3 { 9 } else { 12 }
+        };
+        Self {
+            table: &SIG_PATTERN[usize::from(prev_csbf & 3)],
+            add,
+            dc: if xs + ys == 0 { Some(chroma) } else { None },
+        }
+    }
+
+    /// `ctxInc` of scan position `n`, whose raster index in the sub-block is `raster`.
+    #[inline(always)]
+    fn at(&self, n: usize, raster: usize) -> usize {
+        match self.dc {
+            Some(dc) if n == 0 => dc,
+            _ => usize::from(self.table[raster & 15]) + self.add,
+        }
+    }
+}
+
 /// SAO parameters of one CTB (§7.3.8.3), per colour component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SaoParams {
@@ -1264,6 +1342,7 @@ impl Parser<'_, '_> {
             if coded_sb[xs][ys] {
                 let prev_csbf = u8::from(xs + 1 < sb_width && coded_sb[xs + 1][ys])
                     | (u8::from(ys + 1 < sb_width && coded_sb[xs][ys + 1]) << 1);
+                let sig_ctx = SigCtx::new(log2_size, luma, xs, ys, prev_csbf, scan, ts_ctx);
                 let start = if i == last_sub_block {
                     last_scan_pos as i32 - 1
                 } else {
@@ -1271,12 +1350,10 @@ impl Parser<'_, '_> {
                 };
                 for n in (0..=start).rev() {
                     let n = n as usize;
-                    let (xp, yp) = pos_scan[n];
                     let significant = if n > 0 || !infer_sb_dc {
-                        let xc = (xs << 2) + usize::from(xp);
-                        let yc = (ys << 2) + usize::from(yp);
-                        let inc = self
-                            .sig_ctx_inc(c_idx, log2_size, xc, yc, xp, yp, prev_csbf, scan, ts_ctx);
+                        let (xp, yp) = pos_scan[n];
+                        let raster = (usize::from(yp) << 2) | usize::from(xp);
+                        let inc = sig_ctx.at(n, raster);
                         let s = self.flag(ctx::SIG_COEFF_FLAG + inc);
                         if s {
                             infer_sb_dc = false;
@@ -1326,12 +1403,10 @@ impl Parser<'_, '_> {
             let first_sig_pos = usize::from(sig[n_sig - 1]);
             let sign_hidden = sign_hiding_allowed && last_sig_pos - first_sig_pos > 3;
 
-            let mut signs = [false; 16];
-            for (k, s) in signs.iter_mut().enumerate().take(n_sig) {
-                if !(sign_hidden && k == n_sig - 1) {
-                    *s = self.bypass() == 1;
-                }
-            }
+            // The sign flags come as one run of bypass bins, `sig[0]`'s first, with the hidden
+            // one (the lowest position) absent from the end.
+            let coded_signs = n_sig - usize::from(sign_hidden);
+            let signs = self.engine.decode_bypass_bits(coded_signs as u32);
 
             // coeff_abs_level_remaining and final levels.
             let mut rice: u32 = if persistent_rice {
@@ -1375,7 +1450,10 @@ impl Parser<'_, '_> {
                 let (xp, yp) = pos_scan[usize::from(sig[k])];
                 let xc = (xs << 2) + usize::from(xp);
                 let yc = (ys << 2) + usize::from(yp);
-                let mut level = if signs[k] { -abs } else { abs };
+                let mut level = abs;
+                if k < coded_signs && (signs >> (coded_signs - 1 - k)) & 1 != 0 {
+                    level = -level;
+                }
                 if sign_hidden {
                     sum_abs += i64::from(abs);
                     if k == n_sig - 1 && sum_abs % 2 == 1 {
@@ -1388,69 +1466,6 @@ impl Parser<'_, '_> {
             }
         }
         Ok(transform_skip)
-    }
-
-    /// Context increment of `sig_coeff_flag` (§9.3.4.2.5).
-    #[allow(clippy::too_many_arguments)]
-    fn sig_ctx_inc(
-        &self,
-        c_idx: u8,
-        log2_size: u8,
-        xc: usize,
-        yc: usize,
-        xp: u8,
-        yp: u8,
-        prev_csbf: u8,
-        scan: ScanType,
-        ts_ctx: bool,
-    ) -> usize {
-        const CTX_IDX_MAP: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
-        let luma = c_idx == 0;
-        let sig_ctx: usize = if ts_ctx {
-            if luma { 42 } else { 16 }
-        } else if log2_size == 2 {
-            usize::from(CTX_IDX_MAP[(yc << 2) + xc])
-        } else if xc + yc == 0 {
-            0
-        } else {
-            let (xp, yp) = (usize::from(xp), usize::from(yp));
-            let mut s = match prev_csbf {
-                0 => {
-                    if xp + yp == 0 {
-                        2
-                    } else if xp + yp < 3 {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                1 => match yp {
-                    0 => 2,
-                    1 => 1,
-                    _ => 0,
-                },
-                2 => match xp {
-                    0 => 2,
-                    1 => 1,
-                    _ => 0,
-                },
-                _ => 2,
-            };
-            if luma {
-                if (xc >> 2) + (yc >> 2) > 0 {
-                    s += 3;
-                }
-                s += if log2_size == 3 {
-                    if scan == ScanType::Diagonal { 9 } else { 15 }
-                } else {
-                    21
-                };
-            } else {
-                s += if log2_size == 3 { 9 } else { 12 };
-            }
-            s
-        };
-        if luma { sig_ctx } else { 27 + sig_ctx }
     }
 
     /// `coeff_abs_level_remaining` (§9.3.3.11): Rice prefix/suffix, then Exp-Golomb escape.

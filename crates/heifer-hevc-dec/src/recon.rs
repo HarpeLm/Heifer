@@ -157,13 +157,42 @@ const DCT4: [[i32; 4]; 4] = dct_matrix();
 const DCT8: [[i32; 8]; 8] = dct_matrix();
 const DCT16: [[i32; 16]; 16] = dct_matrix();
 
-/// 2-D inverse transform (§8.6.4.2) of an `N`×`N` block of scaled coefficients `d` whose
-/// non-zero values all lie in the top-left `rows`×`cols` corner: a vertical pass with clipping
-/// to 16 bits, then a horizontal pass shifted by `bd_shift`.
+/// One 1-D inverse transform stage: `out[i] = sum_j m[j][i] * src[j]`, summing only the first
+/// `terms` entries of `src`.
 ///
-/// Both passes accumulate whole contiguous rows of fixed size, which the compiler vectorizes.
-/// Inputs are 16-bit and coefficients at most 90 in magnitude, so the sums fit in `i32`.
-fn inverse_2d<const N: usize>(
+/// Accumulating over `j` on the outside keeps the inner loop a fixed `N` multiply-accumulate
+/// over two contiguous slices, which the compiler vectorizes. A zero term inside that range is
+/// skipped; the skipped terms add nothing, so dropping them is exact.
+///
+/// Inputs are 16-bit and coefficients at most 90 in magnitude, so the sums fit in `i32`
+/// (`32 * 32768 * 90` is well inside it).
+#[inline]
+fn mul_1d<const N: usize>(m: &[[i32; N]; N], src: &[i32; N], terms: usize) -> [i32; N] {
+    let mut acc = [0i32; N];
+    for j in 0..terms.min(N) {
+        let c = src[j];
+        if c == 0 {
+            continue;
+        }
+        let row = &m[j];
+        for i in 0..N {
+            acc[i] += row[i] * c;
+        }
+    }
+    acc
+}
+
+/// 2-D inverse transform (§8.6.4.2) of an `N`×`N` block of scaled coefficients `d` whose
+/// non-zero values all lie in the top-left `rows`×`cols` corner: a column pass with clipping
+/// to 16 bits, then a row pass shifted by `bd_shift`.
+///
+/// Both passes sum only over that rectangle, whose outside is never read: the parser already
+/// gives the tight bounds, so this is exact and cheaper than scanning.
+///
+/// With `FLAT_ROW` (the DCT, whose first basis row `m[0][i]` is constant) the one-row and
+/// one-column shapes are handled directly; the DST's first row is not flat, so it only uses
+/// the general path.
+fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
     m: &[[i32; N]; N],
     d: &[i32],
     rows: usize,
@@ -171,35 +200,50 @@ fn inverse_2d<const N: usize>(
     bd_shift: i32,
     out: &mut [i32],
 ) {
-    // Vertical pass, on the first `width` columns (a multiple of 8 covering `cols`; the
-    // coefficients past `cols` are zero).
-    let width = (cols.div_ceil(8) * 8).min(N);
-    let mut tmp = [[0i32; N]; N];
-    for (y, t) in tmp.iter_mut().enumerate() {
-        let mut acc = [0i32; N];
-        for (k, row) in d.chunks_exact(N).take(rows).enumerate() {
-            let c = m[k][y];
-            for (a, &v) in acc[..width].iter_mut().zip(&row[..width]) {
-                *a += c * v;
-            }
+    let b = &d[..N * N];
+    let (rows, cols) = (rows.min(N), cols.min(N));
+    let rnd = 1 << (bd_shift - 1);
+    if FLAT_ROW && rows == 1 {
+        // Only the first coefficient row is non-zero, so the column pass gives every row the
+        // same values `m[0][0] * d[x]`; the row pass then produces one residual row, repeated
+        // down the block.
+        let mut g = [0i32; N];
+        for (g, &c) in g.iter_mut().zip(b).take(cols) {
+            *g = ((m[0][0] * c + 64) >> 7).clamp(-32768, 32767);
         }
-        for (t, &a) in t[..width].iter_mut().zip(&acc[..width]) {
-            *t = ((a + 64) >> 7).clamp(-32768, 32767);
+        let mut row = mul_1d::<N>(m, &g, cols);
+        for v in row.iter_mut() {
+            *v = (*v + rnd) >> bd_shift;
+        }
+        for o in out.chunks_exact_mut(N) {
+            o.copy_from_slice(&row);
+        }
+        return;
+    }
+    // Column pass on the first `cols` columns (later columns have an all-zero source, so they
+    // stay zero and the row pass never sums over them).
+    let mut g = [[0i32; N]; N];
+    let mut col = [0i32; N];
+    for x in 0..cols {
+        for j in 0..rows {
+            col[j] = b[j * N + x];
+        }
+        let e = mul_1d::<N>(m, &col, rows);
+        for y in 0..N {
+            g[y][x] = ((e[y] + 64) >> 7).clamp(-32768, 32767);
         }
     }
-    // Horizontal pass: only the first `cols` intermediate values can be non-zero.
-    let rnd = 1 << (bd_shift - 1);
-    for (t, o) in tmp.iter().zip(out.chunks_exact_mut(N)) {
-        let mut acc = [0i32; N];
-        for (&c, mk) in t[..cols].iter().zip(m) {
-            if c != 0 {
-                for (a, &v) in acc.iter_mut().zip(mk) {
-                    *a += c * v;
-                }
-            }
+    // Row pass: one row of `g` at a time.
+    for y in 0..N {
+        if FLAT_ROW && cols == 1 {
+            // One column of `g` means every sample of the row is `m[0][i] * g[y][0]`.
+            out[y * N..y * N + N].fill((m[0][0] * g[y][0] + rnd) >> bd_shift);
+            continue;
         }
-        for (o, &a) in o.iter_mut().zip(&acc) {
-            *o = (a + rnd) >> bd_shift;
+        let r = mul_1d::<N>(m, &g[y], cols);
+        let o = &mut out[y * N..y * N + N];
+        for i in 0..N {
+            o[i] = (r[i] + rnd) >> bd_shift;
         }
     }
 }
@@ -841,6 +885,7 @@ impl<'a> Reconstructor<'a> {
         };
         let d = &mut d[..n * n];
         let rnd = 1i64 << (bd_shift - 1);
+        let flat_factor = 16 * scale;
         for (y, (src, dst)) in coeffs
             .chunks_exact(n)
             .zip(d.chunks_exact_mut(n))
@@ -849,17 +894,14 @@ impl<'a> Reconstructor<'a> {
         {
             dst[cols..width].fill(0);
             for (x, (&level, o)) in src[..cols].iter().zip(&mut dst[..cols]).enumerate() {
-                *o = if level == 0 {
-                    0
+                let factor = if flat {
+                    flat_factor
                 } else {
-                    let m = if flat {
-                        16
-                    } else {
-                        Self::scaling_factor(list.unwrap(), tb.log2_size, c, x, y)
-                    };
-                    ((i64::from(level) * i64::from(m) * scale + rnd) >> bd_shift)
-                        .clamp(-32768, 32767) as i32
+                    i64::from(Self::scaling_factor(list.unwrap(), tb.log2_size, c, x, y)) * scale
                 };
+                // A zero level scales to `rnd >> bd_shift`, which is zero for every `bd_shift`
+                // in range, so no special case is needed here.
+                *o = ((i64::from(level) * factor + rnd) >> bd_shift).clamp(-32768, 32767) as i32;
             }
         }
 
@@ -884,11 +926,11 @@ impl<'a> Reconstructor<'a> {
         }
         let out = &mut out[..n * n];
         match n {
-            4 if dst => inverse_2d(&DST4, d, rows, cols, bd_shift2, out),
-            4 => inverse_2d(&DCT4, d, rows, cols, bd_shift2, out),
-            8 => inverse_2d(&DCT8, d, rows, cols, bd_shift2, out),
-            16 => inverse_2d(&DCT16, d, rows, cols, bd_shift2, out),
-            _ => inverse_2d(&DCT32, d, rows, cols, bd_shift2, out),
+            4 if dst => inverse_2d::<4, false>(&DST4, d, rows, cols, bd_shift2, out),
+            4 => inverse_2d::<4, true>(&DCT4, d, rows, cols, bd_shift2, out),
+            8 => inverse_2d::<8, true>(&DCT8, d, rows, cols, bd_shift2, out),
+            16 => inverse_2d::<16, true>(&DCT16, d, rows, cols, bd_shift2, out),
+            _ => inverse_2d::<32, true>(&DCT32, d, rows, cols, bd_shift2, out),
         }
     }
 

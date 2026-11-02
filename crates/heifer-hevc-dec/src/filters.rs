@@ -108,11 +108,11 @@ pub(crate) fn chroma_qp(qpi: i32, chroma_array_type: u8) -> i32 {
 
 /// Applies the deblocking filter to `frame` in place (§8.7.2).
 pub fn deblock(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &CtbLayout) {
-    for vertical in [true, false] {
-        deblock_luma(frame, info, sps, pps, layout, vertical);
-        if sps.chroma_array_type() != 0 {
-            deblock_chroma(frame, info, sps, pps, layout, vertical);
-        }
+    deblock_luma::<true>(frame, info, sps, pps, layout);
+    deblock_luma::<false>(frame, info, sps, pps, layout);
+    if sps.chroma_array_type() != 0 {
+        deblock_chroma::<true>(frame, info, sps, pps, layout);
+        deblock_chroma::<false>(frame, info, sps, pps, layout);
     }
 }
 
@@ -148,13 +148,17 @@ fn edge_filtered(
     true
 }
 
-fn deblock_luma(
+/// Applies the luma deblocking filter (§8.7.2.4) across vertical (`VERTICAL`) or horizontal
+/// edges.
+///
+/// `VERTICAL` is a compile-time constant so the sample addressing below collapses to a base
+/// offset and two strides, with no per-sample branch.
+fn deblock_luma<const VERTICAL: bool>(
     frame: &mut Frame,
     info: &FilterInfo,
     sps: &Sps,
     pps: &Pps,
     layout: &CtbLayout,
-    vertical: bool,
 ) {
     let (w, h) = (
         sps.pic_width_in_luma_samples,
@@ -164,18 +168,14 @@ fn deblock_luma(
     let bit_depth = i32::from(sps.bit_depth_luma);
     let max = (1 << bit_depth) - 1;
     let plane = &mut frame.planes[0];
-    let edge_bit = if vertical { 1 } else { 2 };
+    let edge_bit = if VERTICAL { 1 } else { 2 };
 
     // Each segment: 4 lines across an edge on the 8×8 grid.
-    let (outer, inner) = if vertical {
-        ((0..h).step_by(4), w)
-    } else {
-        ((0..w).step_by(4), h)
-    };
-    for a in outer {
+    let (outer, inner) = if VERTICAL { (h, w) } else { (w, h) };
+    for a in (0..outer).step_by(4) {
         for b in (8..inner).step_by(8) {
-            let (xq, yq) = if vertical { (b, a) } else { (a, b) };
-            let (xp, yp) = if vertical { (b - 1, a) } else { (a, b - 1) };
+            let (xq, yq) = if VERTICAL { (b, a) } else { (a, b) };
+            let (xp, yp) = if VERTICAL { (b - 1, a) } else { (a, b - 1) };
             let iq = info.at(xq, yq);
             if info.edges[iq] & edge_bit == 0
                 || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
@@ -193,27 +193,29 @@ fn deblock_luma(
             ) << (bit_depth - 8);
             let (no_p, no_q) = (info.no_filter[ip], info.no_filter[iq]);
 
-            // Sample accessor: line k (0..4) across the edge, offset i (-4..4; <0 is the P side).
-            let idx = |k: u32, i: i32| -> usize {
-                if vertical {
-                    ((yq + k) as usize) * stride + (xq as i32 + i) as usize
-                } else {
-                    ((yq as i32 + i) as usize) * stride + (xq + k) as usize
-                }
+            // Sample p3..q3 of line `k` runs across the edge: `base` is p3 of line 0, and the
+            // two strides walk along the edge and from one line to the next.
+            let (base, step_i, step_k) = if VERTICAL {
+                (yq as usize * stride + (xq as usize - 4), 1usize, stride)
+            } else {
+                ((yq as usize - 4) * stride + xq as usize, stride, 1usize)
             };
-            let s = |plane: &[u16], k: u32, i: i32| i32::from(plane[idx(k, i)]);
+            let at = |k: usize, i: isize| base + k * step_k + (i + 4) as usize * step_i;
+            let s = |plane: &[u16], k: usize, i: isize| i32::from(plane[at(k, i)]);
 
-            let dp =
-                |plane: &[u16], k| (s(plane, k, -3) - 2 * s(plane, k, -2) + s(plane, k, -1)).abs();
-            let dq =
-                |plane: &[u16], k| (s(plane, k, 2) - 2 * s(plane, k, 1) + s(plane, k, 0)).abs();
+            let dp = |plane: &[u16], k: usize| {
+                (s(plane, k, -3) - 2 * s(plane, k, -2) + s(plane, k, -1)).abs()
+            };
+            let dq = |plane: &[u16], k: usize| {
+                (s(plane, k, 2) - 2 * s(plane, k, 1) + s(plane, k, 0)).abs()
+            };
             let (dp0, dp3, dq0, dq3) = (dp(plane, 0), dp(plane, 3), dq(plane, 0), dq(plane, 3));
             let (dpq0, dpq3) = (dp0 + dq0, dp3 + dq3);
             let d = dpq0 + dpq3;
             if d >= beta {
                 continue;
             }
-            let strong = |plane: &[u16], k, dpq: i32| {
+            let strong = |plane: &[u16], k: usize, dpq: i32| {
                 2 * dpq < (beta >> 2)
                     && (s(plane, k, -4) - s(plane, k, -1)).abs()
                         + (s(plane, k, 0) - s(plane, k, 3)).abs()
@@ -226,7 +228,7 @@ fn deblock_luma(
 
             for k in 0..4 {
                 let [p3, p2, p1, p0, q0, q1, q2, q3] =
-                    core::array::from_fn(|j| s(plane, k, j as i32 - 4));
+                    core::array::from_fn(|j| s(plane, k, j as isize - 4));
                 let mut out = [(p0, -1), (q0, 0), (p1, -2), (q1, 1), (p2, -3), (q2, 2)];
                 let mut n = 0;
                 if de_strong {
@@ -263,27 +265,27 @@ fn deblock_luma(
                     if (i < 0 && no_p) || (i >= 0 && no_q) {
                         continue;
                     }
-                    plane[idx(k, i)] = v as u16;
+                    plane[at(k, i)] = v as u16;
                 }
             }
         }
     }
 }
 
-fn deblock_chroma(
+/// Applies the chroma deblocking filter across vertical (`VERTICAL`) or horizontal edges.
+fn deblock_chroma<const VERTICAL: bool>(
     frame: &mut Frame,
     info: &FilterInfo,
     sps: &Sps,
     pps: &Pps,
     layout: &CtbLayout,
-    vertical: bool,
 ) {
     let (sw, sh) = sps.chroma_subsampling();
     let (cw, ch) = (frame.widths[1], frame.heights[1]);
     let stride = cw as usize;
     let bit_depth = i32::from(sps.bit_depth_chroma);
     let max = (1 << bit_depth) - 1;
-    let edge_bit = if vertical { 1 } else { 2 };
+    let edge_bit = if VERTICAL { 1 } else { 2 };
     let chroma_type = sps.chroma_array_type();
 
     for c in 1..3 {
@@ -294,12 +296,12 @@ fn deblock_chroma(
         });
         let plane = &mut frame.planes[c];
         // Chroma edges lie on an 8×8 grid of chroma samples.
-        let (outer, inner) = if vertical { (ch, cw) } else { (cw, ch) };
+        let (outer, inner) = if VERTICAL { (ch, cw) } else { (cw, ch) };
         for a in 0..outer {
             for b in (8..inner).step_by(8) {
-                let (xc, yc) = if vertical { (b, a) } else { (a, b) };
+                let (xc, yc) = if VERTICAL { (b, a) } else { (a, b) };
                 let (xq, yq) = (xc * sw, yc * sh);
-                let (xp, yp) = if vertical { (xq - 1, yq) } else { (xq, yq - 1) };
+                let (xp, yp) = if VERTICAL { (xq - 1, yq) } else { (xq, yq - 1) };
                 let iq = info.at(xq, yq);
                 if info.edges[iq] & edge_bit == 0
                     || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
@@ -316,21 +318,21 @@ fn deblock_chroma(
                 if tc == 0 {
                     continue;
                 }
-                let idx = |i: i32| -> usize {
-                    if vertical {
-                        yc as usize * stride + (xc as i32 + i) as usize
-                    } else {
-                        (yc as i32 + i) as usize * stride + xc as usize
-                    }
+                // p1, p0, q0, q1 are two samples each side of the edge along `step`.
+                let (base, step) = if VERTICAL {
+                    (yc as usize * stride + (xc as usize - 2), 1usize)
+                } else {
+                    ((yc as usize - 2) * stride + xc as usize, stride)
                 };
+                let at = |i: isize| base + (i + 2) as usize * step;
                 let [p1, p0, q0, q1] =
-                    core::array::from_fn(|j| i32::from(plane[idx(j as i32 - 2)]));
+                    core::array::from_fn(|j| i32::from(plane[at(j as isize - 2)]));
                 let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
                 if !info.no_filter[ip] {
-                    plane[idx(-1)] = (p0 + delta).clamp(0, max) as u16;
+                    plane[at(-1)] = (p0 + delta).clamp(0, max) as u16;
                 }
                 if !info.no_filter[iq] {
-                    plane[idx(0)] = (q0 - delta).clamp(0, max) as u16;
+                    plane[at(0)] = (q0 - delta).clamp(0, max) as u16;
                 }
             }
         }
@@ -338,110 +340,158 @@ fn deblock_chroma(
 }
 
 /// Applies SAO to `frame` in place (§8.7.3). `frame` must already be deblocked.
+///
+/// Band offset only reads the sample it writes, so a plane that uses it exclusively is processed
+/// in place. Edge offset reads neighbouring samples of the *pre-SAO* picture, so a plane that
+/// uses it is copied first — and only then.
 pub fn sao(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &CtbLayout) {
-    let deblocked = frame.clone();
     let num_comps = if sps.chroma_array_type() != 0 { 3 } else { 1 };
     let ctb = sps.ctb_size();
+    let num_ctb = (layout.width * layout.height) as usize;
     for c in 0..num_comps {
-        let (sw, sh) = if c == 0 {
-            (1, 1)
-        } else {
-            sps.chroma_subsampling()
-        };
+        let has_edge = info.sao[..num_ctb].iter().any(|p| p.type_idx[c] == 2);
         let (pw, ph) = (frame.widths[c], frame.heights[c]);
-        let stride = pw as usize;
-        let bit_depth = if c == 0 {
-            sps.bit_depth_luma
+        if has_edge {
+            let src = frame.planes[c].clone();
+            sao_plane(
+                Some(&src),
+                &mut frame.planes[c],
+                c,
+                info,
+                sps,
+                pps,
+                layout,
+                ctb,
+                pw,
+                ph,
+            );
         } else {
-            sps.bit_depth_chroma
-        };
-        let max = (1i32 << bit_depth) - 1;
-        let src = &deblocked.planes[c];
-        let dst = &mut frame.planes[c];
-        for rs in 0..layout.width * layout.height {
-            let params = &info.sao[rs as usize];
-            let type_idx = params.type_idx[c];
-            if type_idx == 0 {
-                continue;
-            }
-            let x0 = (rs % layout.width) * ctb / sw;
-            let y0 = (rs / layout.width) * ctb / sh;
-            let (x1, y1) = ((x0 + ctb / sw).min(pw), (y0 + ctb / sh).min(ph));
-            let offsets = params.offsets[c];
-            if type_idx == 1 {
-                let shift = bit_depth - 5;
-                let band = params.band_position[c];
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        if info.no_filter[info.at(x * sw, y * sh)] {
-                            continue;
-                        }
-                        let i = y as usize * stride + x as usize;
-                        let v = i32::from(src[i]);
-                        let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
-                        if k < 4 {
-                            dst[i] = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
-                        }
+            sao_plane(
+                None,
+                &mut frame.planes[c],
+                c,
+                info,
+                sps,
+                pps,
+                layout,
+                ctb,
+                pw,
+                ph,
+            );
+        }
+    }
+}
+
+/// Applies SAO to one colour plane. `src` is the pre-SAO copy used by edge offset; `None` means
+/// the plane holds no edge-offset CTB and may be filtered in place.
+#[allow(clippy::too_many_arguments)]
+fn sao_plane(
+    src: Option<&[u16]>,
+    dst: &mut [u16],
+    c: usize,
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+    ctb: u32,
+    pw: u32,
+    ph: u32,
+) {
+    let (sw, sh) = if c == 0 {
+        (1, 1)
+    } else {
+        sps.chroma_subsampling()
+    };
+    let stride = pw as usize;
+    let bit_depth = if c == 0 {
+        sps.bit_depth_luma
+    } else {
+        sps.bit_depth_chroma
+    };
+    let max = (1i32 << bit_depth) - 1;
+    for rs in 0..layout.width * layout.height {
+        let params = &info.sao[rs as usize];
+        let type_idx = params.type_idx[c];
+        if type_idx == 0 {
+            continue;
+        }
+        let x0 = (rs % layout.width) * ctb / sw;
+        let y0 = (rs / layout.width) * ctb / sh;
+        let (x1, y1) = ((x0 + ctb / sw).min(pw), (y0 + ctb / sh).min(ph));
+        let offsets = params.offsets[c];
+        if type_idx == 1 {
+            let shift = bit_depth - 5;
+            let band = params.band_position[c];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if info.no_filter[info.at(x * sw, y * sh)] {
+                        continue;
+                    }
+                    let i = y as usize * stride + x as usize;
+                    let v = i32::from(src.map_or(dst[i], |s| s[i]));
+                    let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
+                    if k < 4 {
+                        dst[i] = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
                     }
                 }
-            } else {
-                let (dx, dy): (i32, i32) = match params.eo_class[c] {
-                    0 => (1, 0),
-                    1 => (0, 1),
-                    2 => (1, 1),
-                    _ => (-1, 1),
-                };
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        let (xl, yl) = (x * sw, y * sh);
-                        if info.no_filter[info.at(xl, yl)] {
-                            continue;
-                        }
-                        let (ax, ay) = (x as i32 - dx, y as i32 - dy);
-                        let (bx, by) = (x as i32 + dx, y as i32 + dy);
-                        let inside = |px: i32, py: i32| {
-                            px >= 0 && py >= 0 && px < pw as i32 && py < ph as i32
-                        };
-                        if !inside(ax, ay) || !inside(bx, by) {
-                            continue;
-                        }
-                        if !sao_neighbour_ok(
-                            info,
-                            sps,
-                            pps,
-                            layout,
-                            xl,
-                            yl,
-                            ax as u32 * sw,
-                            ay as u32 * sh,
-                        ) || !sao_neighbour_ok(
-                            info,
-                            sps,
-                            pps,
-                            layout,
-                            xl,
-                            yl,
-                            bx as u32 * sw,
-                            by as u32 * sh,
-                        ) {
-                            continue;
-                        }
-                        let i = y as usize * stride + x as usize;
-                        let v = i32::from(src[i]);
-                        let a = i32::from(src[ay as usize * stride + ax as usize]);
-                        let b = i32::from(src[by as usize * stride + bx as usize]);
-                        let edge = 2 + (v - a).signum() + (v - b).signum();
-                        // edgeIdx 0, 1, 2 are remapped to 1, 2, 0 (§8.7.3.2).
-                        let edge_idx = match edge {
-                            0 => 1,
-                            1 => 2,
-                            2 => 0,
-                            e => e,
-                        };
-                        if edge_idx != 0 {
-                            dst[i] = (v + i32::from(offsets[edge_idx as usize - 1])).clamp(0, max)
-                                as u16;
-                        }
+            }
+        } else {
+            let src = src.expect("edge offset needs the pre-SAO picture");
+            let (dx, dy): (i32, i32) = match params.eo_class[c] {
+                0 => (1, 0),
+                1 => (0, 1),
+                2 => (1, 1),
+                _ => (-1, 1),
+            };
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (xl, yl) = (x * sw, y * sh);
+                    if info.no_filter[info.at(xl, yl)] {
+                        continue;
+                    }
+                    let (ax, ay) = (x as i32 - dx, y as i32 - dy);
+                    let (bx, by) = (x as i32 + dx, y as i32 + dy);
+                    let inside =
+                        |px: i32, py: i32| px >= 0 && py >= 0 && px < pw as i32 && py < ph as i32;
+                    if !inside(ax, ay) || !inside(bx, by) {
+                        continue;
+                    }
+                    if !sao_neighbour_ok(
+                        info,
+                        sps,
+                        pps,
+                        layout,
+                        xl,
+                        yl,
+                        ax as u32 * sw,
+                        ay as u32 * sh,
+                    ) || !sao_neighbour_ok(
+                        info,
+                        sps,
+                        pps,
+                        layout,
+                        xl,
+                        yl,
+                        bx as u32 * sw,
+                        by as u32 * sh,
+                    ) {
+                        continue;
+                    }
+                    let i = y as usize * stride + x as usize;
+                    let v = i32::from(src[i]);
+                    let a = i32::from(src[ay as usize * stride + ax as usize]);
+                    let b = i32::from(src[by as usize * stride + bx as usize]);
+                    let edge = 2 + (v - a).signum() + (v - b).signum();
+                    // edgeIdx 0, 1, 2 are remapped to 1, 2, 0 (§8.7.3.2).
+                    let edge_idx = match edge {
+                        0 => 1,
+                        1 => 2,
+                        2 => 0,
+                        e => e,
+                    };
+                    if edge_idx != 0 {
+                        dst[i] =
+                            (v + i32::from(offsets[edge_idx as usize - 1])).clamp(0, max) as u16;
                     }
                 }
             }

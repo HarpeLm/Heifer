@@ -13,6 +13,18 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Median of a slice of times (empty slice gives 0).
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    s[s.len() / 2]
+}
+
+/// Smallest of a slice of times.
+fn best(v: &[f64]) -> f64 {
+    v.iter().fold(f64::MAX, |m, &x| m.min(x))
+}
+
 fn decoders(threads: usize) -> Vec<(&'static str, Decoder)> {
     let zune = |hw: bool| -> Decoder {
         Box::new(move |data: &[u8]| {
@@ -44,6 +56,17 @@ fn decoders(threads: usize) -> Vec<(&'static str, Decoder)> {
                 };
                 let img = heifer::decode_with_options(data, &o).map_err(|e| e.to_string())?;
                 Ok((img.width, img.height, img.to_rgba8()))
+            }),
+        ),
+        (
+            "heifer8",
+            Box::new(move |data: &[u8]| {
+                let o = heifer::Options {
+                    max_threads: threads,
+                    max_pixels: 1 << 30,
+                };
+                let img = heifer::decode_rgba8(data, &o).map_err(|e| e.to_string())?;
+                Ok((img.width, img.height, img.data))
             }),
         ),
         (
@@ -185,6 +208,81 @@ fn main() {
                 }
             }
         }
-        _ => panic!("decode|encode"),
+        // Profiles one decoder in a loop (best-of-N), for sampling profilers and stable
+        // timings. `heifer-benchmarks profile <decoder> <file> <iters>`. For a single-threaded
+        // competitor set RAYON_NUM_THREADS=1 in the environment. Not used by run.py.
+        "profile" => {
+            let data = std::fs::read(&a[3]).unwrap();
+            let iters: usize = a[4].parse().unwrap();
+            let dec = decoders(1)
+                .into_iter()
+                .find(|(name, _)| *name == a[2])
+                .unwrap_or_else(|| panic!("unknown decoder {}", a[2]))
+                .1;
+            let mut best = f64::MAX;
+            let mut total = 0.0;
+            for _ in 0..iters {
+                let t = Instant::now();
+                let img = dec(&data).unwrap();
+                std::hint::black_box(img);
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                best = best.min(ms);
+                total += ms;
+            }
+            println!(
+                "{}\t{}\tbest {best:.1} ms\tmean {:.1} ms over {iters} iters",
+                a[2],
+                a[3],
+                total / iters as f64
+            );
+        }
+        "ab" => {
+            // Intra-process interleaved A/B: alternates the two decoders every iteration and
+            // flips their order every other pair, so drift and contention hit both equally.
+            let data = std::fs::read(&a[4]).unwrap();
+            let iters: usize = a[5].parse().unwrap();
+            let all = decoders(1);
+            let find = |name: &str| -> &Decoder {
+                &all
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap_or_else(|| panic!("unknown decoder {name}"))
+                    .1
+            };
+            let (da, db) = (find(&a[2]), find(&a[3]));
+            let mut ta = Vec::with_capacity(iters);
+            let mut tb = Vec::with_capacity(iters);
+            for i in 0..iters {
+                let run = |d: &Decoder, t: &mut Vec<f64>| {
+                    let start = Instant::now();
+                    let img = d(&data).unwrap();
+                    std::hint::black_box(img);
+                    t.push(start.elapsed().as_secs_f64() * 1000.0);
+                };
+                if i % 2 == 1 {
+                    run(db, &mut tb);
+                    run(da, &mut ta);
+                } else {
+                    run(da, &mut ta);
+                    run(db, &mut tb);
+                }
+            }
+            let ratio: Vec<f64> = ta.iter().zip(&tb).map(|(a, b)| a / b).collect();
+            let mut rs = ratio.clone();
+            rs.sort_by(f64::total_cmp);
+            println!(
+                "{}\t{}\t{}\tbest {:.1}\t{:.1}\tmedian {:.1}\t{:.1}\tratio(min) {:.3}\tratio(med) {:.3}",
+                a[2],
+                a[3],
+                a[4],
+                best(&ta),
+                best(&tb),
+                median(&ta),
+                median(&tb),
+                best(&ta) / best(&tb),
+                rs[rs.len() / 2],
+            );
+        }
+        _ => panic!("decode|encode|profile|ab"),
     }
 }

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.17 — 2026-11-02
+
+**Performance**
+
+- Decoding is faster, with byte-identical output. The inverse transform runs its column and row
+  passes over only the non-zero rectangle of a block, with dedicated single-row and single-column
+  paths, and the coefficient scaling is branchless with one 64-bit multiply.
+- `residual_coding` derives the significance context of each 4×4 sub-block once instead of per
+  coefficient, and reads a sub-block's sign flags in a single bypass run.
+- The deblocking filter is specialised at compile time for vertical and horizontal edges, dropping
+  a per-sample branch, and SAO copies a colour plane only when it actually holds edge-offset CTBs;
+  a band-offset-only plane is filtered in place.
+
+No API change: existing signatures are unchanged.
+
 ## 0.3.16 — 2026-11-01
 
 **New**
