@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**Correctness**
+
+- The colour primaries and transfer characteristics now fall back to the HEVC VUI when an image
+  has no `nclx` colour information, for coded items and for the tiles of a grid. HDR HEIC files
+  that declare PQ or HLG only in their bitstream are therefore linearised correctly by
+  `decode_hdr` instead of being decoded as SDR; `nclx` still takes precedence when present.
+
 ## 0.3.20 — 2026-11-02
 
 **New**

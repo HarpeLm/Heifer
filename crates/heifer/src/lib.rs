@@ -35,9 +35,11 @@ pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
 
 use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
+use heifer_hevc_dec::params::ParameterSets;
 use heifer_hevc_dec::recon::Frame;
 use heifer_isobmff::boxes::{ColorInfo, Property};
-use heifer_isobmff::{HeifFile, ItemId};
+use heifer_isobmff::{FourCC, HeifFile, ItemId};
 
 /// Errors produced while decoding or encoding a HEIF file.
 #[derive(Debug, thiserror::Error)]
@@ -252,22 +254,18 @@ fn to_srgb<S: Sample>(file: &HeifFile<'_>, id: ItemId, image: Image<S>) -> Resul
     }
 }
 
-/// The `nclx` colour primaries and transfer characteristics of an item, or of the first source
-/// of a derived image (a grid's tiles), following the `dimg` references.
+/// The colour primaries and transfer characteristics of an item, or of the first source of a
+/// derived image (a grid's tiles), following the `dimg` references: the `nclx` colour
+/// information when present, else the HEVC VUI of a coded item.
 fn nclx(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
     let mut current = Some(id);
     for _ in 0..MAX_DEPTH {
         let Some(item) = current else { return Ok(None) };
-        let own = file.item_properties(item)?.find_map(|p| match p {
-            Property::Color(ColorInfo::Nclx {
-                primaries,
-                transfer,
-                ..
-            }) => Some((*primaries, *transfer)),
-            _ => None,
-        });
-        if own.is_some() {
-            return Ok(own);
+        if let Some(colour) = item_nclx(file, item)? {
+            return Ok(Some(colour));
+        }
+        if let Some(colour) = vui_colour(file, item)? {
+            return Ok(Some(colour));
         }
         current = file
             .referenced_items(item, b"dimg")
@@ -276,6 +274,60 @@ fn nclx(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
             .filter(|&first| first != item);
     }
     Ok(None)
+}
+
+/// The `nclx` primaries and transfer characteristics of an item, if it has a `colr` property.
+fn item_nclx(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
+    Ok(file.item_properties(id)?.find_map(|p| match p {
+        Property::Color(ColorInfo::Nclx {
+            primaries,
+            transfer,
+            ..
+        }) => Some((*primaries, *transfer)),
+        _ => None,
+    }))
+}
+
+/// The colour primaries and transfer characteristics declared by the HEVC VUI of a coded item,
+/// when both are specified (not 2, "unspecified"). Some encoders write them only there, e.g.
+/// for HDR HEIC files that have no `nclx` property.
+fn vui_colour(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
+    let item_type = file.item(id)?.item_type;
+    if item_type != FourCC(*b"hvc1") && item_type != FourCC(*b"hev1") {
+        return Ok(None);
+    }
+    let Some(config) = file.hevc_config(id)? else {
+        return Ok(None);
+    };
+    // Parameter sets are normally in `hvcC`; `hev1` streams may also carry them in-band, in
+    // which case the reconstructed Annex B stream is the only place to find the SPS.
+    let mut sets = ParameterSets::default();
+    for nal in &config.nal_units {
+        sets.add(&NalUnit::parse(nal)?)?;
+    }
+    if let Some(colour) = sps_colour(&sets) {
+        return Ok(Some(colour));
+    }
+    if item_type == FourCC(*b"hvc1") {
+        return Ok(None);
+    }
+    let mut sets = ParameterSets::default();
+    for nal in split_annex_b(&file.hevc_bitstream(id)?) {
+        sets.add(&NalUnit::parse(nal)?)?;
+    }
+    Ok(sps_colour(&sets))
+}
+
+/// The colour primaries and transfer characteristics declared by the VUI of a parsed SPS, when
+/// both are specified.
+fn sps_colour(sets: &ParameterSets) -> Option<(u16, u16)> {
+    sets.sps.iter().flatten().find_map(|sps| {
+        let vui = sps.vui.as_ref()?;
+        (vui.colour_primaries != 2 && vui.transfer_characteristics != 2).then_some((
+            u16::from(vui.colour_primaries),
+            u16::from(vui.transfer_characteristics),
+        ))
+    })
 }
 
 /// Decodes the thumbnail of the primary image (a `thmb` item, such as the 320×240 preview

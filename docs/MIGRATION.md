@@ -323,8 +323,8 @@ match heifer::decode(&bytes) {
   decode the item directly with the low-level API.
 - **Colour space is explicit.** `heifer::decode` returns the pixels in the file's own
   colour space. Call `heifer::decode_srgb(&bytes)` to convert to sRGB (this is where the
-  ICC profile or `nclx` is applied; matrix/TRC and LUT-based RGB profiles are read, other
-  input spaces are refused with `Error::Unsupported`, and PQ/HLG belong to
+  ICC profile, `nclx` or the HEVC VUI is applied; matrix/TRC and LUT-based RGB profiles are
+  read, other input spaces are refused with `Error::Unsupported`, and PQ/HLG belong to
   `heifer::decode_hdr`). libheif converts to sRGB by default, so if you relied on that, add
   the `_srgb` call.
 - **Always RGB(A), never planar.** There is no `ColorSpace::YCbCr` output and no `RgbChroma`

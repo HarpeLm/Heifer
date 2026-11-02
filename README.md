@@ -62,7 +62,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
-  management to sRGB (`decode_srgb`, from the ICC profile or `nclx`).
+  management to sRGB (`decode_srgb`, from the ICC profile, `nclx`, or the HEVC VUI).
 - **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos; checked with Apple's ImageIO and ffmpeg.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
@@ -106,7 +106,8 @@ let preview = heifer::decode_thumbnail(&bytes)?;   // the embedded thumbnail, if
 
 The code values of `decode` are those of the file's own colour space: most iPhone and many camera
 photos are `Display P3` (tagged with an ICC profile) and would look washed out if shown as sRGB.
-`decode_srgb` converts them, from the ICC profile when there is one and from `nclx` otherwise:
+`decode_srgb` converts them, from the ICC profile when there is one, else `nclx`, else the
+colour primaries and transfer declared by the HEVC VUI:
 
 ```rust
 let srgb = heifer::decode_srgb(&bytes)?;                               // ICC / nclx applied, in sRGB
@@ -190,10 +191,11 @@ if let Some(gain) = heifer::read_gain_map(&bytes)? {
 per-channel gain, gamma, offset, and headroom metadata. ISO gain maps take precedence when both
 formats are present; `read_gain_map` exposes the legacy Apple map.
 
-Files that carry a PQ (`nclx` transfer 16) or HLG (18) signal instead are linearised on the same
-scale, where 1.0 is the BT.2408 reference white of 203 cd/m²: PQ reaches about 49.3 at peak and
-HLG about 4.9. `decode_hdr` applies no tone mapping, so a display pipeline that cannot show that
-range has to map it down itself. `decode_srgb` refuses these files and points to `decode_hdr`.
+Files that carry a PQ (transfer 16) or HLG (18) signal instead are linearised on the same scale,
+where 1.0 is the BT.2408 reference white of 203 cd/m²: PQ reaches about 49.3 at peak and HLG about
+4.9. The transfer is read from `nclx`, or from the HEVC VUI when the file has no `colr` box.
+`decode_hdr` applies no tone mapping, so a display pipeline that cannot show that range has to
+map it down itself. `decode_srgb` refuses these files and points to `decode_hdr`.
 
 The reverse direction writes the same standard form: a monochrome, half-resolution gain map in a
 hidden item, referenced by a `tmap` metadata item, with the base and tone-mapped items grouped as
@@ -244,8 +246,8 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
-| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
-| **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (`nclx` transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
+| **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | 4:4:4, lossless |
 
