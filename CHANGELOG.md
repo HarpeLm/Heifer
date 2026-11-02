@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.22 — 2026-11-02
 
 **Correctness**
 
