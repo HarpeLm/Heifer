@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Correctness**
+
+- Range Extensions decoding now honours `cabac_bypass_alignment_enabled_flag`: the CABAC engine is
+  aligned before the bypass-coded signs and remaining coefficient levels of each sub-block, as the
+  reference decoder does. 16-bit High Throughput 4:4:4 streams decode correctly, including
+  `WAVETILES_RExt_Sony_2`. All 66 official conformance bitstreams now decode, 42 of them verified
+  against the reference decoder's picture hashes.
+- The `extended_precision_processing_flag` tool remains unsupported; no conformance stream enables
+  it.
+
 ## 0.3.21 — 2026-11-02
 
 **Correctness**

@@ -204,6 +204,22 @@ impl<'a> ArithmeticDecoder<'a> {
         (0..n).fold(0, |acc, _| (acc << 1) | u32::from(self.decode_bypass()))
     }
 
+    /// Aligns the range before aligned bypass decoding (§9.3.4.3.6):
+    /// `ivlCurrRange` is set to 256, so the following bypass bins read the
+    /// bitstream one bit at a time. Used for `coeff_sign_flag` and
+    /// `coeff_abs_level_remaining` when `cabac_bypass_alignment_enabled_flag`
+    /// is set and `escapeDataPresent` is true.
+    ///
+    /// The offset and the read position are left untouched. The top bit of the
+    /// scaled offset is dropped, matching the reference decoder's aligned shift
+    /// register: when the range is 256, the first aligned bin is the bit below
+    /// it. Repeated calls before a bypass run are no-ops.
+    #[inline]
+    pub fn align_bypass(&mut self) {
+        self.range = 256;
+        self.value &= 0x7fff;
+    }
+
     /// Decodes a terminating bin (`DecodeTerminate`, §9.3.4.3.5), used for
     /// `end_of_slice_segment_flag`, `end_of_subset_one_bit` and `pcm_flag`.
     ///
@@ -282,5 +298,26 @@ mod tests {
     fn rejects_invalid_initial_offset() {
         assert!(ArithmeticDecoder::new(&[0xFF, 0x80]).is_err()); // 511
         assert!(ArithmeticDecoder::new(&[0x00, 0x00]).is_ok());
+    }
+
+    #[test]
+    fn align_bypass_drops_the_scaled_offset_top_bit() {
+        // Initial offset 0b1100_1010_0101_1010 has its top bit set. Aligning
+        // drops it, like the reference decoder's 15-bit aligned shift register,
+        // and the following bypass bins are the remaining 15 bits of the
+        // offset, MSB first, then the next stream bits.
+        let data = [0xCA, 0x5A, 0xA5, 0x00];
+        let mut d = ArithmeticDecoder::new(&data).unwrap();
+        d.align_bypass();
+        let expected = [
+            1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, // 0x4A5A, bits 14..0
+            1, // 0xA5, bit 7
+        ];
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(d.decode_bypass(), want, "aligned bypass bin {i}");
+        }
+        // Re-aligning during a bypass run is a no-op.
+        d.align_bypass();
+        assert_eq!(d.decode_bypass(), 0, "0xA5, bit 6");
     }
 }

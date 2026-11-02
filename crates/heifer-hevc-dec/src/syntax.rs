@@ -294,11 +294,9 @@ pub fn decode_slice_segment(
     data: &[u8],
     sink: &mut impl Sink,
 ) -> Result<SliceStats, Error> {
-    if pic.sps.range_extension.cabac_bypass_alignment_enabled_flag
-        || pic.sps.range_extension.extended_precision_processing_flag
-    {
+    if pic.sps.range_extension.extended_precision_processing_flag {
         return Err(Error::Unimplemented(
-            "range extension tools: CABAC bypass alignment, extended precision",
+            "range extension tools: extended precision processing",
         ));
     }
     let (sps, pps) = (pic.sps, pic.pps);
@@ -1381,6 +1379,7 @@ impl Parser<'_, '_> {
             greater1_ctx_state = 1;
             let mut greater1 = [false; 16];
             let mut first_g1: Option<usize> = None;
+            let mut greater1_count = 0u32;
             for (k, g1) in greater1.iter_mut().enumerate().take(n_sig.min(8)) {
                 let inc = ctx_set * 4
                     + usize::from(greater1_ctx_state.min(3))
@@ -1388,6 +1387,7 @@ impl Parser<'_, '_> {
                 *g1 = self.flag(ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + inc);
                 if *g1 {
                     greater1_ctx_state = 0;
+                    greater1_count += 1;
                     first_g1.get_or_insert(k);
                 } else if greater1_ctx_state > 0 && greater1_ctx_state < 3 {
                     greater1_ctx_state += 1;
@@ -1397,6 +1397,17 @@ impl Parser<'_, '_> {
             if first_g1.is_some() {
                 greater2 = self
                     .flag(ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set + if luma { 0 } else { 4 });
+            }
+
+            // `escapeDataPresent` of §7.3.8.11: a second greater1 flag, more
+            // than eight significant coefficients, or greater2. With
+            // `cabac_bypass_alignment_enabled_flag`, the signs and remaining
+            // levels of this sub-block start from `ivlCurrRange = 256`
+            // (§9.3.4.3.6). It is evaluated per sub-block, as the reference
+            // decoder does.
+            let escape_data_present = n_sig > 8 || greater1_count > 1 || greater2;
+            if escape_data_present && self.sps.range_extension.cabac_bypass_alignment_enabled_flag {
+                self.engine.align_bypass();
             }
 
             let last_sig_pos = usize::from(sig[0]);

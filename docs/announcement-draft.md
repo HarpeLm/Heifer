@@ -34,8 +34,8 @@ A video decoder is easy to get subtly wrong, so validation was the main focus:
 
 - **HEVC conformance:** I tested the first picture of each of 66 official ITU-T conformance bitstreams.
   - On the 62 streams that ffmpeg can also decode, heifer's output is identical to ffmpeg's, sample for sample.
-  - 41 streams are also checked against the picture hashes (MD5/checksum SEI) embedded in the official streams. That includes 3 streams that ffmpeg cannot decode.
-  - One stream is unsupported (16-bit extended precision).
+  - 42 streams are also checked against the picture hashes (MD5/checksum SEI) embedded in the official streams. That includes 4 streams that ffmpeg cannot decode.
+  - All 66 streams decode, including the 16-bit High Throughput 4:4:4 one.
 - **Real photos:**
   - iPhone 13 Pro: 48-tile grid, with an HDR gain map and a depth map in the file;
   - rotated iPhone 8 Plus files;

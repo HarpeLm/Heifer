@@ -348,7 +348,7 @@ match heifer::decode(&bytes) {
 | Multiple top-level images (burst, collection, dynamic HEIF) | ✓ | ✓ (`decode_all`) | ready |
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
 | Uncompressed (ISO/IEC 23001-17) | ✓ | — | not yet |
-| 15/16-bit extended precision tools | ✓ | partial | one conformance stream missing |
+| 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
 | Inter-prediction / image sequences (tracks, MP4) | ✓ | — | out of scope (still images only) |
 | Depth maps, non-alpha auxiliary images | ✓ | partial (alpha) | not exposed yet |
 | Region annotations / masks | ✓ | — | not implemented |

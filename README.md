@@ -58,7 +58,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 
 ## <img src="docs/icons/solution.svg" width="24" height="24" align="top"> Features
 
-- **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
+- **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 42 also verified against the reference decoder's MD5 hashes.
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
@@ -245,7 +245,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | | Supported | Not yet |
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
-| **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
+| **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit and 16-bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision processing, image sequences (inter prediction) |
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
@@ -258,14 +258,14 @@ the Range Extensions:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/conformance-dark.svg">
-  <img src="docs/images/conformance-light.svg" alt="HEVC conformance: 38 streams identical to ffmpeg and hash-verified, 24 identical to ffmpeg, 3 hash-verified that ffmpeg cannot decode, 1 unsupported" width="100%">
+  <img src="docs/images/conformance-light.svg" alt="HEVC conformance: 38 streams identical to ffmpeg and hash-verified, 24 identical to ffmpeg, 4 hash-verified that ffmpeg cannot decode" width="100%">
 </picture>
 
 | Check | Result |
 |---|---|
 | Identical to ffmpeg, sample for sample | **62 / 62** comparable streams |
-| Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **41** streams, including 3 that ffmpeg cannot decode |
-| Not supported | 1 (16-bit extended precision tools) |
+| Verified against the reference decoder's picture hash (MD5 / checksum SEI) | **42** streams, including 4 that ffmpeg cannot decode |
+| Not supported | **0** |
 
 ### Robustness
 
