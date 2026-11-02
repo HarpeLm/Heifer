@@ -29,7 +29,7 @@ body:
     id: version
     attributes:
       label: heifer version
-      placeholder: "0.3.19"
+      placeholder: "0.3.20"
     validations:
       required: true
   - type: input
