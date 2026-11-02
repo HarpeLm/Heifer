@@ -14,6 +14,11 @@
 - Validated against littleCMS 2.19 on synthetic `lut8`, `lut16` and `lutAtoB` profiles, including
   the legacy v2 Lab encoding of `lut16` and tetrahedral CLUT interpolation, within 2/255 at
   8 bits.
+- `decode_hdr` now linearises PQ (SMPTE ST 2084, `nclx` transfer 16) and HLG (BT.2100, transfer
+  18) signals. The scale is the BT.2408 reference white of 203 cd/m², so PQ reaches about 49.3
+  and HLG about 4.9 at peak; the full range is returned with no tone mapping. Gain maps apply in
+  the base image's own transfer, and their headroom multiplies the transfer's. `decode_srgb`
+  refuses PQ/HLG with an error that points to `decode_hdr`.
 
 **Correctness**
 

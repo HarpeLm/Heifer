@@ -343,8 +343,13 @@ pub(crate) fn from_primaries<S: Sample>(
 ) -> Result<Image<S>, Error> {
     let matrix = primaries_matrix(primaries)
         .ok_or_else(|| Error::Unsupported(format!("colour primaries {primaries}")))?;
-    let curve = transfer_curve(transfer)
-        .ok_or_else(|| Error::Unsupported(format!("transfer characteristics {transfer}")))?;
+    let curve = transfer_curve(transfer).ok_or_else(|| {
+        let hint = match transfer {
+            16 | 18 => " (HDR: use decode_hdr)",
+            _ => "",
+        };
+        Error::Unsupported(format!("transfer characteristics {transfer}{hint}"))
+    })?;
     if matrix == IDENTITY && curve == Curve::Srgb {
         // Already sRGB: do not pay for a conversion, and leave the samples untouched.
         return Ok(image.clone());

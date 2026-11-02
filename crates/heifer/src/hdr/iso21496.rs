@@ -10,7 +10,7 @@
 use heifer_isobmff::HeifFile;
 use heifer_isobmff::boxes::{ColorInfo, Property};
 
-use super::{HdrImage, srgb_to_linear};
+use super::{HdrImage, Linearizer, Transfer};
 use crate::{Error, Options, decode_item_with};
 
 /// Decodes the image of the file's `tmap` item for a display of `max_headroom`, or `None` when
@@ -23,9 +23,19 @@ pub(super) fn decode(
     let Some(gain) = find(file)? else {
         return Ok(None);
     };
+    let transfer = Transfer::from_nclx(crate::nclx(file, gain.base)?.map(|(_, t)| t));
     let base = decode_item_with(file, gain.base, 0, options)?;
     let map = decode_item_with(file, gain.map, 1, options)?;
-    apply(file, gain.base, base, map, gain.metadata, max_headroom).map(Some)
+    apply(
+        file,
+        gain.base,
+        base,
+        map,
+        gain.metadata,
+        max_headroom,
+        transfer,
+    )
+    .map(Some)
 }
 
 /// The gain map metadata of a `tmap` item. Headrooms and gains are log2 values.
@@ -240,7 +250,7 @@ impl Reader<'_> {
 }
 
 /// Applies the gain map to the base image, towards the alternate rendition, as far as
-/// `max_headroom` allows.
+/// `max_headroom` allows. `transfer` is the transfer function of the base image.
 fn apply(
     file: &HeifFile<'_>,
     base_id: u32,
@@ -248,6 +258,7 @@ fn apply(
     map: crate::Image,
     metadata: Metadata,
     max_headroom: f32,
+    transfer: Transfer,
 ) -> Result<HdrImage, Error> {
     let base_log = metadata.base_headroom;
     let alternate_log = metadata.alternate_headroom;
@@ -265,11 +276,8 @@ fn apply(
     if !headroom.is_finite() {
         return Err(Error::Invalid("ISO 21496-1 headroom is out of range"));
     }
-    let bit_max = f32::from(base.max_value());
     let map_max = f32::from(map.max_value());
-    let lut: Vec<f32> = (0..=base.max_value())
-        .map(|v| srgb_to_linear(f32::from(v) / bit_max))
-        .collect();
+    let linearizer = Linearizer::new(transfer, base.max_value());
     let primaries = file
         .item_properties(base_id)?
         .find_map(|property| match property {
@@ -280,11 +288,7 @@ fn apply(
     let mut data = Vec::with_capacity(base.width as usize * base.height as usize * 3);
     for (index, pixel) in base.data.chunks_exact(4).enumerate() {
         let (x, y) = (index as u32 % base.width, index as u32 / base.width);
-        let source = [
-            lut[usize::from(pixel[0])],
-            lut[usize::from(pixel[1])],
-            lut[usize::from(pixel[2])],
-        ];
+        let source = linearizer.apply([pixel[0], pixel[1], pixel[2]]);
         let mut working = if metadata.use_base_color_space {
             source
         } else {
@@ -316,7 +320,7 @@ fn apply(
     Ok(HdrImage {
         width: base.width,
         height: base.height,
-        headroom,
+        headroom: transfer.headroom() * headroom,
         data,
     })
 }
@@ -391,6 +395,7 @@ fn convert_primaries(rgb: [f32; 3], primaries: u16, to_srgb: bool) -> Result<[f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hdr::srgb_to_linear;
 
     fn ratio(numerator: u32, denominator: u32) -> [u8; 8] {
         [
@@ -554,11 +559,20 @@ mod tests {
         };
         let metadata = parse_metadata(&tmap_payload()).unwrap();
 
-        let hdr = apply(&file, 1, base.clone(), map.clone(), metadata, 4.0).unwrap();
+        let hdr = apply(
+            &file,
+            1,
+            base.clone(),
+            map.clone(),
+            metadata,
+            4.0,
+            Transfer::Sdr,
+        )
+        .unwrap();
         assert!((hdr.data[0] - srgb_to_linear(128.0 / 255.0) * 4.0).abs() < 1e-5);
         assert_eq!(hdr.headroom, 4.0);
 
-        let sdr = apply(&file, 1, base, map, metadata, 1.0).unwrap();
+        let sdr = apply(&file, 1, base, map, metadata, 1.0, Transfer::Sdr).unwrap();
         assert!((sdr.data[0] - srgb_to_linear(128.0 / 255.0)).abs() < 1e-6);
         assert_eq!(sdr.headroom, 1.0);
     }
@@ -587,7 +601,7 @@ mod tests {
         metadata.min = [2.0; 3];
         metadata.max = [2.0; 3];
 
-        let sdr = apply(&file, 1, base, map, metadata, 1.0).unwrap();
+        let sdr = apply(&file, 1, base, map, metadata, 1.0, Transfer::Sdr).unwrap();
         assert!((sdr.data[0] - srgb_to_linear(128.0 / 255.0) / 4.0).abs() < 1e-6);
         assert_eq!(sdr.headroom, 1.0);
     }
@@ -615,7 +629,7 @@ mod tests {
         metadata.alternate_headroom = 1.0;
         metadata.max = [0.0, 1.0, 2.0];
 
-        let hdr = apply(&file, 1, base, map, metadata, 2.0).unwrap();
+        let hdr = apply(&file, 1, base, map, metadata, 2.0, Transfer::Sdr).unwrap();
         assert!((hdr.data[0] - 1.0).abs() < 1e-6);
         assert!((hdr.data[1] - 2.0_f32.powf(128.0 / 255.0)).abs() < 1e-5);
         assert!((hdr.data[2] - 4.0).abs() < 1e-5);

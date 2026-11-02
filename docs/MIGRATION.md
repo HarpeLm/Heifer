@@ -283,7 +283,7 @@ typed [`heifer::Error`](https://docs.rs/heifer/latest/heifer/enum.Error.html):
 | `Error::Container` | the HEIF container is invalid |
 | `Error::Hevc` | the HEVC bitstream could not be decoded |
 | `Error::Encode` | HEVC encoding failed |
-| `Error::Unsupported(String)` | a feature `heifer` does not implement yet (e.g. an ICC profile whose input space is not RGB, PQ/HLG) |
+| `Error::Unsupported(String)` | a feature `heifer` does not implement yet (e.g. an ICC profile whose input space is not RGB, or PQ/HLG through `decode_srgb`) |
 | `Error::Invalid(&'static str)` | the file is internally inconsistent |
 
 ```rust
@@ -324,8 +324,9 @@ match heifer::decode(&bytes) {
 - **Colour space is explicit.** `heifer::decode` returns the pixels in the file's own
   colour space. Call `heifer::decode_srgb(&bytes)` to convert to sRGB (this is where the
   ICC profile or `nclx` is applied; matrix/TRC and LUT-based RGB profiles are read, other
-  input spaces and PQ/HLG are refused with `Error::Unsupported`). libheif converts to sRGB
-  by default, so if you relied on that, add the `_srgb` call.
+  input spaces are refused with `Error::Unsupported`, and PQ/HLG belong to
+  `heifer::decode_hdr`). libheif converts to sRGB by default, so if you relied on that, add
+  the `_srgb` call.
 - **Always RGB(A), never planar.** There is no `ColorSpace::YCbCr` output and no `RgbChroma`
   variant; you get interleaved RGBA (or RGB via `to_rgb8`). Conversion to RGB is done for
   you.
@@ -355,7 +356,7 @@ match heifer::decode(&bytes) {
 | Runtime codec plugins | ✓ | — | by design (pure Rust, wasm, no `unsafe`) |
 | LUT-based ICC for an RGB input (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) | ✓ | ✓ | ready |
 | ICC output tables (`B2A`) / soft proofing | ✓ | — | not needed to decode |
-| PQ / HLG transfer functions | ✓ (HDR) | — (`decode_hdr` is gain maps) | not implemented |
+| PQ / HLG transfer functions | ✓ (HDR) | ✓ (`decode_hdr`, no tone mapping) | ready |
 | IPTC | ✓ | — | not implemented |
 
 If something in this table blocks you, that is worth an issue — it tells us what to build
