@@ -53,6 +53,9 @@ Rust has mostly meant leaning on C and C++.
 against the official conformance bitstreams. Add one line to `Cargo.toml` and it builds anywhere Rust
 builds (Linux, macOS, Windows and WebAssembly are tested in CI), with no system library to install.
 
+Coming from [`libheif-rs`](https://crates.io/crates/libheif-rs)? A call-by-call guide maps the two
+APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
+
 ## <img src="docs/icons/solution.svg" width="24" height="24" align="top"> Features
 
 - **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 41 also verified against the reference decoder's MD5 hashes.
@@ -359,6 +362,9 @@ let file = heifer_isobmff::HeifFile::parse(&bytes)?;
 let tiles = file.referenced_items(file.primary_id, b"dimg");
 let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hevc-dec or ffmpeg
 ```
+
+Replacing `libheif-rs` in an existing project? See **[docs/MIGRATION.md](docs/MIGRATION.md)** for a
+side-by-side API map, behavioural differences and a migration checklist.
 
 ## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
