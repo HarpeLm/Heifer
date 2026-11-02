@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- `heifer::check_file_type` reports whether a file's leading bytes are a HEIC/HEIF file that
+  heifer decodes, without decoding it: the equivalent of `libheif`'s `heif_check_filetype`.
+  `FileTypeResult` mirrors `libheif-rs`, so a caller that gates on `check_file_type` can
+  switch without changing its logic. The API is additive; existing signatures are unchanged.
+
 ## 0.3.18 — 2026-11-02
 
 **New**

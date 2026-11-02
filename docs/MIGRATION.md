@@ -23,6 +23,7 @@ one-line rename. This guide keeps the change mechanical.
 
 - [Cargo.toml](#cargotoml)
 - [Decode a file](#decode-a-file)
+- [Check the file type](#check-the-file-type)
 - [Multiple images](#multiple-images)
 - [Metadata: EXIF, XMP, ICC](#metadata-exif-xmp-icc)
 - [Encode a file](#encode-a-file)
@@ -93,6 +94,35 @@ Decode straight to 8-bit (half the memory) with `decode_rgba8`:
 let image: heifer::Image<u8> = heifer::decode_rgba8(&bytes, &heifer::Options::default())?;
 let rgba: &[u8] = &image.data;              // ready to upload / save
 ```
+
+## Check the file type
+
+`libheif-rs` exposes `check_file_type(&bytes)` to validate a file before decoding it.
+`heifer::check_file_type` returns the same four variants, with `Supported` meaning an HEVC
+HEIF file that `heifer` can decode.
+
+```rust
+// before — libheif-rs
+use libheif_rs::{check_file_type, FileTypeResult};
+
+// after — heifer
+use heifer::{check_file_type, FileTypeResult};
+
+let mut file = std::fs::File::open("./photo.heic")?;
+let mut head = [0; 12];
+std::io::Read::read_exact(&mut file, &mut head)?;
+
+match check_file_type(&head) {
+    FileTypeResult::Supported => { /* decode it */ }
+    FileTypeResult::No => { /* not a HEIF file */ }
+    FileTypeResult::Unsupported | FileTypeResult::MayBe => { /* unsupported or unknown */ }
+}
+```
+
+Only the first 12 bytes are needed (box size, `ftyp`, major brand); any more are ignored. As
+in `libheif`, only the major brand is read: `heic`/`heix` are `Supported`, a generic
+`mif1`/`mif2` is `MayBe`, and AVIF, JPEG, JPEG 2000 and image sequences are `Unsupported`
+because `heifer` does not decode them.
 
 ## Multiple images
 
@@ -275,6 +305,7 @@ match heifer::decode(&bytes) {
 | `ctx.image_handle(id)` | `HeifFile::parse` → `heifer::decode_item(...)` (low-level) |
 | `ctx.top_level_image_ids()` / `number_of_top_level_images()` | `heifer::decode_all(&bytes)` (`HeifFile::top_level_image_ids()` for the IDs) |
 | `lib_heif.decode(&handle, ColorSpace::Rgb(_), None)` | `heifer::decode(&bytes)` |
+| `check_file_type(&bytes)` / `FileTypeResult` | `heifer::check_file_type(&bytes)` / `heifer::FileTypeResult` |
 | `image.planes()` / `.interleaved` / `stride` | `image.data` (interleaved RGBA), `to_rgba8()`, `to_rgb8()` |
 | `handle.metadata_block_ids(b"Exif")` / `handle.metadata(id)` | `heifer::read_metadata(&bytes)` → `.exif` / `.xmp` / `.icc_profile` |
 | `image.scale(w, h, None)` | — (resize with the `image` crate) |

@@ -55,7 +55,7 @@ narrative writes itself.
 | `scryglass` | 78 | *"HEIC/HEIF needs the system libheif C library, so it's opt-in."* |
 | `photofold` | 23 | *"Needs: `brew install libheif pkg-config`."* |
 | `spatial-maker` | 171 | `heic = ["dep:libheif-rs"]`, everything else pure. |
-| `timewall` | 13k | `libheif-rs` non-optional, and **every other dependency is pure Rust** — the purest real target, and literally "Apple dynamic HEIF on Linux". Needs enumerating multiple top-level images (see API gaps). |
+| `timewall` | 13k | `libheif-rs` non-optional, and **every other dependency is pure Rust** — the purest real target, and literally "Apple dynamic HEIF on Linux". Both blockers are now lifted: `decode_all` and `check_file_type`. |
 
 ## Full target list (31 crates, by downloads)
 
@@ -109,8 +109,8 @@ narrative writes itself.
    `panimg-core`, `inkswatch_colorscan`. Same recipe; each is one file.
 3. **The encode showcase**: `kapy` (decode + re-encode with EXIF/XMP) — proves
    `encode_with_metadata`.
-4. **The multi-image cases**: `timewall`, `heic-to-dynamic-gnome-wallpaper` — need the API gap
-   below.
+4. **The multi-image cases**: `timewall`, `heic-to-dynamic-gnome-wallpaper` — the `decode_all`
+   and `check_file_type` gaps are closed, so they are ready to contact.
 5. **The ecosystem multipliers**: `respicta`, `viprs-codecs`, `squish-core`, `panimg-core`,
    `rawshift-image` are libraries — converting them reaches everything built on them.
 6. **Endgame — the `image` crate** (7 632 reverse deps): once concrete users exist plus the
@@ -123,7 +123,10 @@ narrative writes itself.
   — **done**: `heifer_isobmff::HeifFile::top_level_image_ids()` (plus `is_image_item`), and
   `heifer::decode_all` / `decode_all_srgb_rgba8` at the top level. This unblocks `timewall`
   and `heic-to-dynamic-gnome-wallpaper`.
-- **File-type sniffing** (`check_file_type` equivalent) for `timewall::validate_file`. Trivial.
+- ~~**File-type sniffing** (`check_file_type` equivalent) for `timewall::validate_file`.~~ —
+  **done**: `heifer::check_file_type(&head)` returns `FileTypeResult::{Supported, No,
+  Unsupported, MayBe}`, reading the first 12 bytes exactly like `libheif`'s
+  `heif_check_filetype`.
 - Everything else (decode to RGB/RGBA, EXIF/XMP/ICC, encode with metadata, HDR) is already
   covered.
 
@@ -157,7 +160,7 @@ Then, once invited, send the PR: dependency swap, code change, and proof
 | `avify` | — | — | |
 | `scryglass` | — | — | |
 | `photofold` | — | — | |
-| `timewall` | — | — | needs multi-image API |
+| `timewall` | — | — | APIs ready (`decode_all`, `check_file_type`) |
 | `kapy` | — | — | encode showcase |
 | `oculante` | — | — | reach |
 | `image_sieve` | — | — | reach |

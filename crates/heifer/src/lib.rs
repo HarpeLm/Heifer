@@ -93,6 +93,55 @@ impl Options {
     }
 }
 
+/// The result of [`check_file_type`], matching `libheif-rs`'s `FileTypeResult` so that a caller
+/// can switch from `libheif` without changing its validation logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTypeResult {
+    /// A HEVC-coded HEIF file (`heic`/`heix`), which `heifer` decodes.
+    Supported,
+    /// Not a HEIF file.
+    No,
+    /// A HEIF file whose codec `heifer` does not support (AV1/AVIF, JPEG, JPEG 2000, image
+    /// sequences, …).
+    Unsupported,
+    /// Too few bytes to decide, or a generic HEIF brand (`mif1`/`mif2`) whose codec is not
+    /// known from the major brand alone.
+    MayBe,
+}
+
+/// Checks the type of a file from its leading bytes, without decoding it: the equivalent of
+/// `libheif`'s `heif_check_filetype`, for gating or validation before a full decode.
+///
+/// The first 12 bytes are enough (box size, `ftyp`, major brand); any more are ignored. Only
+/// the major brand is read, as in `libheif`: a generic `mif1`/`mif2` file is
+/// [`FileTypeResult::MayBe`] even when it holds HEVC.
+///
+/// ```
+/// let heic = b"\0\0\0\x18ftypheic";
+/// assert_eq!(heifer::check_file_type(heic), heifer::FileTypeResult::Supported);
+/// assert_eq!(
+///     heifer::check_file_type(b"\0\0\0\x18ftypavif"),
+///     heifer::FileTypeResult::Unsupported
+/// );
+/// assert_eq!(heifer::check_file_type(b"not a heif file"), heifer::FileTypeResult::No);
+/// ```
+pub fn check_file_type(data: &[u8]) -> FileTypeResult {
+    if data.len() < 8 {
+        return FileTypeResult::MayBe;
+    }
+    if &data[4..8] != b"ftyp" {
+        return FileTypeResult::No;
+    }
+    if data.len() < 12 {
+        return FileTypeResult::MayBe;
+    }
+    match &data[8..12] {
+        b"heic" | b"heix" => FileTypeResult::Supported,
+        b"mif1" | b"mif2" => FileTypeResult::MayBe,
+        _ => FileTypeResult::Unsupported,
+    }
+}
+
 /// Decodes the primary image of a HEIF/HEIC file, with its alpha channel if any, and applies
 /// the crop, rotation and mirror transforms stored in the file. Grid tiles are decoded in
 /// parallel on all available cores.
