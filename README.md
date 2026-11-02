@@ -113,8 +113,8 @@ let srgb = heifer::decode_srgb(&bytes)?;                               // ICC / 
 let small = heifer::decode_srgb_rgba8(&bytes, &Default::default())?;   // 8-bit, half the memory
 ```
 
-Files in a colour space heifer cannot convert (LUT-based ICC profiles, or PQ/HLG, which are HDR and
-belong to `decode_hdr`) are refused with `Error::Unsupported`.
+Files in a colour space heifer cannot convert (an ICC profile whose input space is not RGB, or
+PQ/HLG, which are HDR and belong to `decode_hdr`) are refused with `Error::Unsupported`.
 
 Limit threads and image size, for example on a server that accepts uploads:
 
@@ -238,7 +238,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 |---|---|---|
 | **Container** | grids, overlays (`iovl`), alpha planes, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision (16-bit), image sequences (inter prediction) |
-| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC RGB ICC profiles (`Display P3`, `Adobe RGB`, …) converted to sRGB by `decode_srgb` (matched to littleCMS to ≈ 0.2/255) | LUT-based (`A2B0`/`B2A0`) ICC profiles |
+| **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; display-headroom limiting | — |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
 | **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | 4:4:4, lossless |

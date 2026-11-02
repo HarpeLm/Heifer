@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- `decode_srgb`, `decode_srgb_with_options` and `decode_srgb_rgba8` now apply LUT-based RGB ICC
+  profiles (`A2B0`/`A2B1`), of type `lut8`, `lut16` and `lutAtoB`, with an XYZ or Lab connection
+  space. The stages run in the order the ICC specification defines, the CLUT is interpolated
+  tetrahedrally as littleCMS does, and a relative-colorimetric table is preferred over a
+  perceptual one. Camera and capture profiles that only ship a LUT now take the same sRGB path as
+  the matrix/TRC profiles already supported. The API is additive; existing signatures are
+  unchanged.
+- Validated against littleCMS 2.19 on synthetic `lut8`, `lut16` and `lutAtoB` profiles, including
+  the legacy v2 Lab encoding of `lut16` and tetrahedral CLUT interpolation, within 2/255 at
+  8 bits.
+
+**Correctness**
+
+- Profiles whose input space is not RGB are still refused with `Error::Unsupported`, as are
+  malformed LUTs and CLUTs too large to allocate.
+
 ## 0.3.19 — 2026-11-02
 
 **New**

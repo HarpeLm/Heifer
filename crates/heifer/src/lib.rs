@@ -171,9 +171,11 @@ pub fn decode_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, Error>
 /// `nclx` colour information. Without either, the samples are returned as coded (as [`decode`]
 /// does).
 ///
-/// This is what a viewer without colour management expects. Files in a colour space heifer
-/// cannot convert (LUT-based ICC profiles, or PQ/HLG transfers, which are HDR and belong to
-/// [`decode_hdr`]) are refused with [`Error::Unsupported`].
+/// This is what a viewer without colour management expects. ICC profiles are read whether they
+/// are matrix/TRC or LUT-based (`A2B0`/`A2B1`, of type `lut8`, `lut16` or `lutAtoB`), as long as
+/// they describe an RGB input. Files in a colour space heifer cannot convert (another ICC input
+/// space, or PQ/HLG transfers, which are HDR and belong to [`decode_hdr`]) are refused with
+/// [`Error::Unsupported`].
 pub fn decode_srgb(bytes: &[u8]) -> Result<Image, Error> {
     decode_srgb_with_options(bytes, &Options::default())
 }
@@ -213,7 +215,8 @@ pub fn decode_all_with_options(bytes: &[u8], options: &Options) -> Result<Vec<Im
 
 /// Like [`decode_all`], at 8 bits per sample and with the samples converted to sRGB, as
 /// [`decode_srgb_rgba8`] does for the primary image. A file in a colour space heifer cannot
-/// convert (a LUT-based ICC profile, or a PQ/HLG transfer) is refused with [`Error::Unsupported`].
+/// convert (an ICC profile that is not an RGB input profile, or a PQ/HLG transfer) is refused
+/// with [`Error::Unsupported`].
 pub fn decode_all_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Vec<Image<u8>>, Error> {
     let file = HeifFile::parse(bytes)?;
     decode_all_images(&file, options, true)
