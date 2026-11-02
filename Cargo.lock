@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "heifer"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "heifer-hevc-dec",
  "heifer-hevc-enc",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-cli"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "heifer",
  "image",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-hevc-dec"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "heifer-isobmff",
  "thiserror",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-hevc-enc"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "heifer-hevc-dec",
  "thiserror",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-isobmff"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "thiserror",
 ]
