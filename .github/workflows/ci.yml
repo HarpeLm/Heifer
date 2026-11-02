@@ -20,6 +20,14 @@ jobs:
       - run: ./scripts/fetch-fixtures.sh
         shell: bash
       - run: cargo test --workspace --all-features
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
   wasm:
     runs-on: ubuntu-latest
     steps:
