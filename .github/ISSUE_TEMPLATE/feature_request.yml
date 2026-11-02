@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a capability for HEIC/HEVC still images.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: Describe the use case, not only the API you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What do you do today
+      description: Workaround, another crate, or a manual step.
+    validations:
+      required: false
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should heifer do
+      description: If you have an API sketch, include it. Additive changes are preferred.
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This concerns HEIC/HEVC still images, not AVIF, VVC or video.
+          required: true
+        - label: This can be implemented in pure Rust, without a C dependency or `unsafe`.
+          required: true
+  - type: textarea
+    id: reference
+    attributes:
+      label: Sample or reference
+      description: A file, a specification clause, or a reference implementation that defines the expected output.
+    validations:
+      required: false

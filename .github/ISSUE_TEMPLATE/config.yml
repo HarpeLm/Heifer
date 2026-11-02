@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/HarpeLm/Heifer/security/advisories/new
+    about: Report crashes, hangs, excessive memory use or memory-safety issues privately.
+  - name: Migrating from libheif-rs
+    url: https://github.com/HarpeLm/Heifer/blob/main/docs/MIGRATION.md
+    about: API map, behaviour differences and the list of known gaps.

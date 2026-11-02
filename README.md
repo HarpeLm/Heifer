@@ -391,6 +391,10 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## <img src="docs/icons/wrench.svg" width="24" height="24" align="top"> Development
 
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) lists the checks CI runs, the
+project's scope, and how changes are tested. The notes below cover building, testing and
+validating in more detail.
+
 <details>
 <summary>Building, testing and validating</summary>
 

@@ -1,0 +1,57 @@
+name: Bug report
+description: A valid file is refused, a file decodes wrongly, or something crashes.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach a private photo. A small crop, a synthetic file, or the output of
+        `cargo run -p heifer-isobmff --example info -- file.heic` is usually enough.
+
+        For a crash, hang, excessive memory use or memory-safety issue on a crafted file, report
+        it privately through the Security tab, not here:
+        https://github.com/HarpeLm/Heifer/security/advisories/new
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happens
+      description: The error, the panic message, or how the output is wrong (colour, geometry, metadata).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: heifer version
+      placeholder: "0.3.19"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 15, aarch64, Rust 1.85"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: Code or command. Say whether the file can be shared and what wrote it (iPhone model, camera, encoder).
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Error message, `info` example output, or a comparison with another decoder.
+      render: shell
+    validations:
+      required: false
