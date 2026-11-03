@@ -25,7 +25,7 @@ use image::error::{
 use image::metadata::Orientation;
 use image::{ColorType, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, ImageResult};
 
-use crate::{EncodeOptions, Image, Metadata, Options};
+use crate::{EncodeFormat, EncodeOptions, Image, Metadata, Options};
 
 /// File extensions handled by heifer.
 const EXTENSIONS: [&str; 3] = ["heic", "heif", "hif"];
@@ -189,20 +189,27 @@ impl ImageDecoder for HeifDecoder {
 pub struct HeifEncoder<W: Write> {
     writer: W,
     options: EncodeOptions,
+    format: EncodeFormat,
     metadata: Metadata,
 }
 
 impl<W: Write> HeifEncoder<W> {
-    /// An encoder with the default options (quality 80, all cores).
+    /// An encoder with the default options (quality 80, all cores, 4:2:0).
     pub fn new(writer: W) -> Self {
         Self::with_options(writer, EncodeOptions::default())
     }
 
-    /// An encoder with the given quality and threads.
+    /// An encoder with the given quality and threads, coding 4:2:0.
     pub fn with_options(writer: W, options: EncodeOptions) -> Self {
+        Self::with_format(writer, options, EncodeFormat::Ycbcr420)
+    }
+
+    /// An encoder with the given chroma format and coding mode.
+    pub fn with_format(writer: W, options: EncodeOptions, format: EncodeFormat) -> Self {
         Self {
             writer,
             options,
+            format,
             metadata: Metadata::default(),
         }
     }
@@ -282,7 +289,7 @@ impl<W: Write> ImageEncoder for HeifEncoder<W> {
             bit_depth,
             has_alpha,
             Some(&self.metadata),
-            crate::encode::EncodeFormat::Ycbcr420,
+            self.format,
             &self.options,
             pixel,
         )

@@ -73,7 +73,9 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 ```sh
 cargo install heifer-cli
 heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converted
-heifer photo.png photo.heic -q 80       # to HEIC
+heifer photo.png photo.heic -q 80       # to HEIC, 4:2:0
+heifer art.png art.heic --format 444    # full-resolution chroma
+heifer shot.png shot.heic --lossless    # no quantization (8-bit input)
 heifer info IMG_1234.heic               # size, tiles, camera, date, metadata
 ```
 

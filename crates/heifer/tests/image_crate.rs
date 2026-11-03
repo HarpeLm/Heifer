@@ -114,6 +114,35 @@ fn encoder_writes_every_colour_type() {
 }
 
 #[test]
+fn encoder_with_format_codes_444_and_lossless() {
+    use heifer::EncodeFormat;
+    use heifer::image_crate::HeifEncoder;
+
+    let rgb = DynamicImage::ImageRgba8(gradient(64, 48)).to_rgb8();
+    let img = DynamicImage::ImageRgb8(rgb.clone());
+    let encode = |format| {
+        let mut heic = Vec::new();
+        img.write_with_encoder(HeifEncoder::with_format(
+            &mut heic,
+            heifer::EncodeOptions::default(),
+            format,
+        ))
+        .unwrap();
+        heic
+    };
+
+    let lossless = heifer::decode(&encode(EncodeFormat::Lossless)).unwrap();
+    assert_eq!(
+        lossless.to_rgb8(),
+        rgb.as_raw().clone(),
+        "lossless is exact"
+    );
+
+    let full = heifer::decode(&encode(EncodeFormat::Ycbcr444)).unwrap();
+    assert_eq!((full.width, full.height), (64, 48));
+}
+
+#[test]
 fn encoder_rejects_float_images() {
     let img = DynamicImage::ImageRgb32F(image::Rgb32FImage::new(4, 4));
     let mut out = Vec::new();

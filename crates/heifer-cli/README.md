@@ -11,8 +11,14 @@ cargo install heifer-cli
 heifer IMG_1234.heic photo.jpg               # one file; formats from the extensions
 heifer *.HEIC --to jpg -o converted           # many files into a folder
 heifer screenshot.png screenshot.heic -q 70   # to HEIC, quality 0-100 (default 80)
+heifer screenshot.png screenshot.heic --format 444   # full-resolution chroma
+heifer screenshot.png screenshot.heic --lossless     # pixel-exact
 heifer info IMG_1234.heic                     # size, tiles, camera, date, metadata
 ```
+
+- `--format 420|444|lossless` picks the HEIC coding: 4:2:0 by default, 4:4:4 for graphics and
+  text, or lossless (4:4:4 GBR, no quantization, so 8-bit input decodes unchanged). `--lossless`
+  is a shortcut, and `-q` has no effect on lossless output.
 
 - EXIF data and ICC colour profiles are kept, and photos are written upright.
 - Existing files are never overwritten unless you pass `--force`.

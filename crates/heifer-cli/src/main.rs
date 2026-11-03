@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use heifer::image_crate::HeifEncoder;
+use heifer::{EncodeFormat, EncodeOptions};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
@@ -25,6 +26,8 @@ EXIF and ICC profiles are kept, and photos are written upright.
 
 Options:
   -q, --quality <0-100>  quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
+      --format <mode>    HEIC coding: 420 (default), 444 or lossless
+      --lossless         same as --format lossless
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
@@ -35,6 +38,7 @@ Examples:
   heifer IMG_1234.heic photo.jpg
   heifer *.HEIC --to jpg -o converted
   heifer screenshot.png screenshot.heic -q 70
+  heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
 
 /// What the command line asks for.
@@ -46,7 +50,33 @@ struct Args {
     to: Option<String>,
     out_dir: Option<PathBuf>,
     quality: Option<u8>,
+    format: Option<EncodeFormat>,
     force: bool,
+}
+
+/// HEIC coding mode named on the command line.
+fn parse_format(name: &str) -> Result<EncodeFormat, String> {
+    match name.to_lowercase().as_str() {
+        "420" | "420p" | "yuv420" | "4:2:0" => Ok(EncodeFormat::Ycbcr420),
+        "444" | "yuv444" | "4:4:4" => Ok(EncodeFormat::Ycbcr444),
+        "lossless" | "rgb" => Ok(EncodeFormat::Lossless),
+        _ => Err(format!(
+            "unknown HEIC format `{name}`: use 420, 444 or lossless"
+        )),
+    }
+}
+
+/// Records the coding mode, rejecting a `--format` and a `--lossless` that disagree.
+fn set_format(args: &mut Args, format: EncodeFormat) -> Result<(), String> {
+    match args.format {
+        Some(current) if current != format => {
+            Err("--format and --lossless ask for different codings".into())
+        }
+        _ => {
+            args.format = Some(format);
+            Ok(())
+        }
+    }
 }
 
 fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, String> {
@@ -71,6 +101,11 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
                 );
             }
             "-t" | "--to" => args.to = Some(value(&arg)?.trim_start_matches('.').to_lowercase()),
+            "--format" => {
+                let format = parse_format(&value(&arg)?)?;
+                set_format(&mut args, format)?;
+            }
+            "--lossless" => set_format(&mut args, EncodeFormat::Lossless)?,
             "-o" | "--out-dir" => args.out_dir = Some(PathBuf::from(value(&arg)?)),
             "-f" | "--force" => args.force = true,
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option `{s}`")),
@@ -170,7 +205,16 @@ fn read(input: &Path) -> Result<Decoded, String> {
     Ok((image, icc, exif))
 }
 
+/// Rejects a HEIC coding mode when the output is not a HEIC file.
+fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
+    if !is_heif(output) && args.format.is_some() {
+        return Err("the HEIC coding mode only applies to HEIC output".into());
+    }
+    Ok(())
+}
+
 fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
+    check_heic_only(args, output)?;
     if output.exists() && !args.force {
         return Err(format!(
             "{} exists (use --force to overwrite)",
@@ -193,12 +237,12 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     };
     let result = match format {
         None => {
-            let options = heifer::EncodeOptions {
+            let options = EncodeOptions {
                 quality: args.quality.unwrap_or(80),
                 ..Default::default()
             };
             write(
-                HeifEncoder::with_options(&mut writer, options),
+                HeifEncoder::with_format(&mut writer, options, args.format.unwrap_or_default()),
                 &image,
                 icc,
                 exif,
@@ -365,6 +409,34 @@ mod tests {
             output_path(&a.inputs[0], &a).ok(),
             Some(PathBuf::from("dir/a.png"))
         );
+    }
+
+    #[test]
+    fn heic_coding_modes() {
+        let format = |s: &str| parse(s).unwrap().unwrap().format;
+        assert_eq!(
+            format("a.png b.heic --format 444"),
+            Some(EncodeFormat::Ycbcr444)
+        );
+        assert_eq!(
+            format("a.png b.heic --format 4:4:4"),
+            Some(EncodeFormat::Ycbcr444)
+        );
+        assert_eq!(
+            format("a.png b.heic --format lossless"),
+            Some(EncodeFormat::Lossless)
+        );
+        assert_eq!(
+            format("a.png b.heic --lossless"),
+            Some(EncodeFormat::Lossless)
+        );
+        assert_eq!(format("a.png b.heic"), None, "the default stays 4:2:0");
+        assert!(parse("a.png b.heic --format 422").is_err());
+        assert!(parse("a.png b.heic --format 444 --lossless").is_err());
+
+        let args = parse("a.png b.heic --lossless").unwrap().unwrap();
+        assert!(check_heic_only(&args, Path::new("b.heic")).is_ok());
+        assert!(check_heic_only(&args, Path::new("b.png")).is_err());
     }
 
     #[test]

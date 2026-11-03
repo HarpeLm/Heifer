@@ -17,15 +17,23 @@ Items are ordered by user impact.
 
 ## In progress
 
-### 1. Encoding options in the CLI
+### 1. Auxiliary images in the CLI
 
-The library already encodes 4:2:0, 4:4:4 and lossless, but the CLI always uses 4:2:0.
+The library lists and decodes auxiliary images, but the CLI cannot extract them.
+
+- `--aux` writes every auxiliary image next to the output.
+- `--depth` and `--gain-map` select one type.
+- Richer `info`: auxiliary images with their URN, size and bit depth, depth metadata, gain map
+  metadata and IPTC presence.
+
+## Done
+
+### Encoding options in the CLI
+
+The CLI now codes HEIC in 4:2:0, 4:4:4 or lossless, with the default unchanged.
 
 - `--format 420|444|lossless`.
 - `--lossless` as a shortcut.
-- Keep the current defaults unchanged.
-
-## Done
 
 ### Uncompressed auxiliary images (`unci`)
 
@@ -40,43 +48,34 @@ HEVC codec, not a general uncompressed image container.
 
 ## Next
 
-### 2. Auxiliary images in the CLI
-
-The library lists and decodes auxiliary images, but the CLI cannot extract them.
-
-- `--aux` writes every auxiliary image next to the output.
-- `--depth` and `--gain-map` select one type.
-- Richer `info`: auxiliary images with their URN, size and bit depth, depth metadata, gain map
-  metadata and IPTC presence.
-
-### 3. IPTC metadata (#4)
+### 2. IPTC metadata (#4)
 
 - Bounded IPTC-IIM parser, exposed as `Metadata::iptc`.
 - No network access, no unbounded allocation.
 
-### 4. Streaming decode (#5)
+### 3. Streaming decode (#5)
 
 - `decode_reader` over `Read + Seek`, without buffering the whole file.
 - Keep `decode` unchanged for callers that already have the bytes.
 - Preserve the same limits and error behaviour.
 
-### 5. Single-thread hot loops
+### 4. Single-thread hot loops
 
 Multi-threaded decoding is already faster than libheif, but one thread is slower than ffmpeg on
 large grids. Optimise the per-tile and colour-conversion loops without adding `unsafe`.
 
-### 6. More encoding knobs
+### 5. More encoding knobs
 
 - Explicit quality and bitrate controls.
 - 4:2:2 encoding.
 - Advanced HEVC parameters for users who need them.
 
-### 7. Region annotations (`rgan`)
+### 6. Region annotations (`rgan`)
 
 - Read region annotations and expose them with the image.
 - Keep them optional and out of the decode hot path.
 
-### 8. Fixtures and fuzzing
+### 7. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.

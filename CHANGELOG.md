@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- The CLI codes HEIC in 4:4:4 and lossless: `--format 420|444|lossless`, and `--lossless` as a
+  shortcut for `--format lossless`. The default stays 4:2:0.
+- `HeifEncoder::with_format` selects the chroma format and coding mode of the `image` crate
+  encoder; `HeifEncoder::new` and `with_options` still code 4:2:0.
+
 ## 0.3.25 — 2026-11-03
 
 **New**
