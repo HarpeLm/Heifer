@@ -31,6 +31,7 @@ pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
+pub use heifer_isobmff::writer::{ALPHA_URN, DEPTH_URN};
 pub use image::{Image, Sample};
 pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
 
@@ -223,6 +224,148 @@ pub fn decode_all_with_options(bytes: &[u8], options: &Options) -> Result<Vec<Im
 pub fn decode_all_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Vec<Image<u8>>, Error> {
     let file = HeifFile::parse(bytes)?;
     decode_all_images(&file, options, true)
+}
+
+/// An auxiliary image of a HEIF image: a depth map, an alpha plane, a gain map or another
+/// refinement stored next to the image and referencing it.
+///
+/// Obtain the list with [`auxiliary_images`] for the primary image, or
+/// [`item_auxiliary_images`] for any image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuxiliaryImage {
+    /// Item ID, to pass to [`decode_auxiliary`].
+    pub id: ItemId,
+    /// Item type, e.g. `hvc1` or `grid`.
+    pub item_type: FourCC,
+    /// Auxiliary type (`auxC` URN), e.g. `urn:mpeg:hevc:2015:auxid:2` for a depth map.
+    pub urn: String,
+    /// Width in pixels from the `ispe` property, `0` when the item has none.
+    pub width: u32,
+    /// Height in pixels from the `ispe` property, `0` when the item has none.
+    pub height: u32,
+    /// Bits per sample, from the `pixi` property, else the HEVC configuration, else 8.
+    pub bit_depth: u8,
+}
+
+impl AuxiliaryImage {
+    /// Whether this is an alpha plane.
+    pub fn is_alpha(&self) -> bool {
+        is_alpha_urn(&self.urn)
+    }
+
+    /// Whether this is a depth map.
+    pub fn is_depth(&self) -> bool {
+        is_depth_urn(&self.urn)
+    }
+}
+
+/// Lists the auxiliary images of the primary image: depth maps of Portrait photos, gain maps,
+/// alpha planes and any other refinement.
+///
+/// The primary image itself is not listed, and neither are thumbnails or grid tiles. Use
+/// [`decode_auxiliary`] to decode one of them.
+pub fn auxiliary_images(bytes: &[u8]) -> Result<Vec<AuxiliaryImage>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    item_auxiliary_images(&file, file.primary_id)
+}
+
+/// Lists the auxiliary images of one image item (an `auxl` reference), in file order.
+pub fn item_auxiliary_images(
+    file: &HeifFile<'_>,
+    id: ItemId,
+) -> Result<Vec<AuxiliaryImage>, Error> {
+    let mut images = Vec::new();
+    for aux in file.auxiliary_items(id) {
+        let item = file.item(aux)?;
+        let properties: Vec<&Property> = file.item_properties(aux)?.collect();
+        // Without an `auxC` type the item cannot be interpreted: skip it.
+        let Some(urn) = properties.iter().find_map(|p| match p {
+            Property::AuxiliaryType(urn) => Some(urn.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let (width, height) = file.image_size(aux)?.unwrap_or((0, 0));
+        let bit_depth = item_bit_depth(file, aux)?.unwrap_or(8);
+        images.push(AuxiliaryImage {
+            id: aux,
+            item_type: item.item_type,
+            urn,
+            width,
+            height,
+            bit_depth,
+        });
+    }
+    Ok(images)
+}
+
+/// Bits per sample of an item: from its `pixi` property, else its HEVC configuration, else from
+/// the first input of a derived image (a grid's first tile).
+fn item_bit_depth(file: &HeifFile<'_>, id: ItemId) -> Result<Option<u8>, Error> {
+    let mut current = Some(id);
+    for _ in 0..MAX_DEPTH {
+        let Some(item) = current else { return Ok(None) };
+        let properties: Vec<&Property> = file.item_properties(item)?.collect();
+        if let Some(bits) = properties.iter().find_map(|p| match p {
+            Property::PixelInfo(channels) => channels.first().copied(),
+            _ => None,
+        }) {
+            return Ok(Some(bits));
+        }
+        if let Some(config) = file.hevc_config(item)? {
+            return Ok(Some(config.bit_depth_luma));
+        }
+        current = file
+            .referenced_items(item, b"dimg")
+            .first()
+            .copied()
+            .filter(|&first| first != item);
+    }
+    Ok(None)
+}
+
+/// Decodes an auxiliary image by item ID, with its own crop, rotation and mirror transforms
+/// applied (the transforms of the primary image are not applied on top).
+///
+/// The result is an RGBA [`Image`] like [`decode`]; monochrome auxiliary images such as depth
+/// maps have their sample replicated in the red, green and blue channels.
+pub fn decode_auxiliary(bytes: &[u8], id: ItemId) -> Result<Image, Error> {
+    decode_auxiliary_with_options(bytes, id, &Options::default())
+}
+
+/// Like [`decode_auxiliary`], with options.
+pub fn decode_auxiliary_with_options(
+    bytes: &[u8],
+    id: ItemId,
+    options: &Options,
+) -> Result<Image, Error> {
+    let file = HeifFile::parse(bytes)?;
+    decode_item_with(&file, id, 0, options)
+}
+
+/// Decodes the auxiliary image of the primary image whose type is `urn`, or `None` when the
+/// file has no such auxiliary image.
+///
+/// For example [`DEPTH_URN`] selects the depth map. When several auxiliary images share a type,
+/// the first one is decoded.
+pub fn decode_auxiliary_urn(bytes: &[u8], urn: &str) -> Result<Option<Image>, Error> {
+    decode_auxiliary_urn_with_options(bytes, urn, &Options::default())
+}
+
+/// Like [`decode_auxiliary_urn`], with options.
+pub fn decode_auxiliary_urn_with_options(
+    bytes: &[u8],
+    urn: &str,
+    options: &Options,
+) -> Result<Option<Image>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    let Some(aux) = item_auxiliary_images(&file, file.primary_id)?
+        .into_iter()
+        .find(|aux| aux.urn == urn)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_item_with(&file, aux.id, 0, options)?))
 }
 
 fn decode_all_images<S: Sample>(
@@ -491,12 +634,27 @@ fn decode_hvc1<S: Sample>(
     Ok(image)
 }
 
+/// Whether an `auxC` type denotes an alpha plane.
+fn is_alpha_urn(urn: &str) -> bool {
+    matches!(
+        urn,
+        "urn:mpeg:hevc:2015:auxid:1" | "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+    )
+}
+
+/// Whether an `auxC` type denotes a depth map.
+fn is_depth_urn(urn: &str) -> bool {
+    matches!(
+        urn,
+        "urn:mpeg:hevc:2015:auxid:2" | "urn:mpeg:mpegB:cicp:systems:auxiliary:depth"
+    )
+}
+
 /// Whether an item is an auxiliary image of type alpha.
 fn is_alpha_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
-    Ok(file.item_properties(id)?.any(|p| {
-        matches!(p, Property::AuxiliaryType(t)
-            if t == "urn:mpeg:hevc:2015:auxid:1" || t == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
-    }))
+    Ok(file
+        .item_properties(id)?
+        .any(|p| matches!(p, Property::AuxiliaryType(t) if is_alpha_urn(t))))
 }
 
 /// Uses the first channel of a decoded alpha image (e.g. a grid of monochrome tiles) as the

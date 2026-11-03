@@ -28,6 +28,9 @@ use crate::boxes::{ColorInfo, HevcConfig};
 /// `auxC` type of alpha planes.
 pub const ALPHA_URN: &str = "urn:mpeg:hevc:2015:auxid:1";
 
+/// `auxC` type of depth maps.
+pub const DEPTH_URN: &str = "urn:mpeg:hevc:2015:auxid:2";
+
 /// An HEVC-coded image to add to a file.
 #[derive(Debug, Clone)]
 pub struct ImageSpec<'a> {

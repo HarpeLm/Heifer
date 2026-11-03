@@ -288,6 +288,28 @@ Re-encoding an HDR photo as a HEIC with an ISO 21496-1 `tmap` gain map:
 let out = heifer::encode_hdr(&base, &hdr, &heifer::EncodeOptions::default())?;
 ```
 
+## Auxiliary images (depth maps, alpha planes)
+
+`libheif` exposes auxiliary images through `HeifImageHandle::auxiliary_images` and
+`get_aux_image`. `heifer` lists them and decodes one by ID or by type:
+
+```rust
+for aux in heifer::auxiliary_images(&bytes)? {
+    // id, item type, auxC URN, width, height, bit depth
+    println!("{}: {}x{} ({} bits)", aux.urn, aux.width, aux.height, aux.bit_depth);
+    if aux.is_depth() {
+        let map = heifer::decode_auxiliary(&bytes, aux.id)?;
+    }
+}
+
+// Or directly by type, None when the file has no such auxiliary image:
+let depth = heifer::decode_auxiliary_urn(&bytes, heifer::DEPTH_URN)?;
+```
+
+Each auxiliary image is decoded with its own `clap`/`irot`/`imir` properties; the transforms of
+the primary image are not applied on top. `item_auxiliary_images` does the same for an image
+other than the primary, and `decode_all` still returns only top-level images.
+
 ## Error handling
 
 `libheif-rs` returns `HeifError` (an error code + sub-code from C). `heifer` returns a
@@ -366,7 +388,7 @@ match heifer::decode(&bytes) {
 | Uncompressed (ISO/IEC 23001-17) | ✓ | — | not yet |
 | 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
 | Inter-prediction / image sequences (tracks, MP4) | ✓ | — | out of scope (still images only) |
-| Depth maps, non-alpha auxiliary images | ✓ | partial (alpha) | not exposed yet |
+| Depth maps, non-alpha auxiliary images | ✓ | ✓ (`auxiliary_images`, `decode_auxiliary`) | ready |
 | Region annotations / masks | ✓ | — | not implemented |
 | Streaming / network `Reader` | ✓ | — (whole `&[u8]`) | not implemented |
 | Runtime codec plugins | ✓ | — | by design (pure Rust, wasm, no `unsafe`) |

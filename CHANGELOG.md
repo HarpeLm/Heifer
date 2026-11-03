@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- `heifer::auxiliary_images` lists the auxiliary images of the primary image (depth maps, alpha
+  planes, gain maps and other refinements): item ID, item type, `auxC` URN, size and bit depth.
+  `item_auxiliary_images` does the same for any image item. `AuxiliaryImage::is_depth` and
+  `is_alpha` recognise the HEVC and CICP URNs.
+- `decode_auxiliary` decodes one by item ID and `decode_auxiliary_urn` by type, with the same
+  `Image` and `Options` as `decode`; the latter returns `None` when the file has no such
+  auxiliary image. Each auxiliary image gets its own `clap`/`irot`/`imir` transforms, not those
+  of the primary image. Monochrome items such as depth maps have their sample replicated in the
+  RGB channels.
+- `heifer::DEPTH_URN` and `heifer::ALPHA_URN` are the `auxC` types of depth maps and alpha
+  planes, also available as `heifer_isobmff::writer` constants.
+- `HeifFile::auxiliary_items` returns the auxiliary items of an image, falling back to the first
+  input of a derived image as the metadata accessors already do.
+- `decode_all` still returns only top-level images: auxiliary planes stay skipped.
+
 ## 0.3.23 — 2026-11-03
 
 **New**

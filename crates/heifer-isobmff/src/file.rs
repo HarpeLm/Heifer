@@ -207,6 +207,21 @@ impl<'a> HeifFile<'a> {
             .collect()
     }
 
+    /// Auxiliary images of an image (`auxl` references): items that refine it, such as an alpha
+    /// plane, a depth map or a gain map.
+    ///
+    /// When a derived image has no auxiliary image of its own, those of its first input (e.g.
+    /// the first tile of a grid) are returned, as the EXIF accessors do.
+    pub fn auxiliary_items(&self, image: ItemId) -> Vec<ItemId> {
+        let direct = self.referencing_items(image, b"auxl");
+        if !direct.is_empty() {
+            return direct;
+        }
+        self.referenced_items(image, b"dimg")
+            .first()
+            .map_or_else(Vec::new, |&first| self.referencing_items(first, b"auxl"))
+    }
+
     /// Item IDs of the top-level images, in declaration order: the images meant to be displayed,
     /// as opposed to their tiles, thumbnails and auxiliary planes.
     ///
