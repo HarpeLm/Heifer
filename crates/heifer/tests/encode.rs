@@ -268,3 +268,150 @@ fn small_images_have_no_thumbnail() {
     .unwrap();
     assert!(heifer::decode_thumbnail(&heic).unwrap().is_none());
 }
+
+#[test]
+fn lossless_preserves_every_sample() {
+    for (w, h, alpha) in [
+        (1, 1, false),
+        (17, 9, true),
+        (64, 48, true),
+        (513, 17, true),
+    ] {
+        let rgba = test_image(w, h, alpha);
+        let heic = heifer::encode_rgba8_with_format(
+            w,
+            h,
+            &rgba,
+            heifer::EncodeFormat::Lossless,
+            &EncodeOptions::default(),
+        )
+        .unwrap();
+        let image = decode(&heic).unwrap();
+        assert_eq!(
+            (image.width, image.height, image.bit_depth, image.has_alpha),
+            (w, h, 8, alpha)
+        );
+        assert_eq!(image.to_rgba8(), rgba, "{w}×{h}: lossless round trip");
+    }
+}
+
+#[test]
+fn lossless_ten_bit_preserves_every_sample() {
+    let (w, h) = (37u32, 23u32);
+    let mut data = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let v = ((x * 27 + y * 5) % 1024) as u16;
+            let a: u16 = if y < h / 2 {
+                1023
+            } else {
+                (x * 13) as u16 % 1024
+            };
+            data.extend([v, 1023 - v, (v * 3) % 1024, a]);
+        }
+    }
+    let image = Image {
+        width: w,
+        height: h,
+        bit_depth: 10,
+        has_alpha: true,
+        data,
+    };
+    let heic = heifer::encode_with_format(
+        &image,
+        heifer::EncodeFormat::Lossless,
+        &EncodeOptions::default(),
+    )
+    .unwrap();
+    let file = heifer::heifer_isobmff::HeifFile::parse(&heic).unwrap();
+    let config = file.hevc_config(file.primary_id).unwrap().unwrap();
+    assert_eq!(
+        (
+            config.profile_idc,
+            config.chroma_format,
+            config.bit_depth_luma
+        ),
+        (4, 3, 10)
+    );
+    assert_eq!(decode(&heic).unwrap().data, image.data);
+}
+
+#[test]
+fn four_four_four_keeps_full_resolution_chroma() {
+    // One-pixel red and blue stripes: 4:2:0 averages them away, 4:4:4 keeps them apart.
+    let (w, h) = (64u32, 48u32);
+    let rgba: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            let x = i % w;
+            if x % 2 == 0 {
+                [230, 20, 20, 255]
+            } else {
+                [20, 20, 230, 255]
+            }
+        })
+        .collect();
+    let options = EncodeOptions {
+        quality: 90,
+        ..EncodeOptions::default()
+    };
+    let heic =
+        heifer::encode_rgba8_with_format(w, h, &rgba, heifer::EncodeFormat::Ycbcr444, &options)
+            .unwrap();
+    let file = heifer::heifer_isobmff::HeifFile::parse(&heic).unwrap();
+    let config = file.hevc_config(file.primary_id).unwrap().unwrap();
+    assert_eq!((config.profile_idc, config.chroma_format), (4, 3));
+    let decoded = decode(&heic).unwrap().to_rgba8();
+    assert!(
+        psnr(&rgba, &decoded, |c| c < 3) > 38.0,
+        "{}",
+        psnr(&rgba, &decoded, |c| c < 3)
+    );
+}
+
+#[test]
+fn lossless_with_metadata_keeps_pixels() {
+    let rgba = test_image(70, 30, true);
+    let metadata = heifer::Metadata {
+        xmp: Some(b"<x:xmpmeta/>".to_vec()),
+        ..Default::default()
+    };
+    let image = decode(
+        &heifer::encode_rgba8_with_format(
+            70,
+            30,
+            &rgba,
+            heifer::EncodeFormat::Lossless,
+            &EncodeOptions::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let heic = heifer::encode_with_metadata_and_format(
+        &image,
+        &metadata,
+        heifer::EncodeFormat::Lossless,
+        &EncodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(heifer::read_metadata(&heic).unwrap(), metadata);
+    assert_eq!(decode(&heic).unwrap().data, image.data);
+}
+
+#[test]
+fn rgb_and_rgba_formats_agree() {
+    let rgba = test_image(33, 21, false);
+    let rgb: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    for format in [
+        heifer::EncodeFormat::Ycbcr444,
+        heifer::EncodeFormat::Lossless,
+    ] {
+        let options = EncodeOptions::default();
+        assert_eq!(
+            heifer::encode_rgb8_with_format(33, 21, &rgb, format, &options).unwrap(),
+            heifer::encode_rgba8_with_format(33, 21, &rgba, format, &options).unwrap()
+        );
+    }
+}

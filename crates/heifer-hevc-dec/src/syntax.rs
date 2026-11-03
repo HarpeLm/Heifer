@@ -959,8 +959,9 @@ impl Parser<'_, '_> {
         let mut cbf_cr = [false; 2];
         if (log2_size > 2 && chroma_type != 0) || chroma_type == 3 {
             let second = chroma_type == 2 && (!split || log2_size == 3);
+            // Each component is gated on its own parent CBF (§7.3.8.8).
             for (cbf, parent) in [(&mut cbf_cb, parent_cbf_cb), (&mut cbf_cr, parent_cbf_cr)] {
-                if depth == 0 || parent[0] || parent[1] {
+                if depth == 0 || parent[0] {
                     cbf[0] = self
                         .engine
                         .decode(&mut self.ctx[ctx::CBF_CHROMA + usize::from(depth)])

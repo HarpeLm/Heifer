@@ -63,7 +63,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
   management to sRGB (`decode_srgb`, from the ICC profile, `nclx`, or the HEVC VUI).
-- **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos; checked with Apple's ImageIO and ffmpeg.
+- **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos, in 4:2:0, 4:4:4 or lossless; checked with Apple's ImageIO and ffmpeg.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
@@ -140,18 +140,34 @@ let again = heifer::encode(&heifer::decode(&bytes)?, &options)?;              //
 // Keep EXIF, XMP and the ICC profile of the original:
 let meta = heifer::read_metadata(&bytes)?;
 let smaller = heifer::encode_with_metadata(&heifer::decode(&bytes)?, &meta, &options)?;
+
+// Full-resolution chroma, for graphics and text, or exact pixels:
+let sharp = heifer::encode_rgba8_with_format(
+    width, height, &rgba, heifer::EncodeFormat::Ycbcr444, &options)?;
+let exact = heifer::encode_rgba8_with_format(
+    width, height, &rgba, heifer::EncodeFormat::Lossless, &options)?;
 ```
+
+`EncodeFormat` also selects the format when re-encoding an `Image`:
+`encode_with_format`, `encode_with_metadata_and_format`, `encode_rgb8_with_format` and
+`encode_rgba8_with_format`. They are additive: `encode`, `encode_rgb8` and `encode_rgba8` keep
+their signatures and write 4:2:0.
+
+`Ycbcr444` codes chroma at full resolution in a Range Extensions (profile 4) stream. `Lossless`
+codes GBR 4:4:4 with `matrix_coeffs = 0` and no transform or quantization, so decoding returns
+the input samples exactly, alpha included; the files are considerably larger. 4:4:4 streams are
+decoded by Apple's ImageIO and by ffmpeg.
 
 When the metadata carries an ICC profile, it is attached to every image item (tiles, grid and
 thumbnail) and no `nclx` colour box is written, as in iPhone photos: the profile is the file's
 colour space. Without one, files are tagged sRGB with `nclx`.
 
-Images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Main 10) when the image
-has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of banding, and split
-into 512×512 tiles that are
-encoded in parallel, like iPhone photos; transparency is kept as an alpha plane. A 12 MP image takes
-about 0.77 s on 10 cores. At quality 80, a re-encoded Apple photo has a PSNR of 42.0 dB against the
-original, both decoded by Apple (1.0 bit per pixel).
+By default images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Main 10)
+when the image has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of
+banding, and split into 512×512 tiles that are encoded in parallel, like iPhone photos;
+transparency is kept as an alpha plane. A 12 MP image takes about 0.77 s on 10 cores. At quality
+80, a re-encoded Apple photo has a PSNR of 42.0 dB against the original, both decoded by Apple
+(1.0 bit per pixel).
 
 The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
 chooses block sizes (64×64 down to 4×4), transform splits and prediction modes by rate-distortion
@@ -249,7 +265,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
-| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | 4:4:4, lossless |
+| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, 4:4:4 and lossless (Range Extensions profile 4), alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | — |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 

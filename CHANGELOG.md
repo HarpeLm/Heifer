@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- The encoder writes 4:4:4 HEVC (Range Extensions profile 4, `chroma_format_idc = 3`) with
+  full-resolution chroma, for graphics, text and other images where 4:2:0 bleeds colours. It
+  also writes lossless pictures: GBR 4:4:4 with `matrix_coeffs = 0`, transform and quantization
+  bypassed in every coding unit, deblocking and SAO off. Decoding a lossless file reproduces
+  every input sample exactly, alpha included. 4:4:4 and lossless files are decoded by Apple's
+  ImageIO and by ffmpeg.
+- `heifer::EncodeFormat` selects `Ycbcr420` (the default, unchanged), `Ycbcr444` or `Lossless`
+  through the new `encode_rgba8_with_format`, `encode_rgb8_with_format`, `encode_with_format`
+  and `encode_with_metadata_and_format`. The existing functions keep their signatures and write
+  4:2:0.
+- The low-level encoder exposes `ChromaFormat`, `CodingOptions`, `encode_picture_with` and
+  `encode_picture16_with`, so callers that build planes themselves can choose the chroma format
+  and lossless coding. `encode_picture` and `encode_picture16` are unchanged.
+- Thumbnails and HDR gain maps stay 4:2:0 lossy. The alpha plane follows the main image and is
+  lossless when the main image is.
+
+**Correctness**
+
+- 4:4:4 transform trees now parse each component's coded-block flag against its own parent
+  flag, as H.265 §7.3.8.8 requires, instead of against either the luma or the other chroma
+  parent. Streams where only one chroma component had a coded parent block now decode without
+  desynchronising.
+
 ## 0.3.22 — 2026-11-02
 
 **Correctness**

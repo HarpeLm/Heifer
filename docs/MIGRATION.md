@@ -228,6 +228,21 @@ let (image, meta) = (heifer::decode(&bytes)?, heifer::read_metadata(&bytes)?);
 let out = heifer::encode_with_metadata(&image, &meta, &heifer::EncodeOptions::default())?;
 ```
 
+`libheif-rs` chooses 4:4:4 with `RgbChroma::C444` and lossless coding with
+`EncoderQuality::Lossless`; in `heifer` both are an `EncodeFormat`:
+
+```rust
+// Full-resolution chroma (HEVC Range Extensions profile 4).
+let sharp = heifer::encode_rgb8_with_format(
+    w, h, &rgb, heifer::EncodeFormat::Ycbcr444, &options)?;
+// Exact RGB, coded as GBR 4:4:4 without transform or quantization.
+let exact = heifer::encode_rgb8_with_format(
+    w, h, &rgb, heifer::EncodeFormat::Lossless, &options)?;
+```
+
+The `_with_format` variants of `encode`, `encode_with_metadata` and `encode_rgba8` take the same
+argument. The original functions are unchanged and write 4:2:0.
+
 The pixels of a decoded image are already upright, so `encode_with_metadata` rewrites the
 EXIF orientation tag to `1`; no viewer will rotate the result twice.
 
@@ -310,6 +325,7 @@ match heifer::decode(&bytes) {
 | `handle.metadata_block_ids(b"Exif")` / `handle.metadata(id)` | `heifer::read_metadata(&bytes)` → `.exif` / `.xmp` / `.icc_profile` |
 | `image.scale(w, h, None)` | — (resize with the `image` crate) |
 | `HeifContext::new()` + `encode_image(...)` | `heifer::encode(&image, &EncodeOptions)`, `encode_rgb8`, `encode_rgba8` |
+| `RgbChroma::C444` / `EncoderQuality::Lossless` | `EncodeFormat::Ycbcr444` / `EncodeFormat::Lossless` with the `_with_format` functions |
 | `EncodingOptions` / `EncoderQuality` | `EncodeOptions { quality, max_threads }` |
 | `DecodingOptions::set_max_decoding_threads` | `Options { max_threads, max_pixels }` |
 | `integration::image::register_all_decoding_hooks()` | `heifer::image_crate::register_image_decoder_hooks()` |

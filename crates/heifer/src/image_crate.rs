@@ -282,6 +282,7 @@ impl<W: Write> ImageEncoder for HeifEncoder<W> {
             bit_depth,
             has_alpha,
             Some(&self.metadata),
+            crate::encode::EncodeFormat::Ycbcr420,
             &self.options,
             pixel,
         )

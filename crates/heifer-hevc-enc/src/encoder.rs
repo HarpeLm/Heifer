@@ -11,6 +11,9 @@
 //! - chroma mode: the two best by SATD coded for real;
 //! - transform tree: split up to twice; 4×4 blocks may skip the transform;
 //! - levels: RDOQ (including coding nothing), sign data hiding; then SAO on the deblocked picture.
+//!
+//! Lossless pictures bypass the transform and quantization: prediction still applies, but the
+//! levels are the raw residual samples, and the in-loop filters are off.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
 use heifer_hevc_dec::nal::NalUnit;
@@ -45,8 +48,9 @@ pub(crate) const MAX_TU_DEPTH: u8 = 2;
 pub struct Planes<'a> {
     /// Luma, `width × height`, row-major.
     pub y: &'a [u8],
-    /// Chroma planes of 4:2:0 pictures, `ceil(width / 2) × ceil(height / 2)` each; `None` for
-    /// monochrome pictures (e.g. alpha planes).
+    /// Chroma planes: `ceil(width / 2) × ceil(height / 2)` each in 4:2:0 (see
+    /// [`CodingOptions::chroma_format`]), `width × height` in 4:4:4; `None` for monochrome
+    /// pictures (e.g. alpha planes).
     pub chroma: Option<(&'a [u8], &'a [u8])>,
 }
 
@@ -55,11 +59,57 @@ pub struct Planes<'a> {
 pub struct Planes16<'a> {
     /// Luma, `width × height`, row-major.
     pub y: &'a [u16],
-    /// Chroma planes of 4:2:0 pictures, `ceil(width / 2) × ceil(height / 2)` each; `None` for
+    /// Chroma planes, of the same size as `y` in 4:4:4 and half its size in 4:2:0; `None` for
     /// monochrome pictures.
     pub chroma: Option<(&'a [u16], &'a [u16])>,
     /// Bits per sample: 8 (Main profile) to 10 (Main 10). Samples must fit.
     pub bit_depth: u8,
+}
+
+/// Chroma format of the planes given to [`encode_picture_with`] and [`encode_picture16_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaFormat {
+    /// One plane, e.g. an alpha channel.
+    Monochrome,
+    /// 4:2:0: chroma at half width and height.
+    Chroma420,
+    /// 4:4:4: chroma at full resolution, coded with the Range Extensions profile.
+    Chroma444,
+}
+
+impl ChromaFormat {
+    /// `chroma_format_idc`.
+    pub(crate) fn idc(self) -> u8 {
+        match self {
+            Self::Monochrome => 0,
+            Self::Chroma420 => 1,
+            Self::Chroma444 => 3,
+        }
+    }
+}
+
+/// Coding options of one picture, for [`encode_picture_with`] and [`encode_picture16_with`].
+///
+/// [`encode_picture`] and [`encode_picture16`] use the format implied by their planes (4:2:0
+/// with chroma, monochrome without) and lossy coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodingOptions {
+    /// Format of the chroma planes; [`ChromaFormat::Monochrome`] requires `planes.chroma` to be
+    /// `None`, the other formats require it.
+    pub chroma_format: ChromaFormat,
+    /// Code the picture losslessly: every coding unit bypasses the transform and quantization,
+    /// and the deblocking filter and SAO are off. Decoding the picture then reproduces the input
+    /// samples exactly. Only 4:4:4 can faithfully represent RGB, with `matrix_coeffs = 0`.
+    pub lossless: bool,
+}
+
+impl Default for CodingOptions {
+    fn default() -> Self {
+        Self {
+            chroma_format: ChromaFormat::Chroma420,
+            lossless: false,
+        }
+    }
 }
 
 /// Encoding parameters.
@@ -95,7 +145,7 @@ pub struct EncodedPicture {
     pub profile_idc: u8,
     /// `general_level_idc`.
     pub level_idc: u8,
-    /// `chroma_format_idc`: 0 or 1.
+    /// `chroma_format_idc`: 0, 1 or 3.
     pub chroma_format: u8,
     /// Size of the decoded picture: the input size, rounded up to even numbers in 4:2:0.
     pub width: u32,
@@ -135,6 +185,28 @@ pub fn encode_picture(
     encode_picture16(width, height, planes, config)
 }
 
+/// Encodes one picture as an IDR frame, with the chroma format and lossless mode of `options`
+/// (for 4:4:4 or lossless coding; [`encode_picture`] covers 4:2:0 and monochrome).
+pub fn encode_picture_with(
+    width: u32,
+    height: u32,
+    planes: Planes<'_>,
+    options: &CodingOptions,
+    config: &EncoderConfig,
+) -> Result<EncodedPicture, Error> {
+    let wide = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
+    let (y, chroma) = (
+        wide(planes.y),
+        planes.chroma.map(|(cb, cr)| (wide(cb), wide(cr))),
+    );
+    let planes = Planes16 {
+        y: &y,
+        chroma: chroma.as_ref().map(|(cb, cr)| (&cb[..], &cr[..])),
+        bit_depth: 8,
+    };
+    encode_picture16_with(width, height, planes, options, config)
+}
+
 /// Encodes one picture of up to 10 bits per sample as an IDR frame (Main 10 profile above 8
 /// bits). 10-bit coding avoids the banding of smooth gradients, e.g. in skies.
 pub fn encode_picture16(
@@ -143,7 +215,29 @@ pub fn encode_picture16(
     planes: Planes16<'_>,
     config: &EncoderConfig,
 ) -> Result<EncodedPicture, Error> {
-    encode_with_reconstruction(width, height, planes, config).map(|(picture, ..)| picture)
+    let options = CodingOptions {
+        chroma_format: if planes.chroma.is_some() {
+            ChromaFormat::Chroma420
+        } else {
+            ChromaFormat::Monochrome
+        },
+        lossless: false,
+    };
+    encode_picture16_with(width, height, planes, &options, config)
+}
+
+/// Encodes one picture of up to 10 bits per sample as an IDR frame, with the chroma format and
+/// lossless mode of `options`. 4:4:4 streams use the Format Range Extensions profile (4);
+/// lossless streams code every coding unit with `cu_transquant_bypass_flag` and disable the
+/// in-loop filters, so that decoding reproduces the samples exactly.
+pub fn encode_picture16_with(
+    width: u32,
+    height: u32,
+    planes: Planes16<'_>,
+    options: &CodingOptions,
+    config: &EncoderConfig,
+) -> Result<EncodedPicture, Error> {
+    encode_with_reconstruction(width, height, planes, options, config).map(|(picture, ..)| picture)
 }
 
 /// Like [`encode_picture`], also returning the encoder's reconstruction of the picture (coded
@@ -152,6 +246,7 @@ fn encode_with_reconstruction(
     width: u32,
     height: u32,
     planes: Planes16<'_>,
+    options: &CodingOptions,
     config: &EncoderConfig,
 ) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
@@ -183,28 +278,51 @@ fn encode_with_reconstruction(
             "luma plane size does not match the picture",
         ));
     }
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    if let Some((cb, cr)) = planes.chroma
-        && (cb.len() != cw * ch || cr.len() != cw * ch)
-    {
-        return Err(Error::InvalidInput(
-            "chroma plane size does not match the picture",
-        ));
+    let format = options.chroma_format;
+    let (cw, ch) = match format {
+        ChromaFormat::Monochrome => (0, 0),
+        ChromaFormat::Chroma420 => (w.div_ceil(2), h.div_ceil(2)),
+        ChromaFormat::Chroma444 => (w, h),
+    };
+    match (planes.chroma, format) {
+        (Some((cb, cr)), ChromaFormat::Chroma420 | ChromaFormat::Chroma444) => {
+            if cb.len() != cw * ch || cr.len() != cw * ch {
+                return Err(Error::InvalidInput(
+                    "chroma plane size does not match the picture",
+                ));
+            }
+        }
+        (None, ChromaFormat::Monochrome) => {}
+        (Some(_), ChromaFormat::Monochrome) => {
+            return Err(Error::InvalidInput(
+                "monochrome pictures have no chroma planes",
+            ));
+        }
+        (None, _) => {
+            return Err(Error::InvalidInput(
+                "chroma planes are missing from the picture",
+            ));
+        }
     }
 
     // 4:2:0 conformance windows crop by 2 samples: odd sizes are rounded up (HEIF crops the
     // rest with a `clap` property).
-    let unit = if planes.chroma.is_some() { 2 } else { 1 };
+    let unit = if format == ChromaFormat::Chroma420 {
+        2
+    } else {
+        1
+    };
     let params = StreamParams {
         width: width.next_multiple_of(8),
         height: height.next_multiple_of(8),
         output_width: width.next_multiple_of(unit),
         output_height: height.next_multiple_of(unit),
-        chroma_format: u8::from(planes.chroma.is_some()),
+        chroma_format: format.idc(),
         bit_depth: planes.bit_depth,
         qp: i32::from(config.qp),
         full_range: config.full_range,
         colour: config.colour,
+        lossless: options.lossless,
     };
     let parameter_sets = vec![params.vps(), params.sps(), params.pps()];
 
@@ -240,22 +358,24 @@ fn encode_with_reconstruction(
     }
 
     // Slice data: the SAO parameters of each block, then its bins. SAO has its own contexts,
-    // so the bins decided without it stay valid.
+    // so the bins decided without it stay valid. Lossless streams disable SAO in the SPS.
     let bit_depth = planes.bit_depth;
-    let chroma = planes.chroma.is_some();
+    let chroma = format != ChromaFormat::Monochrome;
     let write = |sao: &[(CtbSao, SaoParams)]| -> Vec<u8> {
         let mut ctx = Contexts::new(params.qp);
         let mut coder = ArithmeticEncoder::new();
         for (i, bins) in blocks.iter().enumerate() {
-            let (cx, cy) = (i as u32 % ctbs_x, i as u32 / ctbs_x);
-            sao::write(
-                &mut coder,
-                &mut ctx,
-                &sao[i].0,
-                (cx > 0, cy > 0),
-                chroma,
-                bit_depth,
-            );
+            if !sao.is_empty() {
+                let (cx, cy) = (i as u32 % ctbs_x, i as u32 / ctbs_x);
+                sao::write(
+                    &mut coder,
+                    &mut ctx,
+                    &sao[i].0,
+                    (cx > 0, cy > 0),
+                    chroma,
+                    bit_depth,
+                );
+            }
             replay(bins, &mut ctx, &mut coder);
             let last = i + 1 == blocks.len();
             coder.encode_terminate(u8::from(last)); // end_of_slice_segment_flag
@@ -264,17 +384,21 @@ fn encode_with_reconstruction(
     };
     // SAO is chosen on the picture as the decoder reconstructs it before SAO: the deblocked
     // reconstruction (its block edges are those of the chosen codings).
-    let deblocked = enc.recon.deblocked();
-    let src = [&enc.src[0], &enc.src[1], &enc.src[2]];
-    let decisions = sao::decide(
-        &deblocked,
-        src.map(|p| &p.samples[..]),
-        src.map(|p| p.width),
-        chroma,
-        ctb as usize,
-        bit_depth,
-        enc.lambda,
-    );
+    let decisions = if options.lossless {
+        Vec::new()
+    } else {
+        let deblocked = enc.recon.deblocked();
+        let src = [&enc.src[0], &enc.src[1], &enc.src[2]];
+        sao::decide(
+            &deblocked,
+            src.map(|p| &p.samples[..]),
+            src.map(|p| p.width),
+            chroma,
+            ctb as usize,
+            bit_depth,
+            enc.lambda,
+        )
+    };
     let mut rbsp = header_rbsp;
     rbsp.extend_from_slice(&write(&decisions));
 
@@ -404,6 +528,10 @@ struct Encoder<'a> {
     ctx: Contexts,
     src: [Plane; 3],
     chroma: bool,
+    /// Chroma subsampling factor: 2 in 4:2:0, 1 in 4:4:4 (and for monochrome).
+    cs: usize,
+    /// Whether coding units bypass the transform and quantization.
+    lossless: bool,
     width: u32,
     height: u32,
     /// `QpY`, and the quantization parameters `Qp′Y` and `Qp′C` (with `QpBdOffset`).
@@ -454,13 +582,14 @@ impl<'a> Encoder<'a> {
         header: &SliceHeader,
     ) -> Self {
         let (pw, ph) = (params.width as usize, params.height as usize);
+        let cs = if params.chroma_format == 1 { 2 } else { 1 };
         let y = Plane::padded(planes.y, w, h, pw, ph);
         let (cb, cr) = match planes.chroma {
             Some((cb, cr)) => {
-                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let (cw, ch) = (w.div_ceil(cs), h.div_ceil(cs));
                 (
-                    Plane::padded(cb, cw, ch, pw / 2, ph / 2),
-                    Plane::padded(cr, cw, ch, pw / 2, ph / 2),
+                    Plane::padded(cb, cw, ch, pw / cs, ph / cs),
+                    Plane::padded(cr, cw, ch, pw / cs, ph / cs),
                 )
             }
             None => (
@@ -483,17 +612,24 @@ impl<'a> Encoder<'a> {
         let lambda =
             0.57 * 2f64.powf(f64::from(qp - 12) / 3.0) * 4f64.powi(i32::from(planes.bit_depth - 8));
         let grid_w = pw / 4;
+        let qp_c = if params.chroma_format == 3 {
+            qp.min(51)
+        } else {
+            chroma_qp(qp)
+        };
         Self {
             recon,
             log: BinLog::new(),
             ctx: Contexts::new(qp),
             src: [y, cb, cr],
             chroma: planes.chroma.is_some(),
+            cs,
+            lossless: params.lossless,
             width: params.width,
             height: params.height,
             qp,
             qp_luma: qp + bd_offset,
-            qp_c: chroma_qp(qp) + bd_offset,
+            qp_c: qp_c + bd_offset,
             bit_depth: planes.bit_depth,
             lambda,
             sqrt_lambda: lambda.sqrt(),
@@ -548,13 +684,36 @@ impl<'a> Encoder<'a> {
         size: u32,
     ) -> impl Iterator<Item = (usize, u32, u32, u32)> + use<> {
         let n = if self.chroma { 3 } else { 1 };
+        let cs = self.cs as u32;
         [
             (0, x0, y0, size),
-            (1, x0 / 2, y0 / 2, size / 2),
-            (2, x0 / 2, y0 / 2, size / 2),
+            (1, x0 / cs, y0 / cs, size / cs),
+            (2, x0 / cs, y0 / cs, size / cs),
         ]
         .into_iter()
         .take(n)
+    }
+
+    /// Position of a luma sample in the chroma planes.
+    fn chroma_pos(&self, x: u32, y: u32) -> (u32, u32) {
+        let cs = self.cs as u32;
+        (x / cs, y / cs)
+    }
+
+    /// `log2` of the size of the chroma block that covers a luma transform block.
+    fn chroma_log2(&self, log2_size: u8) -> u8 {
+        log2_size - self.cs.trailing_zeros() as u8
+    }
+
+    /// Largest `log2` of a chroma transform block (32×32, or 16×16 in 4:2:0).
+    fn max_chroma_log2(&self) -> u8 {
+        LOG2_MAX_TB - self.cs.trailing_zeros() as u8
+    }
+
+    /// Weight of chroma distortion against luma in rate-distortion decisions. 4:4:4 chroma
+    /// samples are as numerous as luma samples, so they weigh as much.
+    fn chroma_weight(&self) -> f64 {
+        if self.cs == 1 { 1.0 } else { CHROMA_WEIGHT }
     }
 
     /// Saves the state of a block, to try another coding of it and come back. The buffers come
@@ -854,7 +1013,28 @@ impl<'a> Encoder<'a> {
     /// Computes the residual levels of one transform block and reconstructs it.
     fn transform_block(&mut self, c: usize, x: u32, y: u32, log2_size: u8, mode: u8) -> Tb {
         self.predict(c, x, y, log2_size, mode);
-        let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
+        if self.lossless {
+            // Transquant bypass: the levels are the residual samples themselves, and the
+            // decoder adds them to the prediction without a transform.
+            let n = 1usize << log2_size;
+            let levels = if self.diff[..n * n].iter().all(|&d| d == 0) {
+                Vec::new()
+            } else {
+                self.diff[..n * n].to_vec()
+            };
+            self.reconstruct(c, x, y, log2_size, mode, &levels, false);
+            return Tb {
+                c,
+                x,
+                y,
+                log2_size,
+                mode,
+                levels,
+                transform_skip: false,
+                sse: 0.0,
+            };
+        }
+        let w = if c == 0 { 1.0 } else { self.chroma_weight() };
         let levels = self.quantize(c, log2_size, mode, false);
         let sse = self.distortion(c, x, y, log2_size, mode, &levels, false);
         let tb = Tb {
@@ -1003,9 +1183,10 @@ impl<'a> Encoder<'a> {
             self.coeffs = coeffs;
             return Vec::new();
         }
-        let scan = scan_type(log2_size, c == 0, mode);
+        // 4:4:4 chroma scan follows the luma rules at 8×8 too (§7.4.9.11).
+        let scan = scan_type(log2_size, c == 0 || self.cs == 1, mode);
         // λ in units of the squared quantization step, 2^((QP - 4) / 3).
-        let w = if c == 0 { 1.0 } else { CHROMA_WEIGHT };
+        let w = if c == 0 { 1.0 } else { self.chroma_weight() };
         let lambda = (self.lambda / w / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
         let levels = &mut coeffs[..n * n];
         rdoq(
@@ -1059,7 +1240,7 @@ impl<'a> Encoder<'a> {
                 coeffs: (!levels.is_empty()).then_some(levels),
                 coeff_bounds: (cols as u8, rows as u8),
                 transform_skip,
-                transquant_bypass: false,
+                transquant_bypass: self.lossless,
                 qp_y: self.qp,
                 cu_qp_offset: 0,
                 res_scale_val: 0,
@@ -1087,30 +1268,34 @@ impl<'a> Encoder<'a> {
         sse
     }
 
-    /// Chooses the chroma prediction mode of a coding unit whose (first) luma mode is `luma`:
-    /// returns `intra_chroma_pred_mode` (4 = same as luma) and the mode it gives.
+    /// Chooses the chroma prediction mode of a coding unit (or prediction block) whose luma
+    /// mode is `luma_mode`: returns `intra_chroma_pred_mode` (4 = same as luma) and the mode it
+    /// gives. `luma` is the position and size of the luma block the chroma belongs to, `(xc,
+    /// yc)` the position of the chroma block and `log2_c` its size.
+    #[allow(clippy::too_many_arguments)]
     fn choose_chroma_mode(
         &mut self,
+        luma: (u32, u32, u32),
         xc: u32,
         yc: u32,
-        log2_size: u8,
-        luma: u8,
+        log2_c: u8,
+        luma_mode: u8,
         luma_coded: bool,
     ) -> (u8, u8) {
-        let n = 1usize << log2_size;
+        let n = 1usize << log2_c;
         let refs = [1, 2].map(|c| self.recon.intra_references(c, xc, yc, n));
         let mut costs = Vec::with_capacity(5);
         for syntax in [4u8, 0, 1, 2, 3] {
             let mode = match syntax {
-                4 => luma,
+                4 => luma_mode,
                 s => {
                     let m = [0, 26, 10, 1][usize::from(s)];
-                    if m == luma { 34 } else { m }
+                    if m == luma_mode { 34 } else { m }
                 }
             };
             let mut cost = self.sqrt_lambda * if syntax == 4 { 1.0 } else { 3.0 };
             for c in 1..=2 {
-                self.predict_from(&refs[c - 1], c, xc, yc, log2_size, mode);
+                self.predict_from(&refs[c - 1], c, xc, yc, log2_c, mode);
                 cost += satd(&self.diff[..n * n], n) as f64;
             }
             costs.push((cost, syntax, mode));
@@ -1119,8 +1304,8 @@ impl<'a> Encoder<'a> {
         let tried = 2;
         // The best few by SATD are coded (as one transform block per component), and the
         // cheapest in rate and distortion is kept.
-        let log2_tb = log2_size.min(LOG2_MAX_TB - 1);
-        let (x0, y0, size) = (xc * 2, yc * 2, 2u32 << log2_size);
+        let log2_tb = log2_c.min(self.max_chroma_log2());
+        let (x0, y0, size) = luma;
         let start = self.snapshot(x0, y0, size, luma_coded, self.log.checkpoint());
         let contexts = self.ctx;
         let mut best = (f64::MAX, costs[0].1, costs[0].2);
@@ -1135,8 +1320,8 @@ impl<'a> Encoder<'a> {
             }
             let mut d = 0.0;
             let step = 1u32 << log2_tb;
-            for y in (yc..yc + (1 << log2_size)).step_by(step as usize) {
-                for x in (xc..xc + (1 << log2_size)).step_by(step as usize) {
+            for y in (yc..yc + (1 << log2_c)).step_by(step as usize) {
+                for x in (xc..xc + (1 << log2_c)).step_by(step as usize) {
                     for tb in self
                         .chroma_blocks(x, y, log2_tb, mode)
                         .into_iter()
@@ -1199,8 +1384,9 @@ impl<'a> Encoder<'a> {
                 enc.restore(x0, y0, size, &start);
             }
             // Whole blocks have one transform block per component, which no other block of the
-            // trial predicts from: they are reconstructed only if chosen.
-            enc.deferred = kind == CuKind::Whole && log2_size <= LOG2_MAX_TB;
+            // trial predicts from: they are reconstructed only if chosen. Lossless blocks are
+            // reconstructed as they are coded.
+            enc.deferred = !enc.lossless && kind == CuKind::Whole && log2_size <= LOG2_MAX_TB;
             let (d, residual, deferred) = enc.code_cu(x0, y0, log2_size, depth, kind, mode);
             enc.deferred = false;
             *current = Some((kind, mode));
@@ -1264,22 +1450,51 @@ impl<'a> Encoder<'a> {
         // Prediction modes and transform blocks, in decoding order: each block is predicted
         // from the ones reconstructed before it.
         let mut parts: Vec<(u8, [u8; 3])> = Vec::new(); // (mode, MPM candidates)
-        // intra_chroma_pred_mode and the chroma mode (decided once the first luma mode is).
-        let mut chroma = (4u8, mode);
+        // `intra_chroma_pred_mode` and the chroma mode: one per prediction block in 4:4:4
+        // PART_NxN, one per coding unit otherwise.
+        let mut chroma_syntaxes: Vec<(u8, u8)> = Vec::new();
         let tree = if four {
             let half = size / 2;
+            let log2_half = log2_size - 1;
             let mut blocks = Vec::new();
             for i in 0..4u32 {
                 let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
                 let mpm = self.mpm_candidates(x, y);
                 let (mode, luma) = self.small_block(x, y, mpm);
                 parts.push((mode, mpm));
-                blocks.push(TNode::Leaf(luma, None));
+                let mut node = TNode::Leaf(luma, None);
+                if self.chroma && self.cs == 1 {
+                    // 4:4:4: each prediction block has its own chroma block, at full
+                    // resolution, and its own chroma mode. It is reconstructed right after the
+                    // luma block, as the decoder does: the availability of the neighbouring
+                    // samples seen by the next prediction depends on it.
+                    let choice = self.choose_chroma_mode((x, y, half), x, y, log2_half, mode, true);
+                    chroma_syntaxes.push(choice);
+                    let chroma = self.chroma_blocks(x, y, log2_half, choice.1);
+                    if let TNode::Leaf(_, slot) = &mut node {
+                        *slot = chroma;
+                    }
+                }
+                blocks.push(node);
             }
-            if self.chroma {
-                chroma = self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, parts[0].0, true);
+            if self.chroma && self.cs != 1 {
+                let choice = self.choose_chroma_mode(
+                    (x0, y0, size),
+                    x0 / 2,
+                    y0 / 2,
+                    log2_half,
+                    parts[0].0,
+                    true,
+                );
+                chroma_syntaxes.push(choice);
             }
-            let chroma = self.chroma_blocks(x0 / 2, y0 / 2, log2_size - 1, chroma.1);
+            // In 4:2:0, the four 4×4 luma blocks share their parent's chroma blocks, coded
+            // after the last of them.
+            let chroma = if self.chroma && self.cs != 1 {
+                self.chroma_blocks(x0 / 2, y0 / 2, log2_half, chroma_syntaxes[0].1)
+            } else {
+                None
+            };
             TNode::Split(blocks, chroma)
         } else {
             let mpm = self.mpm_candidates(x0, y0);
@@ -1288,24 +1503,32 @@ impl<'a> Encoder<'a> {
             if self.chroma {
                 // The chroma mode is chosen once per coding unit, with its first luma mode, and
                 // kept for the other luma modes tried when it can still be signalled.
-                chroma = match self.chroma_choice {
+                let (xc, yc) = self.chroma_pos(x0, y0);
+                let log2_c = self.chroma_log2(log2_size).min(LOG2_MAX_TB);
+                let choice = match self.chroma_choice {
                     Some(chosen) => chroma_syntax(chosen, mode),
                     None => {
                         let choice =
-                            self.choose_chroma_mode(x0 / 2, y0 / 2, log2_size - 1, mode, false);
+                            self.choose_chroma_mode((x0, y0, size), xc, yc, log2_c, mode, false);
                         self.chroma_choice = Some(choice.1);
                         choice
                     }
                 };
+                chroma_syntaxes.push(choice);
             }
+            let chroma = chroma_syntaxes.first().map_or(1, |c| c.1);
             if kind == CuKind::Whole && log2_size <= LOG2_MAX_TB {
-                self.transform_leaf(x0, y0, log2_size, mode, chroma.1)
+                self.transform_leaf(x0, y0, log2_size, mode, chroma)
             } else {
-                self.split_tree(x0, y0, log2_size, mode, chroma.1, 1)
+                self.split_tree(x0, y0, log2_size, mode, chroma, 1)
             }
         };
 
-        // Syntax: part_mode, the luma modes, the chroma mode, then the transform tree.
+        // Syntax: part_mode, the luma modes, the chroma modes, then the transform tree.
+        if self.lossless {
+            // The PPS enables the flag only for lossless streams.
+            self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
         if log2_size == LOG2_MIN_CB {
             self.bin(ctx::PART_MODE, !four); // 1: PART_2Nx2N, 0: PART_NxN
         }
@@ -1327,11 +1550,11 @@ impl<'a> Encoder<'a> {
                 }
             }
         }
-        if self.chroma {
+        for &(syntax, _) in &chroma_syntaxes {
             // intra_chroma_pred_mode: 0 for "as luma", else 1 and two bypass bits.
-            self.bin(ctx::INTRA_CHROMA_PRED_MODE, chroma.0 != 4);
-            if chroma.0 != 4 {
-                self.log.encode_bypass_bits(u32::from(chroma.0), 2);
+            self.bin(ctx::INTRA_CHROMA_PRED_MODE, syntax != 4);
+            if syntax != 4 {
+                self.log.encode_bypass_bits(u32::from(syntax), 2);
             }
         }
         self.write_tree(&tree, log2_size, 0, (true, true), four);
@@ -1341,7 +1564,7 @@ impl<'a> Encoder<'a> {
             y: y0,
             log2_size,
             part_nxn: four,
-            transquant_bypass: false,
+            transquant_bypass: self.lossless,
             pcm: false,
             qp_y: self.qp,
         });
@@ -1400,19 +1623,22 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /// One transform unit: the luma block and, from 8×8 luma up, its chroma blocks.
+    /// One transform unit: the luma block and, from 8×8 luma up in 4:2:0 (always in 4:4:4), its
+    /// chroma blocks.
     fn transform_leaf(&mut self, x: u32, y: u32, log2_size: u8, mode: u8, chroma: u8) -> TNode {
         let luma = self.transform_block(0, x, y, log2_size, mode);
-        let chroma = if log2_size > 2 {
-            self.chroma_blocks(x / 2, y / 2, log2_size - 1, chroma)
+        let chroma = if self.chroma && (log2_size > 2 || self.cs == 1) {
+            let log2_c = self.chroma_log2(log2_size);
+            let (xc, yc) = self.chroma_pos(x, y);
+            self.chroma_blocks(xc, yc, log2_c, chroma)
         } else {
             None
         };
         TNode::Leaf(luma, chroma)
     }
 
-    /// A block split into four transform trees at `depth`; 4×4 luma blocks share the chroma
-    /// blocks of their parent.
+    /// A block split into four transform trees at `depth`; in 4:2:0, the 4×4 luma blocks share
+    /// the chroma blocks of their parent.
     fn split_tree(
         &mut self,
         x0: u32,
@@ -1428,7 +1654,7 @@ impl<'a> Encoder<'a> {
             let (x, y) = (x0 + (i % 2) * half, y0 + (i / 2) * half);
             blocks.push(self.transform_tree(x, y, log2_size - 1, mode, chroma, depth));
         }
-        let chroma = if log2_size == 3 {
+        let chroma = if self.chroma && self.cs == 2 && log2_size == 3 {
             self.chroma_blocks(x0 / 2, y0 / 2, 2, chroma)
         } else {
             None
@@ -1510,7 +1736,9 @@ impl<'a> Encoder<'a> {
             );
         }
         let cbf = (tree.chroma_cbf(0), tree.chroma_cbf(1));
-        if self.chroma && log2_size > 2 {
+        // 4:4:4 chroma has a transform block at every node, 4×4 ones included; 4:2:0 only from
+        // 8×8 luma up (4×4 luma blocks share their parent's).
+        if self.chroma && (log2_size > 2 || self.cs == 1) {
             if depth == 0 || parent.0 {
                 self.bin(ctx::CBF_CHROMA + usize::from(depth), cbf.0);
             }
@@ -1543,7 +1771,8 @@ impl<'a> Encoder<'a> {
     /// non-zero level: the mirror of the decoder's parsing.
     fn residual_coding(&mut self, tb: &Tb) {
         let (coeffs, c, log2_size, intra_mode) = (&tb.levels[..], tb.c, tb.log2_size, tb.mode);
-        if TRANSFORM_SKIP && log2_size == 2 {
+        if TRANSFORM_SKIP && log2_size == 2 && !self.lossless {
+            // Not signalled with transquant bypass (and the PPS disables it for lossless).
             let ctx = if c == 0 {
                 ctx::TRANSFORM_SKIP_FLAG_LUMA
             } else {
@@ -1552,7 +1781,7 @@ impl<'a> Encoder<'a> {
             self.bin(ctx, tb.transform_skip);
         }
         let luma = c == 0;
-        let scan = scan_type(log2_size, luma, intra_mode);
+        let scan = scan_type(log2_size, luma || self.cs == 1, intra_mode);
         let log2_sb = log2_size - 2;
         let sb_scan = scan_order(log2_sb, scan);
         let positions = scan_positions(log2_size, scan);
@@ -1667,8 +1896,9 @@ impl<'a> Encoder<'a> {
                 );
             }
 
-            // Sign data hiding: the sign of the first level follows from the parity.
-            let sign_hidden = sig_pos[0] - sig_pos[n_sig - 1] > 3;
+            // Sign data hiding: the sign of the first level follows from the parity (not used
+            // with transquant bypass, where the PPS disables it).
+            let sign_hidden = !self.lossless && sig_pos[0] - sig_pos[n_sig - 1] > 3;
             let coded_signs = if sign_hidden { n_sig - 1 } else { n_sig };
             for &v in &sig[..coded_signs] {
                 self.log.encode_bypass(u8::from(v < 0));
@@ -1879,8 +2109,21 @@ mod tests {
             qp,
             ..EncoderConfig::default()
         };
-        let (picture, recon, kinds) =
-            encode_with_reconstruction(w as u32, h as u32, planes, &config).unwrap();
+        let (picture, recon, kinds) = encode_with_reconstruction(
+            w as u32,
+            h as u32,
+            planes,
+            &CodingOptions {
+                chroma_format: if monochrome {
+                    ChromaFormat::Monochrome
+                } else {
+                    ChromaFormat::Chroma420
+                },
+                lossless: false,
+            },
+            &config,
+        )
+        .unwrap();
         KINDS.with(|k| {
             for (total, n) in k.borrow_mut().iter_mut().zip(kinds) {
                 *total += n;
@@ -2000,8 +2243,17 @@ mod tests {
                 qp,
                 ..EncoderConfig::default()
             };
-            let (picture, recon, _) =
-                encode_with_reconstruction(w as u32, h as u32, planes, &config).unwrap();
+            let (picture, recon, _) = encode_with_reconstruction(
+                w as u32,
+                h as u32,
+                planes,
+                &CodingOptions {
+                    chroma_format: ChromaFormat::Chroma420,
+                    lossless: false,
+                },
+                &config,
+            )
+            .unwrap();
             assert_eq!(picture.profile_idc, 2, "Main 10");
             let stream = picture.annex_b();
             let options = DecodeOptions {
@@ -2035,6 +2287,186 @@ mod tests {
                 psnr > if qp == 4 { 50.0 } else { 36.0 },
                 "QP {qp}: {psnr:.1} dB"
             );
+        }
+    }
+
+    /// A deterministic 4:4:4 picture: gradients, edges and noise on all three components.
+    fn test_picture_444(w: usize, h: usize, seed: u32, bit_depth: u8) -> [Vec<u16>; 3] {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state % 63) as i32 - 31
+        };
+        let max = (1i32 << bit_depth) - 1;
+        let scale = max / 255;
+        let plane = |k: usize, noise: &mut dyn FnMut() -> i32| -> Vec<u16> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let v = match (x * 3 / w.max(1), y * 3 / h.max(1)) {
+                        (0, _) => (x * 255 / w.max(1)) as i32,
+                        (1, _) => (y * 255 / h.max(1)) as i32,
+                        (2, 0) => {
+                            if (x / 2 + y / 2) % 2 == 0 {
+                                30
+                            } else {
+                                225
+                            }
+                        }
+                        (_, 0) => 128 + noise() * 2,
+                        (_, _) => 255 - (x + y) as i32 * 255 / (w + h) as i32,
+                    } + k as i32 * 9;
+                    (v * scale).clamp(0, max) as u16
+                })
+                .collect()
+        };
+        [
+            plane(0, &mut noise),
+            plane(1, &mut noise),
+            plane(2, &mut noise),
+        ]
+    }
+
+    #[test]
+    fn round_trip_444() {
+        for (w, h) in [(1, 1), (7, 5), (16, 16), (64, 48), (100, 37), (33, 130)] {
+            let [y, cb, cr] = test_picture_444(w, h, (w * 17 + h) as u32, 8);
+            let planes = Planes16 {
+                y: &y,
+                chroma: Some((&cb, &cr)),
+                bit_depth: 8,
+            };
+            let config = EncoderConfig {
+                qp: 22,
+                ..EncoderConfig::default()
+            };
+            let options = CodingOptions {
+                chroma_format: ChromaFormat::Chroma444,
+                lossless: false,
+            };
+            let (picture, recon, _) =
+                encode_with_reconstruction(w as u32, h as u32, planes, &options, &config).unwrap();
+            assert_eq!(picture.profile_idc, 4, "Format Range Extensions");
+            assert_eq!(picture.chroma_format, 3);
+            assert_eq!((picture.width, picture.height), (w as u32, h as u32));
+            let stream = picture.annex_b();
+
+            let unfiltered = decode_picture(
+                &stream,
+                DecodeOptions {
+                    skip_loop_filters: true,
+                    verify_hash: false,
+                    max_pixels: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(unfiltered.chroma_format, 3);
+            for c in 0..3 {
+                let (cw, ch) = (
+                    unfiltered.widths[c] as usize,
+                    unfiltered.heights[c] as usize,
+                );
+                assert_eq!(
+                    crop(&unfiltered, c, cw, ch),
+                    crop(&recon, c, cw, ch),
+                    "{w}×{h}, component {c}"
+                );
+            }
+
+            let frame = decode_picture(&stream, DecodeOptions::default()).unwrap();
+            let psnr = |c: usize, src: &[u16]| -> f64 {
+                let (cw, ch) = (frame.widths[c] as usize, frame.heights[c] as usize);
+                let decoded = crop(&frame, c, cw, ch);
+                let mse = decoded
+                    .iter()
+                    .zip(src)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+                    / src.len() as f64;
+                10.0 * (255.0f64.powi(2) / mse.max(1e-9)).log10()
+            };
+            let p = [psnr(0, &y), psnr(1, &cb), psnr(2, &cr)];
+            assert!(
+                p.iter().all(|&p| p > 34.0),
+                "{w}×{h}: {:.1} {:.1} {:.1} dB",
+                p[0],
+                p[1],
+                p[2]
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_444_and_monochrome_are_exact() {
+        for (w, h) in [(1, 1), (8, 8), (17, 9), (64, 64), (100, 37)] {
+            for bit_depth in [8u8, 10] {
+                let [y, cb, cr] = test_picture_444(w, h, (w * 13 + h) as u32, bit_depth);
+                let planes = Planes16 {
+                    y: &y,
+                    chroma: Some((&cb, &cr)),
+                    bit_depth,
+                };
+                let options = CodingOptions {
+                    chroma_format: ChromaFormat::Chroma444,
+                    lossless: true,
+                };
+                let (picture, recon, _) = encode_with_reconstruction(
+                    w as u32,
+                    h as u32,
+                    planes,
+                    &options,
+                    &EncoderConfig::default(),
+                )
+                .unwrap();
+                assert_eq!(picture.profile_idc, 4);
+                let stream = picture.annex_b();
+                let frame = decode_picture(&stream, DecodeOptions::default()).unwrap();
+                for c in 0..3 {
+                    let src = [&y, &cb, &cr][c];
+                    assert_eq!(
+                        crop(&frame, c, w, h),
+                        crop(&recon, c, w, h),
+                        "{w}×{h}, {bit_depth} bits, component {c}"
+                    );
+                    assert_eq!(
+                        &crop(&frame, c, w, h)[..],
+                        &src[..],
+                        "{w}×{h}, {bit_depth} bits, component {c}: not lossless"
+                    );
+                }
+            }
+
+            // Monochrome, e.g. an alpha channel.
+            let [y, _, _] = test_picture_444(w, h, (w + h * 3) as u32, 8);
+            let planes = Planes16 {
+                y: &y,
+                chroma: None,
+                bit_depth: 8,
+            };
+            let options = CodingOptions {
+                chroma_format: ChromaFormat::Monochrome,
+                lossless: true,
+            };
+            let (picture, ..) = encode_with_reconstruction(
+                w as u32,
+                h as u32,
+                planes,
+                &options,
+                &EncoderConfig::default(),
+            )
+            .unwrap();
+            let frame = decode_picture(
+                &picture.annex_b(),
+                DecodeOptions {
+                    skip_loop_filters: true,
+                    verify_hash: false,
+                    max_pixels: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(crop(&frame, 0, w, h), y, "{w}×{h}: monochrome not lossless");
         }
     }
 

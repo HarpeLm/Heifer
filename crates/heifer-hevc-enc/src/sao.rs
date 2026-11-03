@@ -233,7 +233,12 @@ pub(crate) fn decide(
         for cx in 0..cols {
             let all: Vec<Stats> = (0..comps)
                 .map(|c| {
-                    let (sw, sh) = if c == 0 { (1, 1) } else { (2, 2) };
+                    let (sw, sh) = match (c, rec.chroma_format) {
+                        (0, _) => (1, 1),
+                        (_, 1) => (2, 2),
+                        (_, 2) => (2, 1),
+                        _ => (1, 1),
+                    };
                     let (pw, ph) = (rec.widths[c] as usize, rec.heights[c] as usize);
                     let (x0, y0) = (cx * ctb / sw, cy * ctb / sh);
                     let (bw, bh) = ((ctb / sw).min(pw - x0), (ctb / sh).min(ph - y0));

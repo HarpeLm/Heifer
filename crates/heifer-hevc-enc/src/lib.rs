@@ -1,8 +1,9 @@
 //! HEVC (H.265) intra-only encoder for HEIF still images.
 //!
 //! Spec: ITU-T H.265. Only intra coding is needed for still images. The encoder produces
-//! Main profile streams (8-bit 4:2:0, or 4:0:0 for alpha planes) that the `heifer-hevc-dec`
-//! decoder reconstructs exactly as the encoder predicted them.
+//! Main, Main 10 and Format Range Extensions (4:4:4) streams, with 4:2:0, 4:4:4 or monochrome
+//! planes, lossy or lossless, that the `heifer-hevc-dec` decoder reconstructs exactly as the
+//! encoder predicted them.
 //!
 //! ```
 //! use heifer_hevc_enc::encoder::{EncoderConfig, Planes, encode_picture};

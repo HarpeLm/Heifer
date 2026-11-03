@@ -8,13 +8,19 @@
 //! assert_eq!((image.width, image.height), (64, 48));
 //! ```
 //!
-//! Images are converted to YCbCr 4:2:0 (BT.601 matrix, full range, sRGB colour space), in
-//! 10 bits (HEVC Main 10) when the image has more than 8 bits per sample, and
-//! coded as 512×512 tiles of a `grid` image, encoded in parallel, like the photos of iPhones.
-//! Images of at most 512×512 pixels are coded as a single picture. The alpha channel, if any
-//! sample is not opaque, is coded as a monochrome auxiliary image.
+//! By default, images are converted to YCbCr 4:2:0 (BT.601 matrix, full range, sRGB colour
+//! space), in 10 bits (HEVC Main 10) when the image has more than 8 bits per sample, and coded
+//! as 512×512 tiles of a `grid` image, encoded in parallel, like the photos of iPhones. Images
+//! of at most 512×512 pixels are coded as a single picture. The alpha channel, if any sample is
+//! not opaque, is coded as a monochrome auxiliary image.
+//!
+//! [`EncodeFormat`] selects full-resolution chroma (4:4:4) or lossless GBR coding instead; the
+//! functions without a `_with_format` suffix keep writing 4:2:0.
 
-use heifer_hevc_enc::encoder::{EncodedPicture, EncoderConfig, Planes16, encode_picture16};
+use heifer_hevc_enc::encoder::{
+    ChromaFormat, CodingOptions, EncodedPicture, EncoderConfig, Planes16, encode_picture16,
+    encode_picture16_with,
+};
 use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
 use heifer_isobmff::writer::{ALPHA_URN, HeifWriter, ImageSpec};
@@ -23,6 +29,19 @@ use crate::{Error, HdrImage, Image, Metadata};
 
 /// Size of grid tiles.
 const TILE: u32 = 512;
+
+/// Chroma format and coding mode of an encoded image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodeFormat {
+    /// YCbCr 4:2:0, BT.601 matrix, lossy: the usual HEIC photos, with the smallest files.
+    #[default]
+    Ycbcr420,
+    /// YCbCr 4:4:4, BT.601 matrix, lossy: full-resolution chroma for graphics and text.
+    Ycbcr444,
+    /// GBR 4:4:4 without transform or quantization: decoding reproduces every sample exactly.
+    /// Lossless files are much larger than lossy ones.
+    Lossless,
+}
 
 /// Encoding options.
 #[derive(Debug, Clone, Copy)]
@@ -68,9 +87,21 @@ pub fn encode_rgba8(
     rgba: &[u8],
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
+    encode_rgba8_with_format(width, height, rgba, EncodeFormat::Ycbcr420, options)
+}
+
+/// Like [`encode_rgba8`], with the chroma format and coding mode of `format`. With
+/// [`EncodeFormat::Lossless`], the decoded pixels are exactly the input pixels, alpha included.
+pub fn encode_rgba8_with_format(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    format: EncodeFormat,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
     check_input(width, height, rgba.len(), 4)?;
     let has_alpha = rgba.chunks_exact(4).any(|p| p[3] != 255);
-    encode_pixels(width, height, 8, has_alpha, None, options, |i| {
+    encode_pixels(width, height, 8, has_alpha, None, format, options, |i| {
         let p = &rgba[i * 4..i * 4 + 4];
         [p[0], p[1], p[2], p[3]].map(u16::from)
     })
@@ -83,8 +114,19 @@ pub fn encode_rgb8(
     rgb: &[u8],
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
+    encode_rgb8_with_format(width, height, rgb, EncodeFormat::Ycbcr420, options)
+}
+
+/// Like [`encode_rgb8`], with the chroma format and coding mode of `format`.
+pub fn encode_rgb8_with_format(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    format: EncodeFormat,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
     check_input(width, height, rgb.len(), 3)?;
-    encode_pixels(width, height, 8, false, None, options, |i| {
+    encode_pixels(width, height, 8, false, None, format, options, |i| {
         let p = &rgb[i * 3..i * 3 + 3];
         [p[0], p[1], p[2], 255].map(u16::from)
     })
@@ -94,7 +136,16 @@ pub fn encode_rgb8(
 /// 8 bits, or in 10 bits (HEVC Main 10) for images of more bits per sample, which keeps smooth
 /// gradients free of banding.
 pub fn encode(image: &Image, options: &EncodeOptions) -> Result<Vec<u8>, Error> {
-    encode_with_metadata(image, &Metadata::default(), options)
+    encode_with_format(image, EncodeFormat::Ycbcr420, options)
+}
+
+/// Like [`encode`], with the chroma format and coding mode of `format`.
+pub fn encode_with_format(
+    image: &Image,
+    format: EncodeFormat,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
+    encode_with_metadata_and_format(image, &Metadata::default(), format, options)
 }
 
 /// Like [`encode`], also storing EXIF, XMP and the ICC profile, e.g. those read by
@@ -114,6 +165,16 @@ pub fn encode_with_metadata(
     metadata: &Metadata,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
+    encode_with_metadata_and_format(image, metadata, EncodeFormat::Ycbcr420, options)
+}
+
+/// Like [`encode_with_metadata`], with the chroma format and coding mode of `format`.
+pub fn encode_with_metadata_and_format(
+    image: &Image,
+    metadata: &Metadata,
+    format: EncodeFormat,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
     check_input(image.width, image.height, image.data.len(), 4)?;
     let max = u32::from(image.max_value());
     let bit_depth = if image.bit_depth > 8 { 10 } else { 8 };
@@ -125,6 +186,7 @@ pub fn encode_with_metadata(
         bit_depth,
         image.has_alpha,
         Some(metadata),
+        format,
         options,
         |i| {
             let p = &image.data[i * 4..i * 4 + 4];
@@ -178,6 +240,7 @@ pub fn encode_hdr_with_metadata(
         bit_depth,
         base.has_alpha,
         Some(metadata),
+        EncodeFormat::Ycbcr420,
         options,
         |i| {
             let p = &base.data[i * 4..i * 4 + 4];
@@ -262,12 +325,20 @@ fn encode_monochrome(
         ..EncoderConfig::default()
     };
     if width <= TILE && height <= TILE {
-        let picture = encode_region(&source, (0, 0), (width, height), true, &config)?;
+        let picture = encode_region(
+            &source,
+            (0, 0),
+            (width, height),
+            true,
+            &config,
+            EncodeFormat::Ycbcr420,
+        )?;
         return Ok(add_picture(
             writer,
             &picture,
             (width, height),
             true,
+            8,
             None,
             None,
         ));
@@ -278,10 +349,18 @@ fn encode_monochrome(
             "image too large for a grid of 512×512 tiles",
         ));
     }
-    let pictures = encode_tiles(&source, columns, rows, true, &config, options)?;
+    let pictures = encode_tiles(
+        &source,
+        columns,
+        rows,
+        true,
+        &config,
+        EncodeFormat::Ycbcr420,
+        options,
+    )?;
     let ids: Vec<ItemId> = pictures
         .iter()
-        .map(|p| add_picture(writer, p, (TILE, TILE), true, None, None))
+        .map(|p| add_picture(writer, p, (TILE, TILE), true, 8, None, None))
         .collect();
     Ok(writer.add_hidden_grid(rows as u16, columns as u16, width, height, &ids, None))
 }
@@ -306,14 +385,24 @@ const COLOR: ColorInfo = ColorInfo::Nclx {
     full_range: true,
 };
 
+/// sRGB colour space with the identity matrix (GBR planes), as lossless images are coded.
+const COLOR_GBR: ColorInfo = ColorInfo::Nclx {
+    primaries: 1,
+    transfer: 13,
+    matrix: 0,
+    full_range: true,
+};
+
 /// Encodes an image given by a function returning the RGBA pixel at an index, of `bit_depth`
 /// (8 or 10) bits per sample, with its metadata.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_pixels(
     width: u32,
     height: u32,
     bit_depth: u8,
     has_alpha: bool,
     metadata: Option<&Metadata>,
+    format: EncodeFormat,
     options: &EncodeOptions,
     pixel: impl Fn(usize) -> [u16; 4] + Sync,
 ) -> Result<Vec<u8>, Error> {
@@ -325,6 +414,7 @@ pub(crate) fn encode_pixels(
         bit_depth,
         has_alpha,
         metadata,
+        format,
         options,
         pixel,
     )?;
@@ -340,6 +430,7 @@ fn encode_into(
     bit_depth: u8,
     has_alpha: bool,
     metadata: Option<&Metadata>,
+    format: EncodeFormat,
     options: &EncodeOptions,
     pixel: impl Fn(usize) -> [u16; 4] + Sync,
 ) -> Result<ItemId, Error> {
@@ -352,7 +443,7 @@ fn encode_into(
     // With an ICC profile the colour space is the profile's: it is attached to every image
     // item, and no `nclx` is written next to it (as in iPhone photos).
     let icc = metadata.and_then(|m| m.icc_profile.as_deref());
-    let image = encode_image(&source, has_alpha, icc, options, writer)?;
+    let image = encode_image(&source, has_alpha, icc, options, format, writer)?;
     // A thumbnail, as in iPhone photos: viewers show it without decoding the whole image.
     if width.max(height) > TILE {
         let (tw, th, pixels) = thumbnail(&source);
@@ -367,7 +458,14 @@ fn encode_into(
             quality: options.quality.min(60),
             ..*options
         };
-        let id = encode_image(&thumb, has_alpha, icc, &preview, writer)?;
+        let id = encode_image(
+            &thumb,
+            has_alpha,
+            icc,
+            &preview,
+            EncodeFormat::Ycbcr420,
+            writer,
+        )?;
         writer.add_reference(*b"thmb", id, &[image]);
     }
     if let Some(m) = metadata {
@@ -427,12 +525,17 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
     has_alpha: bool,
     icc: Option<&[u8]>,
     options: &EncodeOptions,
+    format: EncodeFormat,
     writer: &mut HeifWriter,
 ) -> Result<ItemId, Error> {
     let (width, height) = (source.width, source.height);
     let qp = options.qp();
     let color = EncoderConfig {
         qp,
+        colour: match format {
+            EncodeFormat::Lossless => (1, 13, 0),
+            _ => (1, 13, 6),
+        },
         ..EncoderConfig::default()
     };
     // Alpha edges are visible: code the alpha plane a little better.
@@ -441,16 +544,27 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
         colour: (2, 2, 2),
         ..color
     };
-    let nclx = icc.is_none().then_some(&COLOR);
+    let nclx = icc.is_none().then_some(match format {
+        EncodeFormat::Lossless => &COLOR_GBR,
+        _ => &COLOR,
+    });
 
     if width <= TILE && height <= TILE {
-        let picture = encode_region(source, (0, 0), (width, height), false, &color)?;
-        let image = add_picture(writer, &picture, (width, height), false, nclx, icc);
+        let picture = encode_region(source, (0, 0), (width, height), false, &color, format)?;
+        let image = add_picture(
+            writer,
+            &picture,
+            (width, height),
+            false,
+            source.bit_depth,
+            nclx,
+            icc,
+        );
         if has_alpha {
             // Same coded size as the colour picture, so that both are cropped alike.
             let coded = (picture.width, picture.height);
-            let alpha = encode_region(source, (0, 0), coded, true, &alpha)?;
-            add_alpha_picture(writer, image, &alpha, (width, height));
+            let alpha = encode_region(source, (0, 0), coded, true, &alpha, format)?;
+            add_alpha_picture(writer, image, &alpha, (width, height), source.bit_depth);
         }
         return Ok(image);
     }
@@ -461,20 +575,20 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
             "image too large for a grid of 512×512 tiles",
         ));
     }
-    let tiles = encode_tiles(source, columns, rows, false, &color, options)?;
+    let tiles = encode_tiles(source, columns, rows, false, &color, format, options)?;
     let ids: Vec<ItemId> = tiles
         .iter()
-        .map(|t| add_picture(writer, t, (TILE, TILE), true, nclx, icc))
+        .map(|t| add_picture(writer, t, (TILE, TILE), true, source.bit_depth, nclx, icc))
         .collect();
     let grid = writer.add_grid(rows as u16, columns as u16, width, height, &ids, nclx, None);
     if let Some(icc) = icc {
         writer.add_icc_profile(grid, icc);
     }
     if has_alpha {
-        let tiles = encode_tiles(source, columns, rows, true, &alpha, options)?;
+        let tiles = encode_tiles(source, columns, rows, true, &alpha, format, options)?;
         let ids: Vec<ItemId> = tiles
             .iter()
-            .map(|t| add_picture(writer, t, (TILE, TILE), true, None, None))
+            .map(|t| add_picture(writer, t, (TILE, TILE), true, source.bit_depth, None, None))
             .collect();
         let alpha = writer.add_grid(
             rows as u16,
@@ -498,12 +612,13 @@ fn encode_tiles<F: Fn(usize) -> [u16; 4] + Sync>(
     rows: u32,
     alpha: bool,
     config: &EncoderConfig,
+    format: EncodeFormat,
     options: &EncodeOptions,
 ) -> Result<Vec<EncodedPicture>, Error> {
     let count = (columns * rows) as usize;
     let tile = |i: usize| {
         let origin = ((i as u32 % columns) * TILE, (i as u32 / columns) * TILE);
-        encode_region(source, origin, (TILE, TILE), alpha, config)
+        encode_region(source, origin, (TILE, TILE), alpha, config, format)
     };
     let threads = options.threads().min(count);
     if threads <= 1 {
@@ -536,14 +651,16 @@ fn encode_tiles<F: Fn(usize) -> [u16; 4] + Sync>(
         .collect()
 }
 
-/// Encodes the `size` region at `origin` of the image: its colour (YCbCr 4:2:0) or its alpha
-/// channel (monochrome). Pixels outside the image repeat the nearest edge.
+/// Encodes the `size` region at `origin` of the image: its colour, in the chroma format and
+/// coding mode of `format`, or its alpha channel (monochrome, lossless when `format` is).
+/// Pixels outside the image repeat the nearest edge.
 fn encode_region<F: Fn(usize) -> [u16; 4]>(
     source: &Source<F>,
     origin: (u32, u32),
     size: (u32, u32),
     alpha: bool,
     config: &EncoderConfig,
+    format: EncodeFormat,
 ) -> Result<EncodedPicture, Error> {
     let (w, h) = (size.0 as usize, size.1 as usize);
     let (width, height) = (source.width as usize, source.height as usize);
@@ -553,6 +670,7 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         (source.pixel)(y * width + x)
     };
     let bit_depth = source.bit_depth;
+    let lossless = format == EncodeFormat::Lossless;
     if alpha {
         let a: Vec<u16> = (0..w * h).map(|i| at(i % w, i / w)[3]).collect();
         let planes = Planes16 {
@@ -560,7 +678,42 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
             chroma: None,
             bit_depth,
         };
-        return Ok(encode_picture16(size.0, size.1, planes, config)?);
+        let options = CodingOptions {
+            chroma_format: ChromaFormat::Monochrome,
+            lossless,
+        };
+        return Ok(encode_picture16_with(
+            size.0, size.1, planes, &options, config,
+        )?);
+    }
+    if lossless {
+        // GBR: component 0 is G, then B and R, with the identity matrix in the VUI. Bypassing
+        // the transform and quantization makes the round trip exact.
+        let (mut g, mut b, mut r) = (
+            Vec::with_capacity(w * h),
+            Vec::with_capacity(w * h),
+            Vec::with_capacity(w * h),
+        );
+        for row in 0..h {
+            for col in 0..w {
+                let [red, green, blue, _] = at(col, row);
+                g.push(green);
+                b.push(blue);
+                r.push(red);
+            }
+        }
+        let planes = Planes16 {
+            y: &g,
+            chroma: Some((&b, &r)),
+            bit_depth,
+        };
+        let options = CodingOptions {
+            chroma_format: ChromaFormat::Chroma444,
+            lossless: true,
+        };
+        return Ok(encode_picture16_with(
+            size.0, size.1, planes, &options, config,
+        )?);
     }
 
     // BT.601, full range, in 16-bit fixed point.
@@ -575,46 +728,65 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
             cr_full.push(32768 * r - 27439 * g - 5329 * b);
         }
     }
-    // 4:2:0 with the chroma samples on the even rows and columns, where Apple's decoder (and
-    // heifer's) puts them: a [1 2 1] filter in both directions around each of them.
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let (mid, max) = (1i64 << (bit_depth - 1), (1i64 << bit_depth) - 1);
-    let chroma = |full: &[i32]| -> Vec<u16> {
-        let mut out = Vec::with_capacity(cw * ch);
-        for cy in 0..ch {
-            let rows = [(2 * cy).saturating_sub(1), 2 * cy, (2 * cy + 1).min(h - 1)];
-            for cx in 0..cw {
-                let x = 2 * cx;
-                let cols = [x.saturating_sub(1), x, (x + 1).min(w - 1)];
-                let mut sum = 0i64;
-                for (r, wy) in rows.into_iter().zip([1i64, 2, 1]) {
-                    for (c, wx) in cols.into_iter().zip([1i64, 2, 1]) {
-                        sum += wy * wx * i64::from(full[r * w + c]);
-                    }
-                }
-                let n = 16i64 << 16;
-                out.push(((sum + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16);
-            }
-        }
-        out
+    let full = |full: &[i32]| -> Vec<u16> {
+        let n = 1i64 << 16;
+        full.iter()
+            .map(|&v| ((i64::from(v) + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16)
+            .collect()
     };
-    let (cb, cr) = (chroma(&cb_full), chroma(&cr_full));
+    let (cb, cr) = if format == EncodeFormat::Ycbcr444 {
+        (full(&cb_full), full(&cr_full))
+    } else {
+        // 4:2:0 with the chroma samples on the even rows and columns, where Apple's decoder
+        // (and heifer's) puts them: a [1 2 1] filter in both directions around each of them.
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let filtered = |full: &[i32]| -> Vec<u16> {
+            let mut out = Vec::with_capacity(cw * ch);
+            for cy in 0..ch {
+                let rows = [(2 * cy).saturating_sub(1), 2 * cy, (2 * cy + 1).min(h - 1)];
+                for cx in 0..cw {
+                    let x = 2 * cx;
+                    let cols = [x.saturating_sub(1), x, (x + 1).min(w - 1)];
+                    let mut sum = 0i64;
+                    for (r, wy) in rows.into_iter().zip([1i64, 2, 1]) {
+                        for (c, wx) in cols.into_iter().zip([1i64, 2, 1]) {
+                            sum += wy * wx * i64::from(full[r * w + c]);
+                        }
+                    }
+                    let n = 16i64 << 16;
+                    out.push(((sum + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16);
+                }
+            }
+            out
+        };
+        (filtered(&cb_full), filtered(&cr_full))
+    };
     let planes = Planes16 {
         y: &y,
         chroma: Some((&cb, &cr)),
         bit_depth,
     };
-    Ok(encode_picture16(size.0, size.1, planes, config)?)
+    if format == EncodeFormat::Ycbcr444 {
+        let options = CodingOptions {
+            chroma_format: ChromaFormat::Chroma444,
+            lossless: false,
+        };
+        Ok(encode_picture16_with(
+            size.0, size.1, planes, &options, config,
+        )?)
+    } else {
+        Ok(encode_picture16(size.0, size.1, planes, config)?)
+    }
 }
 
-fn hevc_config(picture: &EncodedPicture) -> HevcConfig {
+fn hevc_config(picture: &EncodedPicture, bit_depth: u8) -> HevcConfig {
     HevcConfig {
         profile_idc: picture.profile_idc,
         level_idc: picture.level_idc,
         chroma_format: picture.chroma_format,
-        // Main (1) is 8 bits, Main 10 (2) is 10 bits here.
-        bit_depth_luma: if picture.profile_idc == 2 { 10 } else { 8 },
-        bit_depth_chroma: if picture.profile_idc == 2 { 10 } else { 8 },
+        bit_depth_luma: bit_depth,
+        bit_depth_chroma: bit_depth,
         nal_length_size: 4,
         nal_units: picture.parameter_sets.clone(),
     }
@@ -628,6 +800,7 @@ fn add_picture(
     picture: &EncodedPicture,
     size: (u32, u32),
     hidden: bool,
+    bit_depth: u8,
     color: Option<&ColorInfo>,
     icc: Option<&[u8]>,
 ) -> ItemId {
@@ -639,7 +812,7 @@ fn add_picture(
         ..ImageSpec::new(
             picture.width,
             picture.height,
-            hevc_config(picture),
+            hevc_config(picture, bit_depth),
             &picture.slices,
         )
     });
@@ -654,6 +827,7 @@ fn add_alpha_picture(
     image: ItemId,
     picture: &EncodedPicture,
     size: (u32, u32),
+    bit_depth: u8,
 ) -> ItemId {
     writer.add_alpha(
         image,
@@ -662,7 +836,7 @@ fn add_alpha_picture(
             ..ImageSpec::new(
                 picture.width,
                 picture.height,
-                hevc_config(picture),
+                hevc_config(picture, bit_depth),
                 &picture.slices,
             )
         },
