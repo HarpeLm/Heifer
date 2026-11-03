@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "heifer"
-version = "0.3.16"
+version = "0.3.25"
 dependencies = [
  "heifer-hevc-dec",
  "heifer-hevc-enc",
@@ -237,14 +237,14 @@ dependencies = [
 
 [[package]]
 name = "heifer-hevc-dec"
-version = "0.3.16"
+version = "0.3.25"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "heifer-hevc-enc"
-version = "0.3.16"
+version = "0.3.25"
 dependencies = [
  "heifer-hevc-dec",
  "thiserror",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "heifer-isobmff"
-version = "0.3.16"
+version = "0.3.25"
 dependencies = [
  "thiserror",
 ]

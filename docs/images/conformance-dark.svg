@@ -2,9 +2,9 @@
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
 <text x="24" y="34" font-size="17" font-weight="600" fill="#e6edf3">HEVC conformance: 66 official bitstreams (ITU-T H.265.1)</text>
 <text x="24" y="56" font-size="12.5" fill="#9198a1">First picture of each stream, compared with ffmpeg and with the reference decoder's picture hashes</text>
-<rect x="24.0" y="74" width="406.4" height="26" rx="3" fill="#5b9be0"/>
-<rect x="432.4" y="74" width="256.7" height="26" rx="3" fill="#2f5784"/>
-<rect x="691.1" y="74" width="42.8" height="26" rx="3" fill="#d39a5a"/>
+<rect x="24.0" y="74" width="407.9" height="26" rx="3" fill="#5b9be0"/>
+<rect x="433.9" y="74" width="256.9" height="26" rx="3" fill="#2f5784"/>
+<rect x="692.8" y="74" width="41.2" height="26" rx="3" fill="#d39a5a"/>
 <rect x="24" y="118" width="11" height="11" rx="2" fill="#5b9be0"/><text x="41" y="127.5" font-size="12" fill="#9198a1">38 identical to ffmpeg and hash-verified</text>
 <rect x="394" y="118" width="11" height="11" rx="2" fill="#2f5784"/><text x="411" y="127.5" font-size="12" fill="#9198a1">24 identical to ffmpeg</text>
 <rect x="24" y="140" width="11" height="11" rx="2" fill="#d39a5a"/><text x="41" y="149.5" font-size="12" fill="#9198a1">4 hash-verified, ffmpeg cannot decode</text>

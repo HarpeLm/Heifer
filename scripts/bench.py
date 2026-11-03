@@ -5,6 +5,9 @@ Run on an idle machine (no fuzzing, no build):
     ./scripts/fetch-real.sh
     cargo build --release -p heifer --example bench
     ./scripts/bench.py
+The conformance chart comes from scripts/conformance.py, which writes docs/conformance.json:
+    cargo build --release -p heifer-hevc-dec --example decode
+    ./scripts/conformance.py
 Results are also written to docs/benchmark.json.
 """
 import json, pathlib, platform, re, statistics, subprocess, sys
@@ -92,7 +95,7 @@ def stacked_chart(name, title, subtitle, parts):
     width, height, x0, span = 760, 172, 24, 712
     total = sum(n for _, n, _ in parts)
     for theme, c in THEMES.items():
-        colors = c["series"] + [c["grid"]]
+        colors = c["series"] + ["#8b949e", "#b3593f"]
         s = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
              f'font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">',
              f'<rect width="100%" height="100%" rx="8" fill="{c["bg"]}"/>',
@@ -113,10 +116,24 @@ def stacked_chart(name, title, subtitle, parts):
 
 
 def conformance():
-    stacked_chart("conformance", "HEVC conformance: 66 official bitstreams (ITU-T H.265.1)",
+    """The stacked chart of scripts/conformance.py's run (docs/conformance.json)."""
+    path = ROOT / "docs/conformance.json"
+    if not path.exists():
+        sys.exit("run scripts/conformance.py first: docs/conformance.json is missing")
+    c = json.loads(path.read_text())
+    parts = [
+        ("identical to ffmpeg and hash-verified", c["identical_and_hash"], 0),
+        ("identical to ffmpeg", c["identical"], 1),
+    ]
+    if c.get("hash_only"):
+        parts.append(("hash-verified, ffmpeg cannot decode", c["hash_only"], 2))
+    if c.get("different"):
+        parts.append(("different from ffmpeg", c["different"], 3))
+    if c.get("error"):
+        parts.append(("unsupported", c["error"], 3))
+    stacked_chart("conformance", f"HEVC conformance: {c['total']} official bitstreams (ITU-T H.265.1)",
                   "First picture of each stream, compared with ffmpeg and with the reference decoder's picture hashes",
-                  [("identical to ffmpeg and hash-verified", 38, 0), ("identical to ffmpeg", 24, 1),
-                   ("hash-verified, ffmpeg cannot decode", 3, 2), ("unsupported (16-bit tools)", 1, 3)])
+                  parts)
 
 
 def benchmarks():

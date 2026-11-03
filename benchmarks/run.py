@@ -208,6 +208,99 @@ def versions():
     return heifer, v, ffmpeg
 
 
+REAL_FILES = [
+    ("Xiaomi, 5 MP", "heif_special__xiaomi.heic"),
+    ("iPhone 13 Pro, 12 MP", "heif_other__pug.heic"),
+    ("8000×6000, 48 MP", "benchmarks__image_large.heic"),
+    ("Galaxy S24 Ultra, 200 MP", "heif_special__200MP.heic"),
+]
+
+BENCH_EX = os.path.join(RELEASE, "examples/bench")
+HEIFER_CLI = os.path.join(RELEASE, "heifer")
+
+
+def tool_version(args, pattern):
+    out = run(args).stdout + run(args).stderr
+    m = re.search(pattern, out)
+    return m.group(1) if m else "?"
+
+
+def median_time(cmd, out_path=None, runs=5):
+    """Median wall time of `cmd`, removing `out_path` before each run."""
+    times = []
+    for _ in range(runs):
+        if out_path and os.path.exists(out_path):
+            os.remove(out_path)
+        t = datetime.datetime.now()
+        if run(cmd).returncode:
+            return None
+        times.append((datetime.datetime.now() - t).total_seconds() * 1000)
+    return statistics.median(times)
+
+
+def bench_libheif(image, threads):
+    """heifer against libheif (heif-convert / heif-enc), on real photos and on `image`."""
+    if not (shutil.which("heif-convert") and shutil.which("heif-enc")):
+        return None
+    out = os.path.join(WORK, "libheif")
+    os.makedirs(out, exist_ok=True)
+    version = {
+        "libheif": tool_version(["heif-convert", "--version"], r"(\d+\.\d+\.\d+)"),
+        "libde265": tool_version(["heif-convert", "--list-decoders"], r"libde265.*?version (\d+\.\d+\.\d+)"),
+        "x265": tool_version(["heif-enc", "--list-encoders"], r"x265.*?\((\d+\.\d+)"),
+    }
+    decode = []
+    for label, name in REAL_FILES:
+        src = os.path.join(ROOT, "tests/fixtures/real", name)
+        if not os.path.exists(src):
+            return None
+        apple = os.path.join(out, name + ".apple.png")
+        run(["sips", "-s", "format", "png", src, "--out", apple])
+        heifer_png = os.path.join(out, name + ".heifer.png")
+        libheif_png = os.path.join(out, name + ".libheif.png")
+        pure = run([BENCH_EX, src, "5", str(threads)]).stdout.strip()
+        row = {
+            "label": label,
+            "heifer_ms": float(pure) if pure else None,
+            "heifer_cli_ms": median_time([HEIFER_CLI, src, heifer_png, "-f"], heifer_png),
+            "libheif_cli_ms": median_time(["heif-convert", "--png-compression-level", "1", src,
+                                          libheif_png], libheif_png),
+            "heifer_psnr": rgb_psnr(apple, heifer_png) if os.path.exists(heifer_png) else None,
+            "libheif_psnr": rgb_psnr(apple, libheif_png) if os.path.exists(libheif_png) else None,
+        }
+        print(f"libheif decode {label:26} heifer {row['heifer_ms']} ms, "
+              f"CLI {row['heifer_cli_ms']} / {row['libheif_cli_ms']} ms")
+        decode.append(row)
+
+    encode_dir = os.path.join(out, "encode")
+    os.makedirs(encode_dir, exist_ok=True)
+
+    def encode_point(encoder, q):
+        heic = os.path.join(encode_dir, f"{encoder}_q{q}.heic")
+        png = heic + ".png"
+        if encoder == "heifer":
+            ms = median_time([HEIFER_CLI, image, heic, "-q", str(q), "-f"], heic, 3)
+        else:
+            ms = median_time(["heif-enc", image, "-q", str(q), "-o", heic], heic, 3)
+        if ms is None or not os.path.exists(heic):
+            return None
+        if os.path.exists(png):
+            os.remove(png)
+        run([HEIFER_CLI, heic, png, "-f"])
+        p = rgb_psnr(image, png) if os.path.exists(png) else None
+        return {"q": q, "size": os.path.getsize(heic), "psnr": p, "ms": ms}
+
+    heifer_points = [p for q in (40, 60, 75, 85, 95) if (p := encode_point("heifer", q))]
+    libheif_points = [p for q in (30, 40, 50, 60, 70, 80) if (p := encode_point("libheif", q))]
+    bd = None
+    if len(heifer_points) >= 3 and len(libheif_points) >= 3:
+        bd = bd_rate([(p["size"], p["psnr"]) for p in heifer_points],
+                     [(p["size"], p["psnr"]) for p in libheif_points])
+    print(f"libheif encode: BD-rate libheif vs heifer {bd:+.1f}%" if bd is not None else "libheif encode: no overlap")
+    return {"version": version, "decode": decode, "image": os.path.basename(image),
+            "encode": {"heifer": heifer_points, "libheif": libheif_points, "bd_rate": bd}}
+
+
 def machine():
     chip = run(["sysctl", "-n", "machdep.cpu.brand_string"]).stdout.strip()
     p = run(["sysctl", "-n", "hw.perflevel0.physicalcpu"]).stdout.strip()
@@ -220,7 +313,8 @@ def fmt_ms(v):
     return f"{v:.0f} ms" if v is not None else "—"
 
 
-def write(decode, encode, x265, heifer_version, vers, ffmpeg_version, machine_desc, threads, n_files):
+def write(decode, encode, x265, heifer_version, vers, ffmpeg_version, machine_desc, threads, n_files,
+          libheif=None):
     L = []
     L.append("# Benchmarks\n")
     L.append(f"heifer {heifer_version} against the other HEIC decoders and encoders, measured "
@@ -301,6 +395,38 @@ def write(decode, encode, x265, heifer_version, vers, ffmpeg_version, machine_de
         for preset, v in x265.items():
             L.append(f"| `{preset}` | {v:+.1f}% |")
         L.append("")
+    if libheif:
+        v = libheif["version"]
+        L.append("## Against libheif\n")
+        L.append(f"libheif {v['libheif']}, with libde265 {v['libde265']} for decoding and x265 "
+                 f"{v['x265']} for encoding, through `heif-convert` and `heif-enc` (Homebrew "
+                 "builds). Same machine and files.\n")
+        L.append("Decoding the four real photos of `tests/fixtures/real`: time of the whole "
+                 "command, PNG output included, median of 5 runs. heifer uses the PNG encoder of "
+                 "the `image` crate; libheif is given `--png-compression-level 1`, close to its "
+                 "speed (its default level is about four times slower here). PSNR against "
+                 "Apple's decoder.\n")
+        L.append("| File | heifer decode | heifer → PNG | libheif → PNG | PSNR heifer | PSNR libheif |")
+        L.append("|---|---|---|---|---|---|")
+        for r in libheif["decode"]:
+            psnr = lambda p: f"{p:.1f} dB" if p is not None else "—"
+            L.append(f"| {r['label']} | {fmt_ms(r['heifer_ms'])} | {fmt_ms(r['heifer_cli_ms'])} | "
+                     f"{fmt_ms(r['libheif_cli_ms'])} | {psnr(r['heifer_psnr'])} | {psnr(r['libheif_psnr'])} |")
+        L.append("")
+        enc = libheif["encode"]
+        L.append(f"Encoding `{libheif['image']}`, median of 3 runs each. PSNR against the source, "
+                 "decoded by heifer.\n")
+        L.append("| Encoder | Quality | Size | PSNR | Time |")
+        L.append("|---|---|---|---|---|")
+        for name, points in (("heifer", enc["heifer"]), ("libheif x265", enc["libheif"])):
+            for p in points:
+                L.append(f"| {name} | {p['q']} | {p['size'] / 1000:.0f} KB | {p['psnr']:.1f} dB | "
+                         f"{p['ms']:.0f} ms |")
+        L.append("")
+        if enc["bd_rate"] is not None:
+            bigger = "larger" if enc["bd_rate"] >= 0 else "smaller"
+            L.append(f"At equal PSNR, libheif's files are {abs(enc['bd_rate']):.1f}% {bigger} than "
+                     "heifer's (Bjøntegaard, size difference at matched quality).\n")
     path = os.path.join(ROOT, "docs/BENCHMARKS.md")
     open(path, "w").write("\n".join(L))
     return path
@@ -314,7 +440,7 @@ def main():
         machine_desc, threads = machine()
         heifer_version, vers, ffmpeg_version = versions()
         print(write(r["decode"], r["encode"], r["x265"], heifer_version, vers, ffmpeg_version,
-                    machine_desc, threads, len(decode_set)))
+                    machine_desc, threads, len(decode_set), r.get("libheif")))
         return
     build()
     decode_set, encode_set = prepare()
@@ -322,11 +448,12 @@ def main():
     decode = bench_decode(decode_set, threads)
     encode = bench_encode(encode_set)
     x265 = bench_x265(encode_set[0])
+    libheif = bench_libheif(encode_set[2], threads)
     heifer_version, vers, ffmpeg_version = versions()
-    json.dump({"decode": decode, "encode": encode, "x265": x265},
+    json.dump({"decode": decode, "encode": encode, "x265": x265, "libheif": libheif},
               open(os.path.join(WORK, "results.json"), "w"), indent=1, default=str)
     print(write(decode, encode, x265, heifer_version, vers, ffmpeg_version, machine_desc,
-                threads, len(decode_set)))
+                threads, len(decode_set), libheif))
 
 
 if __name__ == "__main__":

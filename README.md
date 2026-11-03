@@ -321,22 +321,22 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 22 ms (ffmpeg 56), iPhone 12 MP 40 ms (ffmpeg 96), 48 MP 196 ms (ffmpeg 582), Galaxy 200 MP 0.54 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 18 ms (ffmpeg 57), iPhone 12 MP 24 ms (ffmpeg 96), 48 MP 129 ms (ffmpeg 583), Galaxy 200 MP 0.49 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 22 ms | 120 ms | 56 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 40 ms | 167 ms | 96 ms |
-| 8000×6000, 48 MP | 196 ms | 0.97 s | 582 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.54 s | 2.1 s | fails |
+| Xiaomi, 5 MP | 18 ms | 99 ms | 57 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 24 ms | 143 ms | 96 ms |
+| 8000×6000, 48 MP | 129 ms | 0.81 s | 583 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.49 s | 1.85 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 162 ms on 1 thread to 32 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 143 ms on 1 thread to 23 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 162 ms with 1 thread down to 32 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 143 ms with 1 thread down to 23 ms with 10" width="100%">
 </picture>
 
 On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
@@ -344,8 +344,8 @@ slower than ffmpeg. The hot loops are written so that the compiler vectorizes th
 without any `unsafe` code.
 
 **[Benchmarks against every other HEIC decoder and encoder](docs/BENCHMARKS.md)** (heic-rs,
-heic, heic-decoder, zune-heic, still265, ffmpeg, x265, Apple), reproducible with
-`python3 benchmarks/run.py`.
+heic, heic-decoder, zune-heic, still265, ffmpeg, libheif with libde265 and x265, Apple),
+reproducible with `python3 benchmarks/run.py`.
 
 ### Other pure-Rust decoders
 
