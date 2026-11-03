@@ -9,14 +9,25 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.3.24, auxiliary images.
-- Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps.
+- Latest release: 0.3.25, uncompressed auxiliary images.
+- Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
+  auxiliary planes.
 - Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
 - Conformance: 66 official HEVC bitstreams, no unsupported stream.
 
 ## In progress
 
-### 1. Uncompressed auxiliary images (`unci`) — implemented, unreleased
+### 1. Encoding options in the CLI
+
+The library already encodes 4:2:0, 4:4:4 and lossless, but the CLI always uses 4:2:0.
+
+- `--format 420|444|lossless`.
+- `--lossless` as a shortcut.
+- Keep the current defaults unchanged.
+
+## Done
+
+### Uncompressed auxiliary images (`unci`)
 
 Decode ISO/IEC 23001-17 uncompressed items when they are auxiliary images (depth maps, alpha
 planes, gain maps). Uncompressed items stay unsupported as primary images: heifer remains an
@@ -29,15 +40,7 @@ HEVC codec, not a general uncompressed image container.
 
 ## Next
 
-### 2. Encoding options in the CLI
-
-The library already encodes 4:2:0, 4:4:4 and lossless, but the CLI always uses 4:2:0.
-
-- `--format 420|444|lossless`.
-- `--lossless` as a shortcut.
-- Keep the current defaults unchanged.
-
-### 3. Auxiliary images in the CLI
+### 2. Auxiliary images in the CLI
 
 The library lists and decodes auxiliary images, but the CLI cannot extract them.
 
@@ -46,34 +49,34 @@ The library lists and decodes auxiliary images, but the CLI cannot extract them.
 - Richer `info`: auxiliary images with their URN, size and bit depth, depth metadata, gain map
   metadata and IPTC presence.
 
-### 4. IPTC metadata (#4)
+### 3. IPTC metadata (#4)
 
 - Bounded IPTC-IIM parser, exposed as `Metadata::iptc`.
 - No network access, no unbounded allocation.
 
-### 5. Streaming decode (#5)
+### 4. Streaming decode (#5)
 
 - `decode_reader` over `Read + Seek`, without buffering the whole file.
 - Keep `decode` unchanged for callers that already have the bytes.
 - Preserve the same limits and error behaviour.
 
-### 6. Single-thread hot loops
+### 5. Single-thread hot loops
 
 Multi-threaded decoding is already faster than libheif, but one thread is slower than ffmpeg on
 large grids. Optimise the per-tile and colour-conversion loops without adding `unsafe`.
 
-### 7. More encoding knobs
+### 6. More encoding knobs
 
 - Explicit quality and bitrate controls.
 - 4:2:2 encoding.
 - Advanced HEVC parameters for users who need them.
 
-### 8. Region annotations (`rgan`)
+### 7. Region annotations (`rgan`)
 
 - Read region annotations and expose them with the image.
 - Keep them optional and out of the decode hot path.
 
-### 9. Fixtures and fuzzing
+### 8. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.
