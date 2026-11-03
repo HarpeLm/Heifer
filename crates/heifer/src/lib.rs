@@ -21,6 +21,7 @@ pub mod image;
 #[cfg(feature = "image")]
 pub mod image_crate;
 pub mod metadata;
+mod uncompressed;
 
 pub use encode::{
     EncodeFormat, EncodeOptions, encode, encode_hdr, encode_hdr_with_metadata, encode_rgb8,
@@ -315,6 +316,11 @@ fn item_bit_depth(file: &HeifFile<'_>, id: ItemId) -> Result<Option<u8>, Error> 
         if let Some(config) = file.hevc_config(item)? {
             return Ok(Some(config.bit_depth_luma));
         }
+        if let Some(config) = file.uncompressed_config(item)? {
+            if let Some(component) = config.components.first() {
+                return Ok(Some(u8::try_from(component.bit_depth).unwrap_or(8)));
+            }
+        }
         current = file
             .referenced_items(item, b"dimg")
             .first()
@@ -508,8 +514,17 @@ fn decode_item_with<S: Sample>(
         return Err(Error::Invalid("derived images nested too deeply"));
     }
     let item = file.item(id)?;
+    // Uncompressed items are only decoded as auxiliary images: heifer is an HEVC codec, not a
+    // general uncompressed image decoder.
+    if item.item_type.0 == *b"unci" && !is_auxiliary_item(file, id)? {
+        return Err(Error::Unsupported(format!(
+            "image item type `{}`",
+            item.item_type
+        )));
+    }
     let mut image = match &item.item_type.0 {
         b"hvc1" => decode_hvc1(file, id, options)?,
+        b"unci" => uncompressed::decode(file, id, options)?,
         b"grid" => decode_grid(file, id, depth, options)?,
         b"iovl" => decode_overlay(file, id, depth, options)?,
         b"iden" => match file.referenced_items(id, b"dimg")[..] {
@@ -605,6 +620,12 @@ fn decode_hvc1<S: Sample>(
         if !is_alpha_item(file, aux)? {
             continue;
         }
+        // An uncompressed alpha plane is samples, not an HEVC bitstream.
+        if file.item(aux)?.item_type.0 == *b"unci" {
+            let alpha: Image<S> = uncompressed::decode(file, aux, options)?;
+            attach_alpha_image(&mut image, &alpha)?;
+            break;
+        }
         let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
         // The alpha plane must cover the image: anything smaller would be read out of bounds.
         if alpha.widths[0] < image.width || alpha.heights[0] < image.height {
@@ -648,6 +669,17 @@ fn is_depth_urn(urn: &str) -> bool {
         urn,
         "urn:mpeg:hevc:2015:auxid:2" | "urn:mpeg:mpegB:cicp:systems:auxiliary:depth"
     )
+}
+
+/// Whether an item is an auxiliary image: it has an `auxC` type and points to the image it
+/// refines with an `auxl` reference.
+fn is_auxiliary_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
+    if file.referenced_items(id, b"auxl").is_empty() {
+        return Ok(false);
+    }
+    Ok(file
+        .item_properties(id)?
+        .any(|p| matches!(p, Property::AuxiliaryType(_))))
 }
 
 /// Whether an item is an auxiliary image of type alpha.

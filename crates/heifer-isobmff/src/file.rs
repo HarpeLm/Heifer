@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use crate::boxes::{
     self, ConstructionMethod, FileType, Grid, HevcConfig, ItemLocation, ItemReference, Property,
-    PropertyAssociation,
+    PropertyAssociation, UncompressedConfig,
 };
 use crate::{BoxIter, Error, FourCC};
 
@@ -186,6 +186,14 @@ impl<'a> HeifFile<'a> {
     pub fn hevc_config(&self, id: ItemId) -> Result<Option<&HevcConfig>, Error> {
         Ok(self.item_properties(id)?.find_map(|p| match p {
             Property::HevcConfig(c) => Some(c),
+            _ => None,
+        }))
+    }
+
+    /// Uncompressed frame configuration from the `uncC` property (ISO/IEC 23001-17).
+    pub fn uncompressed_config(&self, id: ItemId) -> Result<Option<&UncompressedConfig>, Error> {
+        Ok(self.item_properties(id)?.find_map(|p| match p {
+            Property::UncompressedConfig(config) => Some(config),
             _ => None,
         }))
     }

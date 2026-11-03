@@ -310,6 +310,11 @@ Each auxiliary image is decoded with its own `clap`/`irot`/`imir` properties; th
 the primary image are not applied on top. `item_auxiliary_images` does the same for an image
 other than the primary, and `decode_all` still returns only top-level images.
 
+Uncompressed auxiliary images (`unci`, ISO/IEC 23001-17) are decoded the same way. Single
+component, unsigned frames of 1 to 16 bits are supported, with the component, pixel and row
+alignment declared by `uncC`. Uncompressed primary images stay unsupported: `heifer` remains an
+HEVC codec.
+
 ## Error handling
 
 `libheif-rs` returns `HeifError` (an error code + sub-code from C). `heifer` returns a
@@ -385,7 +390,7 @@ match heifer::decode(&bytes) {
 | EXIF / XMP / ICC | ✓ | ✓ | ready |
 | Multiple top-level images (burst, collection, dynamic HEIF) | ✓ | ✓ (`decode_all`) | ready |
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
-| Uncompressed (ISO/IEC 23001-17) | ✓ | — | not yet |
+| Uncompressed (ISO/IEC 23001-17) | ✓ | auxiliary images only (`unci`) | primary images out of scope |
 | 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
 | Inter-prediction / image sequences (tracks, MP4) | ✓ | — | out of scope (still images only) |
 | Depth maps, non-alpha auxiliary images | ✓ | ✓ (`auxiliary_images`, `decode_auxiliary`) | ready |

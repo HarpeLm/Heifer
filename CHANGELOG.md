@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- Uncompressed auxiliary images (`unci`, ISO/IEC 23001-17) are decoded by `decode_auxiliary`
+  and `decode_auxiliary_urn`, including depth maps and alpha planes stored without HEVC
+  compression. Single-component unsigned frames of 1 to 16 bits are supported, with component
+  alignment, pixel size and row alignment. Uncompressed images remain unsupported as primary
+  images: heifer stays an HEVC codec.
+- `heifer_isobmff::boxes::UncompressedConfig` parses the `uncC` frame configuration, and
+  `HeifFile::uncompressed_config` returns it. `AuxiliaryImage::bit_depth` now reads it when an
+  item has no `pixi` property.
+- An uncompressed alpha plane is attached to its primary HEVC image by `decode`, like an HEVC
+  alpha plane.
+
 ## 0.3.24 — 2026-11-03
 
 **New**

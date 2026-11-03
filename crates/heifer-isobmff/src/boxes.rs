@@ -374,6 +374,156 @@ pub enum ColorInfo {
     Icc(Vec<u8>),
 }
 
+/// One component of an uncompressed frame (`uncC`, ISO/IEC 23001-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncompressedComponent {
+    /// Component index in the frame.
+    pub index: u16,
+    /// Bits used by one sample, from 1 to 256.
+    pub bit_depth: u16,
+    /// Sample representation: 0 unsigned, 1 float, 2 complex, 3 signed.
+    pub format: u8,
+    /// Bytes each sample is aligned to, or 0 for no alignment.
+    pub align_size: u8,
+}
+
+/// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
+///
+/// Version 0 describes the components explicitly. Version 1 uses a four-character profile code
+/// and leaves `components` empty; heifer only decodes version 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncompressedConfig {
+    /// Box version: 0 for explicit components, 1 for a profile code.
+    pub version: u8,
+    /// Profile four-character code, or 0 when the frame does not follow a profile.
+    pub profile: u32,
+    /// Components of the frame, in storage order.
+    pub components: Vec<UncompressedComponent>,
+    /// 0 none, 1 4:2:2, 2 4:2:0, 3 4:1:1.
+    pub sampling: u8,
+    /// 0 component, 1 pixel, 2 mixed, 3 row, 4 tile-component, 5 multi-Y.
+    pub interleave: u8,
+    /// Block size in bytes, 0 when components are not grouped in blocks.
+    pub block_size: u8,
+    /// Whether component samples are little-endian.
+    pub components_little_endian: bool,
+    /// Whether block padding is in the least significant bits.
+    pub block_pad_lsb: bool,
+    /// Whether block headers are little-endian.
+    pub block_little_endian: bool,
+    /// Whether block data is stored in reverse order.
+    pub block_reversed: bool,
+    /// Whether padding bytes have an unknown value.
+    pub pad_unknown: bool,
+    /// Bytes per pixel, 0 when pixels are not aligned.
+    pub pixel_size: u32,
+    /// Bytes each row is aligned to, or 0 for no alignment.
+    pub row_align_size: u32,
+    /// Bytes each tile is aligned to, or 0 for no alignment.
+    pub tile_align_size: u32,
+    /// Number of tile columns.
+    pub columns: u32,
+    /// Number of tile rows.
+    pub rows: u32,
+}
+
+impl UncompressedConfig {
+    /// Parses the content of an `uncC` box.
+    pub fn parse(content: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(content);
+        let (version, _) = r.full_box()?;
+        let profile = r.u32()?;
+        if version == 1 {
+            return Ok(Self {
+                version,
+                profile,
+                components: Vec::new(),
+                sampling: 0,
+                interleave: 1,
+                block_size: 0,
+                components_little_endian: false,
+                block_pad_lsb: false,
+                block_little_endian: false,
+                block_reversed: false,
+                pad_unknown: false,
+                pixel_size: 0,
+                row_align_size: 0,
+                tile_align_size: 0,
+                columns: 1,
+                rows: 1,
+            });
+        }
+        if version != 0 {
+            return Err(invalid(b"uncC", "only versions 0 and 1 are defined"));
+        }
+        let count = r.u32()?;
+        if count > 256 {
+            return Err(invalid(b"uncC", "too many components"));
+        }
+        let mut components = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let index = r.u16()?;
+            let bit_depth = u16::from(r.u8()?) + 1;
+            let format = r.u8()?;
+            let align_size = r.u8()?;
+            if format > 3 {
+                return Err(invalid(b"uncC", "component format must be 0 to 3"));
+            }
+            if align_size != 0 && u32::from(align_size) * 8 < u32::from(bit_depth) {
+                return Err(invalid(
+                    b"uncC",
+                    "component alignment is smaller than its bit depth",
+                ));
+            }
+            components.push(UncompressedComponent {
+                index,
+                bit_depth,
+                format,
+                align_size,
+            });
+        }
+        let sampling = r.u8()?;
+        if sampling > 3 {
+            return Err(invalid(b"uncC", "sampling mode must be 0 to 3"));
+        }
+        let interleave = r.u8()?;
+        if interleave > 5 {
+            return Err(invalid(b"uncC", "interleave mode must be 0 to 5"));
+        }
+        let block_size = r.u8()?;
+        let flags = r.u8()?;
+        let pixel_size = r.u32()?;
+        let row_align_size = r.u32()?;
+        let tile_align_size = r.u32()?;
+        let columns = r
+            .u32()?
+            .checked_add(1)
+            .ok_or_else(|| invalid(b"uncC", "tile column count overflows a 32-bit integer"))?;
+        let rows = r
+            .u32()?
+            .checked_add(1)
+            .ok_or_else(|| invalid(b"uncC", "tile row count overflows a 32-bit integer"))?;
+        Ok(Self {
+            version,
+            profile,
+            components,
+            sampling,
+            interleave,
+            block_size,
+            components_little_endian: flags & 0x80 != 0,
+            block_pad_lsb: flags & 0x40 != 0,
+            block_little_endian: flags & 0x20 != 0,
+            block_reversed: flags & 0x10 != 0,
+            pad_unknown: flags & 0x08 != 0,
+            pixel_size,
+            row_align_size,
+            tile_align_size,
+            columns,
+            rows,
+        })
+    }
+}
+
 /// An item property, from the `ipco` box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Property {
@@ -390,6 +540,8 @@ pub enum Property {
     Color(ColorInfo),
     /// `pixi`: bits per channel.
     PixelInfo(Vec<u8>),
+    /// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
+    UncompressedConfig(UncompressedConfig),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
     /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
@@ -439,6 +591,7 @@ impl Property {
                 let n = r.u8()?;
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
+            b"uncC" => Self::UncompressedConfig(UncompressedConfig::parse(content)?),
             b"irot" => Self::Rotation(r.u8()? & 0x03),
             b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {
@@ -525,6 +678,64 @@ mod tests {
         // The remaining bits are reserved and must not be taken for the axis.
         assert_eq!(parse(0xFE), Property::Mirror(true));
         assert_eq!(parse(0xFF), Property::Mirror(false));
+    }
+
+    #[test]
+    fn uncc_parses_components_and_layout() {
+        #[rustfmt::skip]
+        let content = [
+            0, 0, 0, 0,             // version 0, flags
+            0, 0, 0, 0,             // profile
+            0, 0, 0, 1,             // component_count
+            0, 0,                   // component_index
+            9,                      // component_bit_depth_minus_one (10 bits)
+            3,                      // component_format (signed)
+            2,                      // component_align_size
+            0,                      // sampling (none)
+            1,                      // interleave (pixel)
+            0,                      // block_size
+            0x80,                   // components_little_endian
+            0, 0, 0, 2,             // pixel_size
+            0, 0, 0, 4,             // row_align_size
+            0, 0, 0, 0,             // tile_align_size
+            0, 0, 0, 0,             // num_tile_cols_minus_one
+            0, 0, 0, 1,             // num_tile_rows_minus_one
+        ];
+        let Property::UncompressedConfig(config) =
+            Property::parse(FourCC(*b"uncC"), &content).unwrap()
+        else {
+            panic!("not an uncompressed configuration");
+        };
+        assert_eq!(config.version, 0);
+        assert_eq!(config.profile, 0);
+        assert_eq!(config.components.len(), 1);
+        assert_eq!(
+            config.components[0],
+            UncompressedComponent {
+                index: 0,
+                bit_depth: 10,
+                format: 3,
+                align_size: 2
+            }
+        );
+        assert_eq!((config.sampling, config.interleave), (0, 1));
+        assert!(config.components_little_endian);
+        assert_eq!(config.pixel_size, 2);
+        assert_eq!(config.row_align_size, 4);
+        assert_eq!((config.columns, config.rows), (1, 2));
+    }
+
+    #[test]
+    fn uncc_version_1_keeps_the_profile() {
+        let content = [1, 0, 0, 0, b'r', b'g', b'b', b'3'];
+        let Property::UncompressedConfig(config) =
+            Property::parse(FourCC(*b"uncC"), &content).unwrap()
+        else {
+            panic!("not an uncompressed configuration");
+        };
+        assert_eq!(config.version, 1);
+        assert_eq!(config.profile, u32::from_be_bytes(*b"rgb3"));
+        assert!(config.components.is_empty());
     }
 
     #[test]
