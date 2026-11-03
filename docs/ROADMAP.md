@@ -9,7 +9,7 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.3.25, uncompressed auxiliary images.
+- Latest release: 0.3.26, HEIC coding options in the CLI.
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   auxiliary planes.
 - Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
