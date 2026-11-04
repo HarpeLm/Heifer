@@ -14,6 +14,7 @@
 //! ([`heifer_hevc_dec`], [`heifer_hevc_enc`]).
 
 pub mod color;
+pub mod depth;
 pub mod encode;
 pub mod hdr;
 mod icc;
@@ -23,6 +24,7 @@ pub mod image_crate;
 pub mod metadata;
 mod uncompressed;
 
+pub use depth::{DepthInfo, DepthRepresentation};
 pub use encode::{
     EncodeFormat, EncodeOptions, encode, encode_hdr, encode_hdr_with_metadata, encode_rgb8,
     encode_rgb8_with_format, encode_rgba8, encode_rgba8_with_format, encode_with_format,
@@ -257,6 +259,11 @@ impl AuxiliaryImage {
     /// Whether this is a depth map.
     pub fn is_depth(&self) -> bool {
         is_depth_urn(&self.urn)
+    }
+
+    /// Whether this is an HDR gain map, such as Apple's or Samsung's.
+    pub fn is_gain_map(&self) -> bool {
+        self.urn == hdr::APPLE_GAIN_MAP || self.urn.ends_with(":aux:hdrgainmap")
     }
 }
 

@@ -10,7 +10,9 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
+use image::{
+    DynamicImage, ImageBuffer, ImageDecoder, ImageEncoder, ImageFormat, ImageReader, Luma, Rgba,
+};
 
 const USAGE: &str = "\
 heifer: convert HEIC/HEIF photos, in pure Rust
@@ -28,15 +30,22 @@ Options:
   -q, --quality <0-100>  quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
       --format <mode>    HEIC coding: 420 (default), 444 or lossless
       --lossless         same as --format lossless
+      --aux              also write every auxiliary image as PNG
+      --depth            also write the depth map as PNG
+      --gain-map         also write the HDR gain map as PNG
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
   -h, --help             show this help
   -V, --version          show the version
 
+Auxiliary images are written next to the output, for example photo.depth.png.
+
 Examples:
   heifer IMG_1234.heic photo.jpg
-  heifer *.HEIC --to jpg -o converted
+  heifer IMG_1234.heic photo.jpg --depth
+  heifer portrait.heic portrait.png --aux
+  heifer *.HEIC --to jpg -o converted --gain-map
   heifer screenshot.png screenshot.heic -q 70
   heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
@@ -51,7 +60,17 @@ struct Args {
     out_dir: Option<PathBuf>,
     quality: Option<u8>,
     format: Option<EncodeFormat>,
+    aux: bool,
+    depth: bool,
+    gain_map: bool,
     force: bool,
+}
+
+impl Args {
+    /// Whether an auxiliary image should be written next to the output.
+    fn wants_aux(&self) -> bool {
+        self.aux || self.depth || self.gain_map
+    }
 }
 
 /// HEIC coding mode named on the command line.
@@ -106,6 +125,9 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
                 set_format(&mut args, format)?;
             }
             "--lossless" => set_format(&mut args, EncodeFormat::Lossless)?,
+            "--aux" => args.aux = true,
+            "--depth" => args.depth = true,
+            "--gain-map" => args.gain_map = true,
             "-o" | "--out-dir" => args.out_dir = Some(PathBuf::from(value(&arg)?)),
             "-f" | "--force" => args.force = true,
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option `{s}`")),
@@ -215,6 +237,9 @@ fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
 
 fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     check_heic_only(args, output)?;
+    if args.wants_aux() && !is_heif(input) {
+        return Err("auxiliary images can only be extracted from HEIC/HEIF input".into());
+    }
     if output.exists() && !args.force {
         return Err(format!(
             "{} exists (use --force to overwrite)",
@@ -222,6 +247,11 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
         ));
     }
     let start = Instant::now();
+    let aux_bytes = if args.wants_aux() {
+        Some(std::fs::read(input).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let (image, icc, exif) = read(input)?;
     let file = std::fs::File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
     let mut writer = std::io::BufWriter::new(file);
@@ -284,6 +314,194 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
         human(size),
         start.elapsed()
     );
+    if let Some(bytes) = &aux_bytes {
+        write_auxiliary(output, bytes, args)?;
+    }
+    Ok(())
+}
+
+/// Writes the auxiliary images selected by `--aux`, `--depth` and `--gain-map`.
+fn write_auxiliary(output: &Path, bytes: &[u8], args: &Args) -> Result<(), String> {
+    let auxiliary = heifer::auxiliary_images(bytes).map_err(|e| e.to_string())?;
+    // An explicit selector must find the type it asks for; `--aux` alone is happy with none.
+    if args.depth && !auxiliary.iter().any(heifer::AuxiliaryImage::is_depth) {
+        return Err("no depth map in this file".into());
+    }
+    if args.gain_map && !auxiliary.iter().any(heifer::AuxiliaryImage::is_gain_map) {
+        return Err("no HDR gain map in this file".into());
+    }
+    let mut seen = Vec::new();
+    let selected: Vec<_> = auxiliary
+        .into_iter()
+        .filter(|aux| {
+            args.aux || (args.depth && aux.is_depth()) || (args.gain_map && aux.is_gain_map())
+        })
+        .map(|aux| {
+            let path = auxiliary_path(output, &aux, &mut seen);
+            (path, aux)
+        })
+        .collect();
+    // Check every target before writing any, so that a conflict leaves no partial output.
+    for (path, _) in &selected {
+        if path.exists() && !args.force {
+            return Err(format!(
+                "{} exists (use --force to overwrite)",
+                path.display()
+            ));
+        }
+    }
+    for (path, aux) in selected {
+        let image = heifer::decode_auxiliary(bytes, aux.id).map_err(|e| e.to_string())?;
+        write_auxiliary_png(&path, &aux, &image)?;
+        println!(
+            "  {} ({} {}×{}, {}-bit)",
+            path.display(),
+            auxiliary_kind(&aux),
+            aux.width,
+            aux.height,
+            aux.bit_depth
+        );
+    }
+    Ok(())
+}
+
+/// Path of an auxiliary image next to the main output: `photo.depth.png`, `photo.gain-map.png`,
+/// then `photo.depth-<id>.png` for a second image of the same kind.
+fn auxiliary_path(
+    output: &Path,
+    aux: &heifer::AuxiliaryImage,
+    seen: &mut Vec<(&'static str, usize)>,
+) -> PathBuf {
+    let kind = auxiliary_slug(aux);
+    let number = match seen.iter_mut().find(|(name, _)| *name == kind) {
+        Some((_, number)) => {
+            *number += 1;
+            *number
+        }
+        None => {
+            seen.push((kind, 1));
+            1
+        }
+    };
+    let base = output.with_extension("");
+    let stem = base
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "image".into());
+    let name = if number == 1 {
+        format!("{stem}.{kind}.png")
+    } else {
+        format!("{stem}.{kind}-{}.png", aux.id)
+    };
+    base.with_file_name(name)
+}
+
+fn auxiliary_slug(aux: &heifer::AuxiliaryImage) -> &'static str {
+    if aux.is_depth() {
+        "depth"
+    } else if aux.is_gain_map() {
+        "gain-map"
+    } else if aux.is_alpha() {
+        "alpha"
+    } else {
+        "aux"
+    }
+}
+
+fn auxiliary_kind(aux: &heifer::AuxiliaryImage) -> &'static str {
+    if aux.is_depth() {
+        "depth map"
+    } else if aux.is_gain_map() {
+        "HDR gain map"
+    } else if aux.is_alpha() {
+        "alpha plane"
+    } else {
+        "auxiliary image"
+    }
+}
+
+/// Writes a decoded auxiliary image as PNG: grayscale for depth, alpha and gain maps, RGBA for
+/// other refinements, at the coded bit depth. Samples below 8 bits are widened to 8, above to 16,
+/// so that the PNG viewer sees the full range.
+fn write_auxiliary_png(
+    path: &Path,
+    aux: &heifer::AuxiliaryImage,
+    image: &heifer::Image,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let grayscale = aux.is_depth() || aux.is_gain_map() || aux.is_alpha();
+    let width = image.width;
+    let height = image.height;
+    let max = u32::from(image.max_value());
+    let to_8 = |value: u16| ((u32::from(value) * 255 + max / 2) / max) as u8;
+    let to_16 = |value: u16| ((u32::from(value) * 65535 + max / 2) / max) as u16;
+    let invalid = || format!("{}: invalid image size", path.display());
+    let png = match (grayscale, image.bit_depth) {
+        (true, 0..=8) => {
+            let data = image
+                .data
+                .chunks_exact(4)
+                .map(|pixel| to_8(pixel[0]))
+                .collect();
+            DynamicImage::ImageLuma8(
+                ImageBuffer::<Luma<u8>, _>::from_raw(width, height, data).ok_or_else(invalid)?,
+            )
+        }
+        (true, _) => {
+            let data = image
+                .data
+                .chunks_exact(4)
+                .map(|pixel| to_16(pixel[0]))
+                .collect();
+            DynamicImage::ImageLuma16(
+                ImageBuffer::<Luma<u16>, _>::from_raw(width, height, data).ok_or_else(invalid)?,
+            )
+        }
+        (false, 0..=8) => {
+            let data = image
+                .data
+                .chunks_exact(4)
+                .flat_map(|pixel| {
+                    [
+                        to_8(pixel[0]),
+                        to_8(pixel[1]),
+                        to_8(pixel[2]),
+                        to_8(pixel[3]),
+                    ]
+                })
+                .collect();
+            DynamicImage::ImageRgba8(
+                ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, data).ok_or_else(invalid)?,
+            )
+        }
+        (false, _) => {
+            let data = image
+                .data
+                .chunks_exact(4)
+                .flat_map(|pixel| {
+                    [
+                        to_16(pixel[0]),
+                        to_16(pixel[1]),
+                        to_16(pixel[2]),
+                        to_16(pixel[3]),
+                    ]
+                })
+                .collect();
+            DynamicImage::ImageRgba16(
+                ImageBuffer::<Rgba<u16>, _>::from_raw(width, height, data).ok_or_else(invalid)?,
+            )
+        }
+    };
+    let result = png
+        .write_to(&mut writer, ImageFormat::Png)
+        .map_err(|error| error.to_string())
+        .and_then(|()| std::io::Write::flush(&mut writer).map_err(|error| error.to_string()));
+    if let Err(error) = result {
+        drop(writer);
+        let _ = std::fs::remove_file(path); // no truncated file left behind
+        return Err(format!("{}: {error}", path.display()));
+    }
     Ok(())
 }
 
@@ -304,17 +522,25 @@ fn write(
 }
 
 fn info(input: &Path) -> Result<(), String> {
+    for line in info_lines(input)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines printed by `heifer info`, kept separate so that tests can read them.
+fn info_lines(input: &Path) -> Result<Vec<String>, String> {
     let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
-    println!("{}", input.display());
+    let mut lines = vec![input.display().to_string()];
     if !bytes.get(4..8).is_some_and(|b| b == b"ftyp") {
         let (image, _, _) = read(input)?;
-        println!(
+        lines.push(format!(
             "  {}×{}, {:?}",
             image.width(),
             image.height(),
             image.color()
-        );
-        return Ok(());
+        ));
+        return Ok(lines);
     }
     let file = heifer::heifer_isobmff::HeifFile::parse(&bytes).map_err(|e| e.to_string())?;
     let image = heifer::decode(&bytes).map_err(|e| e.to_string())?;
@@ -323,24 +549,64 @@ fn info(input: &Path) -> Result<(), String> {
         Ok(g) => format!("grid of {}×{} tiles", g.columns, g.rows),
         Err(_) => format!("single `{}` image", primary.item_type),
     };
-    println!(
+    lines.push(format!(
         "  {}×{}, {}-bit{}, {layout}, {}",
         image.width,
         image.height,
         image.bit_depth,
         if image.has_alpha { ", alpha" } else { "" },
         human(bytes.len() as u64)
-    );
+    ));
     for thumb in file.referencing_items(file.primary_id, b"thmb") {
         if let Ok(Some((w, h))) = file.image_size(thumb) {
-            println!("  thumbnail {w}×{h}");
+            lines.push(format!("  thumbnail {w}×{h}"));
         }
     }
-    if heifer::read_gain_map(&bytes).ok().flatten().is_some() {
-        println!("  HDR gain map");
-    }
     let meta = heifer::read_metadata(&bytes).map_err(|e| e.to_string())?;
-    if let Some(exif) = meta.exif_fields() {
+    let exif = meta.exif_fields();
+    let headroom = exif.as_ref().and_then(|exif| exif.apple_hdr_headroom());
+    for aux in heifer::auxiliary_images(&bytes).unwrap_or_default() {
+        let size = if aux.width == 0 || aux.height == 0 {
+            "unknown size".to_string()
+        } else {
+            format!("{}×{}", aux.width, aux.height)
+        };
+        lines.push(format!(
+            "  {} {}, {}-bit, {}",
+            auxiliary_kind(&aux),
+            size,
+            aux.bit_depth,
+            aux.urn
+        ));
+        if aux.is_depth()
+            && let Ok(Some(info)) = heifer::DepthInfo::read(&bytes, aux.id)
+        {
+            let mut parts = Vec::new();
+            if let Some(value) = info.z_near {
+                parts.push(format!("z-near {value:.6}"));
+            }
+            if let Some(value) = info.z_far {
+                parts.push(format!("z-far {value:.6}"));
+            }
+            if let Some(value) = info.d_min {
+                parts.push(format!("d-min {value:.6}"));
+            }
+            if let Some(value) = info.d_max {
+                parts.push(format!("d-max {value:.6}"));
+            }
+            parts.push(info.representation.to_string());
+            if let Some(view) = info.disparity_reference_view {
+                parts.push(format!("reference view {view}"));
+            }
+            lines.push(format!("    depth metadata: {}", parts.join(", ")));
+        }
+        if aux.is_gain_map()
+            && let Some(headroom) = headroom
+        {
+            lines.push(format!("    gain map metadata: headroom {headroom:.1}×"));
+        }
+    }
+    if let Some(exif) = exif {
         let mut parts = Vec::new();
         if let (Some(make), Some(model)) = (exif.make(), exif.model()) {
             parts.push(format!("{make} {model}"));
@@ -352,21 +618,23 @@ fn info(input: &Path) -> Result<(), String> {
             parts.push("GPS position".into());
         }
         if !parts.is_empty() {
-            println!("  {}", parts.join(" · "));
+            lines.push(format!("  {}", parts.join(" · ")));
         }
     }
+    let has_iptc = file.items.iter().any(|item| item.item_type.0 == *b"iptc");
     let present: Vec<&str> = [
         (meta.exif.is_some(), "EXIF"),
         (meta.xmp.is_some(), "XMP"),
         (meta.icc_profile.is_some(), "ICC profile"),
+        (has_iptc, "IPTC"),
     ]
     .into_iter()
     .filter_map(|(has, name)| has.then_some(name))
     .collect();
     if !present.is_empty() {
-        println!("  metadata: {}", present.join(", "));
+        lines.push(format!("  metadata: {}", present.join(", ")));
     }
-    Ok(())
+    Ok(lines)
 }
 
 fn human(bytes: u64) -> String {
@@ -380,9 +648,26 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn parse(s: &str) -> Result<Option<Args>, String> {
         parse_args(s.split_whitespace().map(String::from))
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+    }
+
+    /// A unique folder under the system temporary directory, removed by the caller.
+    fn temp_dir(tag: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let number = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("heifer-cli-{}-{tag}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -448,5 +733,169 @@ mod tests {
         assert!(parse("a b c").is_err());
         assert!(parse("a b -q 101").is_err());
         assert!(parse("a b --bogus").is_err());
+    }
+
+    #[test]
+    fn auxiliary_flags_are_parsed() {
+        let all = parse("in.heic out.png --aux").unwrap().unwrap();
+        assert!(all.aux && !all.depth && !all.gain_map);
+        assert!(all.wants_aux());
+        let depth = parse("in.heic out.png --depth").unwrap().unwrap();
+        assert!(depth.depth && !depth.aux && depth.wants_aux());
+        let gain = parse("in.heic out.png --gain-map").unwrap().unwrap();
+        assert!(gain.gain_map && !gain.aux && gain.wants_aux());
+        assert!(!parse("in.heic out.png").unwrap().unwrap().wants_aux());
+    }
+
+    #[test]
+    fn info_describes_a_portrait() {
+        let path = fixture("real/heif_other__pug.heic");
+        if !path.exists() {
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let lines = info_lines(&path).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("depth map 768×576, 8-bit, urn:mpeg:hevc:2015:auxid:2"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("d-min 1.498047") && joined.contains("d-max 4.382812"),
+            "{joined}"
+        );
+        assert!(joined.contains("uniform disparity"), "{joined}");
+        assert!(joined.contains("reference view 0"), "{joined}");
+        assert!(
+            joined
+                .contains("HDR gain map 2016×1512, 8-bit, urn:com:apple:photo:2020:aux:hdrgainmap"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn info_describes_an_unci_depth_map() {
+        let path = fixture("real/heif_special__unsupported_depth_image.heic");
+        if !path.exists() {
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let lines = info_lines(&path).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("depth map 64×32, 8-bit, urn:mpeg:hevc:2015:auxid:2"),
+            "{joined}"
+        );
+        assert!(!joined.contains("depth metadata"), "{joined}");
+    }
+
+    #[test]
+    fn info_reports_iptc() {
+        let path = fixture("real/heif_other__L_exif_xmp_iptc.heic");
+        if !path.exists() {
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let lines = info_lines(&path).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("metadata: EXIF, XMP, IPTC"), "{joined}");
+    }
+
+    #[test]
+    fn extracts_every_auxiliary_image() {
+        let path = fixture("real/heif_other__pug.heic");
+        if !path.exists() {
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let dir = temp_dir("aux");
+        let output = dir.join("photo.png");
+        let mut args = parse("in.heic out.png --aux").unwrap().unwrap();
+        write_auxiliary(&output, &bytes, &args).unwrap();
+
+        let depth = dir.join("photo.depth.png");
+        let gain = dir.join("photo.gain-map.png");
+        assert!(depth.exists() && gain.exists());
+        let depth_image = image::open(&depth).unwrap();
+        assert_eq!((depth_image.width(), depth_image.height()), (768, 576));
+        assert_eq!(depth_image.color(), image::ColorType::L8);
+        let gain_image = image::open(&gain).unwrap();
+        assert_eq!((gain_image.width(), gain_image.height()), (2016, 1512));
+        assert_eq!(gain_image.color(), image::ColorType::L8);
+
+        // Existing files are kept unless --force is given.
+        let error = write_auxiliary(&output, &bytes, &args).unwrap_err();
+        assert!(error.contains("exists"), "{error}");
+        args.force = true;
+        write_auxiliary(&output, &bytes, &args).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_auxiliary_types_are_errors() {
+        let unci = fixture("real/heif_special__unsupported_depth_image.heic");
+        let alpha = fixture("alpha.heic");
+        let plain = fixture("single_image.heic");
+        if !unci.exists() || !alpha.exists() || !plain.exists() {
+            eprintln!("skipping: fixtures not found");
+            return;
+        }
+        let dir = temp_dir("missing");
+        let output = dir.join("photo.png");
+
+        let bytes = std::fs::read(&unci).unwrap();
+        let args = parse("in.heic out.png --gain-map").unwrap().unwrap();
+        let error = write_auxiliary(&output, &bytes, &args).unwrap_err();
+        assert!(error.contains("no HDR gain map"), "{error}");
+
+        let bytes = std::fs::read(&alpha).unwrap();
+        let args = parse("in.heic out.png --depth").unwrap().unwrap();
+        let error = write_auxiliary(&output, &bytes, &args).unwrap_err();
+        assert!(error.contains("no depth map"), "{error}");
+
+        // --aux alone is fine with a file that has no auxiliary image at all.
+        let bytes = std::fs::read(&plain).unwrap();
+        let args = parse("in.heic out.png --aux").unwrap().unwrap();
+        assert!(write_auxiliary(&output, &bytes, &args).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn widens_10_bit_auxiliary_images_to_16_bit_png() {
+        let path = fixture("real/heif__RGBA_10__128x128.heif");
+        if !path.exists() {
+            eprintln!("skipping: {} not found", path.display());
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let dir = temp_dir("alpha10");
+        let output = dir.join("photo.png");
+        let args = parse("in.heif out.png --aux").unwrap().unwrap();
+        write_auxiliary(&output, &bytes, &args).unwrap();
+
+        let alpha = image::open(dir.join("photo.alpha.png")).unwrap();
+        assert_eq!(alpha.color(), image::ColorType::L16);
+        assert_eq!((alpha.width(), alpha.height()), (128, 128));
+        assert!(
+            alpha.to_luma16().iter().any(|&value| value > 1023),
+            "10-bit samples are widened to the 16-bit PNG range"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auxiliary_output_requires_a_heif_input() {
+        let dir = temp_dir("non-heif");
+        let args = parse("in.png out.png --depth").unwrap().unwrap();
+        let error = convert(&dir.join("in.png"), &dir.join("out.png"), &args).unwrap_err();
+        assert!(
+            error.contains("only be extracted from HEIC/HEIF"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

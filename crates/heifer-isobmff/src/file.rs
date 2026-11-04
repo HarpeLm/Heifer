@@ -45,6 +45,8 @@ pub struct HeifFile<'a> {
     /// All item references from `iref`.
     pub references: Vec<ItemReference>,
     idat: Option<&'a [u8]>,
+    /// Subtype bytes of the `auxC` property of each auxiliary item.
+    auxiliary_subtypes: Vec<(ItemId, Vec<u8>)>,
 }
 
 impl<'a> HeifFile<'a> {
@@ -71,6 +73,7 @@ impl<'a> HeifFile<'a> {
         let mut locations = Vec::new();
         let mut references = Vec::new();
         let mut properties = Vec::new();
+        let mut auxiliary_type_data = Vec::new();
         let mut associations = Vec::new();
         let mut idat = None;
 
@@ -88,7 +91,11 @@ impl<'a> HeifFile<'a> {
                         let child = child?;
                         match &child.header.box_type.0 {
                             b"ipco" => {
-                                properties = boxes::parse_property_container(child.content)?;
+                                let parsed = boxes::parse_property_container_with_aux_subtypes(
+                                    child.content,
+                                )?;
+                                properties = parsed.properties;
+                                auxiliary_type_data = parsed.auxiliary_subtypes;
                             }
                             b"ipma" => associations
                                 .extend(boxes::parse_property_associations(child.content)?),
@@ -140,6 +147,19 @@ impl<'a> HeifFile<'a> {
             }
         }
 
+        let auxiliary_subtypes = items
+            .iter()
+            .filter_map(|item| {
+                item.properties.iter().find_map(|association| {
+                    let index = usize::from(association.index).checked_sub(1)?;
+                    auxiliary_type_data
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(|data| (item.id, data.clone()))
+                })
+            })
+            .collect();
+
         Ok(Self {
             data,
             file_type,
@@ -148,6 +168,7 @@ impl<'a> HeifFile<'a> {
             properties,
             references,
             idat,
+            auxiliary_subtypes,
         })
     }
 
@@ -228,6 +249,20 @@ impl<'a> HeifFile<'a> {
         self.referenced_items(image, b"dimg")
             .first()
             .map_or_else(Vec::new, |&first| self.referencing_items(first, b"auxl"))
+    }
+
+    /// Subtype bytes of an item's `auxC` property, if it has one.
+    ///
+    /// These bytes carry codec-specific auxiliary information. Depth maps use them for the
+    /// HEVC depth representation information SEI message; an auxiliary image without an `auxC`
+    /// property, or without subtype data, gives `None` or an empty slice.
+    pub fn auxiliary_subtypes(&self, id: ItemId) -> Result<Option<&[u8]>, Error> {
+        self.item(id)?;
+        Ok(self
+            .auxiliary_subtypes
+            .iter()
+            .find(|(item, _)| *item == id)
+            .map(|(_, data)| data.as_slice()))
     }
 
     /// Item IDs of the top-level images, in declaration order: the images meant to be displayed,

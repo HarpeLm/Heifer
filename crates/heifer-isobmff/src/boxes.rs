@@ -600,23 +600,54 @@ impl Property {
                 horiz_offset: (r.i32()?, r.u32()?),
                 vert_offset: (r.i32()?, r.u32()?),
             },
-            b"auxC" => {
-                r.full_box()?;
-                Self::AuxiliaryType(r.cstring())
-            }
+            b"auxC" => Self::AuxiliaryType(parse_auxiliary_type(content)?.0),
             _ => Self::Unknown(box_type, content.to_vec()),
         })
     }
 }
 
+/// Parses `auxC`: the auxiliary type URN and its subtype bytes.
+fn parse_auxiliary_type(content: &[u8]) -> Result<(String, Vec<u8>), Error> {
+    let mut r = Reader::new(content);
+    r.full_box()?;
+    let urn = r.cstring();
+    Ok((urn, r.rest().to_vec()))
+}
+
 /// `ipco`: the list of properties, in order (indices in `ipma` are 1-based into this list).
 pub fn parse_property_container(content: &[u8]) -> Result<Vec<Property>, Error> {
-    crate::BoxIter::new(content)
-        .map(|b| {
-            let b = b?;
-            Property::parse(b.header.box_type, b.content)
-        })
-        .collect()
+    Ok(parse_property_container_with_aux_subtypes(content)?.properties)
+}
+
+/// An `ipco` property container: the properties, plus the subtype bytes of each `auxC` property
+/// (one entry per property, `None` for the other properties).
+pub(crate) struct PropertyContainer {
+    /// Properties, in declaration order.
+    pub properties: Vec<Property>,
+    /// Auxiliary subtype bytes of each property.
+    pub auxiliary_subtypes: Vec<Option<Vec<u8>>>,
+}
+
+/// `ipco`, keeping the subtype bytes of the `auxC` properties.
+pub(crate) fn parse_property_container_with_aux_subtypes(
+    content: &[u8],
+) -> Result<PropertyContainer, Error> {
+    let mut properties = Vec::new();
+    let mut auxiliary_subtypes = Vec::new();
+    for b in crate::BoxIter::new(content) {
+        let b = b?;
+        properties.push(Property::parse(b.header.box_type, b.content)?);
+        let subtypes = if &b.header.box_type.0 == b"auxC" {
+            Some(parse_auxiliary_type(b.content)?.1)
+        } else {
+            None
+        };
+        auxiliary_subtypes.push(subtypes);
+    }
+    Ok(PropertyContainer {
+        properties,
+        auxiliary_subtypes,
+    })
 }
 
 /// Description of a `grid` derived image (stored as the grid item's data).

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- The CLI extracts auxiliary images: `--aux` writes every depth map, gain map, alpha plane and
+  other refinement next to the output as PNG, while `--depth` and `--gain-map` select one type.
+  Files are named after the output (`photo.depth.png`, `photo.gain-map.png`, `photo.alpha.png`,
+  `photo.aux-<id>.png`); grayscale planes keep the coded bit depth; a type that the file does not
+  have is an error; existing files are never overwritten without `--force`.
+- `heifer info` lists the auxiliary images of the primary image with their URN, size and bit
+  depth, the depth representation information of depth maps (near and far planes, disparity
+  range, representation and reference view), the HDR gain map headroom when the photo carries
+  it, and reports IPTC presence.
+- `heifer::DepthInfo` and `heifer::DepthRepresentation` read the depth representation
+  information SEI message that HEIF depth maps store in the `auxC` subtype bytes.
+- `HeifFile::auxiliary_subtypes` returns the `auxC` subtype bytes of an item; `auxC` subtypes are
+  parsed when the property container is read.
+- `AuxiliaryImage::is_gain_map` recognises Apple and Samsung HDR gain map URNs.
+
 ## 0.3.26 — 2026-11-03
 
 **New**

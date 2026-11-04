@@ -76,7 +76,8 @@ heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converte
 heifer photo.png photo.heic -q 80       # to HEIC, 4:2:0
 heifer art.png art.heic --format 444    # full-resolution chroma
 heifer shot.png shot.heic --lossless    # no quantization (8-bit input)
-heifer info IMG_1234.heic               # size, tiles, camera, date, metadata
+heifer IMG_1234.heic photo.png --depth  # extract the Portrait depth map too
+heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images, metadata
 ```
 
 **Library**:

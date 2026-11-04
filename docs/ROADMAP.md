@@ -15,18 +15,17 @@ Items are ordered by user impact.
 - Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
 - Conformance: 66 official HEVC bitstreams, no unsupported stream.
 
-## In progress
+## Done
 
-### 1. Auxiliary images in the CLI
+### Auxiliary images in the CLI
 
-The library lists and decodes auxiliary images, but the CLI cannot extract them.
+The CLI extracts the auxiliary images that the library already lists and decodes.
 
-- `--aux` writes every auxiliary image next to the output.
+- `--aux` writes every auxiliary image next to the output, as `photo.depth.png`,
+  `photo.gain-map.png`, `photo.alpha.png` or `photo.aux-<id>.png`.
 - `--depth` and `--gain-map` select one type.
 - Richer `info`: auxiliary images with their URN, size and bit depth, depth metadata, gain map
   metadata and IPTC presence.
-
-## Done
 
 ### Encoding options in the CLI
 
@@ -48,34 +47,34 @@ HEVC codec, not a general uncompressed image container.
 
 ## Next
 
-### 2. IPTC metadata (#4)
+### 1. IPTC metadata (#4)
 
 - Bounded IPTC-IIM parser, exposed as `Metadata::iptc`.
 - No network access, no unbounded allocation.
 
-### 3. Streaming decode (#5)
+### 2. Streaming decode (#5)
 
 - `decode_reader` over `Read + Seek`, without buffering the whole file.
 - Keep `decode` unchanged for callers that already have the bytes.
 - Preserve the same limits and error behaviour.
 
-### 4. Single-thread hot loops
+### 3. Single-thread hot loops
 
 Multi-threaded decoding is already faster than libheif, but one thread is slower than ffmpeg on
 large grids. Optimise the per-tile and colour-conversion loops without adding `unsafe`.
 
-### 5. More encoding knobs
+### 4. More encoding knobs
 
 - Explicit quality and bitrate controls.
 - 4:2:2 encoding.
 - Advanced HEVC parameters for users who need them.
 
-### 6. Region annotations (`rgan`)
+### 5. Region annotations (`rgan`)
 
 - Read region annotations and expose them with the image.
 - Keep them optional and out of the decode hot path.
 
-### 7. Fixtures and fuzzing
+### 6. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.
