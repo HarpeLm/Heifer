@@ -155,6 +155,12 @@ pub struct ItemLocation {
     pub extents: Vec<Extent>,
 }
 
+/// Maximum number of extents accepted in one `iloc` box.
+///
+/// Each extent costs 24 bytes in memory, so this bounds the metadata of a maliciously large
+/// box to a few tens of megabytes while staying far above anything a real file uses.
+const MAX_ILOC_EXTENTS: usize = 1 << 20;
+
 /// `iloc`: item locations. Field sizes are declared in the box header (4-bit values: 0, 4 or 8 bytes).
 pub fn parse_item_locations(content: &[u8]) -> Result<Vec<ItemLocation>, Error> {
     let mut r = Reader::new(content);
@@ -172,6 +178,24 @@ pub fn parse_item_locations(content: &[u8]) -> Result<Vec<ItemLocation>, Error> 
     } else {
         r.u32()?
     };
+
+    // Every item takes at least the ID, the construction method (when present), the data
+    // reference index, the base offset and the extent count. A count that cannot fit in the
+    // box, as a malicious file may declare, must not make us loop over it.
+    let item_header_size = (if version < 2 { 2 } else { 4 })
+        + (if version >= 1 { 2 } else { 0 })
+        + 2
+        + usize::from(base_offset_size)
+        + 2;
+    if !usize::try_from(count).is_ok_and(|n| n <= r.remaining() / item_header_size) {
+        return Err(invalid(b"iloc", "item count exceeds box size"));
+    }
+
+    // Bytes each extent consumes. With all field sizes at 0 an extent carries no information
+    // at all, so a box could otherwise declare hundreds of thousands of empty extents in a few
+    // bytes each and exhaust memory.
+    let extent_size = usize::from(index_size) + usize::from(offset_size) + usize::from(length_size);
+    let mut total_extents = 0usize;
 
     let mut items = Vec::with_capacity(count.min(4096) as usize);
     for _ in 0..count {
@@ -193,6 +217,17 @@ pub fn parse_item_locations(content: &[u8]) -> Result<Vec<ItemLocation>, Error> 
         r.u16()?; // data_reference_index: 0 = this file
         let base_offset = r.uint(base_offset_size)?;
         let extent_count = r.u16()?;
+        if extent_size == 0 {
+            if extent_count > 1 {
+                return Err(invalid(b"iloc", "extents without any field"));
+            }
+        } else if usize::from(extent_count) > r.remaining() / extent_size {
+            return Err(invalid(b"iloc", "extent count exceeds box size"));
+        }
+        total_extents = total_extents
+            .checked_add(usize::from(extent_count))
+            .filter(|&n| n <= MAX_ILOC_EXTENTS)
+            .ok_or_else(|| invalid(b"iloc", "too many extents"))?;
         let mut extents = Vec::with_capacity(usize::from(extent_count));
         for _ in 0..extent_count {
             let index = r.uint(index_size)?;
@@ -793,6 +828,63 @@ mod tests {
             vec![Extent {
                 offset: 105,
                 length: 8,
+                index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn iloc_item_count_exceeding_box_is_rejected() {
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0,       // version 0, flags
+            0x00,             // offset_size=0, length_size=0
+            0x10,             // base_offset_size=1, index_size=0
+            0x03, 0xE8,       // item_count = 1000
+            0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, // one item only
+        ];
+        let error = parse_item_locations(&data).expect_err("the count cannot fit in the box");
+        assert!(matches!(error, Error::InvalidBox { .. }));
+    }
+
+    #[test]
+    fn iloc_extents_without_fields_are_rejected() {
+        // All field sizes are zero, so each extent would consume no byte at all: a 12-byte
+        // box could otherwise declare 65535 extents per item.
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0,       // version 0, flags
+            0x00,             // offset_size=0, length_size=0
+            0x10,             // base_offset_size=1, index_size=0
+            0, 1,             // item_count
+            0, 7,             // item_ID
+            0, 0,             // data_reference_index
+            0,                // base_offset
+            0xFF, 0xFF,       // extent_count = 65535
+        ];
+        let error = parse_item_locations(&data).expect_err("empty extents must be rejected");
+        assert!(matches!(error, Error::InvalidBox { .. }));
+    }
+
+    #[test]
+    fn iloc_accepts_a_single_extent_without_fields() {
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0,       // version 0, flags
+            0x00,             // offset_size=0, length_size=0
+            0x10,             // base_offset_size=1, index_size=0
+            0, 1,             // item_count
+            0, 7,             // item_ID
+            0, 0,             // data_reference_index
+            0,                // base_offset
+            0, 1,             // extent_count
+        ];
+        let locs = parse_item_locations(&data).unwrap();
+        assert_eq!(
+            locs[0].extents,
+            vec![Extent {
+                offset: 0,
+                length: 0,
                 index: 0,
             }]
         );

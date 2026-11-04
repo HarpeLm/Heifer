@@ -1077,7 +1077,7 @@ impl Parser<'_, '_> {
                     }
                 }
                 self.is_cu_chroma_qp_offset_coded = true;
-                self.cu_qp_offset = if flag { list[idx] } else { (0, 0) };
+                self.cu_qp_offset = chroma_qp_offset(list, flag, idx);
             }
         }
 
@@ -1503,6 +1503,18 @@ impl Parser<'_, '_> {
     }
 }
 
+/// `CuQpOffsetCb`/`CuQpOffsetCr` selected for the current coding unit.
+///
+/// A stream may set `cu_chroma_qp_offset_enabled_flag` while the PPS carries an empty offset
+/// list; there is then no offset to apply.
+fn chroma_qp_offset(list: &[(i8, i8)], flag: bool, idx: usize) -> (i8, i8) {
+    if flag {
+        list.get(idx).copied().unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    }
+}
+
 /// Position and parameters of one transform block.
 #[derive(Clone, Copy)]
 struct BlockInfo {
@@ -1525,4 +1537,17 @@ struct TreeCtx {
     luma_modes: [u8; 4],
     chroma_modes: [u8; 4],
     max_depth: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chroma_qp_offset;
+
+    #[test]
+    fn empty_chroma_qp_offset_list_is_ignored() {
+        assert_eq!(chroma_qp_offset(&[], true, 0), (0, 0));
+        assert_eq!(chroma_qp_offset(&[(1, -2)], true, 0), (1, -2));
+        assert_eq!(chroma_qp_offset(&[(1, -2)], false, 0), (0, 0));
+        assert_eq!(chroma_qp_offset(&[(1, -2)], true, 5), (0, 0));
+    }
 }

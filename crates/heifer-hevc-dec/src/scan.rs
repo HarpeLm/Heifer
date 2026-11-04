@@ -1,6 +1,6 @@
 //! Scan orders (H.265 §6.5): CTB raster/tile scan conversion and coefficient scans.
 
-use crate::params::{Pps, Sps};
+use crate::params::{Pps, Sps, Tiles};
 
 /// Coefficient scan types (`scanIdx`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,14 +88,7 @@ impl CtbLayout {
         let (width, height) = sps.pic_size_in_ctbs();
         let (col_widths, row_heights) = match &pps.tiles {
             None => (vec![width], vec![height]),
-            Some(t) => (
-                t.column_widths
-                    .clone()
-                    .unwrap_or_else(|| uniform(t.num_columns, width)),
-                t.row_heights
-                    .clone()
-                    .unwrap_or_else(|| uniform(t.num_rows, height)),
-            ),
+            Some(t) => tile_sizes(t, width, height),
         };
         let bounds = |sizes: &[u32]| {
             let mut bd = vec![0];
@@ -176,6 +169,35 @@ fn uniform(n: u32, total: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Tile column widths and row heights, or the picture as a single tile when the layout does not
+/// match the picture size.
+///
+/// A PPS stores explicit tile sizes computed against the SPS that was current when it was
+/// parsed, but a stream may redefine that SPS afterwards. The sizes can then sum to more than
+/// the picture, which would index past the CTB tables. Such a layout is ignored.
+fn tile_sizes(tiles: &Tiles, width: u32, height: u32) -> (Vec<u32>, Vec<u32>) {
+    let cols = tiles
+        .column_widths
+        .clone()
+        .unwrap_or_else(|| uniform(tiles.num_columns, width));
+    let rows = tiles
+        .row_heights
+        .clone()
+        .unwrap_or_else(|| uniform(tiles.num_rows, height));
+    let fits = |sizes: &[u32], expected: usize, total: u32| {
+        sizes.len() == expected
+            && sizes.iter().all(|&s| s > 0)
+            && sizes.iter().try_fold(0u32, |acc, &s| acc.checked_add(s)) == Some(total)
+    };
+    if fits(&cols, tiles.num_columns as usize, width)
+        && fits(&rows, tiles.num_rows as usize, height)
+    {
+        (cols, rows)
+    } else {
+        (vec![width], vec![height])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +227,30 @@ mod tests {
     fn uniform_spacing() {
         assert_eq!(uniform(3, 10), vec![3, 3, 4]);
         assert_eq!(uniform(1, 7), vec![7]);
+    }
+
+    #[test]
+    fn inconsistent_tile_layout_falls_back_to_one_tile() {
+        // A PPS parsed against a 3×3 picture, used with a 2×2 one.
+        let tiles = Tiles {
+            column_widths: Some(vec![1, 2]),
+            row_heights: Some(vec![3]),
+            num_columns: 2,
+            num_rows: 1,
+            loop_filter_across_tiles_enabled_flag: false,
+        };
+        assert_eq!(tile_sizes(&tiles, 2, 2), (vec![2], vec![2]));
+    }
+
+    #[test]
+    fn consistent_tile_layout_is_kept() {
+        let tiles = Tiles {
+            column_widths: Some(vec![1, 1]),
+            row_heights: Some(vec![2]),
+            num_columns: 2,
+            num_rows: 1,
+            loop_filter_across_tiles_enabled_flag: false,
+        };
+        assert_eq!(tile_sizes(&tiles, 2, 2), (vec![1, 1], vec![2]));
     }
 }
