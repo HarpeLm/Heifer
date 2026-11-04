@@ -40,6 +40,10 @@ for t in decode container parallel; do
   seed "$t" "$ROOT/tests/fixtures"
   seed "$t" "$ROOT/fuzz/seeds/libheif"
 done
+# Every input that ever crashed a target, reduced to the smallest set that keeps its coverage.
+for t in decode container parallel hevc cabac encode; do
+  seed "$t" "$ROOT/fuzz/regressions/$t"
+done
 [ -d "$ROOT/tests/conformance" ] && find "$ROOT/tests/conformance" \( -name '*.bit' -o -name '*.bin' \) -size -100k \
   -exec cp -n {} corpus/hevc/ \; 2>/dev/null || true
 [ -n "$(ls corpus/cabac)" ] || printf '\x1a\x00\x01\x02' > corpus/cabac/seed

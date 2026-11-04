@@ -7,6 +7,11 @@
 - `iref` and `ipma` parsing bound their entry counts by the size of the box, like `iloc`, so a
   crafted count can no longer reserve memory for entries the file does not contain.
 
+**Tests**
+
+- The minimized inputs that once crashed the fuzzers are kept in `fuzz/regressions/` and replayed
+  at the start of every fuzzing run.
+
 ## 0.3.27 — 2026-11-04
 
 **Security**
