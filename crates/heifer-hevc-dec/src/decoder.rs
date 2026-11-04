@@ -5,6 +5,7 @@ use crate::nal::NalUnitType;
 use crate::nal::{NalUnit, split_annex_b};
 use crate::params::ParameterSets;
 use crate::recon::{Frame, Reconstructor};
+use crate::scan::tiles_fit;
 use crate::sei::{PictureHash, parse_picture_hash};
 use crate::slice::SliceHeader;
 use crate::syntax::{Picture, decode_slice_segment};
@@ -93,6 +94,14 @@ pub fn decode_picture_checked(
             return Err(Error::Unimplemented(
                 "picture larger than the configured size limit",
             ));
+        }
+        if let Some(tiles) = &pps.tiles {
+            let (width, height) = sps.pic_size_in_ctbs();
+            if !tiles_fit(tiles, width, height) {
+                return Err(Error::Invalid(
+                    "tile layout does not match the picture size",
+                ));
+            }
         }
         let (pic, recon) =
             state.get_or_insert_with(|| (Picture::new(sps, pps), Reconstructor::new(sps, pps)));

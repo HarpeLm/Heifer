@@ -174,8 +174,18 @@ fn uniform(n: u32, total: u32) -> Vec<u32> {
 ///
 /// A PPS stores explicit tile sizes computed against the SPS that was current when it was
 /// parsed, but a stream may redefine that SPS afterwards. The sizes can then sum to more than
-/// the picture, which would index past the CTB tables. Such a layout is ignored.
+/// the picture, which would index past the CTB tables. Such a layout is ignored here; the
+/// decoder rejects it before reaching this point.
 fn tile_sizes(tiles: &Tiles, width: u32, height: u32) -> (Vec<u32>, Vec<u32>) {
+    checked_tile_sizes(tiles, width, height).unwrap_or_else(|| (vec![width], vec![height]))
+}
+
+/// Whether a tile layout covers exactly the picture, with one entry per declared tile.
+pub(crate) fn tiles_fit(tiles: &Tiles, width: u32, height: u32) -> bool {
+    checked_tile_sizes(tiles, width, height).is_some()
+}
+
+fn checked_tile_sizes(tiles: &Tiles, width: u32, height: u32) -> Option<(Vec<u32>, Vec<u32>)> {
     let cols = tiles
         .column_widths
         .clone()
@@ -189,13 +199,8 @@ fn tile_sizes(tiles: &Tiles, width: u32, height: u32) -> (Vec<u32>, Vec<u32>) {
             && sizes.iter().all(|&s| s > 0)
             && sizes.iter().try_fold(0u32, |acc, &s| acc.checked_add(s)) == Some(total)
     };
-    if fits(&cols, tiles.num_columns as usize, width)
-        && fits(&rows, tiles.num_rows as usize, height)
-    {
-        (cols, rows)
-    } else {
-        (vec![width], vec![height])
-    }
+    (fits(&cols, tiles.num_columns as usize, width) && fits(&rows, tiles.num_rows as usize, height))
+        .then_some((cols, rows))
 }
 
 #[cfg(test)]
@@ -240,6 +245,7 @@ mod tests {
             loop_filter_across_tiles_enabled_flag: false,
         };
         assert_eq!(tile_sizes(&tiles, 2, 2), (vec![2], vec![2]));
+        assert!(!tiles_fit(&tiles, 2, 2));
     }
 
     #[test]
@@ -252,5 +258,6 @@ mod tests {
             loop_filter_across_tiles_enabled_flag: false,
         };
         assert_eq!(tile_sizes(&tiles, 2, 2), (vec![1, 1], vec![2]));
+        assert!(tiles_fit(&tiles, 2, 2));
     }
 }
