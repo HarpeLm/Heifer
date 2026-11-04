@@ -279,6 +279,12 @@ pub fn parse_item_references(content: &[u8]) -> Result<Vec<ItemReference>, Error
         };
         let from = id(&mut c)?;
         let count = c.u16()?;
+        // Every referenced ID needs its full width; a malicious count must not make the
+        // collector reserve for entries that the box cannot hold.
+        let id_size = if version == 0 { 2 } else { 4 };
+        if usize::from(count) > c.remaining() / id_size {
+            return Err(invalid(b"iref", "reference count exceeds box size"));
+        }
         let to = (0..count)
             .map(|_| id(&mut c))
             .collect::<Result<Vec<_>, _>>()?;
@@ -307,6 +313,12 @@ pub fn parse_property_associations(
     let mut r = Reader::new(content);
     let (version, flags) = r.full_box()?;
     let count = r.u32()?;
+    // Each entry holds at least the item ID and its association count. Bound the loop by the
+    // bytes that are actually there, like `iloc` does.
+    let entry_size = (if version < 1 { 2usize } else { 4 }) + 1;
+    if !usize::try_from(count).is_ok_and(|n| n <= r.remaining() / entry_size) {
+        return Err(invalid(b"ipma", "association count exceeds box size"));
+    }
     let mut out = Vec::with_capacity(count.min(4096) as usize);
     for _ in 0..count {
         let id = if version < 1 {
@@ -315,6 +327,10 @@ pub fn parse_property_associations(
             r.u32()?
         };
         let n = r.u8()?;
+        let assoc_size = if flags & 1 != 0 { 2 } else { 1 };
+        if usize::from(n) > r.remaining() / assoc_size {
+            return Err(invalid(b"ipma", "association list exceeds box size"));
+        }
         let mut assocs = Vec::with_capacity(usize::from(n));
         for _ in 0..n {
             let (essential, index) = if flags & 1 != 0 {
@@ -919,6 +935,45 @@ mod tests {
                 essential: true
             }
         );
+    }
+
+    #[test]
+    fn iref_count_exceeding_box_is_rejected() {
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0,             // version 0, flags
+            0, 0, 0, 16,            // child size
+            b'd', b'i', b'm', b'g', // reference type
+            0, 9,                   // from
+            0xFF, 0xFF,             // reference count = 65535
+            0, 1, 0, 2,             // two IDs only
+        ];
+        let error = parse_item_references(&data).expect_err("the count cannot fit in the box");
+        assert!(matches!(error, Error::InvalidBox { .. }));
+    }
+
+    #[test]
+    fn ipma_association_count_exceeding_box_is_rejected() {
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0,       // version 0, flags
+            0, 0, 0x03, 0xE8, // entry count = 1000
+        ];
+        let error = parse_property_associations(&data).expect_err("the count cannot fit");
+        assert!(matches!(error, Error::InvalidBox { .. }));
+    }
+
+    #[test]
+    fn ipma_association_list_exceeding_box_is_rejected() {
+        #[rustfmt::skip]
+        let data = [
+            0, 0, 0, 0, // version 0, flags
+            0, 0, 0, 1, // entry count
+            0, 9,       // item ID
+            200,        // association count, with no byte left for them
+        ];
+        let error = parse_property_associations(&data).expect_err("the list cannot fit");
+        assert!(matches!(error, Error::InvalidBox { .. }));
     }
 
     #[test]

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Correctness**
+
+- `iref` and `ipma` parsing bound their entry counts by the size of the box, like `iloc`, so a
+  crafted count can no longer reserve memory for entries the file does not contain.
+
 ## 0.3.27 — 2026-11-04
 
 **Security**
