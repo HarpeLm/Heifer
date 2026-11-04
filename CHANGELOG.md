@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3.27 — 2026-11-04
+
+**Security**
+
+- `iloc` parsing bounds item and extent counts by the size of the box, rejects extents that
+  carry no field at all, and caps the total number of extents. A 42 KB crafted file could
+  previously make parsing allocate gigabytes (found by fuzzing).
+- An HEVC PPS tile layout that does not match the active SPS is now rejected with
+  `Error::Invalid` instead of indexing past the CTB tables or decoding a wrong image (found by
+  fuzzing).
+- A stream that enables chroma QP offsets with an empty PPS offset list no longer panics; the
+  offset is zero (found by fuzzing).
+
 **New**
 
 - The CLI extracts auxiliary images: `--aux` writes every depth map, gain map, alpha plane and
