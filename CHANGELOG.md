@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.28 — 2026-11-05
 
 **Correctness**
 
@@ -9,10 +9,10 @@
 
 **Performance**
 
-- Decoding is about 3% faster on the 13-file single-thread benchmark, and 6% faster on 12 MP
-  photos: the last significant coefficient is located through the inverse scan order instead of
-  scanning the whole block, and `residual_coding` reads the 4×4 raster positions from a table.
-  Output is unchanged.
+- Decoding is about 4% faster on the 13-file single-thread benchmark (872 ms to 838 ms), and 7%
+  faster on 12 MP photos (122 ms to 113 ms): the last significant coefficient is located through
+  the inverse scan order instead of scanning the whole block, and `residual_coding` reads the 4×4
+  raster positions from a table. Output is unchanged.
 
 **Tests**
 
