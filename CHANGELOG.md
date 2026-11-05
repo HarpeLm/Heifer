@@ -9,6 +9,11 @@
   The integer sums are only regrouped, so the output is byte-identical; a test compares both on
   random and extreme inputs for every size, and the 42 hash-verified conformance streams still
   match. About 1% faster single-threaded decoding.
+- Context-coded CABAC bins are decoded without a branch: both outcomes are computed and one is
+  selected with a mask, the next context state comes from a single table lookup, and the range
+  is renormalized by its leading zeros. Context bins are often close to random, so the branch
+  was frequently mispredicted. Byte-identical output, checked against the branching form on
+  three million bins; about 3% faster single-threaded decoding of 12 MP photos.
 
 ## 0.3.28 — 2026-11-05
 

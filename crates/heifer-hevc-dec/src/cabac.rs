@@ -43,6 +43,29 @@ pub const TRANS_IDX_LPS: [u8; 64] = [
     33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
+/// Next context of [`ArithmeticDecoder::decode`], as `state << 1 | mps`, indexed by
+/// `state << 2 | mps << 1 | lps` where `lps` says whether the least probable symbol was
+/// decoded: the transitions of §9.3.4.3.2.2 in one lookup.
+static NEXT_STATE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut state = 0;
+    while state < 64 {
+        let mut mps = 0;
+        while mps < 2 {
+            // Most probable symbol: one state up, at most 62.
+            let up = if state + 1 > 62 { 62 } else { state + 1 };
+            t[(state << 2) | (mps << 1)] = ((up << 1) | mps) as u8;
+            // Least probable symbol: TRANS_IDX_LPS, and the MPS flips at state 0.
+            let down = TRANS_IDX_LPS[state] as usize;
+            let new_mps = if state == 0 { 1 - mps } else { mps };
+            t[(state << 2) | (mps << 1) | 1] = ((down << 1) | new_mps) as u8;
+            mps += 1;
+        }
+        state += 1;
+    }
+    t
+};
+
 /// One context variable: a probability state and the value of the most probable symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ContextModel {
@@ -151,8 +174,42 @@ impl<'a> ArithmeticDecoder<'a> {
     }
 
     /// Decodes one bin with a context (`DecodeDecision`, §9.3.4.3.2).
+    ///
+    /// Branchless: context-coded bins are often close to random, so a branch between the most
+    /// and least probable symbol would be mispredicted often. Both outcomes are computed and
+    /// one is selected with a mask; the next state comes from one table lookup, and the range is
+    /// renormalized by its leading zeros.
     #[inline(always)]
     pub fn decode(&mut self, ctx: &mut ContextModel) -> u8 {
+        let state = usize::from(ctx.state);
+        let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
+        let range = self.range - lps;
+        let scaled = range << 7;
+        // All ones for the least probable symbol, zero for the most probable one.
+        let lps_mask = u32::from(self.value >= scaled).wrapping_neg();
+        self.value -= scaled & lps_mask;
+        let range = range ^ ((range ^ lps) & lps_mask);
+        let next = NEXT_STATE
+            [(usize::from(ctx.state) << 2) | (usize::from(ctx.mps) << 1) | (lps_mask & 1) as usize];
+        let bin = ctx.mps ^ (lps_mask & 1) as u8;
+        ctx.state = next >> 1;
+        ctx.mps = next & 1;
+        // Shift the range back to 9 bits: none or one bit after the most probable symbol, up to
+        // seven after the least probable one.
+        let shift = range.leading_zeros() - 23;
+        self.range = range << shift;
+        self.value <<= shift;
+        self.bits_needed += shift as i32;
+        if self.bits_needed >= 0 {
+            self.value |= self.fetch() << self.bits_needed;
+            self.bits_needed -= 8;
+        }
+        bin
+    }
+
+    /// The branching form of [`decode`](Self::decode), kept to check it against.
+    #[cfg(test)]
+    pub(crate) fn decode_reference(&mut self, ctx: &mut ContextModel) -> u8 {
         let state = usize::from(ctx.state);
         let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
         let range = self.range - lps;
@@ -261,6 +318,42 @@ impl<'a> ArithmeticDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The branchless decode gives the same bins, contexts and engine state as the branching
+    /// form of the specification.
+    #[test]
+    fn branchless_decode_matches_reference() {
+        let mut seed = 0x1234_5678_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..2000 {
+            let data: Vec<u8> = (0..256).map(|_| next() as u8).collect();
+            let Ok(mut a) = ArithmeticDecoder::new(&data) else {
+                continue;
+            };
+            let mut b = a.clone();
+            let mut ctxs: Vec<ContextModel> = (0..8)
+                .map(|_| ContextModel {
+                    state: (next() % 63) as u8,
+                    mps: (next() & 1) as u8,
+                })
+                .collect();
+            let mut ctxs_b = ctxs.clone();
+            for _ in 0..1500 {
+                let i = (next() % 8) as usize;
+                assert_eq!(a.decode(&mut ctxs[i]), b.decode_reference(&mut ctxs_b[i]));
+                assert_eq!(ctxs[i], ctxs_b[i]);
+                assert_eq!(
+                    (a.range, a.value, a.bits_needed, a.next),
+                    (b.range, b.value, b.bits_needed, b.next)
+                );
+            }
+        }
+    }
 
     #[test]
     fn context_init_examples() {
