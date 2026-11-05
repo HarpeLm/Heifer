@@ -36,10 +36,14 @@ pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
+pub use heifer_isobmff::region::{Geometry, RegionItem, UserDescription};
 pub use heifer_isobmff::writer::{ALPHA_URN, DEPTH_URN};
 pub use image::{Image, Sample};
 pub use iptc::{Dataset, Iptc};
-pub use metadata::{Exif, Metadata, item_iptc, item_metadata, read_iptc, read_metadata};
+pub use metadata::{
+    Exif, Metadata, Regions, item_iptc, item_metadata, item_regions, read_iptc, read_metadata,
+    read_regions,
+};
 pub use reader::{ReadError, decode_reader, decode_reader_with_options, read_metadata_reader};
 
 use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};

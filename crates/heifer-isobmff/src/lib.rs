@@ -13,6 +13,7 @@ pub mod boxes;
 mod file;
 mod header;
 mod reader;
+pub mod region;
 pub mod writer;
 
 pub use file::{HeifFile, Item, ItemId, is_image_item};

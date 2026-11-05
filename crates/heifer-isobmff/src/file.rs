@@ -436,6 +436,41 @@ impl<'a> HeifFile<'a> {
         Ok(None)
     }
 
+    /// Region items (`rgan`) describing an image, through their `cdsc` reference.
+    pub fn region_items(&self, image: ItemId) -> Vec<ItemId> {
+        self.referencing_items(image, b"cdsc")
+            .into_iter()
+            .filter(|&id| self.item(id).is_ok_and(|i| i.item_type.0 == *b"rgan"))
+            .collect()
+    }
+
+    /// Parses a region item, its referenced-mask regions linked to the targets of its `mask`
+    /// references in order.
+    pub fn region_item(&self, id: ItemId) -> Result<crate::region::RegionItem, Error> {
+        if self.item(id)?.item_type.0 != *b"rgan" {
+            return Err(Error::InvalidBox {
+                box_type: FourCC(*b"rgan"),
+                reason: "not a region item",
+            });
+        }
+        let data = self.item_data(id)?;
+        crate::region::RegionItem::parse(&data, self.referenced_items(id, b"mask"))
+    }
+
+    /// The `udes` user descriptions (name, description, tags) of an item, such as a region item.
+    pub fn user_descriptions(
+        &self,
+        id: ItemId,
+    ) -> Result<Vec<crate::region::UserDescription>, Error> {
+        self.item_properties(id)?
+            .filter_map(|p| match p {
+                Property::Unknown(kind, content) if kind.0 == *b"udes" => Some(content),
+                _ => None,
+            })
+            .map(|content| crate::region::UserDescription::parse(content))
+            .collect()
+    }
+
     /// IPTC metadata of an image: the IPTC-IIM block of an `iptc` item (or of a `mime` item of
     /// type `application/x-iptc`) that describes it, unparsed.
     pub fn iptc(&self, image: ItemId) -> Result<Option<Vec<u8>>, Error> {

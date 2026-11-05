@@ -57,6 +57,11 @@ HEVC codec, not a general uncompressed image container.
   `Read + Seek`, reading only the boxes and item data a call needs.
 - The slice API is unchanged; the decode fuzzer checks that both paths agree.
 
+### Region annotations (`rgan`)
+
+- `read_regions` / `item_regions` with every geometry and the `udes` descriptions, and
+  `HeifWriter::add_region_item` to write them.
+
 ## Next
 
 ### 1. Single-thread hot loops
@@ -70,12 +75,7 @@ large grids. Optimise the per-tile and colour-conversion loops without adding `u
 - 4:2:2 encoding.
 - Advanced HEVC parameters for users who need them.
 
-### 3. Region annotations (`rgan`)
-
-- Read region annotations and expose them with the image.
-- Keep them optional and out of the decode hot path.
-
-### 4. Fixtures and fuzzing
+### 3. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.

@@ -38,6 +38,37 @@ pub fn item_metadata(file: &HeifFile<'_>, id: ItemId) -> Result<Metadata, Error>
     })
 }
 
+/// One region item of an image: its regions (faces, objects, ...) and their descriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regions {
+    /// ID of the region item.
+    pub item: ItemId,
+    /// Reference size and geometries; scale them from the reference size to the image size.
+    pub regions: heifer_isobmff::region::RegionItem,
+    /// Names, descriptions and tags (`udes`) attached to the region item.
+    pub descriptions: Vec<heifer_isobmff::region::UserDescription>,
+}
+
+/// Reads the region annotations (`rgan` items) of the primary image, without decoding pixels.
+pub fn read_regions(bytes: &[u8]) -> Result<Vec<Regions>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    item_regions(&file, file.primary_id)
+}
+
+/// Like [`read_regions`], for one image item.
+pub fn item_regions(file: &HeifFile<'_>, id: ItemId) -> Result<Vec<Regions>, Error> {
+    file.region_items(id)
+        .into_iter()
+        .map(|item| {
+            Ok(Regions {
+                item,
+                regions: file.region_item(item)?,
+                descriptions: file.user_descriptions(item)?,
+            })
+        })
+        .collect()
+}
+
 /// Reads the IPTC-IIM block of the primary image, unparsed: from its `iptc` item or, failing
 /// that, from its EXIF data. Parse it with [`Iptc::parse`](crate::Iptc::parse).
 pub fn read_iptc(bytes: &[u8]) -> Result<Option<Vec<u8>>, Error> {

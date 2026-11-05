@@ -621,6 +621,28 @@ fn info_lines(input: &Path) -> Result<Vec<String>, String> {
             lines.push(format!("  {}", parts.join(" · ")));
         }
     }
+    if let Ok(regions) = heifer::item_regions(&file, file.primary_id) {
+        for r in &regions {
+            let names: Vec<&str> = r
+                .descriptions
+                .iter()
+                .map(|d| d.name.as_str())
+                .filter(|n| !n.is_empty())
+                .collect();
+            let count = r.regions.regions.len();
+            lines.push(format!(
+                "  regions: {count} region{} on {}×{}{}",
+                if count == 1 { "" } else { "s" },
+                r.regions.reference_width,
+                r.regions.reference_height,
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                }
+            ));
+        }
+    }
     let iptc_block = heifer::item_iptc(&file, file.primary_id).ok().flatten();
     let has_iptc = iptc_block.is_some();
     if let Some(iptc) = iptc_block

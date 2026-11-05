@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- Region annotations (`rgan`, ISO/IEC 23008-12): `read_regions` and `item_regions` return the
+  region items of an image with their geometries (points, rectangles, ellipses, polygons,
+  polylines, referenced and inline masks) in the coordinates of their reference size, and the
+  names, descriptions and tags of their `udes` properties. Referenced masks are linked to their
+  mask items through the `mask` references in order, and `Geometry::mask_bit` reads inline masks.
+  `HeifWriter::add_region_item` writes them, with 32-bit fields only when a value needs them.
+  The syntax follows libheif; every count and size is checked against the data, and the
+  container fuzzer now parses them. `heifer info` lists the region items of the primary image.
+
 ## 0.3.29 — 2026-11-05
 
 **New**

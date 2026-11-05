@@ -328,6 +328,33 @@ impl HeifWriter {
         id
     }
 
+    /// Adds a region item (`rgan`) describing `image`, with an optional `udes` description.
+    /// `masks` are the mask image items of its referenced-mask regions, in order.
+    pub fn add_region_item(
+        &mut self,
+        image: ItemId,
+        regions: &crate::region::RegionItem,
+        masks: &[ItemId],
+        description: Option<&crate::region::UserDescription>,
+    ) -> Result<ItemId, crate::Error> {
+        let data = regions.encode()?;
+        let properties = match description {
+            Some(d) => {
+                let mut b = ((8 + d.encode().len()) as u32).to_be_bytes().to_vec();
+                b.extend_from_slice(b"udes");
+                b.extend_from_slice(&d.encode());
+                vec![(self.property(b), false)]
+            }
+            None => Vec::new(),
+        };
+        let id = self.add_item(*b"rgan", true, properties, data);
+        self.add_reference(*b"cdsc", id, &[image]);
+        if !masks.is_empty() {
+            self.add_reference(*b"mask", id, masks);
+        }
+        Ok(id)
+    }
+
     /// Adds an ICC profile (`colr` of type `prof`) to an image or grid item already added.
     /// Unknown items are ignored.
     pub fn add_icc_profile(&mut self, item: ItemId, icc: &[u8]) {
@@ -680,6 +707,53 @@ mod tests {
                 vec![0x44, 1, 0xCC],
             ],
         }
+    }
+
+    #[test]
+    fn region_items_round_trip() {
+        use crate::region::{Geometry, RegionItem, UserDescription};
+        let slices = [vec![0x26, 1, 1]];
+        let mut w = HeifWriter::new();
+        let image = w.add_image(&ImageSpec::new(640, 480, config(1), &slices));
+        let mask = w.add_image(&ImageSpec {
+            hidden: true,
+            ..ImageSpec::new(64, 64, config(0), &slices)
+        });
+        let regions = RegionItem {
+            reference_width: 640,
+            reference_height: 480,
+            regions: vec![
+                Geometry::Rectangle {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 50,
+                },
+                Geometry::ReferencedMask {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                    mask_item: Some(mask),
+                },
+            ],
+        };
+        let description = UserDescription {
+            lang: "en".into(),
+            name: "Face".into(),
+            description: "A person".into(),
+            tags: "face".into(),
+        };
+        let id = w
+            .add_region_item(image, &regions, &[mask], Some(&description))
+            .unwrap();
+        let bytes = w.finish();
+        let file = HeifFile::parse(&bytes).unwrap();
+        assert_eq!(file.region_items(image), [id]);
+        assert_eq!(file.region_item(id).unwrap(), regions);
+        assert_eq!(file.user_descriptions(id).unwrap(), [description]);
+        assert!(file.region_items(mask).is_empty());
+        assert!(file.region_item(image).is_err(), "not a region item");
     }
 
     #[test]

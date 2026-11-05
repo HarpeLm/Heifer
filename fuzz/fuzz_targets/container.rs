@@ -9,6 +9,8 @@ fuzz_target!(|data: &[u8]| {
             let _ = file.hevc_bitstream(item.id);
             let _ = file.grid(item.id);
             let _ = file.image_size(item.id);
+            let _ = file.region_item(item.id);
+            let _ = file.user_descriptions(item.id);
         }
     }
 });
