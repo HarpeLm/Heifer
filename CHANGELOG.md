@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Performance**
+
+- The inverse DCT runs as a partial butterfly: the even and odd coefficients are combined
+  through the symmetry of the basis, with about half the multiplications of the matrix product.
+  The integer sums are only regrouped, so the output is byte-identical; a test compares both on
+  random and extreme inputs for every size, and the 42 hash-verified conformance streams still
+  match. About 1% faster single-threaded decoding.
+
 ## 0.3.28 — 2026-11-05
 
 **Correctness**

@@ -182,6 +182,126 @@ fn mul_1d<const N: usize>(m: &[[i32; N]; N], src: &[i32; N], terms: usize) -> [i
     acc
 }
 
+/// Odd half of the `N`-point DCT matrix: `odd[i][j] = DCT_N[2i + 1][j]` for `j < N / 2`,
+/// the rows that the partial butterfly multiplies by the odd coefficients.
+const fn odd_rows<const N: usize, const H: usize>() -> [[i32; H]; H] {
+    let mut m = [[0i32; H]; H];
+    let mut i = 0;
+    while i < H {
+        let mut j = 0;
+        while j < H {
+            m[i][j] = DCT32[(2 * i + 1) * (32 / N)][j];
+            j += 1;
+        }
+        i += 1;
+    }
+    m
+}
+
+const ODD4: [[i32; 2]; 2] = odd_rows::<4, 2>();
+const ODD8: [[i32; 4]; 4] = odd_rows::<8, 4>();
+const ODD16: [[i32; 8]; 8] = odd_rows::<16, 8>();
+const ODD32: [[i32; 16]; 16] = odd_rows::<32, 16>();
+
+/// One butterfly level of the inverse DCT: the `N`-point output from the `N / 2`-point
+/// inverse of the even coefficients (`even`) and the odd coefficients of `src`, of which the
+/// first `terms` entries may be non-zero.
+///
+/// The DCT basis is symmetric, `DCT_N[k][N - 1 - n] = (-1)^k DCT_N[k][n]`, and its even rows
+/// are the `N / 2`-point basis. So with `E` the even part and `O` the odd part of
+/// `sum_k DCT_N[k][n] * src[k]`, the outputs are `E[n] + O[n]` and `E[n] - O[n]` mirrored:
+/// the same integer sums as the matrix product, regrouped, so the result is identical.
+#[inline]
+fn butterfly<const N: usize, const H: usize>(
+    odd: &[[i32; H]; H],
+    even: [i32; H],
+    src: &[i32; N],
+    terms: usize,
+) -> [i32; N] {
+    let mut o = [0i32; H];
+    for (i, row) in odd.iter().enumerate().take(terms.min(N) / 2) {
+        let c = src[2 * i + 1];
+        if c == 0 {
+            continue;
+        }
+        for j in 0..H {
+            o[j] += row[j] * c;
+        }
+    }
+    let mut out = [0i32; N];
+    for j in 0..H {
+        out[j] = even[j] + o[j];
+        out[N - 1 - j] = even[j] - o[j];
+    }
+    out
+}
+
+/// The even coefficients of `src` (`src[2i]`), and how many of them may be non-zero.
+#[inline]
+fn evens<const N: usize, const H: usize>(src: &[i32; N], terms: usize) -> ([i32; H], usize) {
+    let mut e = [0i32; H];
+    for (i, e) in e.iter_mut().enumerate() {
+        *e = src[2 * i];
+    }
+    (e, terms.min(N).div_ceil(2))
+}
+
+fn idct2(src: &[i32; 2], terms: usize) -> [i32; 2] {
+    // DCT_2 = [[64, 64], [64, -64]].
+    let e = if terms > 0 { 64 * src[0] } else { 0 };
+    let o = if terms > 1 { 64 * src[1] } else { 0 };
+    [e + o, e - o]
+}
+
+fn idct4(src: &[i32; 4], terms: usize) -> [i32; 4] {
+    let (e, t) = evens::<4, 2>(src, terms);
+    butterfly(&ODD4, idct2(&e, t), src, terms)
+}
+
+fn idct8(src: &[i32; 8], terms: usize) -> [i32; 8] {
+    let (e, t) = evens::<8, 4>(src, terms);
+    butterfly(&ODD8, idct4(&e, t), src, terms)
+}
+
+fn idct16(src: &[i32; 16], terms: usize) -> [i32; 16] {
+    let (e, t) = evens::<16, 8>(src, terms);
+    butterfly(&ODD16, idct8(&e, t), src, terms)
+}
+
+fn idct32(src: &[i32; 32], terms: usize) -> [i32; 32] {
+    let (e, t) = evens::<32, 16>(src, terms);
+    butterfly(&ODD32, idct16(&e, t), src, terms)
+}
+
+/// One 1-D inverse DCT stage of size `N`, by partial butterfly: the same result as
+/// `mul_1d(&DCT_N, src, terms)` with about half the multiplications.
+#[inline]
+fn idct_1d<const N: usize>(src: &[i32; N], terms: usize) -> [i32; N] {
+    let mut out = [0i32; N];
+    match N {
+        4 => out.copy_from_slice(&idct4(src[..].try_into().expect("N = 4"), terms)),
+        8 => out.copy_from_slice(&idct8(src[..].try_into().expect("N = 8"), terms)),
+        16 => out.copy_from_slice(&idct16(src[..].try_into().expect("N = 16"), terms)),
+        _ => out.copy_from_slice(&idct32(src[..].try_into().expect("N = 32"), terms)),
+    }
+    out
+}
+
+/// One 1-D stage of the inverse transform: the partial butterfly for the DCT (`FLAT_ROW`), the
+/// matrix product for the DST.
+#[inline]
+fn inverse_1d<const N: usize, const FLAT_ROW: bool>(
+    m: &[[i32; N]; N],
+    src: &[i32; N],
+    terms: usize,
+) -> [i32; N] {
+    if FLAT_ROW {
+        idct_1d::<N>(src, terms)
+    } else {
+        mul_1d::<N>(m, src, terms)
+    }
+}
+
 /// 2-D inverse transform (§8.6.4.2) of an `N`×`N` block of scaled coefficients `d` whose
 /// non-zero values all lie in the top-left `rows`×`cols` corner: a column pass with clipping
 /// to 16 bits, then a row pass shifted by `bd_shift`.
@@ -211,7 +331,7 @@ fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
         for (g, &c) in g.iter_mut().zip(b).take(cols) {
             *g = ((m[0][0] * c + 64) >> 7).clamp(-32768, 32767);
         }
-        let mut row = mul_1d::<N>(m, &g, cols);
+        let mut row = inverse_1d::<N, FLAT_ROW>(m, &g, cols);
         for v in row.iter_mut() {
             *v = (*v + rnd) >> bd_shift;
         }
@@ -228,7 +348,7 @@ fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
         for j in 0..rows {
             col[j] = b[j * N + x];
         }
-        let e = mul_1d::<N>(m, &col, rows);
+        let e = inverse_1d::<N, FLAT_ROW>(m, &col, rows);
         for y in 0..N {
             g[y][x] = ((e[y] + 64) >> 7).clamp(-32768, 32767);
         }
@@ -240,7 +360,7 @@ fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
             out[y * N..y * N + N].fill((m[0][0] * g[y][0] + rnd) >> bd_shift);
             continue;
         }
-        let r = mul_1d::<N>(m, &g[y], cols);
+        let r = inverse_1d::<N, FLAT_ROW>(m, &g[y], cols);
         let o = &mut out[y * N..y * N + N];
         for i in 0..N {
             o[i] = (r[i] + rnd) >> bd_shift;
@@ -1066,6 +1186,50 @@ impl Sink for Reconstructor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The partial butterfly gives exactly the matrix product, for every size and number of
+    /// non-zero inputs, including the 16-bit extremes.
+    #[test]
+    fn butterfly_matches_matrix_product() {
+        fn check<const N: usize>(m: &[[i32; N]; N]) {
+            let mut seed = 0x9e37_79b9_u32;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed
+            };
+            for round in 0..2000 {
+                let mut src = [0i32; N];
+                for v in &mut src {
+                    *v = match round % 4 {
+                        0 => i32::from(next() as i16),
+                        1 => [-32768, 32767, 0][(next() % 3) as usize],
+                        2 => (next() % 9) as i32 - 4,
+                        _ => {
+                            if next() % 4 == 0 {
+                                i32::from(next() as i16)
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                }
+                for terms in 0..=N {
+                    assert_eq!(
+                        idct_1d::<N>(&src, terms),
+                        mul_1d::<N>(m, &src, terms),
+                        "N = {N}, terms = {terms}"
+                    );
+                }
+            }
+        }
+        check::<4>(&DCT4);
+        check::<8>(&DCT8);
+        check::<16>(&DCT16);
+        check::<32>(&DCT32);
+    }
+
     use crate::scan::{ScanType, scan_order};
 
     #[test]
