@@ -106,6 +106,10 @@ let rgba: Vec<u8> = image.to_rgba8();   // or to_rgb8(); image.data keeps 16-bit
 
 let preview = heifer::decode_thumbnail(&bytes)?;   // the embedded thumbnail, if any: much faster
 
+// From a file or any `Read + Seek`, without holding the whole file: only the boxes and the item
+// data the image needs are read (thumbnails and other images are skipped).
+let image = heifer::decode_reader(std::io::BufReader::new(std::fs::File::open("photo.heic")?))?;
+
 // Auxiliary images next to the primary one: depth maps of Portrait photos, alpha planes, ...
 for aux in heifer::auxiliary_images(&bytes)? {
     println!("{}: {}×{}, {} bits, depth: {}", aux.urn, aux.width, aux.height, aux.bit_depth, aux.is_depth());
@@ -186,7 +190,7 @@ slightly smaller than still265's Slow preset (0.3 to 0.6%, [benchmarks](docs/BEN
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
 
-Read EXIF, XMP and the ICC profile without decoding pixels:
+Read EXIF, XMP, IPTC and the ICC profile without decoding pixels:
 
 ```rust
 let meta = heifer::read_metadata(&bytes)?;
@@ -194,6 +198,15 @@ if let Some(exif) = meta.exif_fields() {
     println!("{:?} {:?} taken {:?}", exif.make(), exif.model(), exif.date_time());
 }
 let icc: Option<Vec<u8>> = meta.icc_profile;   // also meta.exif (raw TIFF) and meta.xmp
+
+// IPTC-IIM: caption, keywords, credit and location of news and stock photos.
+if let Some(block) = heifer::read_iptc(&bytes)? {
+    let iptc = heifer::Iptc::parse(&block)?;
+    println!("{:?} {:?} {:?}", iptc.caption(), iptc.keywords(), iptc.city());
+}
+
+// Only the container and the metadata items, from a reader: a few kilobytes of a large file.
+let meta = heifer::read_metadata_reader(std::fs::File::open("photo.heic")?)?;
 ```
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> HDR photos
@@ -273,7 +286,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **HEVC** | Main, Main 10, Main Still Picture, intra Range Extensions: 8–12 bit and 16-bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision processing, image sequences (inter prediction) |
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
-| **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC | IPTC |
+| **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC, IPTC-IIM (from an `iptc` item or EXIF; caption, keywords, by-line, copyright, place, date) | writing IPTC |
 | **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, 4:4:4 and lossless (Range Extensions profile 4), alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | — |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
@@ -412,6 +425,7 @@ side-by-side API map, behavioural differences and a migration checklist.
 - [x] **0.3.9**: files smaller than x265 `slow` and still265 Slow (SAO, 64×64 blocks, deeper transform trees, transform skip)
 - [x] **0.3.15**: HDR gain map encoding (ISO 21496-1 `tmap`)
 - [x] **0.3.16**: ICC colour management (`decode_srgb`; an ICC profile replaces `nclx` when encoding)
+- [x] **IPTC** (#4) and decoding from a reader (#5)
 - [ ] **Next**: single-thread decoding speed (still slower than ffmpeg)
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

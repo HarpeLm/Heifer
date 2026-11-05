@@ -45,36 +45,37 @@ HEVC codec, not a general uncompressed image container.
 - Honour component alignment, pixel size and row alignment.
 - Keep a clear `Unsupported` error for layouts outside that subset.
 
+### IPTC metadata (#4)
+
+- Bounded IPTC-IIM parser: `read_iptc`, `item_iptc` and `Iptc`, from an `iptc` item or EXIF.
+- Exposed as separate functions rather than a `Metadata` field, so that code building
+  `Metadata` keeps compiling. Writing IPTC is not supported yet.
+
+### Decoding from a reader (#5)
+
+- `decode_reader`, `decode_reader_with_options` and `read_metadata_reader` over
+  `Read + Seek`, reading only the boxes and item data a call needs.
+- The slice API is unchanged; the decode fuzzer checks that both paths agree.
+
 ## Next
 
-### 1. IPTC metadata (#4)
-
-- Bounded IPTC-IIM parser, exposed as `Metadata::iptc`.
-- No network access, no unbounded allocation.
-
-### 2. Streaming decode (#5)
-
-- `decode_reader` over `Read + Seek`, without buffering the whole file.
-- Keep `decode` unchanged for callers that already have the bytes.
-- Preserve the same limits and error behaviour.
-
-### 3. Single-thread hot loops
+### 1. Single-thread hot loops
 
 Multi-threaded decoding is already faster than libheif, but one thread is slower than ffmpeg on
 large grids. Optimise the per-tile and colour-conversion loops without adding `unsafe`.
 
-### 4. More encoding knobs
+### 2. More encoding knobs
 
 - Explicit quality and bitrate controls.
 - 4:2:2 encoding.
 - Advanced HEVC parameters for users who need them.
 
-### 5. Region annotations (`rgan`)
+### 3. Region annotations (`rgan`)
 
 - Read region annotations and expose them with the image.
 - Keep them optional and out of the decode hot path.
 
-### 6. Fixtures and fuzzing
+### 4. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.

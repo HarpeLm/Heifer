@@ -38,6 +38,26 @@ pub fn item_metadata(file: &HeifFile<'_>, id: ItemId) -> Result<Metadata, Error>
     })
 }
 
+/// Reads the IPTC-IIM block of the primary image, unparsed: from its `iptc` item or, failing
+/// that, from its EXIF data. Parse it with [`Iptc::parse`](crate::Iptc::parse).
+pub fn read_iptc(bytes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let file = HeifFile::parse(bytes)?;
+    item_iptc(&file, file.primary_id)
+}
+
+/// Like [`read_iptc`], for one image item.
+pub fn item_iptc(file: &HeifFile<'_>, id: ItemId) -> Result<Option<Vec<u8>>, Error> {
+    if let Some(iptc) = file.iptc(id)? {
+        return Ok(Some(iptc));
+    }
+    let exif = file.exif(id)?;
+    Ok(exif
+        .as_deref()
+        .and_then(Exif::parse)
+        .and_then(|e| e.iptc())
+        .map(<[u8]>::to_vec))
+}
+
 /// A copy of EXIF data whose orientation tag, if any, says "upright" (1): for images whose
 /// pixels are already upright, so that no viewer rotates them again.
 pub(crate) fn exif_upright(exif: &[u8]) -> Vec<u8> {
@@ -70,6 +90,8 @@ mod tag {
     pub const GPS_IFD: u16 = 0x8825;
     pub const DATE_TIME_ORIGINAL: u16 = 0x9003;
     pub const MAKER_NOTE: u16 = 0x927C;
+    /// IPTC-NAA block, written into IFD0 by some tools.
+    pub const IPTC_NAA: u16 = 0x83BB;
     /// Apple MakerNote tags used to compute the HDR headroom.
     pub const APPLE_HDR_33: u16 = 33;
     pub const APPLE_HDR_48: u16 = 48;
@@ -165,6 +187,19 @@ impl<'a> Exif<'a> {
             .filter(|s| !s.is_empty())
     }
 
+    /// Raw bytes of a `BYTE`, `UNDEFINED` or `LONG` tag.
+    fn bytes(&self, ifd: usize, wanted: u16) -> Option<&'a [u8]> {
+        let (kind, count, at) = self.find(ifd, wanted)?;
+        let unit = match kind {
+            1 | 7 => 1,
+            4 => 4,
+            _ => return None,
+        };
+        let len = (count as usize).checked_mul(unit)?;
+        let start = if len <= 4 { at } else { self.u32(at)? as usize };
+        self.data.get(start..start.checked_add(len)?)
+    }
+
     /// Value of a rational (`RATIONAL`, `SRATIONAL`) or `FLOAT` tag.
     fn real(&self, ifd: usize, wanted: u16) -> Option<f64> {
         let (kind, _, at) = self.find(ifd, wanted)?;
@@ -251,6 +286,11 @@ impl<'a> Exif<'a> {
             .or_else(|| self.ascii(self.ifd0, tag::DATE_TIME))
     }
 
+    /// The IPTC-IIM block stored in IFD0 (tag `0x83BB`), as some tools write it.
+    pub fn iptc(&self) -> Option<&'a [u8]> {
+        self.bytes(self.ifd0, tag::IPTC_NAA)
+    }
+
     /// Whether the image has GPS information.
     pub fn has_gps(&self) -> bool {
         self.long(self.ifd0, tag::GPS_IFD).is_some()
@@ -311,6 +351,26 @@ mod tests {
         assert_eq!(e.make(), Some("Apple"));
         assert_eq!(e.model(), None);
         assert!(!e.has_gps());
+    }
+
+    #[test]
+    fn iptc_in_exif_ifd0() {
+        // Little-endian TIFF, IFD0 with one IPTC-NAA entry (UNDEFINED) pointing after the IFD.
+        let iim = [0x1C, 2, 25, 0, 3, b'a', b'b', b'c'];
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        t.extend_from_slice(&1u16.to_le_bytes());
+        t.extend_from_slice(&0x83BBu16.to_le_bytes());
+        t.extend_from_slice(&7u16.to_le_bytes());
+        t.extend_from_slice(&(iim.len() as u32).to_le_bytes());
+        t.extend_from_slice(&26u32.to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.extend_from_slice(&iim);
+        let exif = Exif::parse(&t).unwrap();
+        assert_eq!(exif.iptc(), Some(&iim[..]));
+        // An offset past the end is ignored, not a panic.
+        t[18..22].copy_from_slice(&1000u32.to_le_bytes());
+        assert_eq!(Exif::parse(&t).unwrap().iptc(), None);
     }
 
     #[test]

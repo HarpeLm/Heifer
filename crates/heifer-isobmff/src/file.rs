@@ -436,6 +436,20 @@ impl<'a> HeifFile<'a> {
         Ok(None)
     }
 
+    /// IPTC metadata of an image: the IPTC-IIM block of an `iptc` item (or of a `mime` item of
+    /// type `application/x-iptc`) that describes it, unparsed.
+    pub fn iptc(&self, image: ItemId) -> Result<Option<Vec<u8>>, Error> {
+        let accept = |i: &Item| {
+            i.item_type.0 == *b"iptc"
+                || (i.item_type.0 == *b"mime"
+                    && i.content_type.as_deref() == Some("application/x-iptc"))
+        };
+        match self.metadata_items(image, accept).first() {
+            Some(&id) => Ok(Some(self.item_data(id)?.into_owned())),
+            None => Ok(None),
+        }
+    }
+
     /// XMP metadata of an image (an XML packet), from a `mime` item of type
     /// `application/rdf+xml`.
     pub fn xmp(&self, image: ItemId) -> Result<Option<Vec<u8>>, Error> {

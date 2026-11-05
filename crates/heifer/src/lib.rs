@@ -21,7 +21,9 @@ mod icc;
 pub mod image;
 #[cfg(feature = "image")]
 pub mod image_crate;
+pub mod iptc;
 pub mod metadata;
+pub mod reader;
 mod uncompressed;
 
 pub use depth::{DepthInfo, DepthRepresentation};
@@ -36,7 +38,9 @@ pub use heifer_hevc_enc;
 pub use heifer_isobmff;
 pub use heifer_isobmff::writer::{ALPHA_URN, DEPTH_URN};
 pub use image::{Image, Sample};
-pub use metadata::{Exif, Metadata, item_metadata, read_metadata};
+pub use iptc::{Dataset, Iptc};
+pub use metadata::{Exif, Metadata, item_iptc, item_metadata, read_iptc, read_metadata};
+pub use reader::{ReadError, decode_reader, decode_reader_with_options, read_metadata_reader};
 
 use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};

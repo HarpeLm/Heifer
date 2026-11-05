@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**New**
+
+- IPTC metadata (#4): `read_iptc` and `item_iptc` return the IPTC-IIM block of an image, from its
+  `iptc` item (or a `mime` item of type `application/x-iptc`) or, failing that, from the
+  IPTC-NAA tag of its EXIF data (`Exif::iptc`). `Iptc::parse` reads it, Photoshop resource
+  blocks included: every dataset in file order, repeated ones kept, with `caption`, `keywords`,
+  `by_line`, `copyright`, `city`, `country`, `date_created` and `time_created`. Text is UTF-8
+  when the block declares it, ISO 8859-1 otherwise. Every length is checked against the data.
+  `heifer info` shows the caption, by-line, place and keywords.
+- Decoding from a reader (#5): `decode_reader`, `decode_reader_with_options` and
+  `read_metadata_reader` take any `Read + Seek`. Only the `ftyp` and `meta` boxes and the data of
+  the items the call needs are read: metadata costs a few kilobytes of a large file, and a burst
+  or collection reads about a tenth of it for its primary image. The output is identical to the
+  slice API, which the decode fuzzer now checks on every input. Reader failures are reported by
+  the new `ReadError`.
+- The existing API is unchanged: `Metadata` keeps its fields, and the slice functions are as
+  before.
+
 **Performance**
 
 - The inverse DCT runs as a partial butterfly: the even and odd coefficients are combined

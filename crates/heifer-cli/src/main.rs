@@ -621,7 +621,34 @@ fn info_lines(input: &Path) -> Result<Vec<String>, String> {
             lines.push(format!("  {}", parts.join(" · ")));
         }
     }
-    let has_iptc = file.items.iter().any(|item| item.item_type.0 == *b"iptc");
+    let iptc_block = heifer::item_iptc(&file, file.primary_id).ok().flatten();
+    let has_iptc = iptc_block.is_some();
+    if let Some(iptc) = iptc_block
+        .as_deref()
+        .and_then(|b| heifer::Iptc::parse(b).ok())
+    {
+        let mut parts = Vec::new();
+        if let Some(caption) = iptc.caption() {
+            parts.push(format!("\"{caption}\""));
+        }
+        if let Some(by) = iptc.by_line() {
+            parts.push(format!("by {by}"));
+        }
+        let place: Vec<String> = [iptc.city(), iptc.country()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !place.is_empty() {
+            parts.push(place.join(", "));
+        }
+        let keywords = iptc.keywords();
+        if !keywords.is_empty() {
+            parts.push(format!("keywords: {}", keywords.join(", ")));
+        }
+        if !parts.is_empty() {
+            lines.push(format!("  IPTC: {}", parts.join(" · ")));
+        }
+    }
     let present: Vec<&str> = [
         (meta.exif.is_some(), "EXIF"),
         (meta.xmp.is_some(), "XMP"),
@@ -799,6 +826,10 @@ mod tests {
         let lines = info_lines(&path).unwrap();
         let joined = lines.join("\n");
         assert!(joined.contains("metadata: EXIF, XMP, IPTC"), "{joined}");
+        assert!(
+            joined.contains("IPTC: Budapest, Hungary · keywords: HvK, 2006"),
+            "{joined}"
+        );
     }
 
     #[test]

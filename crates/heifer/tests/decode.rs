@@ -337,3 +337,30 @@ fn files_without_metadata() {
         heifer::Metadata::default()
     );
 }
+
+#[test]
+fn reads_iptc_of_a_real_file() {
+    let Some(p) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/real/heif_other__L_exif_xmp_iptc.heic")
+        .canonicalize()
+        .ok()
+    else {
+        return;
+    };
+    let bytes = std::fs::read(p).unwrap();
+    let block = heifer::read_iptc(&bytes)
+        .unwrap()
+        .expect("the file has an iptc item");
+    let iptc = heifer::Iptc::parse(&block).unwrap();
+    assert_eq!(iptc.city().as_deref(), Some("Budapest"));
+    assert_eq!(iptc.country().as_deref(), Some("Hungary"));
+    assert_eq!(
+        iptc.keywords(),
+        [
+            "HvK", "2006", "summer", "July", "holiday", "Hungary", "Budapest"
+        ]
+    );
+    // Files without IPTC are unchanged.
+    let plain = heifer::encode_rgba8(16, 16, &[128; 16 * 16 * 4], &Default::default()).unwrap();
+    assert_eq!(heifer::read_iptc(&plain).unwrap(), None);
+}
