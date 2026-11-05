@@ -21,6 +21,18 @@ pub fn scan_order(log2_size: u8, scan: ScanType) -> &'static [(u8, u8)] {
     &SCAN_ORDERS[usize::from(log2_size)][scan as usize]
 }
 
+/// The inverse of [`scan_order`]: `scan_index(log2_size, scan)[y * size + x]` is the position
+/// of `(x, y)` in the scan order.
+pub fn scan_index(log2_size: u8, scan: ScanType) -> &'static [u8] {
+    &SCAN_INDICES[usize::from(log2_size)][scan as usize]
+}
+
+/// `raster_index[n]` is the raster position `(y << 2) | x` of scan position `n` in a 4×4
+/// sub-block, so the residual loop reads it without unpacking a coordinate pair.
+pub fn sub_raster(scan: ScanType) -> &'static [u8; 16] {
+    &SUB_RASTER[scan as usize]
+}
+
 /// `[log2_size][scan type]` → positions.
 type ScanTables = [[Vec<(u8, u8)>; 3]; 4];
 
@@ -28,6 +40,33 @@ static SCAN_ORDERS: std::sync::LazyLock<ScanTables> = std::sync::LazyLock::new(|
     core::array::from_fn(|l| {
         let size = 1u8 << l;
         [diagonal(size), horizontal(size), vertical(size)]
+    })
+});
+
+/// `[log2_size][scan type]` → inverse positions.
+type ScanIndexTables = [[Vec<u8>; 3]; 4];
+
+static SCAN_INDICES: std::sync::LazyLock<ScanIndexTables> = std::sync::LazyLock::new(|| {
+    core::array::from_fn(|l| {
+        core::array::from_fn(|s| {
+            let size = 1usize << l;
+            let mut index = vec![0u8; size * size];
+            for (i, &(x, y)) in SCAN_ORDERS[l][s].iter().enumerate() {
+                index[usize::from(y) * size + usize::from(x)] = i as u8;
+            }
+            index
+        })
+    })
+});
+
+/// `[scan type]` → raster index of each 4×4 scan position.
+static SUB_RASTER: std::sync::LazyLock<[[u8; 16]; 3]> = std::sync::LazyLock::new(|| {
+    core::array::from_fn(|s| {
+        let mut raster = [0u8; 16];
+        for (i, &(x, y)) in SCAN_ORDERS[2][s].iter().enumerate() {
+            raster[i] = (y << 2) | x;
+        }
+        raster
     })
 });
 
@@ -226,6 +265,25 @@ mod tests {
             &[(0, 0), (0, 1), (1, 0), (1, 1)]
         );
         assert_eq!(scan_order(0, ScanType::Diagonal), &[(0, 0)]);
+    }
+
+    #[test]
+    fn scan_index_inverts_scan_order() {
+        for log2_size in 0..=3 {
+            for scan in [ScanType::Diagonal, ScanType::Horizontal, ScanType::Vertical] {
+                let order = scan_order(log2_size, scan);
+                let index = scan_index(log2_size, scan);
+                let size = 1usize << log2_size;
+                assert_eq!(index.len(), order.len());
+                for (i, &(x, y)) in order.iter().enumerate() {
+                    assert_eq!(
+                        usize::from(index[usize::from(y) * size + usize::from(x)]),
+                        i,
+                        "log2_size {log2_size}, scan {scan:?}, position ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,13 @@
 - `iref` and `ipma` parsing bound their entry counts by the size of the box, like `iloc`, so a
   crafted count can no longer reserve memory for entries the file does not contain.
 
+**Performance**
+
+- Decoding is about 3% faster on the 13-file single-thread benchmark, and 6% faster on 12 MP
+  photos: the last significant coefficient is located through the inverse scan order instead of
+  scanning the whole block, and `residual_coding` reads the 4×4 raster positions from a table.
+  Output is unchanged.
+
 **Tests**
 
 - The minimized inputs that once crashed the fuzzers are kept in `fuzz/regressions/` and replayed

@@ -12,7 +12,7 @@ use crate::bitreader::BitReader;
 use crate::cabac::{ArithmeticDecoder, ContextModel};
 use crate::contexts::{Contexts, ctx};
 use crate::params::{Pps, Sps};
-use crate::scan::{CtbLayout, ScanType, scan_order};
+use crate::scan::{CtbLayout, ScanType, scan_index, scan_order, sub_raster};
 use crate::slice::SliceHeader;
 
 /// `ctxIdxMap` for `sig_coeff_flag` in a 4×4 transform block (Table 9-39), by raster position.
@@ -1266,33 +1266,23 @@ impl Parser<'_, '_> {
         if scan == ScanType::Vertical {
             last.swap(0, 1);
         }
-        let (last_x, last_y) = (last[0] as u8, last[1] as u8);
+        let (last_x, last_y) = (usize::from(last[0] as u8), usize::from(last[1] as u8));
+        if last_x >= size || last_y >= size {
+            return Err(Error::Invalid(
+                "last significant coefficient outside the block",
+            ));
+        }
 
         let log2_sb = log2_size - 2;
         let sb_scan = scan_order(log2_sb, scan);
-        let pos_scan = scan_order(2, scan);
-        let num_sb = 1usize << (2 * log2_sb);
-
-        // Locate the last significant position in scan order.
-        let mut last_sub_block = num_sb - 1;
-        let mut last_scan_pos = 16;
-        loop {
-            if last_scan_pos == 0 {
-                if last_sub_block == 0 {
-                    return Err(Error::Invalid("last significant coefficient not found"));
-                }
-                last_scan_pos = 16;
-                last_sub_block -= 1;
-            }
-            last_scan_pos -= 1;
-            let (xs, ys) = sb_scan[last_sub_block];
-            let (xp, yp) = pos_scan[last_scan_pos];
-            if (xs << 2) + xp == last_x && (ys << 2) + yp == last_y {
-                break;
-            }
-        }
-
         let sb_width = 1usize << log2_sb;
+        // Two inverse lookups locate the last significant coefficient directly instead of
+        // walking the coded sub-blocks backwards: its sub-block, and its position inside it.
+        let last_sub_block =
+            usize::from(scan_index(log2_sb, scan)[(last_y >> 2) * sb_width + (last_x >> 2)]);
+        let last_scan_pos = usize::from(scan_index(2, scan)[(last_y & 3) * 4 + (last_x & 3)]);
+        let sr = sub_raster(scan);
+
         let mut coded_sb = [[false; 8]; 8];
         // Implicit RDPCM (intra, horizontal/vertical, no transform) disables sign hiding.
         let implicit_rdpcm = self.sps.range_extension.implicit_rdpcm_enabled_flag
@@ -1350,8 +1340,7 @@ impl Parser<'_, '_> {
                 for n in (0..=start).rev() {
                     let n = n as usize;
                     let significant = if n > 0 || !infer_sb_dc {
-                        let (xp, yp) = pos_scan[n];
-                        let raster = (usize::from(yp) << 2) | usize::from(xp);
+                        let raster = usize::from(sr[n]);
                         let inc = sig_ctx.at(n, raster);
                         let s = self.flag(ctx::SIG_COEFF_FLAG + inc);
                         if s {
@@ -1459,9 +1448,9 @@ impl Parser<'_, '_> {
                         };
                     }
                 }
-                let (xp, yp) = pos_scan[usize::from(sig[k])];
-                let xc = (xs << 2) + usize::from(xp);
-                let yc = (ys << 2) + usize::from(yp);
+                let raster = usize::from(sr[usize::from(sig[k])]);
+                let xc = (xs << 2) | (raster & 3);
+                let yc = (ys << 2) | (raster >> 2);
                 let mut level = abs;
                 if k < coded_signs && (signs >> (coded_signs - 1 - k)) & 1 != 0 {
                     level = -level;
