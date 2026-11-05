@@ -28,7 +28,7 @@ EXIF and ICC profiles are kept, and photos are written upright.
 
 Options:
   -q, --quality <0-100>  quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
-      --format <mode>    HEIC coding: 420 (default), 444 or lossless
+      --format <mode>    HEIC coding: 420 (default), 422, 444 or lossless
       --lossless         same as --format lossless
       --aux              also write every auxiliary image as PNG
       --depth            also write the depth map as PNG
@@ -77,10 +77,11 @@ impl Args {
 fn parse_format(name: &str) -> Result<EncodeFormat, String> {
     match name.to_lowercase().as_str() {
         "420" | "420p" | "yuv420" | "4:2:0" => Ok(EncodeFormat::Ycbcr420),
+        "422" | "yuv422" | "4:2:2" => Ok(EncodeFormat::Ycbcr422),
         "444" | "yuv444" | "4:4:4" => Ok(EncodeFormat::Ycbcr444),
         "lossless" | "rgb" => Ok(EncodeFormat::Lossless),
         _ => Err(format!(
-            "unknown HEIC format `{name}`: use 420, 444 or lossless"
+            "unknown HEIC format `{name}`: use 420, 422, 444 or lossless"
         )),
     }
 }
@@ -765,7 +766,11 @@ mod tests {
             Some(EncodeFormat::Lossless)
         );
         assert_eq!(format("a.png b.heic"), None, "the default stays 4:2:0");
-        assert!(parse("a.png b.heic --format 422").is_err());
+        assert_eq!(
+            format("a.png b.heic --format 4:2:2"),
+            Some(EncodeFormat::Ycbcr422)
+        );
+        assert!(parse("a.png b.heic --format 411").is_err());
         assert!(parse("a.png b.heic --format 444 --lossless").is_err());
 
         let args = parse("a.png b.heic --lossless").unwrap().unwrap();

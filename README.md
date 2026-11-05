@@ -74,7 +74,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 cargo install heifer-cli
 heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converted
 heifer photo.png photo.heic -q 80       # to HEIC, 4:2:0
-heifer art.png art.heic --format 444    # full-resolution chroma
+heifer art.png art.heic --format 444    # full-resolution chroma (or 422: half width)
 heifer shot.png shot.heic --lossless    # no quantization (8-bit input)
 heifer IMG_1234.heic photo.png --depth  # extract the Portrait depth map too
 heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images, metadata
@@ -287,7 +287,7 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC, IPTC-IIM (from an `iptc` item or EXIF; caption, keywords, by-line, copyright, place, date), region annotations (`rgan`: points, rectangles, ellipses, polygons, masks, with `udes` names and tags; read and written) | writing IPTC |
-| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, 4:4:4 and lossless (Range Extensions profile 4), alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | — |
+| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, 4:2:2, 4:4:4 and lossless (Range Extensions profile 4), alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | — |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 

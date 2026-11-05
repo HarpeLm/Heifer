@@ -2,7 +2,21 @@
 
 ## Unreleased
 
+**Breaking**
+
+- `EncodeFormat` gains `Ycbcr422` and `heifer_hevc_enc::encoder::ChromaFormat` gains `Chroma422`;
+  both enums are now `#[non_exhaustive]`, so a `match` on them needs a wildcard arm. This is the
+  only incompatible change, and future formats will not break code again.
+
 **New**
+
+- 4:2:2 encoding: `EncodeFormat::Ycbcr422` (and `--format 422` in the CLI) codes chroma at half
+  width and full height, with the Range Extensions profile. Each transform unit has two square
+  chroma blocks per component, the bottom one predicted from the top one, with their own coded
+  block flags, and chroma prediction modes are mapped by Table 8-3. Odd widths are rounded up
+  and cropped with `clap`, as odd sizes already were in 4:2:0. Files decode in heifer, ffmpeg
+  and Apple's ImageIO; on a photo at quality 80, 4:2:2 sits between 4:2:0 and 4:4:4 in size and
+  quality. The encoder round-trip tests and the encode fuzzer cover it.
 
 - Region annotations (`rgan`, ISO/IEC 23008-12): `read_regions` and `item_regions` return the
   region items of an image with their geometries (points, rectangles, ellipses, polygons,

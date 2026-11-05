@@ -95,7 +95,7 @@ pub(crate) struct StreamParams {
     /// Size of the image, before padding to the coded size.
     pub output_width: u32,
     pub output_height: u32,
-    /// `chroma_format_idc`: 0 = monochrome, 1 = 4:2:0, 3 = 4:4:4.
+    /// `chroma_format_idc`: 0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
     pub chroma_format: u8,
     /// Bits per sample, 8 to 10.
     pub bit_depth: u8,
@@ -109,9 +109,9 @@ pub(crate) struct StreamParams {
 
 impl StreamParams {
     /// `general_profile_idc`: Main (1) for 8 bits, Main 10 (2) above, Range Extensions (4) for
-    /// 4:4:4.
+    /// 4:2:2 and 4:4:4.
     pub(crate) fn profile_idc(&self) -> u8 {
-        if self.chroma_format == 3 {
+        if matches!(self.chroma_format, 2 | 3) {
             4
         } else if self.bit_depth > 8 {
             2
@@ -190,9 +190,19 @@ impl StreamParams {
         if right == 0 && bottom == 0 {
             w.bit(false);
         } else {
-            // In units of chroma samples (2 luma samples in 4:2:0, 1 otherwise).
-            let unit = if self.chroma_format == 1 { 2 } else { 1 };
-            w.bit(true).ue(0).ue(right / unit).ue(0).ue(bottom / unit);
+            // In units of chroma samples: 2 luma samples horizontally in 4:2:0 and 4:2:2,
+            // vertically in 4:2:0 only.
+            let unit_x = if matches!(self.chroma_format, 1 | 2) {
+                2
+            } else {
+                1
+            };
+            let unit_y = if self.chroma_format == 1 { 2 } else { 1 };
+            w.bit(true)
+                .ue(0)
+                .ue(right / unit_x)
+                .ue(0)
+                .ue(bottom / unit_y);
         }
         let bd = u32::from(self.bit_depth - 8);
         w.ue(bd).ue(bd); // bit_depth_luma_minus8, bit_depth_chroma_minus8

@@ -369,6 +369,42 @@ fn four_four_four_keeps_full_resolution_chroma() {
 }
 
 #[test]
+fn four_two_two_keeps_full_height_chroma() {
+    // One-pixel red and blue horizontal stripes: 4:2:0 averages them away, 4:2:2 keeps every
+    // row of chroma.
+    let (w, h) = (64u32, 48u32);
+    let rgba: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            if (i / w) % 2 == 0 {
+                [230, 20, 20, 255]
+            } else {
+                [20, 20, 230, 255]
+            }
+        })
+        .collect();
+    let options = EncodeOptions {
+        quality: 90,
+        ..EncodeOptions::default()
+    };
+    let encode = |format| {
+        let heic = heifer::encode_rgba8_with_format(w, h, &rgba, format, &options).unwrap();
+        (
+            heic.clone(),
+            psnr(&rgba, &decode(&heic).unwrap().to_rgba8(), |c| c < 3),
+        )
+    };
+    let (heic, p422) = encode(heifer::EncodeFormat::Ycbcr422);
+    let (_, p420) = encode(heifer::EncodeFormat::Ycbcr420);
+    let file = heifer::heifer_isobmff::HeifFile::parse(&heic).unwrap();
+    let config = file.hevc_config(file.primary_id).unwrap().unwrap();
+    assert_eq!((config.profile_idc, config.chroma_format), (4, 2));
+    assert!(
+        p422 > 38.0 && p422 > p420 + 10.0,
+        "4:2:2 {p422:.1} dB, 4:2:0 {p420:.1} dB"
+    );
+}
+
+#[test]
 fn lossless_with_metadata_keeps_pixels() {
     let rgba = test_image(70, 30, true);
     let metadata = heifer::Metadata {
@@ -405,6 +441,7 @@ fn rgb_and_rgba_formats_agree() {
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     for format in [
+        heifer::EncodeFormat::Ycbcr422,
         heifer::EncodeFormat::Ycbcr444,
         heifer::EncodeFormat::Lossless,
     ] {
@@ -413,5 +450,24 @@ fn rgb_and_rgba_formats_agree() {
             heifer::encode_rgb8_with_format(33, 21, &rgb, format, &options).unwrap(),
             heifer::encode_rgba8_with_format(33, 21, &rgba, format, &options).unwrap()
         );
+    }
+}
+
+#[test]
+fn odd_sizes_keep_their_size_in_every_format() {
+    for (w, h) in [(17u32, 13u32), (1, 1), (33, 2), (2, 33)] {
+        let rgba = test_image(w, h, false);
+        for format in [
+            heifer::EncodeFormat::Ycbcr420,
+            heifer::EncodeFormat::Ycbcr422,
+            heifer::EncodeFormat::Ycbcr444,
+            heifer::EncodeFormat::Lossless,
+        ] {
+            let heic =
+                heifer::encode_rgba8_with_format(w, h, &rgba, format, &EncodeOptions::default())
+                    .unwrap();
+            let image = decode(&heic).unwrap();
+            assert_eq!((image.width, image.height), (w, h), "{format:?} {w}×{h}");
+        }
     }
 }

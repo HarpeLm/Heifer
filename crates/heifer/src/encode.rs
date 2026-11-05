@@ -32,10 +32,14 @@ const TILE: u32 = 512;
 
 /// Chroma format and coding mode of an encoded image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EncodeFormat {
     /// YCbCr 4:2:0, BT.601 matrix, lossy: the usual HEIC photos, with the smallest files.
     #[default]
     Ycbcr420,
+    /// YCbCr 4:2:2, BT.601 matrix, lossy: chroma at half width and full height, as in
+    /// broadcast and many cameras (Range Extensions profile).
+    Ycbcr422,
     /// YCbCr 4:4:4, BT.601 matrix, lossy: full-resolution chroma for graphics and text.
     Ycbcr444,
     /// GBR 4:4:4 without transform or quantization: decoding reproduces every sample exactly.
@@ -737,6 +741,27 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
     };
     let (cb, cr) = if format == EncodeFormat::Ycbcr444 {
         (full(&cb_full), full(&cr_full))
+    } else if format == EncodeFormat::Ycbcr422 {
+        // 4:2:2 with the chroma samples on the even columns: a [1 2 1] filter horizontally.
+        let cw = w.div_ceil(2);
+        let filtered = |full: &[i32]| -> Vec<u16> {
+            let mut out = Vec::with_capacity(cw * h);
+            for row in 0..h {
+                for cx in 0..cw {
+                    let x = 2 * cx;
+                    let cols = [x.saturating_sub(1), x, (x + 1).min(w - 1)];
+                    let sum: i64 = cols
+                        .into_iter()
+                        .zip([1i64, 2, 1])
+                        .map(|(c, wx)| wx * i64::from(full[row * w + c]))
+                        .sum();
+                    let n = 4i64 << 16;
+                    out.push(((sum + n * mid + n / 2).div_euclid(n)).clamp(0, max) as u16);
+                }
+            }
+            out
+        };
+        (filtered(&cb_full), filtered(&cr_full))
     } else {
         // 4:2:0 with the chroma samples on the even rows and columns, where Apple's decoder
         // (and heifer's) puts them: a [1 2 1] filter in both directions around each of them.
@@ -767,9 +792,13 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         chroma: Some((&cb, &cr)),
         bit_depth,
     };
-    if format == EncodeFormat::Ycbcr444 {
+    if matches!(format, EncodeFormat::Ycbcr422 | EncodeFormat::Ycbcr444) {
         let options = CodingOptions {
-            chroma_format: ChromaFormat::Chroma444,
+            chroma_format: if format == EncodeFormat::Ycbcr422 {
+                ChromaFormat::Chroma422
+            } else {
+                ChromaFormat::Chroma444
+            },
             lossless: false,
         };
         Ok(encode_picture16_with(
