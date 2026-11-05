@@ -10,6 +10,13 @@
 
 **New**
 
+- Image sequences (`.heics`, bursts, animations), first part: `read_sequence` describes the
+  main track of a file (size, frame durations, keyframes) from its `moov` sample tables, and
+  `decode_sequence_frame` decodes its keyframes with the intra decoder. Frames predicted from
+  other frames need inter prediction, not decoded yet: they return `Error::Unsupported`.
+  `heifer_isobmff::track` parses tracks (`tkhd`, `mdhd`, `hdlr`, `stsd` with `hvcC`, `stsz`,
+  `stco`/`co64`, `stsc`, `stts`, `stss`, `tref`), with every count checked against its box.
+  Tested on the Nokia animation and burst samples, and fuzzed.
 - Size targets: `encode_to_size` encodes at a high quality whose file fits in a byte budget, and
   returns the quality used; `fit_to_size` does the same search around any encoder (the CLI uses
   it with the `image` crate encoder and metadata). Quality is searched by dichotomy over the 44

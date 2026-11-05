@@ -14,9 +14,10 @@ mod file;
 mod header;
 mod reader;
 pub mod region;
+pub mod track;
 pub mod writer;
 
-pub use file::{HeifFile, Item, ItemId, is_image_item};
+pub use file::{HeifFile, Item, ItemId, hevc_annex_b, is_image_item};
 pub use header::{BoxHeader, BoxIter, FourCC, RawBox, read_box_header};
 
 /// Errors produced while parsing or writing a container.

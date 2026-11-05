@@ -24,6 +24,7 @@ pub mod image_crate;
 pub mod iptc;
 pub mod metadata;
 pub mod reader;
+pub mod sequence;
 mod uncompressed;
 
 pub use depth::{DepthInfo, DepthRepresentation};
@@ -45,6 +46,10 @@ pub use metadata::{
     read_regions,
 };
 pub use reader::{ReadError, decode_reader, decode_reader_with_options, read_metadata_reader};
+pub use sequence::{
+    FrameInfo, SequenceInfo, decode_sequence_frame, decode_sequence_frame_with_options,
+    read_sequence,
+};
 
 use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};
 use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};

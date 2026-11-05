@@ -13,4 +13,14 @@ fuzz_target!(|data: &[u8]| {
             let _ = file.user_descriptions(item.id);
         }
     }
+    if let Ok(tracks) = heifer_isobmff::track::parse_tracks(data) {
+        for track in &tracks {
+            for i in 0..track.samples.len().min(64) {
+                if let (Some(config), Ok(sample)) = (&track.hevc_config, track.sample_data(data, i))
+                {
+                    let _ = heifer_isobmff::hevc_annex_b(config, sample);
+                }
+            }
+        }
+    }
 });

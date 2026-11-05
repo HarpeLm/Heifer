@@ -17,6 +17,10 @@ fetch "$NOKIA/grid_960x640.heic"               grid.heic
 fetch "$NOKIA/alpha_1440x960.heic"             alpha.heic
 fetch "$NOKIA/random_collection_1440x960.heic" collection.heic
 fetch "$NOKIA/bird_burst.heic"                 burst.heic
+# Image sequences: animations with keyframes, and a burst with a thumbnail track.
+fetch "$NOKIA/candle_animation.heic"           candle_animation.heic
+fetch "$NOKIA/sea1_animation.heic"             sea1_animation.heic
+fetch "$NOKIA/rally_burst.heic"                rally_burst.heic
 fetch "$CONFORMANCE/C042.heic"                 mirrored.heic
 fetch "$CONFORMANCE/C008.heic"                 iden_rotated.heic
 fetch "$CONFORMANCE/C039.heic"                 iden_nested.heic

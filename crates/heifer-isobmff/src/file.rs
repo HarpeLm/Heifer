@@ -534,27 +534,33 @@ impl<'a> HeifFile<'a> {
             .hevc_config(id)?
             .ok_or(Error::MissingBox(FourCC(*b"hvcC")))?;
         let data = self.item_data(id)?;
-        let mut out = Vec::with_capacity(data.len() + 256);
-        for nal in &config.nal_units {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(nal);
-        }
-        let len_size = usize::from(config.nal_length_size);
-        let mut rest: &[u8] = &data;
-        while !rest.is_empty() {
-            let (len_bytes, tail) = rest
-                .split_at_checked(len_size)
-                .ok_or(Error::UnexpectedEof)?;
-            let len = len_bytes
-                .iter()
-                .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
-            let (nal, tail) = tail.split_at_checked(len).ok_or(Error::UnexpectedEof)?;
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(nal);
-            rest = tail;
-        }
-        Ok(out)
+        hevc_annex_b(config, &data)
     }
+}
+
+/// An Annex B HEVC stream: the parameter sets of `config`, then the length-prefixed NAL units of
+/// `data` (an item's data or a track sample), each behind a start code.
+pub fn hevc_annex_b(config: &HevcConfig, data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(data.len() + 256);
+    for nal in &config.nal_units {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    let len_size = usize::from(config.nal_length_size);
+    let mut rest: &[u8] = data;
+    while !rest.is_empty() {
+        let (len_bytes, tail) = rest
+            .split_at_checked(len_size)
+            .ok_or(Error::UnexpectedEof)?;
+        let len = len_bytes
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        let (nal, tail) = tail.split_at_checked(len).ok_or(Error::UnexpectedEof)?;
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+        rest = tail;
+    }
+    Ok(out)
 }
 
 /// Whether an item type is an image, coded or derived, as opposed to metadata (`Exif`, `mime`)
