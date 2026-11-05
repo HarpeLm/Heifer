@@ -10,6 +10,12 @@
 
 **New**
 
+- Size targets: `encode_to_size` encodes at a high quality whose file fits in a byte budget, and
+  returns the quality used; `fit_to_size` does the same search around any encoder (the CLI uses
+  it with the `image` crate encoder and metadata). Quality is searched by dichotomy over the 44
+  qualities that give distinct quantization parameters, about six encodes, and every candidate
+  is measured, so the result never exceeds the budget. The CLI gains `--max-size` (`-s`), e.g.
+  `--max-size 500K`, and prints the quality chosen.
 - 4:2:2 encoding: `EncodeFormat::Ycbcr422` (and `--format 422` in the CLI) codes chroma at half
   width and full height, with the Range Extensions profile. Each transform unit has two square
   chroma blocks per component, the bottom one predicted from the top one, with their own coded

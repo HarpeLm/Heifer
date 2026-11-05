@@ -71,7 +71,7 @@ large grids. Optimise the per-tile and colour-conversion loops without adding `u
 
 ### 2. More encoding knobs
 
-- Explicit quality and bitrate controls.
+- ~~Size targets~~: done (`encode_to_size`, `--max-size`).
 - ~~4:2:2 encoding~~: done.
 - Advanced HEVC parameters for users who need them.
 

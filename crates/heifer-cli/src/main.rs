@@ -30,6 +30,7 @@ Options:
   -q, --quality <0-100>  quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
       --format <mode>    HEIC coding: 420 (default), 422, 444 or lossless
       --lossless         same as --format lossless
+  -s, --max-size <size>  HEIC no larger than this (e.g. 500K, 2M): the quality is chosen
       --aux              also write every auxiliary image as PNG
       --depth            also write the depth map as PNG
       --gain-map         also write the HDR gain map as PNG
@@ -59,6 +60,8 @@ struct Args {
     to: Option<String>,
     out_dir: Option<PathBuf>,
     quality: Option<u8>,
+    /// `--max-size`: largest HEIC file, in bytes.
+    max_size: Option<usize>,
     format: Option<EncodeFormat>,
     aux: bool,
     depth: bool,
@@ -71,6 +74,24 @@ impl Args {
     fn wants_aux(&self) -> bool {
         self.aux || self.depth || self.gain_map
     }
+}
+
+/// A file size: bytes, or with a `K`/`KB` (1000) or `M`/`MB` (1000000) suffix.
+fn parse_size(text: &str) -> Result<usize, String> {
+    let lower = text.trim().to_lowercase();
+    let (number, unit) = match lower.trim_end_matches('b') {
+        n if n.ends_with('k') => (&n[..n.len() - 1], 1_000.0),
+        n if n.ends_with('m') => (&n[..n.len() - 1], 1_000_000.0),
+        n => (n, 1.0),
+    };
+    number
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| (v * unit).round() as usize)
+        .filter(|&v| v > 0)
+        .ok_or(format!("size must be like 500K or 2M, not `{text}`"))
 }
 
 /// HEIC coding mode named on the command line.
@@ -120,6 +141,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
                         .ok_or(format!("quality must be 0 to 100, not `{q}`"))?,
                 );
             }
+            "-s" | "--max-size" => args.max_size = Some(parse_size(&value(&arg)?)?),
             "-t" | "--to" => args.to = Some(value(&arg)?.trim_start_matches('.').to_lowercase()),
             "--format" => {
                 let format = parse_format(&value(&arg)?)?;
@@ -233,6 +255,17 @@ fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
     if !is_heif(output) && args.format.is_some() {
         return Err("the HEIC coding mode only applies to HEIC output".into());
     }
+    if args.max_size.is_some() {
+        if !is_heif(output) {
+            return Err("--max-size only applies to HEIC output".into());
+        }
+        if args.quality.is_some() {
+            return Err("--max-size chooses the quality: do not give -q as well".into());
+        }
+        if args.format == Some(EncodeFormat::Lossless) {
+            return Err("--max-size does not apply to lossless coding".into());
+        }
+    }
     Ok(())
 }
 
@@ -266,7 +299,36 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
                 .map_err(|_| format!("unknown output format for {}", output.display()))?,
         )
     };
+    let mut fitted_quality = None;
     let result = match format {
+        None if args.max_size.is_some() => {
+            let max = args.max_size.expect("checked");
+            let encode = |quality: u8| -> Result<Vec<u8>, String> {
+                let mut bytes = Vec::new();
+                let options = EncodeOptions {
+                    quality,
+                    ..Default::default()
+                };
+                let heif = args.format.unwrap_or_default();
+                write(
+                    HeifEncoder::with_format(&mut bytes, options, heif),
+                    &image,
+                    icc.clone(),
+                    exif.clone(),
+                )?;
+                Ok(bytes)
+            };
+            match heifer::fit_to_size(max, encode)? {
+                Some((bytes, quality)) => {
+                    fitted_quality = Some(quality);
+                    std::io::Write::write_all(&mut writer, &bytes).map_err(|e| e.to_string())
+                }
+                None => Err(format!(
+                    "the image does not fit in {}, even at quality 0",
+                    human(max as u64)
+                )),
+            }
+        }
         None => {
             let options = EncodeOptions {
                 quality: args.quality.unwrap_or(80),
@@ -306,8 +368,9 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
         return Err(e);
     }
     let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    let quality = fitted_quality.map_or(String::new(), |q| format!(", quality {q}"));
     println!(
-        "{} → {} ({}×{}, {}, {:.2?})",
+        "{} → {} ({}×{}, {}{quality}, {:.2?})",
         input.display(),
         output.display(),
         image.width(),
@@ -776,6 +839,25 @@ mod tests {
         let args = parse("a.png b.heic --lossless").unwrap().unwrap();
         assert!(check_heic_only(&args, Path::new("b.heic")).is_ok());
         assert!(check_heic_only(&args, Path::new("b.png")).is_err());
+    }
+
+    #[test]
+    fn max_size() {
+        assert_eq!(parse_size("500K"), Ok(500_000));
+        assert_eq!(parse_size("2mb"), Ok(2_000_000));
+        assert_eq!(parse_size("1.5M"), Ok(1_500_000));
+        assert_eq!(parse_size("1234"), Ok(1234));
+        for bad in ["", "0", "-5K", "abc", "K"] {
+            assert!(parse_size(bad).is_err(), "{bad}");
+        }
+        let args = parse("a.png b.heic --max-size 300K").unwrap().unwrap();
+        assert_eq!(args.max_size, Some(300_000));
+        assert!(check_heic_only(&args, Path::new("b.heic")).is_ok());
+        assert!(check_heic_only(&args, Path::new("b.png")).is_err());
+        let both = parse("a.png b.heic -s 300K -q 50").unwrap().unwrap();
+        assert!(check_heic_only(&both, Path::new("b.heic")).is_err());
+        let lossless = parse("a.png b.heic -s 300K --lossless").unwrap().unwrap();
+        assert!(check_heic_only(&lossless, Path::new("b.heic")).is_err());
     }
 
     #[test]

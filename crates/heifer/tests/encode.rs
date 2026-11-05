@@ -471,3 +471,83 @@ fn odd_sizes_keep_their_size_in_every_format() {
         }
     }
 }
+
+#[test]
+fn encode_to_size_fits_the_budget() {
+    let rgba = test_image(300, 200, false);
+    let image =
+        decode(&heifer::encode_rgba8(300, 200, &rgba, &EncodeOptions::default()).unwrap()).unwrap();
+    let meta = heifer::Metadata::default();
+    let options = EncodeOptions::default();
+    let at = |q: u8| {
+        heifer::encode_with_metadata_and_format(
+            &image,
+            &meta,
+            heifer::EncodeFormat::Ycbcr420,
+            &EncodeOptions {
+                quality: q,
+                ..options
+            },
+        )
+        .unwrap()
+        .len()
+    };
+    let (small, large) = (at(20), at(95));
+    for budget in [small, (small + large) / 2, large, large * 2] {
+        let (heic, quality) = heifer::encode_to_size(
+            &image,
+            &meta,
+            heifer::EncodeFormat::Ycbcr420,
+            budget,
+            &options,
+        )
+        .unwrap();
+        assert!(heic.len() <= budget, "{} > {budget}", heic.len());
+        assert_eq!(
+            heic.len(),
+            at(quality),
+            "the quality reported is the one used"
+        );
+        // The next quality step would not have fitted (unless already at the top).
+        if quality < 100 && budget < large * 2 {
+            assert!(at(quality + 2) > budget || at(quality + 1) > budget || quality >= 95);
+        }
+        decode(&heic).unwrap();
+    }
+    assert_eq!(
+        heifer::encode_to_size(
+            &image,
+            &meta,
+            heifer::EncodeFormat::Ycbcr420,
+            large * 2,
+            &options
+        )
+        .unwrap()
+        .1,
+        100
+    );
+    assert!(
+        heifer::encode_to_size(&image, &meta, heifer::EncodeFormat::Ycbcr420, 100, &options)
+            .is_err()
+    );
+    // Lossless is encoded once: it fits or it does not.
+    assert!(
+        heifer::encode_to_size(
+            &image,
+            &meta,
+            heifer::EncodeFormat::Lossless,
+            1000,
+            &options
+        )
+        .is_err()
+    );
+    let (_, q) = heifer::encode_to_size(
+        &image,
+        &meta,
+        heifer::EncodeFormat::Lossless,
+        usize::MAX,
+        &options,
+    )
+    .unwrap();
+    assert_eq!(q, 100);
+}

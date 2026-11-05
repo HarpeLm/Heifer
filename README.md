@@ -75,6 +75,7 @@ cargo install heifer-cli
 heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converted
 heifer photo.png photo.heic -q 80       # to HEIC, 4:2:0
 heifer art.png art.heic --format 444    # full-resolution chroma (or 422: half width)
+heifer photo.png photo.heic -s 500K     # the best quality that fits in 500 KB
 heifer shot.png shot.heic --lossless    # no quantization (8-bit input)
 heifer IMG_1234.heic photo.png --depth  # extract the Portrait depth map too
 heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images, metadata

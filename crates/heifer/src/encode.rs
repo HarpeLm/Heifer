@@ -199,6 +199,100 @@ pub fn encode_with_metadata_and_format(
     )
 }
 
+/// Encodes at the highest quality whose file fits in `max_bytes`, like
+/// [`encode_with_metadata_and_format`]; returns the file and the quality used.
+///
+/// Quality is searched by dichotomy (about six encodes), and every candidate is measured, so the
+/// result never exceeds `max_bytes`. Files usually grow with quality, but not strictly: the
+/// quality found is a high one that fits, not always the highest. `options.quality` is ignored.
+/// A lossless file is encoded once. Fails with [`Error::Unsupported`] when even quality 0 is
+/// too large.
+pub fn encode_to_size(
+    image: &Image,
+    metadata: &Metadata,
+    format: EncodeFormat,
+    max_bytes: usize,
+    options: &EncodeOptions,
+) -> Result<(Vec<u8>, u8), Error> {
+    let encode = |quality: u8| {
+        encode_with_metadata_and_format(
+            image,
+            metadata,
+            format,
+            &EncodeOptions {
+                quality,
+                ..*options
+            },
+        )
+    };
+    if format == EncodeFormat::Lossless {
+        let heic = encode(100)?;
+        return if heic.len() <= max_bytes {
+            Ok((heic, 100))
+        } else {
+            Err(too_large(heic.len(), max_bytes))
+        };
+    }
+    fit_to_size(max_bytes, encode)?.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "the image does not fit in {max_bytes} bytes, even at quality 0"
+        ))
+    })
+}
+
+fn too_large(size: usize, max_bytes: usize) -> Error {
+    Error::Unsupported(format!(
+        "the lossless file takes {size} bytes, more than {max_bytes}"
+    ))
+}
+
+/// Finds a high quality whose output of `encode` fits in `max_bytes`, by dichotomy over the
+/// qualities that give distinct quantization parameters (44 of them, so about six calls).
+/// Returns the output and its quality, or `None` when even quality 0 is too large.
+///
+/// For encoders other than [`encode_to_size`]'s, such as the `image` crate `HeifEncoder`
+/// with metadata.
+pub fn fit_to_size<E>(
+    max_bytes: usize,
+    mut encode: impl FnMut(u8) -> Result<Vec<u8>, E>,
+) -> Result<Option<(Vec<u8>, u8)>, E> {
+    // The highest quality of each quantization parameter, in increasing quality.
+    let mut qualities: Vec<u8> = Vec::new();
+    for q in 0..=100u8 {
+        let qp = EncodeOptions {
+            quality: q,
+            ..EncodeOptions::default()
+        }
+        .qp();
+        let same = qualities.last().is_some_and(|&last| {
+            EncodeOptions {
+                quality: last,
+                ..EncodeOptions::default()
+            }
+            .qp()
+                == qp
+        });
+        if same {
+            *qualities.last_mut().expect("not empty") = q;
+        } else {
+            qualities.push(q);
+        }
+    }
+    let (mut lo, mut hi) = (0usize, qualities.len());
+    let mut best = None;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let out = encode(qualities[mid])?;
+        if out.len() <= max_bytes {
+            best = Some((out, qualities[mid]));
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(best)
+}
+
 /// Encodes an HDR image as a HEIC file with an ISO 21496-1 gain map: `base` is the SDR image
 /// shown by viewers that ignore the gain map, and `hdr` is the linear-light rendition (see
 /// [`HdrImage`]) to reconstruct on HDR displays. Both must have the same size, and `hdr` must
