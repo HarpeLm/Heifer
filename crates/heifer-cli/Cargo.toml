@@ -17,7 +17,7 @@ name = "heifer"
 path = "src/main.rs"
 
 [dependencies]
-heifer = { path = "../heifer", version = "0.3.28", features = ["image"] }
+heifer = { path = "../heifer", version = "0.3.29", features = ["image"] }
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "gif"] }
 
 [lints]

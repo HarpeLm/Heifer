@@ -9,7 +9,7 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.3.27, fuzzing security fixes.
+- Latest release: 0.3.29, IPTC metadata, decoding from a reader, faster CABAC.
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   auxiliary planes.
 - Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
