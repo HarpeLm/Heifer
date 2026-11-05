@@ -18,7 +18,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.55 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.53 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -322,22 +322,22 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 18 ms (ffmpeg 57), iPhone 12 MP 24 ms (ffmpeg 96), 48 MP 129 ms (ffmpeg 583), Galaxy 200 MP 0.49 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 17 ms (ffmpeg 57), iPhone 12 MP 25 ms (ffmpeg 96), 48 MP 141 ms (ffmpeg 583), Galaxy 200 MP 0.53 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 18 ms | 99 ms | 57 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 24 ms | 143 ms | 96 ms |
-| 8000×6000, 48 MP | 129 ms | 0.81 s | 583 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.49 s | 1.85 s | fails |
+| Xiaomi, 5 MP | 17 ms | 100 ms | 57 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 25 ms | 140 ms | 96 ms |
+| 8000×6000, 48 MP | 141 ms | 0.82 s | 583 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.53 s | 1.99 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 143 ms on 1 thread to 23 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 140 ms on 1 thread to 26 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 143 ms with 1 thread down to 23 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 140 ms with 1 thread down to 26 ms with 10" width="100%">
 </picture>
 
 On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
