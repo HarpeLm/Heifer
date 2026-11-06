@@ -7,7 +7,7 @@
 use crate::Error;
 use crate::bitreader::BitReader;
 use crate::nal::{NalHeader, NalUnitType};
-use crate::params::{ParameterSets, skip_st_ref_pic_set};
+use crate::params::{ParameterSets, ShortTermRps, parse_st_ref_pic_set};
 
 /// `slice_type` (Table 7-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,27 @@ pub struct SliceHeader {
     pub colour_plane_id: u8,
     /// `slice_pic_order_cnt_lsb` (0 for IDR pictures).
     pub slice_pic_order_cnt_lsb: u32,
+    /// Short-term reference picture set of this slice.
+    pub st_rps: ShortTermRps,
+    /// `short_term_ref_pic_set_sps_flag`: whether `st_rps` comes from the SPS (rather than
+    /// being coded in this header).
+    pub st_rps_from_sps: bool,
+    /// `slice_temporal_mvp_enabled_flag`.
+    pub slice_temporal_mvp_enabled_flag: bool,
+    /// `num_ref_idx_l0_active_minus1`.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// `num_ref_idx_l1_active_minus1` (B slices; 0 for P and I slices).
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// `cabac_init_flag`.
+    pub cabac_init_flag: bool,
+    /// `collocated_from_l0_flag` (inferred as true for P slices).
+    pub collocated_from_l0_flag: bool,
+    /// `collocated_ref_idx`.
+    pub collocated_ref_idx: u8,
+    /// `five_minus_max_num_merge_cand`.
+    pub five_minus_max_num_merge_cand: u8,
+    /// `list_entry_l0` when `ref_pic_list_modification_flag_l0` is set.
+    pub list_entry_l0: Option<Vec<u8>>,
     /// `slice_sao_luma_flag`.
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag`.
@@ -127,8 +148,8 @@ impl SliceHeader {
                 1 => SliceType::P,
                 _ => SliceType::I,
             };
-            if slice_type != SliceType::I {
-                return Err(Error::Unimplemented("P and B slices (inter prediction)"));
+            if slice_type == SliceType::B {
+                return Err(Error::Unimplemented("B slices (bi-prediction)"));
             }
             let pic_output_flag = !pps.output_flag_present_flag || r.flag()?;
             let colour_plane_id = if sps.separate_colour_plane_flag {
@@ -138,22 +159,38 @@ impl SliceHeader {
             };
 
             let mut slice_pic_order_cnt_lsb = 0;
+            let mut st_rps = ShortTermRps::default();
+            let mut st_rps_from_sps = false;
+            let mut slice_temporal_mvp_enabled_flag = false;
             let is_idr = nal_type == 19 || nal_type == 20;
             if !is_idr {
                 slice_pic_order_cnt_lsb = r.bits(u32::from(sps.log2_max_pic_order_cnt_lsb))?;
-                let num_sets = sps.st_rps_num_delta_pocs.len();
-                let short_term_ref_pic_set_sps_flag = r.flag()?;
-                if !short_term_ref_pic_set_sps_flag {
-                    skip_st_ref_pic_set(&mut r, num_sets, &sps.st_rps_num_delta_pocs, true)?;
-                } else if num_sets > 1 {
-                    let bits = usize::BITS - (num_sets - 1).leading_zeros();
-                    r.skip(bits as usize)?; // short_term_ref_pic_set_idx
+                let num_sets = sps.st_rps.len();
+                st_rps_from_sps = r.flag()?;
+                if st_rps_from_sps {
+                    let idx = if num_sets > 1 {
+                        let bits = usize::BITS - (num_sets - 1).leading_zeros();
+                        r.bits(bits)? as usize
+                    } else {
+                        0
+                    };
+                    st_rps = sps
+                        .st_rps
+                        .get(idx)
+                        .ok_or(Error::Invalid("short_term_ref_pic_set_idx out of range"))?
+                        .clone();
+                } else {
+                    st_rps = parse_st_ref_pic_set(&mut r, num_sets, &sps.st_rps, true)?;
                 }
+                let mut num_long_term = 0;
                 if sps.long_term_ref_pics_present_flag {
-                    skip_long_term_refs(&mut r, sps)?;
+                    num_long_term = skip_long_term_refs(&mut r, sps)?;
+                }
+                if slice_type != SliceType::I && num_long_term > 0 {
+                    return Err(Error::Unimplemented("long-term reference pictures"));
                 }
                 if sps.sps_temporal_mvp_enabled_flag {
-                    r.flag()?; // slice_temporal_mvp_enabled_flag
+                    slice_temporal_mvp_enabled_flag = r.flag()?;
                 }
             }
 
@@ -163,6 +200,46 @@ impl SliceHeader {
                 if sps.chroma_array_type() != 0 {
                     slice_sao_chroma_flag = r.flag()?;
                 }
+            }
+
+            // Inter prediction fields of the header, coded before `slice_qp_delta` (§7.3.6.1).
+            let mut num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+            let mut cabac_init_flag = false;
+            let collocated_from_l0_flag = true;
+            let mut collocated_ref_idx = 0;
+            let mut five_minus_max_num_merge_cand = 0;
+            let mut list_entry_l0 = None;
+            if slice_type == SliceType::P {
+                if r.flag()? {
+                    // num_ref_idx_active_override_flag
+                    num_ref_idx_l0_active_minus1 =
+                        r.ue_max(14, "num_ref_idx_l0_active_minus1")? as u8;
+                }
+                let num_l0 = usize::from(num_ref_idx_l0_active_minus1) + 1;
+                if pps.lists_modification_present_flag && st_rps.used_count() > 1 {
+                    let bits = usize::BITS - (st_rps.used_count() - 1).leading_zeros();
+                    if r.flag()? {
+                        // ref_pic_list_modification_flag_l0
+                        let mut entries = Vec::with_capacity(num_l0);
+                        for _ in 0..num_l0 {
+                            entries.push(r.bits(bits)? as u8);
+                        }
+                        list_entry_l0 = Some(entries);
+                    }
+                }
+                if pps.cabac_init_present_flag {
+                    cabac_init_flag = r.flag()?;
+                }
+                if slice_temporal_mvp_enabled_flag && num_ref_idx_l0_active_minus1 > 0 {
+                    collocated_ref_idx = r.ue_max(14, "collocated_ref_idx")? as u8;
+                    if usize::from(collocated_ref_idx) >= num_l0 {
+                        return Err(Error::Invalid("collocated_ref_idx out of range"));
+                    }
+                }
+                if pps.weighted_pred_flag {
+                    return Err(Error::Unimplemented("weighted prediction for P slices"));
+                }
+                five_minus_max_num_merge_cand = r.ue_max(4, "five_minus_max_num_merge_cand")? as u8;
             }
 
             let qp_bd_offset = 6 * (i32::from(sps.bit_depth_luma) - 8);
@@ -215,6 +292,16 @@ impl SliceHeader {
                 pic_output_flag,
                 colour_plane_id,
                 slice_pic_order_cnt_lsb,
+                st_rps,
+                st_rps_from_sps,
+                slice_temporal_mvp_enabled_flag,
+                num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1: 0,
+                cabac_init_flag,
+                collocated_from_l0_flag,
+                collocated_ref_idx,
+                five_minus_max_num_merge_cand,
+                list_entry_l0,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
                 slice_qp_delta,
@@ -266,8 +353,9 @@ impl SliceHeader {
     }
 }
 
-/// Skips the long-term reference picture part of a slice header.
-fn skip_long_term_refs(r: &mut BitReader<'_>, sps: &crate::params::Sps) -> Result<(), Error> {
+/// Skips the long-term reference picture part of a slice header and returns how many pictures
+/// it adds to the current reference picture set.
+fn skip_long_term_refs(r: &mut BitReader<'_>, sps: &crate::params::Sps) -> Result<u32, Error> {
     let num_lt_sps = u32::from(sps.num_long_term_ref_pics_sps);
     let num_long_term_sps = if num_lt_sps > 0 {
         r.ue_max(num_lt_sps, "num_long_term_sps")?
@@ -287,7 +375,7 @@ fn skip_long_term_refs(r: &mut BitReader<'_>, sps: &crate::params::Sps) -> Resul
             r.ue()?; // delta_poc_msb_cycle_lt
         }
     }
-    Ok(())
+    Ok(num_long_term_sps + num_long_term_pics)
 }
 
 #[cfg(test)]
@@ -372,16 +460,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inter_slices_and_bad_addresses() {
+    fn rejects_bad_slice_addresses() {
         let sets = sets();
-        let mut w = BitWriter::default();
-        w.bit(true).bit(false).ue(0).ue(1); // P slice
-        assert_eq!(
-            SliceHeader::parse(&w.finish(), &cra(), &sets, None),
-            Err(Error::Unimplemented("P and B slices (inter prediction)"))
-        );
         let mut w = BitWriter::default();
         w.bit(false).bit(false).ue(0).bit(false).bits(3, 2).ue(2); // address 3 is valid...
         assert!(SliceHeader::parse(&w.finish(), &cra(), &sets, None).is_err()); // ...but header truncated
+    }
+
+    #[test]
+    fn parses_p_slice_header() {
+        let sets = sets();
+        let pps = sets.pps[0].as_ref().unwrap();
+        assert!(pps.cabac_init_present_flag && !pps.lists_modification_present_flag);
+        let mut w = BitWriter::default();
+        w.bit(true).bit(false).ue(0).ue(1); // first, no_output, pps 0, P slice
+        w.bits(7, 8); // slice_pic_order_cnt_lsb
+        // RPS coded in the slice, predicted from the SPS set: one negative picture at -2.
+        w.bit(false).bit(true).ue(0).bit(true).ue(0);
+        w.bit(true).bit(false).bit(false);
+        w.bit(true).bit(false); // SAO luma on, chroma off
+        w.bit(true).ue(1); // num_ref_idx_active_override_flag, l0 active minus1
+        w.bit(true); // cabac_init_flag
+        w.ue(2); // five_minus_max_num_merge_cand
+        w.se(0).se(0).se(0); // slice_qp_delta, cb, cr offsets
+        w.bit(false); // deblocking override
+        w.bit(false); // slice_loop_filter_across_slices_enabled_flag
+        let h = SliceHeader::parse(&w.finish(), &cra(), &sets, None).unwrap();
+        assert_eq!(h.slice_type, SliceType::P);
+        assert_eq!(h.slice_pic_order_cnt_lsb, 7);
+        assert_eq!(h.st_rps.negative.len(), 1);
+        assert_eq!(h.st_rps.negative[0].delta_poc, -2);
+        assert!(h.st_rps.negative[0].used_by_curr_pic);
+        assert_eq!(h.st_rps.used_count(), 1);
+        assert!(!h.st_rps_from_sps);
+        assert_eq!(h.num_ref_idx_l0_active_minus1, 1);
+        assert!(h.cabac_init_flag);
+        assert_eq!(h.five_minus_max_num_merge_cand, 2);
+        assert!(!h.slice_temporal_mvp_enabled_flag);
+        assert!(h.list_entry_l0.is_none());
     }
 }

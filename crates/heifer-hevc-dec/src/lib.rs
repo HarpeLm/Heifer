@@ -10,6 +10,7 @@ pub mod filters;
 pub mod nal;
 pub mod params;
 pub mod recon;
+pub mod refs;
 pub mod scan;
 pub mod sei;
 pub mod slice;

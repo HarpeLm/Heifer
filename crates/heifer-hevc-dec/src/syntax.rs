@@ -299,7 +299,14 @@ pub fn decode_slice_segment(
             "range extension tools: extended precision processing",
         ));
     }
+    if header.slice_type != crate::slice::SliceType::I {
+        // The coding unit syntax is still intra-only: stop before misparsing inter blocks.
+        return Err(Error::Unimplemented(
+            "slice data of P slices (inter prediction)",
+        ));
+    }
     let (sps, pps) = (pic.sps, pic.pps);
+    let init_type = Contexts::init_type(header.slice_type, header.cabac_init_flag);
     let mut p = Parser {
         sps,
         pps,
@@ -307,8 +314,9 @@ pub fn decode_slice_segment(
         data,
         pos: 0,
         engine: ArithmeticDecoder::new(data)?,
-        ctx: Contexts::new(slice_qp_y),
+        ctx: Contexts::new_with_type(slice_qp_y, init_type),
         slice_qp_y,
+        init_type,
         qp_bd_offset: 6 * (i32::from(sps.bit_depth_luma) - 8),
         is_cu_qp_delta_coded: false,
         cu_qp_delta_val: 0,
@@ -345,6 +353,8 @@ struct Parser<'p, 'a> {
     engine: ArithmeticDecoder<'p>,
     ctx: Contexts,
     slice_qp_y: i32,
+    /// `initType` of the slice's CABAC initialization (§9.3.1).
+    init_type: u8,
     qp_bd_offset: i32,
     is_cu_qp_delta_coded: bool,
     cu_qp_delta_val: i32,
@@ -431,7 +441,7 @@ impl Parser<'_, '_> {
             // Context initialization / synchronization (§9.3.1).
             if first_in_tile {
                 if !first_in_segment {
-                    self.ctx = Contexts::new(self.slice_qp_y);
+                    self.ctx = Contexts::new_with_type(self.slice_qp_y, self.init_type);
                 }
                 self.first_qg_in_substream = true;
             } else if wpp && row_start {
@@ -444,7 +454,7 @@ impl Parser<'_, '_> {
                 // The availability check needs this CTB marked as part of the current slice.
                 self.ctx = match (tr_available, self.pic.wpp_saved) {
                     (true, Some(saved)) => saved,
-                    _ => Contexts::new(self.slice_qp_y),
+                    _ => Contexts::new_with_type(self.slice_qp_y, self.init_type),
                 };
                 self.first_qg_in_substream = true;
             } else if first_in_segment && header.dependent_slice_segment_flag {

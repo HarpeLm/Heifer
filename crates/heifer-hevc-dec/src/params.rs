@@ -198,18 +198,54 @@ impl ScalingList {
     }
 }
 
-/// Reads one `st_ref_pic_set(stRpsIdx)` (§7.3.7) and returns its `NumDeltaPocs`.
-/// Contents are discarded: they only matter for inter prediction.
+/// One picture of a short-term reference picture set (§7.4.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortTermRefPic {
+    /// `DeltaPocS0` / `DeltaPocS1`: POC difference with the current picture, negative for a
+    /// picture that precedes it and positive for one that follows it in output order.
+    pub delta_poc: i32,
+    /// `UsedByCurrPicS0` / `UsedByCurrPicS1`: whether the current picture may reference it.
+    pub used_by_curr_pic: bool,
+}
+
+/// A short-term reference picture set (§7.3.7), in the order the spec derives it: negative
+/// delta POCs from the nearest to the farthest, then positive ones from the nearest to the
+/// farthest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShortTermRps {
+    /// Pictures that precede the current one (negative delta POC).
+    pub negative: Vec<ShortTermRefPic>,
+    /// Pictures that follow the current one (positive delta POC).
+    pub positive: Vec<ShortTermRefPic>,
+}
+
+impl ShortTermRps {
+    /// `NumDeltaPocs`.
+    pub fn num_delta_pocs(&self) -> u32 {
+        (self.negative.len() + self.positive.len()) as u32
+    }
+
+    /// `NumPicTotalCurr` contributed by this set: the number of pictures used by the current
+    /// picture.
+    pub fn used_count(&self) -> usize {
+        self.negative
+            .iter()
+            .chain(&self.positive)
+            .filter(|p| p.used_by_curr_pic)
+            .count()
+    }
+}
+
+/// Reads one `st_ref_pic_set(stRpsIdx)` (§7.3.7).
 ///
-/// `num_delta_pocs` holds `NumDeltaPocs` of the sets decoded so far. In a slice header
-/// (`in_slice_header`), `delta_idx_minus1` selects the reference set; in the SPS it is always
-/// the previous set.
-pub(crate) fn skip_st_ref_pic_set(
+/// `rps` holds the sets decoded so far. In a slice header (`in_slice_header`),
+/// `delta_idx_minus1` selects the reference set; in the SPS it is always the previous set.
+pub(crate) fn parse_st_ref_pic_set(
     r: &mut BitReader<'_>,
     idx: usize,
-    num_delta_pocs: &[u32],
+    rps: &[ShortTermRps],
     in_slice_header: bool,
-) -> Result<u32, Error> {
+) -> Result<ShortTermRps, Error> {
     let inter_ref_pic_set_prediction_flag = idx != 0 && r.flag()?;
     if inter_ref_pic_set_prediction_flag {
         let delta_idx = if in_slice_header {
@@ -217,26 +253,84 @@ pub(crate) fn skip_st_ref_pic_set(
         } else {
             1
         };
-        let ref_num = num_delta_pocs[idx - delta_idx];
-        r.flag()?; // delta_rps_sign
-        r.ue_max(32767, "abs_delta_rps_minus1")?;
-        let mut count = 0;
-        for _ in 0..=ref_num {
+        let ref_set = rps
+            .get(idx.checked_sub(delta_idx).ok_or(Error::Invalid(
+                "st_ref_pic_set: reference set index out of range",
+            ))?)
+            .ok_or(Error::Invalid(
+                "st_ref_pic_set: reference set is not decoded yet",
+            ))?;
+        let delta_rps_sign = r.flag()?;
+        let abs_delta_rps_minus1 = r.ue_max(32767, "abs_delta_rps_minus1")? as i32;
+        let delta_rps = (1 - 2 * i32::from(delta_rps_sign)) * (abs_delta_rps_minus1 + 1);
+
+        let ref_len = ref_set.negative.len() + ref_set.positive.len();
+        let mut used = Vec::with_capacity(ref_len + 1);
+        let mut use_delta = Vec::with_capacity(ref_len + 1);
+        for _ in 0..=ref_len {
             let used_by_curr_pic_flag = r.flag()?;
-            let use_delta_flag = used_by_curr_pic_flag || r.flag()?;
-            if use_delta_flag {
-                count += 1;
+            let use_delta_flag = if used_by_curr_pic_flag {
+                true
+            } else {
+                r.flag()?
+            };
+            used.push(used_by_curr_pic_flag);
+            use_delta.push(use_delta_flag);
+        }
+
+        let mut set = ShortTermRps::default();
+        for (j, (&used, &use_delta)) in used.iter().zip(&use_delta).enumerate() {
+            if !use_delta {
+                continue;
+            }
+            let base = if j < ref_len {
+                if j < ref_set.negative.len() {
+                    ref_set.negative[j].delta_poc
+                } else {
+                    ref_set.positive[j - ref_set.negative.len()].delta_poc
+                }
+            } else {
+                0
+            };
+            let delta_poc = base + delta_rps;
+            let pic = ShortTermRefPic {
+                delta_poc,
+                used_by_curr_pic: used,
+            };
+            if delta_poc < 0 {
+                set.negative.push(pic);
+            } else if delta_poc > 0 {
+                set.positive.push(pic);
             }
         }
-        Ok(count)
+        // §7.4.8: negative pictures in decreasing order (nearest first), positive ones in
+        // increasing order (nearest first).
+        set.negative.sort_by_key(|p| -p.delta_poc);
+        set.positive.sort_by_key(|p| p.delta_poc);
+        Ok(set)
     } else {
         let num_negative_pics = r.ue_max(16, "num_negative_pics")?;
         let num_positive_pics = r.ue_max(16, "num_positive_pics")?;
-        for _ in 0..num_negative_pics + num_positive_pics {
-            r.ue_max(32767, "delta_poc_minus1")?;
-            r.flag()?; // used_by_curr_pic_flag
+        let mut set = ShortTermRps::default();
+        let mut delta_poc = 0;
+        for _ in 0..num_negative_pics {
+            delta_poc -= r.ue_max(32767, "delta_poc_s0_minus1")? as i32 + 1;
+            let used_by_curr_pic = r.flag()?;
+            set.negative.push(ShortTermRefPic {
+                delta_poc,
+                used_by_curr_pic,
+            });
         }
-        Ok(num_negative_pics + num_positive_pics)
+        delta_poc = 0;
+        for _ in 0..num_positive_pics {
+            delta_poc += r.ue_max(32767, "delta_poc_s1_minus1")? as i32 + 1;
+            let used_by_curr_pic = r.flag()?;
+            set.positive.push(ShortTermRefPic {
+                delta_poc,
+                used_by_curr_pic,
+            });
+        }
+        Ok(set)
     }
 }
 
@@ -451,8 +545,11 @@ pub struct Sps {
     pub sample_adaptive_offset_enabled_flag: bool,
     /// PCM parameters, if `pcm_enabled_flag` is set.
     pub pcm: Option<Pcm>,
+    /// Short-term reference picture sets, one per `num_short_term_ref_pic_sets` entry.
+    pub st_rps: Vec<ShortTermRps>,
     /// `NumDeltaPocs` of each short-term reference picture set; its length is
-    /// `num_short_term_ref_pic_sets`. Needed to parse slice headers.
+    /// `num_short_term_ref_pic_sets`. Kept alongside [`Sps::st_rps`] for callers that only
+    /// need the counts.
     pub st_rps_num_delta_pocs: Vec<u32>,
     /// `long_term_ref_pics_present_flag`.
     pub long_term_ref_pics_present_flag: bool,
@@ -566,11 +663,11 @@ impl Sps {
         };
 
         let num_short_term_ref_pic_sets = r.ue_max(64, "num_short_term_ref_pic_sets")? as usize;
-        let mut num_delta_pocs = Vec::with_capacity(num_short_term_ref_pic_sets);
+        let mut st_rps = Vec::with_capacity(num_short_term_ref_pic_sets);
         for i in 0..num_short_term_ref_pic_sets {
-            let n = skip_st_ref_pic_set(&mut r, i, &num_delta_pocs, false)?;
-            num_delta_pocs.push(n);
+            st_rps.push(parse_st_ref_pic_set(&mut r, i, &st_rps, false)?);
         }
+        let num_delta_pocs = st_rps.iter().map(ShortTermRps::num_delta_pocs).collect();
         let long_term_ref_pics_present_flag = r.flag()?;
         let mut num_long_term_ref_pics_sps = 0;
         if long_term_ref_pics_present_flag {
@@ -629,6 +726,7 @@ impl Sps {
             amp_enabled_flag,
             sample_adaptive_offset_enabled_flag,
             pcm,
+            st_rps,
             st_rps_num_delta_pocs: num_delta_pocs,
             long_term_ref_pics_present_flag,
             num_long_term_ref_pics_sps,
