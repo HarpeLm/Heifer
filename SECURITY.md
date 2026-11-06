@@ -4,13 +4,15 @@ heifer decodes untrusted files, so security issues are taken seriously.
 
 ## Supported versions
 
-Security fixes are released for the latest published version.
+Security fixes are released for the latest published version, and backported to the previous
+minor series (e.g. 0.4.x while 0.5 is current) for six months after a new minor release.
 
 ## Reporting a vulnerability
 
 Please **do not open a public issue** for a vulnerability.
 Report it privately through GitHub instead: go to the
 [Security tab](https://github.com/HarpeLm/Heifer/security) and click **Report a vulnerability**.
+If you cannot use GitHub, write to HarpeLm@proton.me.
 
 Please include:
 
@@ -30,3 +32,7 @@ In scope:
 
 Out of scope: decoding mistakes on valid files with no security impact. Please report those as
 normal [issues](https://github.com/HarpeLm/Heifer/issues).
+
+## Maintainers
+
+heifer is maintained by HarpeLm, the only owner of the crates on crates.io.

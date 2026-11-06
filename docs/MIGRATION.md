@@ -45,7 +45,7 @@ libheif-sys = "1"          # only if referenced directly
 
 # after
 [dependencies]
-heifer = "0.3"
+heifer = "0.4"
 ```
 
 `heifer` needs Rust **1.85** (edition 2024) and has no non-Rust dependencies. To confirm

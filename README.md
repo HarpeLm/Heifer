@@ -85,7 +85,7 @@ heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images,
 
 ```toml
 [dependencies]
-heifer = "0.3"
+heifer = "0.4"
 ```
 
 Decoding only? Turn off the default `encoder` feature: heifer then depends on its container and
@@ -93,7 +93,7 @@ decoder crates and `thiserror`, nothing else.
 
 ```toml
 [dependencies]
-heifer = { version = "0.3", default-features = false }
+heifer = { version = "0.4", default-features = false }
 ```
 
 Or try the examples on your own photos:
@@ -266,7 +266,7 @@ ISO 21496-1 `log2` gain range, so any headroom above 1 works.
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.3", features = ["image"] }
+heifer = { version = "0.4", features = ["image"] }
 ```
 
 ```rust
@@ -420,6 +420,14 @@ let hevc = file.hevc_bitstream(tiles[0])?;   // Annex B, decodable by heifer-hev
 
 Replacing `libheif-rs` in an existing project? See **[docs/MIGRATION.md](docs/MIGRATION.md)** for a
 side-by-side API map, behavioural differences and a migration checklist.
+
+## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Versioning
+
+heifer follows [semver](https://semver.org). From 0.4.0 on, a 0.x minor release (0.4 → 0.5) is
+the only place breaking changes go, and they are listed first in the
+[CHANGELOG](CHANGELOG.md); patch releases (0.4.0 → 0.4.1) only fix bugs or add features. Minor
+releases are kept to a few a year, so pinning an exact version stays practical. Public enums
+that may grow are `#[non_exhaustive]`.
 
 ## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
