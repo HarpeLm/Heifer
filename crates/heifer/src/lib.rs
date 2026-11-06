@@ -6,15 +6,22 @@
 //! let rgba: Vec<u8> = image.to_rgba8();
 //! println!("{}x{}, alpha: {}", image.width, image.height, image.has_alpha);
 //!
+//! # #[cfg(feature = "encoder")]
+//! # {
 //! let heic = heifer::encode(&image, &heifer::EncodeOptions::default()).unwrap();
 //! std::fs::write("copy.heic", heic).unwrap();
+//! # }
 //! ```
 //!
 //! This crate ties together the container ([`heifer_isobmff`]) and the HEVC codec
-//! ([`heifer_hevc_dec`], [`heifer_hevc_enc`]).
+//! ([`heifer_hevc_dec`], and `heifer_hevc_enc` with the default `encoder` feature).
+//!
+//! Features: `encoder` (default) adds HEIC encoding; disable default features for a
+//! decode-only build. `image` adds the `image` crate integration.
 
 pub mod color;
 pub mod depth;
+#[cfg(feature = "encoder")]
 pub mod encode;
 pub mod hdr;
 mod icc;
@@ -28,6 +35,7 @@ pub mod sequence;
 mod uncompressed;
 
 pub use depth::{DepthInfo, DepthRepresentation};
+#[cfg(feature = "encoder")]
 pub use encode::{
     EncodeFormat, EncodeOptions, encode, encode_hdr, encode_hdr_with_metadata, encode_rgb8,
     encode_rgb8_with_format, encode_rgba8, encode_rgba8_with_format, encode_to_size,
@@ -35,6 +43,7 @@ pub use encode::{
 };
 pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
+#[cfg(feature = "encoder")]
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
 pub use heifer_isobmff::region::{Geometry, RegionItem, UserDescription};
@@ -69,6 +78,7 @@ pub enum Error {
     #[error("HEVC: {0}")]
     Hevc(#[from] heifer_hevc_dec::Error),
     /// An image could not be encoded.
+    #[cfg(feature = "encoder")]
     #[error("HEVC encoding: {0}")]
     Encode(#[from] heifer_hevc_enc::Error),
     /// The file uses a feature heifer does not support yet.

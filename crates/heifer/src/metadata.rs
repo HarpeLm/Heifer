@@ -89,6 +89,7 @@ pub fn item_iptc(file: &HeifFile<'_>, id: ItemId) -> Result<Option<Vec<u8>>, Err
         .map(<[u8]>::to_vec))
 }
 
+#[cfg(feature = "encoder")]
 /// A copy of EXIF data whose orientation tag, if any, says "upright" (1): for images whose
 /// pixels are already upright, so that no viewer rotates them again.
 pub(crate) fn exif_upright(exif: &[u8]) -> Vec<u8> {
@@ -173,6 +174,7 @@ impl<'a> Exif<'a> {
         })
     }
 
+    #[cfg(feature = "encoder")]
     /// Position of the orientation tag's value in IFD0, if it is a single SHORT.
     pub(crate) fn orientation_position(&self) -> Option<usize> {
         match self.find(self.ifd0, tag::ORIENTATION)? {

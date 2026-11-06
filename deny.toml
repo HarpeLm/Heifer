@@ -1,0 +1,25 @@
+# cargo deny check: advisories, licences, banned and duplicate crates, crate sources.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every advisory in the RustSec database is an error, unmaintained crates included.
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+# Permissive licences only, compatible with heifer's MIT OR Apache-2.0.
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between the workspace crates also carry a version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

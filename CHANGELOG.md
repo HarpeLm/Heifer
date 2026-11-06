@@ -10,6 +10,12 @@
 
 **New**
 
+- Decode-only builds: the encoder is now behind the `encoder` feature, on by default. With
+  `default-features = false`, heifer depends only on `heifer-isobmff`, `heifer-hevc-dec` and
+  `thiserror`; `image` integration still decodes, and `HeifEncoder` needs `encoder`. CI lints
+  and tests this build.
+- Supply chain checks: `deny.toml` and CI jobs running `cargo deny` (RustSec advisories,
+  licences, banned and duplicate crates, sources) and `cargo audit`.
 - Image sequences (`.heics`, bursts, animations), first part: `read_sequence` describes the
   main track of a file (size, frame durations, keyframes) from its `moov` sample tables, and
   `decode_sequence_frame` decodes its keyframes with the intra decoder. Frames predicted from

@@ -155,6 +155,7 @@ fn parse_metadata(data: &[u8]) -> Result<Metadata, Error> {
     })
 }
 
+#[cfg(feature = "encoder")]
 /// The `tmap` item payload for a monochrome gain map with the given headroom: version 0,
 /// `use_base_colour_space`, no base headroom, no gain below 1, gamma 1 and no offsets.
 pub(crate) fn payload(headroom: f32) -> Result<Vec<u8>, Error> {
@@ -488,6 +489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encoder")]
     fn serialises_monochrome_tmap_metadata() {
         let data = payload(4.0).unwrap();
         assert_eq!(data.len(), 62);

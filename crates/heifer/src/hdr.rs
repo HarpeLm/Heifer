@@ -21,6 +21,7 @@
 
 mod iso21496;
 
+#[cfg(feature = "encoder")]
 pub(crate) use iso21496::payload as tmap_payload;
 
 use heifer_isobmff::HeifFile;

@@ -20,6 +20,32 @@ jobs:
       - run: ./scripts/fetch-fixtures.sh
         shell: bash
       - run: cargo test --workspace --all-features
+  # A decode-only build, without the encoder: what downstream decoders depend on.
+  decode-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p heifer --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p heifer --no-default-features --features image --all-targets -- -D warnings
+      - run: ./scripts/fetch-fixtures.sh
+        shell: bash
+      - run: cargo test -p heifer --no-default-features --features image
+  # Supply chain: RustSec advisories, licences, duplicate and banned crates, crate sources.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
   docs:
     runs-on: ubuntu-latest
     steps:

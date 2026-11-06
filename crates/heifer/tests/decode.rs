@@ -339,6 +339,7 @@ fn files_without_metadata() {
 }
 
 #[test]
+#[cfg(feature = "encoder")]
 fn reads_iptc_of_a_real_file() {
     let Some(p) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/real/heif_other__L_exif_xmp_iptc.heic")

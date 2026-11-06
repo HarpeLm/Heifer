@@ -16,15 +16,59 @@ categories = ["multimedia::images", "multimedia::encoding", "parser-implementati
 thiserror.workspace = true
 heifer-isobmff.workspace = true
 heifer-hevc-dec.workspace = true
-heifer-hevc-enc.workspace = true
+heifer-hevc-enc = { workspace = true, optional = true }
 image = { version = "0.25.8", default-features = false, optional = true }
 
 [features]
+default = ["encoder"]
+# HEIC encoding (the `heifer-hevc-enc` crate). Without it, heifer only decodes.
+encoder = ["dep:heifer-hevc-enc"]
 # Integration with the `image` crate (decoder, encoder, hooks for image::open).
 image = ["dep:image"]
 
 [dev-dependencies]
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+
+# Tests and examples that encode their inputs need the encoder.
+[[test]]
+name = "auxiliary"
+required-features = ["encoder"]
+
+[[test]]
+name = "color"
+required-features = ["encoder"]
+
+[[test]]
+name = "encode"
+required-features = ["encoder"]
+
+[[test]]
+name = "reader"
+required-features = ["encoder"]
+
+[[test]]
+name = "sequence"
+required-features = ["encoder"]
+
+[[test]]
+name = "hdr_encode"
+required-features = ["encoder"]
+
+[[test]]
+name = "hdr_transfer"
+required-features = ["encoder"]
+
+[[test]]
+name = "robustness"
+required-features = ["encoder"]
+
+[[test]]
+name = "image_crate"
+required-features = ["encoder", "image"]
+
+[[example]]
+name = "to_heic"
+required-features = ["encoder"]
 
 [lints]
 workspace = true

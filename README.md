@@ -88,6 +88,14 @@ heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images,
 heifer = "0.3"
 ```
 
+Decoding only? Turn off the default `encoder` feature: heifer then depends on its container and
+decoder crates and `thiserror`, nothing else.
+
+```toml
+[dependencies]
+heifer = { version = "0.3", default-features = false }
+```
+
 Or try the examples on your own photos:
 
 ```sh

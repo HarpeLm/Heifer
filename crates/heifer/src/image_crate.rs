@@ -7,9 +7,10 @@
 //!
 //! [`HeifDecoder`] can also be used directly with `image::DynamicImage::from_decoder`.
 //!
-//! [`HeifEncoder`] writes HEIC files from any image of the `image` crate:
+//! With the `encoder` feature (default), `HeifEncoder` writes HEIC files from any image of the
+//! `image` crate:
 //!
-//! ```no_run
+//! ```ignore
 //! let img = image::open("photo.png").unwrap();
 //! let file = std::fs::File::create("photo.heic").unwrap();
 //! img.write_with_encoder(heifer::image_crate::HeifEncoder::new(file)).unwrap();
@@ -17,15 +18,16 @@
 //!
 //! (`image::save` and `DynamicImage::save` only know the formats built into `image`.)
 
-use std::io::{Read, Write};
+use std::io::Read;
 
-use image::error::{
-    DecodingError, EncodingError, ImageFormatHint, UnsupportedError, UnsupportedErrorKind,
-};
+use image::error::{DecodingError, ImageFormatHint};
 use image::metadata::Orientation;
-use image::{ColorType, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, ImageResult};
+use image::{ColorType, ImageDecoder, ImageError, ImageResult};
 
-use crate::{EncodeFormat, EncodeOptions, Image, Metadata, Options};
+use crate::{Image, Metadata, Options};
+
+#[cfg(feature = "encoder")]
+pub use encoder::HeifEncoder;
 
 /// File extensions handled by heifer.
 const EXTENSIONS: [&str; 3] = ["heic", "heif", "hif"];
@@ -179,133 +181,143 @@ impl ImageDecoder for HeifDecoder {
     }
 }
 
-/// Encodes images as HEIC files, for `DynamicImage::write_with_encoder` and the other users of
-/// [`ImageEncoder`].
-///
-/// Accepts 8- and 16-bit grey, grey + alpha, RGB and RGBA images (16-bit images are coded in
-/// 10 bits). The ICC profile and EXIF metadata given by `image` are stored in the file; the EXIF
-/// orientation is set to 1, since the pixels are stored as given.
-#[derive(Debug)]
-pub struct HeifEncoder<W: Write> {
-    writer: W,
-    options: EncodeOptions,
-    format: EncodeFormat,
-    metadata: Metadata,
-}
+#[cfg(feature = "encoder")]
+mod encoder {
+    use std::io::Write;
 
-impl<W: Write> HeifEncoder<W> {
-    /// An encoder with the default options (quality 80, all cores, 4:2:0).
-    pub fn new(writer: W) -> Self {
-        Self::with_options(writer, EncodeOptions::default())
+    use image::error::{EncodingError, ImageFormatHint, UnsupportedError, UnsupportedErrorKind};
+    use image::{ExtendedColorType, ImageEncoder, ImageError, ImageResult};
+
+    use crate::{EncodeFormat, EncodeOptions, Metadata};
+
+    /// Encodes images as HEIC files, for `DynamicImage::write_with_encoder` and the other users of
+    /// [`ImageEncoder`].
+    ///
+    /// Accepts 8- and 16-bit grey, grey + alpha, RGB and RGBA images (16-bit images are coded in
+    /// 10 bits). The ICC profile and EXIF metadata given by `image` are stored in the file; the EXIF
+    /// orientation is set to 1, since the pixels are stored as given.
+    #[derive(Debug)]
+    pub struct HeifEncoder<W: Write> {
+        writer: W,
+        options: EncodeOptions,
+        format: EncodeFormat,
+        metadata: Metadata,
     }
 
-    /// An encoder with the given quality and threads, coding 4:2:0.
-    pub fn with_options(writer: W, options: EncodeOptions) -> Self {
-        Self::with_format(writer, options, EncodeFormat::Ycbcr420)
-    }
+    impl<W: Write> HeifEncoder<W> {
+        /// An encoder with the default options (quality 80, all cores, 4:2:0).
+        pub fn new(writer: W) -> Self {
+            Self::with_options(writer, EncodeOptions::default())
+        }
 
-    /// An encoder with the given chroma format and coding mode.
-    pub fn with_format(writer: W, options: EncodeOptions, format: EncodeFormat) -> Self {
-        Self {
-            writer,
-            options,
-            format,
-            metadata: Metadata::default(),
+        /// An encoder with the given quality and threads, coding 4:2:0.
+        pub fn with_options(writer: W, options: EncodeOptions) -> Self {
+            Self::with_format(writer, options, EncodeFormat::Ycbcr420)
+        }
+
+        /// An encoder with the given chroma format and coding mode.
+        pub fn with_format(writer: W, options: EncodeOptions, format: EncodeFormat) -> Self {
+            Self {
+                writer,
+                options,
+                format,
+                metadata: Metadata::default(),
+            }
         }
     }
-}
 
-fn hint() -> ImageFormatHint {
-    ImageFormatHint::Name("HEIF".into())
-}
+    fn hint() -> ImageFormatHint {
+        ImageFormatHint::Name("HEIF".into())
+    }
 
-impl<W: Write> ImageEncoder for HeifEncoder<W> {
-    fn write_image(
-        mut self,
-        buf: &[u8],
-        width: u32,
-        height: u32,
-        color_type: ExtendedColorType,
-    ) -> ImageResult<()> {
-        use ExtendedColorType as C;
-        let (channels, wide) = match color_type {
-            C::L8 => (1, false),
-            C::La8 => (2, false),
-            C::Rgb8 => (3, false),
-            C::Rgba8 => (4, false),
-            C::L16 => (1, true),
-            C::La16 => (2, true),
-            C::Rgb16 => (3, true),
-            C::Rgba16 => (4, true),
-            _ => {
-                return Err(ImageError::Unsupported(
-                    UnsupportedError::from_format_and_kind(
-                        hint(),
-                        UnsupportedErrorKind::Color(color_type),
+    impl<W: Write> ImageEncoder for HeifEncoder<W> {
+        fn write_image(
+            mut self,
+            buf: &[u8],
+            width: u32,
+            height: u32,
+            color_type: ExtendedColorType,
+        ) -> ImageResult<()> {
+            use ExtendedColorType as C;
+            let (channels, wide) = match color_type {
+                C::L8 => (1, false),
+                C::La8 => (2, false),
+                C::Rgb8 => (3, false),
+                C::Rgba8 => (4, false),
+                C::L16 => (1, true),
+                C::La16 => (2, true),
+                C::Rgb16 => (3, true),
+                C::Rgba16 => (4, true),
+                _ => {
+                    return Err(ImageError::Unsupported(
+                        UnsupportedError::from_format_and_kind(
+                            hint(),
+                            UnsupportedErrorKind::Color(color_type),
+                        ),
+                    ));
+                }
+            };
+            let bytes = if wide { 2 } else { 1 };
+            let expected = u64::from(width) * u64::from(height) * channels * bytes;
+            if buf.len() as u64 != expected {
+                return Err(ImageError::Parameter(
+                    image::error::ParameterError::from_kind(
+                        image::error::ParameterErrorKind::DimensionMismatch,
                     ),
                 ));
             }
-        };
-        let bytes = if wide { 2 } else { 1 };
-        let expected = u64::from(width) * u64::from(height) * channels * bytes;
-        if buf.len() as u64 != expected {
-            return Err(ImageError::Parameter(
-                image::error::ParameterError::from_kind(
-                    image::error::ParameterErrorKind::DimensionMismatch,
-                ),
-            ));
+            let channels = channels as usize;
+            // 16-bit images are coded in 10 bits (no banding), 8-bit ones in 8 bits.
+            let (bit_depth, top) = if wide { (10, 1023u16) } else { (8, 255) };
+            let sample = |i: usize| -> u16 {
+                if wide {
+                    let v = u16::from_ne_bytes([buf[2 * i], buf[2 * i + 1]]);
+                    ((u32::from(v) * 1023 + 32767) / 65535) as u16
+                } else {
+                    u16::from(buf[i])
+                }
+            };
+            let pixel = |i: usize| -> [u16; 4] {
+                let p = i * channels;
+                match channels {
+                    1 => {
+                        let v = sample(p);
+                        [v, v, v, top]
+                    }
+                    2 => {
+                        let v = sample(p);
+                        [v, v, v, sample(p + 1)]
+                    }
+                    3 => [sample(p), sample(p + 1), sample(p + 2), top],
+                    _ => [sample(p), sample(p + 1), sample(p + 2), sample(p + 3)],
+                }
+            };
+            let n = width as usize * height as usize;
+            let has_alpha = channels % 2 == 0 && (0..n).any(|i| pixel(i)[3] != top);
+            let heic = crate::encode::encode_pixels(
+                width,
+                height,
+                bit_depth,
+                has_alpha,
+                Some(&self.metadata),
+                self.format,
+                &self.options,
+                pixel,
+            )
+            .map_err(|e| ImageError::Encoding(EncodingError::new(hint(), e)))?;
+            self.writer.write_all(&heic).map_err(ImageError::IoError)
         }
-        let channels = channels as usize;
-        // 16-bit images are coded in 10 bits (no banding), 8-bit ones in 8 bits.
-        let (bit_depth, top) = if wide { (10, 1023u16) } else { (8, 255) };
-        let sample = |i: usize| -> u16 {
-            if wide {
-                let v = u16::from_ne_bytes([buf[2 * i], buf[2 * i + 1]]);
-                ((u32::from(v) * 1023 + 32767) / 65535) as u16
-            } else {
-                u16::from(buf[i])
-            }
-        };
-        let pixel = |i: usize| -> [u16; 4] {
-            let p = i * channels;
-            match channels {
-                1 => {
-                    let v = sample(p);
-                    [v, v, v, top]
-                }
-                2 => {
-                    let v = sample(p);
-                    [v, v, v, sample(p + 1)]
-                }
-                3 => [sample(p), sample(p + 1), sample(p + 2), top],
-                _ => [sample(p), sample(p + 1), sample(p + 2), sample(p + 3)],
-            }
-        };
-        let n = width as usize * height as usize;
-        let has_alpha = channels % 2 == 0 && (0..n).any(|i| pixel(i)[3] != top);
-        let heic = crate::encode::encode_pixels(
-            width,
-            height,
-            bit_depth,
-            has_alpha,
-            Some(&self.metadata),
-            self.format,
-            &self.options,
-            pixel,
-        )
-        .map_err(|e| ImageError::Encoding(EncodingError::new(hint(), e)))?;
-        self.writer.write_all(&heic).map_err(ImageError::IoError)
-    }
 
-    fn set_icc_profile(&mut self, icc_profile: Vec<u8>) -> Result<(), UnsupportedError> {
-        self.metadata.icc_profile = Some(icc_profile);
-        Ok(())
-    }
+        fn set_icc_profile(&mut self, icc_profile: Vec<u8>) -> Result<(), UnsupportedError> {
+            self.metadata.icc_profile = Some(icc_profile);
+            Ok(())
+        }
 
-    fn set_exif_metadata(&mut self, exif: Vec<u8>) -> Result<(), UnsupportedError> {
-        // Some callers keep the `Exif\0\0` prefix of JPEG APP1 segments.
-        let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(&exif);
-        self.metadata.exif = Some(tiff.to_vec());
-        Ok(())
+        fn set_exif_metadata(&mut self, exif: Vec<u8>) -> Result<(), UnsupportedError> {
+            // Some callers keep the `Exif\0\0` prefix of JPEG APP1 segments.
+            let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(&exif);
+            self.metadata.exif = Some(tiff.to_vec());
+            Ok(())
+        }
     }
 }
