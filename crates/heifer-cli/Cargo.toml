@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 heifer = { path = "../heifer", version = "0.4.0", features = ["image"] }
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "gif"] }
+# APNG output (already used by `image` for PNG).
+png = "0.18"
 
 [lints]
 workspace = true

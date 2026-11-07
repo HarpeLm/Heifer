@@ -32,8 +32,13 @@
   implement the output process (C.5.2): reordering, DPB fullness and latency limits,
   `no_output_of_prior_pics_flag` and `pic_output_flag`. Frames and frame counts match ffmpeg on
   17 conformance streams.
-- CLI: `--frames` extracts every frame of an image sequence (`out-001.png`, ...); converting a
-  file that holds a sequence prints a note, and `heifer info` describes the sequence.
+- CLI: `--frames` extracts every frame of an image sequence (`out-001.png`, ...), or writes
+  one animated GIF or APNG when the output is `.gif` or `.apng`; converting a file that holds a
+  sequence prints a note, and `heifer info` describes the sequence.
+- `image` crate: `HeifSequenceDecoder` reads image sequences as an `image::AnimationDecoder`
+  (RGBA 8-bit frames in display order, with their durations).
+- `check_file_type`: HEVC image sequences (`hevc`, `hevx`) are `Supported`, and generic ones
+  (`msf1`) `MayBe`.
 - B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
   bi-predictive and zero merge candidates on both lists, and the collocated picture from
   either list.

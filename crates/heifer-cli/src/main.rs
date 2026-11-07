@@ -35,7 +35,8 @@ Options:
       --depth            also write the depth map as PNG
       --gain-map         also write the HDR gain map as PNG
       --frames           write every frame of an image sequence (burst, animation) instead
-                         of the main image: out.png gives out-001.png, out-002.png, ...
+                         of the main image: out.png gives out-001.png, out-002.png, ...;
+                         out.gif or out.apng gives one animated file
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
@@ -50,6 +51,7 @@ Examples:
   heifer portrait.heic portrait.png --aux
   heifer *.HEIC --to jpg -o converted --gain-map
   heifer burst.heics frames.png --frames
+  heifer burst.heics burst.gif --frames
   heifer screenshot.png screenshot.heic -q 70
   heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
@@ -428,6 +430,13 @@ fn write_frames(input: &Path, output: &Path, args: &Args) -> Result<(), String> 
     if args.format.is_some() || args.max_size.is_some() || args.wants_aux() {
         return Err("--frames cannot be combined with HEIC or auxiliary image options".into());
     }
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase);
+    if matches!(ext.as_deref(), Some("gif" | "apng")) {
+        return write_animation(input, output, args, ext.as_deref() == Some("apng"));
+    }
     let format = ImageFormat::from_path(output)
         .map_err(|_| format!("unknown output format for {}", output.display()))?;
     let start = Instant::now();
@@ -680,6 +689,91 @@ fn info(input: &Path) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+/// `--frames` to a GIF or APNG output: one animated file, played in a loop.
+fn write_animation(input: &Path, output: &Path, args: &Args, apng: bool) -> Result<(), String> {
+    use image::AnimationDecoder;
+    if output.exists() && !args.force {
+        return Err(format!(
+            "{} exists (use --force to overwrite)",
+            output.display()
+        ));
+    }
+    let start = Instant::now();
+    let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+    let decoder =
+        heifer::image_crate::HeifSequenceDecoder::from_bytes(bytes, &heifer::Options::default())
+            .map_err(|e| e.to_string())?;
+    let count = decoder.len();
+    let frames = decoder.into_frames();
+    // Write to a temporary file first, so that a failure leaves no partial output.
+    let partial = output.with_extension("partial");
+    let file =
+        std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+    let writer = std::io::BufWriter::new(file);
+    let result = if apng {
+        write_apng(writer, frames, count)
+    } else {
+        let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(writer, 10);
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .and_then(|()| encoder.try_encode_frames(frames))
+            .map_err(|e| e.to_string())
+    };
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+    std::fs::rename(&partial, output).map_err(|e| format!("{}: {e}", output.display()))?;
+    let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "{} → {} ({count} frames, {}, {:.2?})",
+        input.display(),
+        output.display(),
+        human(size),
+        start.elapsed()
+    );
+    Ok(())
+}
+
+/// Writes animated PNG frames (RGBA 8-bit), each with its own delay, played in a loop.
+fn write_apng(
+    writer: impl std::io::Write,
+    frames: image::Frames<'_>,
+    count: usize,
+) -> Result<(), String> {
+    let mut frames = frames.peekable();
+    let (width, height) = match frames.peek() {
+        Some(Ok(f)) => f.buffer().dimensions(),
+        Some(Err(_)) => {
+            return Err(match frames.next() {
+                Some(Err(e)) => e.to_string(),
+                _ => unreachable!("peeked an error"),
+            });
+        }
+        None => return Err("the sequence has no frame".into()),
+    };
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let num_frames = u32::try_from(count).map_err(|_| "too many frames")?;
+    encoder
+        .set_animated(num_frames, 0)
+        .map_err(|e| e.to_string())?;
+    let mut png = encoder.write_header().map_err(|e| e.to_string())?;
+    for frame in frames {
+        let frame = frame.map_err(|e| e.to_string())?;
+        // The delay in milliseconds, as a fraction of a second.
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let ms = (f64::from(numer) / f64::from(denom))
+            .round()
+            .clamp(0.0, 65535.0) as u16;
+        png.set_frame_delay(ms, 1000).map_err(|e| e.to_string())?;
+        png.write_image_data(frame.buffer().as_raw())
+            .map_err(|e| e.to_string())?;
+    }
+    png.finish().map_err(|e| e.to_string())
 }
 
 /// The lines printed by `heifer info`, kept separate so that tests can read them.
@@ -1204,6 +1298,48 @@ mod tests {
         let args = parse("in out.png").unwrap().unwrap();
         let err = convert(&bframes(), &dir.join("x.png"), &args).unwrap_err();
         assert!(err.contains("use --frames"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn animations_keep_every_frame_and_delay() {
+        use image::AnimationDecoder;
+        let dir = temp_dir("anim");
+        let args = parse("in out.gif --frames").unwrap().unwrap();
+        let gif = dir.join("a.gif");
+        write_frames(&bframes(), &gif, &args).unwrap();
+        let file = std::io::BufReader::new(std::fs::File::open(&gif).unwrap());
+        let frames = image::codecs::gif::GifDecoder::new(file)
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+        assert_eq!(frames.len(), 24);
+        assert!(frames.iter().all(|f| f.delay().numer_denom_ms() == (40, 1)));
+
+        let apng = dir.join("a.apng");
+        write_frames(&bframes(), &apng, &args).unwrap();
+        let file = std::io::BufReader::new(std::fs::File::open(&apng).unwrap());
+        let frames = image::codecs::png::PngDecoder::new(file)
+            .unwrap()
+            .apng()
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+        assert_eq!(frames.len(), 24);
+        assert!(frames.iter().all(|f| f.delay().numer_denom_ms() == (40, 1)));
+        // Lossless: the same pixels as the decoder's frames.
+        let own: Vec<heifer::Image> = heifer::decode_sequence(&std::fs::read(bframes()).unwrap())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(frames[7].buffer().as_raw(), &own[7].to_rgba8());
+
+        // No overwrite without --force, and no partial file left behind.
+        let err = write_frames(&bframes(), &gif, &args).unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+        assert!(!dir.join("a.partial").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
