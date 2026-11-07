@@ -130,6 +130,9 @@ pub struct TransformBlock<'a> {
     pub transform_skip: bool,
     /// `cu_transquant_bypass_flag` of the coding unit.
     pub transquant_bypass: bool,
+    /// Explicit RDPCM of an inter block without transform (range extension): `Some(true)`
+    /// accumulates the residual vertically, `Some(false)` horizontally.
+    pub explicit_rdpcm: Option<bool>,
     /// The coding unit is inter predicted: the prediction is already in the picture, and the
     /// residual uses neither the DST nor implicit RDPCM.
     pub inter: bool,
@@ -393,6 +396,7 @@ pub fn decode_slice_segment(
             },
         ],
         mvd_l1_zero: header.mvd_l1_zero_flag,
+        explicit_rdpcm: None,
     };
     if header.dependent_slice_segment_flag {
         // QP prediction continues across the segments of a slice (§8.6.1).
@@ -442,6 +446,8 @@ struct Parser<'p, 'a> {
     num_ref_idx: [usize; 2],
     /// `mvd_l1_zero_flag`.
     mvd_l1_zero: bool,
+    /// Explicit RDPCM direction of the last `residual_coding`, if used.
+    explicit_rdpcm: Option<bool>,
 }
 
 /// Helpers to decode bins with a context index.
@@ -1510,7 +1516,9 @@ impl Parser<'_, '_> {
     /// Parses the residual of one block if coded, then emits it.
     fn block(&mut self, b: BlockInfo, cbf: bool, sink: &mut impl Sink) -> Result<(), Error> {
         let n = 1usize << (2 * b.log2_size);
-        let transform_skip = cbf && self.residual_coding(b.log2_size, b.c_idx, b.intra_mode)?;
+        self.explicit_rdpcm = None;
+        let transform_skip =
+            cbf && self.residual_coding(b.log2_size, b.c_idx, b.intra_mode, b.inter)?;
         let coeffs = std::mem::take(&mut self.coeffs);
         let (cols, rows) = (self.coeff_bounds.1, self.coeff_bounds.2);
         sink.transform_block(&TransformBlock {
@@ -1523,6 +1531,7 @@ impl Parser<'_, '_> {
             coeff_bounds: (cols as u8, rows as u8),
             transform_skip,
             transquant_bypass: self.cu_transquant_bypass,
+            explicit_rdpcm: self.explicit_rdpcm,
             inter: b.inter,
             qp_y: b.qp_y,
             cu_qp_offset: b.cu_qp_offset,
@@ -1541,9 +1550,15 @@ impl Parser<'_, '_> {
         self.coeff_bounds = (size, 0, 0);
     }
 
-    /// `residual_coding()` (§7.3.8.11). Fills `self.coeffs[..size²]` and returns
-    /// `transform_skip_flag`.
-    fn residual_coding(&mut self, log2_size: u8, c_idx: u8, intra_mode: u8) -> Result<bool, Error> {
+    /// `residual_coding()` (§7.3.8.11). Fills `self.coeffs[..size²]` and
+    /// `self.explicit_rdpcm`, and returns `transform_skip_flag`.
+    fn residual_coding(
+        &mut self,
+        log2_size: u8,
+        c_idx: u8,
+        intra_mode: u8,
+        inter: bool,
+    ) -> Result<bool, Error> {
         let size = 1usize << log2_size;
         self.clear_coeffs();
         self.coeff_bounds.0 = size;
@@ -1557,6 +1572,15 @@ impl Parser<'_, '_> {
             } else {
                 ctx::TRANSFORM_SKIP_FLAG_CHROMA
             });
+        // explicit_rdpcm_flag and explicit_rdpcm_dir_flag (inter blocks without transform).
+        if inter
+            && self.sps.range_extension.explicit_rdpcm_enabled_flag
+            && (transform_skip || self.cu_transquant_bypass)
+            && self.flag(ctx::EXPLICIT_RDPCM_FLAG + usize::from(!luma))
+        {
+            self.explicit_rdpcm =
+                Some(self.flag(ctx::EXPLICIT_RDPCM_DIR_FLAG + usize::from(!luma)));
+        }
 
         // last_sig_coeff_{x,y}_prefix (§9.3.4.2.3).
         let (ctx_offset, ctx_shift) = if luma {
@@ -1622,12 +1646,16 @@ impl Parser<'_, '_> {
         let sr = sub_raster(scan);
 
         let mut coded_sb = [[false; 8]; 8];
-        // Implicit RDPCM (intra, horizontal/vertical, no transform) disables sign hiding.
-        let implicit_rdpcm = self.sps.range_extension.implicit_rdpcm_enabled_flag
+        // Implicit RDPCM (intra, horizontal/vertical, no transform) and explicit RDPCM disable
+        // sign hiding.
+        let implicit_rdpcm = !inter
+            && self.sps.range_extension.implicit_rdpcm_enabled_flag
             && (transform_skip || self.cu_transquant_bypass)
             && (intra_mode == 10 || intra_mode == 26);
-        let sign_hiding_allowed =
-            self.pps.sign_data_hiding_enabled_flag && !self.cu_transquant_bypass && !implicit_rdpcm;
+        let sign_hiding_allowed = self.pps.sign_data_hiding_enabled_flag
+            && !self.cu_transquant_bypass
+            && !implicit_rdpcm
+            && self.explicit_rdpcm.is_none();
         // Persistent Rice adaptation (§9.3.3.11): statistics per sub-block type.
         let persistent_rice = self
             .sps

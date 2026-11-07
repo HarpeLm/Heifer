@@ -1266,6 +1266,7 @@ impl<'a> Encoder<'a> {
                 coeff_bounds: (cols as u8, rows as u8),
                 transform_skip,
                 transquant_bypass: self.lossless,
+                explicit_rdpcm: None,
                 inter: false,
                 qp_y: self.qp,
                 cu_qp_offset: 0,
