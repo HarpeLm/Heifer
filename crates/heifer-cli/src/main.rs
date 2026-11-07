@@ -34,6 +34,8 @@ Options:
       --aux              also write every auxiliary image as PNG
       --depth            also write the depth map as PNG
       --gain-map         also write the HDR gain map as PNG
+      --frames           write every frame of an image sequence (burst, animation) instead
+                         of the main image: out.png gives out-001.png, out-002.png, ...
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
@@ -47,6 +49,7 @@ Examples:
   heifer IMG_1234.heic photo.jpg --depth
   heifer portrait.heic portrait.png --aux
   heifer *.HEIC --to jpg -o converted --gain-map
+  heifer burst.heics frames.png --frames
   heifer screenshot.png screenshot.heic -q 70
   heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
@@ -66,6 +69,8 @@ struct Args {
     aux: bool,
     depth: bool,
     gain_map: bool,
+    /// `--frames`: write the frames of the image sequence.
+    frames: bool,
     force: bool,
 }
 
@@ -151,6 +156,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
             "--aux" => args.aux = true,
             "--depth" => args.depth = true,
             "--gain-map" => args.gain_map = true,
+            "--frames" => args.frames = true,
             "-o" | "--out-dir" => args.out_dir = Some(PathBuf::from(value(&arg)?)),
             "-f" | "--force" => args.force = true,
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option `{s}`")),
@@ -270,6 +276,9 @@ fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
 }
 
 fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
+    if args.frames {
+        return write_frames(input, output, args);
+    }
     check_heic_only(args, output)?;
     if args.wants_aux() && !is_heif(input) {
         return Err("auxiliary images can only be extracted from HEIC/HEIF input".into());
@@ -286,7 +295,10 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     } else {
         None
     };
-    let (image, icc, exif) = read(input)?;
+    let (image, icc, exif) = read(input).map_err(|e| match sequence_frames(input) {
+        Some(n) => format!("{e} (the file holds an image sequence of {n} frames: use --frames)"),
+        None => e,
+    })?;
     let file = std::fs::File::create(output).map_err(|e| format!("{}: {e}", output.display()))?;
     let mut writer = std::io::BufWriter::new(file);
 
@@ -381,6 +393,84 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     if let Some(bytes) = &aux_bytes {
         write_auxiliary(output, bytes, args)?;
     }
+    if let Some(n) = sequence_frames(input).filter(|&n| n > 1) {
+        println!("  also holds an image sequence of {n} frames: add --frames to extract them");
+    }
+    Ok(())
+}
+
+/// The number of frames of the image sequence of a HEIF input, if it has one.
+fn sequence_frames(input: &Path) -> Option<usize> {
+    let bytes = std::fs::read(input).ok()?;
+    if !bytes.get(4..8).is_some_and(|b| b == b"ftyp") {
+        return None;
+    }
+    heifer::read_sequence(&bytes)
+        .ok()
+        .flatten()
+        .map(|seq| seq.frames.len())
+}
+
+/// Path of frame `index` (from 0) of `count`, after `output`: `out-001.png`, with at least
+/// three digits.
+fn frame_path(output: &Path, index: usize, count: usize) -> PathBuf {
+    let digits = count.to_string().len().max(3);
+    let stem = output.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = output.extension().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!("{stem}-{:0digits$}.{ext}", index + 1))
+}
+
+/// `--frames`: writes every frame of the image sequence, in display order.
+fn write_frames(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
+    if is_heif(output) {
+        return Err("--frames writes images: give a PNG, JPEG, WebP... output".into());
+    }
+    if args.format.is_some() || args.max_size.is_some() || args.wants_aux() {
+        return Err("--frames cannot be combined with HEIC or auxiliary image options".into());
+    }
+    let format = ImageFormat::from_path(output)
+        .map_err(|_| format!("unknown output format for {}", output.display()))?;
+    let start = Instant::now();
+    let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+    let seq = heifer::read_sequence(&bytes)
+        .map_err(|e| e.to_string())?
+        .ok_or("no image sequence in this file")?;
+    let count = seq.frames.len();
+    let paths: Vec<PathBuf> = (0..count).map(|i| frame_path(output, i, count)).collect();
+    // Check every target before writing any, so that a conflict leaves no partial output.
+    if !args.force
+        && let Some(p) = paths.iter().find(|p| p.exists())
+    {
+        return Err(format!("{} exists (use --force to overwrite)", p.display()));
+    }
+    let frames = heifer::decode_sequence(&bytes).map_err(|e| e.to_string())?;
+    for (frame, path) in frames.zip(&paths) {
+        let frame = frame.map_err(|e| e.to_string())?;
+        let buffer =
+            ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, frame.to_rgba8())
+                .ok_or("frame of an unexpected size")?;
+        let mut image = DynamicImage::ImageRgba8(buffer);
+        if matches!(format, ImageFormat::Jpeg) {
+            image = DynamicImage::ImageRgb8(image.to_rgb8());
+        }
+        image
+            .save_with_format(path, format)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    println!(
+        "{} → {} … {} ({count} frames {}×{}, {:.2} s, {:.2?})",
+        input.display(),
+        paths
+            .first()
+            .map_or(String::new(), |p| p.display().to_string()),
+        paths
+            .last()
+            .map_or(String::new(), |p| p.display().to_string()),
+        seq.width,
+        seq.height,
+        seq.duration(),
+        start.elapsed()
+    );
     Ok(())
 }
 
@@ -606,7 +696,26 @@ fn info_lines(input: &Path) -> Result<Vec<String>, String> {
         ));
         return Ok(lines);
     }
-    let file = heifer::heifer_isobmff::HeifFile::parse(&bytes).map_err(|e| e.to_string())?;
+    let sequence = heifer::read_sequence(&bytes).ok().flatten();
+    let sequence_line = sequence.as_ref().map(|seq| {
+        let keyframes = seq.frames.iter().filter(|f| f.keyframe).count();
+        format!(
+            "  image sequence: {} frames {}×{}, {:.2} s, {keyframes} keyframes",
+            seq.frames.len(),
+            seq.width,
+            seq.height,
+            seq.duration()
+        )
+    });
+    let file = match heifer::heifer_isobmff::HeifFile::parse(&bytes) {
+        Ok(file) => file,
+        // A sequence without a still image.
+        Err(_) if sequence_line.is_some() => {
+            lines.extend(sequence_line);
+            return Ok(lines);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let image = heifer::decode(&bytes).map_err(|e| e.to_string())?;
     let primary = file.item(file.primary_id).map_err(|e| e.to_string())?;
     let layout = match file.grid(file.primary_id) {
@@ -747,6 +856,7 @@ fn info_lines(input: &Path) -> Result<Vec<String>, String> {
     if !present.is_empty() {
         lines.push(format!("  metadata: {}", present.join(", ")));
     }
+    lines.extend(sequence_line);
     Ok(lines)
 }
 
@@ -1037,5 +1147,63 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn bframes() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../heifer/tests/data/bframes.mp4")
+    }
+
+    #[test]
+    fn frame_paths_are_numbered_after_the_output() {
+        let out = Path::new("dir/burst.png");
+        assert_eq!(frame_path(out, 0, 24), Path::new("dir/burst-001.png"));
+        assert_eq!(frame_path(out, 23, 24), Path::new("dir/burst-024.png"));
+        assert_eq!(frame_path(out, 0, 1200), Path::new("dir/burst-0001.png"));
+        let args = parse("in.heics out.png --frames").unwrap().unwrap();
+        assert!(args.frames);
+    }
+
+    #[test]
+    fn frames_are_written_in_display_order() {
+        let dir = temp_dir("frames");
+        let out = dir.join("f.png");
+        let args = parse("in out.png --frames").unwrap().unwrap();
+        write_frames(&bframes(), &out, &args).unwrap();
+        // The brightness of the test stream grows with the display index.
+        let means: Vec<f64> = (0..24)
+            .map(|i| {
+                let image = image::open(frame_path(&out, i, 24)).unwrap().to_luma8();
+                image.pixels().map(|p| f64::from(p.0[0])).sum::<f64>() / f64::from(128 * 96)
+            })
+            .collect();
+        assert!(means.windows(2).all(|m| m[1] > m[0] + 3.0), "{means:?}");
+        assert!(!frame_path(&out, 24, 24).exists());
+        // Existing frames are not overwritten without --force.
+        let err = write_frames(&bframes(), &out, &args).unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+        let forced = parse("in out.png --frames -f").unwrap().unwrap();
+        write_frames(&bframes(), &out, &forced).unwrap();
+        // Frames are images, not HEIC.
+        let err = write_frames(&bframes(), &dir.join("f.heic"), &args).unwrap_err();
+        assert!(err.contains("--frames"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sequences_are_reported() {
+        assert_eq!(sequence_frames(&bframes()), Some(24));
+        let lines = info_lines(&bframes()).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("image sequence: 24 frames 128×96, 0.96 s, 2 keyframes")),
+            "{lines:?}"
+        );
+        // A file with only a sequence points to --frames.
+        let dir = temp_dir("seq-only");
+        let args = parse("in out.png").unwrap().unwrap();
+        let err = convert(&bframes(), &dir.join("x.png"), &args).unwrap_err();
+        assert!(err.contains("use --frames"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
