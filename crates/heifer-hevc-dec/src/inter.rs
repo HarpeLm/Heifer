@@ -286,7 +286,7 @@ pub fn merge(
     merge_idx: usize,
     max_num_merge_cand: usize,
     log2_par_mrg_level: u8,
-    num_ref_idx: usize,
+    num_ref_idx: [usize; 2],
 ) -> Motion {
     let mut g = *geom;
     // Parallel merge level: all prediction blocks of an 8×8 coding unit share one list.
@@ -355,7 +355,11 @@ pub fn merge(
     }
     let mut zero_idx = 0;
     while list.len() < max_num_merge_cand.max(merge_idx + 1) {
-        let r = if zero_idx < num_ref_idx { zero_idx } else { 0 };
+        let r = if zero_idx < num_ref_idx[0] {
+            zero_idx
+        } else {
+            0
+        };
         list.push(Motion::l0([0; 2], r as i8));
         zero_idx += 1;
     }

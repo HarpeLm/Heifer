@@ -382,7 +382,15 @@ pub fn decode_slice_segment(
         cu_chroma_qp_offset_enabled: header.cu_chroma_qp_offset_enabled_flag,
         refs,
         max_num_merge_cand: 5 - usize::from(header.five_minus_max_num_merge_cand),
-        num_ref_idx_l0: usize::from(header.num_ref_idx_l0_active_minus1) + 1,
+        num_ref_idx: [
+            usize::from(header.num_ref_idx_l0_active_minus1) + 1,
+            if header.slice_type == SliceType::B {
+                usize::from(header.num_ref_idx_l1_active_minus1) + 1
+            } else {
+                0
+            },
+        ],
+        mvd_l1_zero: header.mvd_l1_zero_flag,
     };
     if header.dependent_slice_segment_flag {
         // QP prediction continues across the segments of a slice (§8.6.1).
@@ -428,8 +436,10 @@ struct Parser<'p, 'a> {
     refs: Option<SliceRefs<'p>>,
     /// `MaxNumMergeCand`.
     max_num_merge_cand: usize,
-    /// `num_ref_idx_l0_active_minus1 + 1`.
-    num_ref_idx_l0: usize,
+    /// `num_ref_idx_lX_active_minus1 + 1` of each list; 0 for `RefPicList1` of a P slice.
+    num_ref_idx: [usize; 2],
+    /// `mvd_l1_zero_flag`.
+    mvd_l1_zero: bool,
 }
 
 /// Helpers to decode bins with a context index.
@@ -976,33 +986,42 @@ impl Parser<'_, '_> {
                 merge_idx,
                 self.max_num_merge_cand,
                 self.pps.log2_parallel_merge_level,
-                self.num_ref_idx_l0,
+                self.num_ref_idx,
             )
         } else {
-            // P slices: inter_pred_idc is not coded, the block uses RefPicList0.
-            let mut ref_idx = 0usize;
-            if self.num_ref_idx_l0 > 1 {
-                // Truncated Rice, cMax = num_ref_idx - 1: two context-coded bins, then bypass.
-                let c_max = self.num_ref_idx_l0 - 1;
-                while ref_idx < c_max {
-                    let bin = if ref_idx < 2 {
-                        self.flag(ctx::REF_IDX_L0 + ref_idx)
-                    } else {
-                        self.bypass() == 1
-                    };
-                    if !bin {
-                        break;
-                    }
-                    ref_idx += 1;
-                }
+            // inter_pred_idc (B slices only; P slices use RefPicList0): which lists are used.
+            let mut uses = [true, false];
+            if self.num_ref_idx[1] > 0 {
+                let bi = g.w + g.h != 12 && {
+                    let depth = self.pic.ct_depth[self.pic.idx(g.x_cb, g.y_cb)];
+                    self.flag(ctx::INTER_PRED_IDC + usize::from(depth))
+                };
+                uses = if bi {
+                    [true, true]
+                } else if self.flag(ctx::INTER_PRED_IDC + 4) {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
             }
-            let mvd = self.mvd_coding()?;
-            let mvp_flag = self.flag(ctx::MVP_LX_FLAG);
-            let candidates = inter::amvp(&*self, &refs, g, ref_idx as i8, 0);
-            let mvp = candidates[usize::from(mvp_flag)];
-            // (mvp + mvd) wrapped to 16 bits (8-197 to 8-200).
-            let mv = [0, 1].map(|k| (i32::from(mvp[k]) + mvd[k]) as u16 as i16);
-            Motion::l0(mv, ref_idx as i8)
+            let mut motion = Motion::NONE;
+            for list in 0..2 {
+                if !uses[list] {
+                    continue;
+                }
+                let ref_idx = self.ref_idx(list);
+                let mvd = if list == 1 && self.mvd_l1_zero && uses[0] {
+                    [0; 2]
+                } else {
+                    self.mvd_coding()?
+                };
+                let mvp_flag = self.flag(ctx::MVP_LX_FLAG);
+                let mvp = inter::amvp(&*self, &refs, g, ref_idx, list)[usize::from(mvp_flag)];
+                motion.ref_idx[list] = ref_idx;
+                // (mvp + mvd) wrapped to 16 bits (8-197 to 8-200).
+                motion.mv[list] = [0, 1].map(|k| (i32::from(mvp[k]) + mvd[k]) as u16 as i16);
+            }
+            motion
         };
         let (w4, x4, y4) = (self.pic.w4, g.x as usize >> 2, g.y as usize >> 2);
         let h4 = self.pic.motion.len() / w4;
@@ -1019,6 +1038,27 @@ impl Parser<'_, '_> {
             motion,
         });
         Ok(merge)
+    }
+
+    /// `ref_idx_lX` (§7.3.8.6): truncated Rice with cMax = `num_ref_idx_active - 1`, two
+    /// context-coded bins then bypass bins; 0 when the list has a single active entry. Both
+    /// lists share the same contexts (Table 9-4).
+    fn ref_idx(&mut self, list: usize) -> i8 {
+        let c_max = self.num_ref_idx[list].saturating_sub(1);
+        let base = ctx::REF_IDX_L0;
+        let mut ref_idx = 0;
+        while ref_idx < c_max {
+            let bin = if ref_idx < 2 {
+                self.flag(base + ref_idx)
+            } else {
+                self.bypass() == 1
+            };
+            if !bin {
+                break;
+            }
+            ref_idx += 1;
+        }
+        ref_idx as i8
     }
 
     /// `mvd_coding()` (§7.3.8.9): the motion vector difference.
