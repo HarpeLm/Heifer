@@ -58,7 +58,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 
 ## <img src="docs/icons/solution.svg" width="24" height="24" align="top"> Features
 
-- **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 42 also verified against the reference decoder's MD5 hashes.
+- **Correct**: identical to ffmpeg on 62/62 comparable HEVC conformance bitstreams; 42 also verified against the reference decoder's MD5 hashes. Image sequences (P and B frames): every picture of 114 conformance bitstreams matches its MD5.
 - **Real photos**: iPhone (48-tile grids, rotation, spatial photos), Samsung 200 MP, Xiaomi, Sony.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
@@ -85,7 +85,7 @@ heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images,
 
 ```toml
 [dependencies]
-heifer = "0.4"
+heifer = "0.5"
 ```
 
 Decoding only? Turn off the default `encoder` feature: heifer then depends on its container and
@@ -93,7 +93,7 @@ decoder crates and `thiserror`, nothing else.
 
 ```toml
 [dependencies]
-heifer = { version = "0.4", default-features = false }
+heifer = { version = "0.5", default-features = false }
 ```
 
 Or try the examples on your own photos:
@@ -266,7 +266,7 @@ ISO 21496-1 `log2` gain range, so any headroom above 1 works.
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.4", features = ["image"] }
+heifer = { version = "0.5", features = ["image"] }
 ```
 
 ```rust
@@ -443,6 +443,8 @@ that may grow are `#[non_exhaustive]`.
 - [x] **0.3.15**: HDR gain map encoding (ISO 21496-1 `tmap`)
 - [x] **0.3.16**: ICC colour management (`decode_srgb`; an ICC profile replaces `nclx` when encoding)
 - [x] **IPTC** (#4) and decoding from a reader (#5)
+- [x] **0.4**: 4:2:2 encoding, size targets, region annotations, decode-only builds
+- [x] **0.5**: image sequences with P and B frames in display order, as `image` animations and GIF/APNG in the CLI
 - [ ] **Next**: single-thread decoding speed (still slower than ffmpeg)
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

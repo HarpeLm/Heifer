@@ -1,72 +1,82 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-11-07
+
+Image sequences decode completely: P and B frames, long-term references, in display order,
+from HEIF files, MP4 tracks and raw HEVC streams, verified against 114 conformance bitstreams.
 
 **Breaking**
 
-- New public fields: `heifer_isobmff::track::Sample::composition_offset`,
-  `heifer_hevc_dec::refs::RefPic::long_term` and
-  `heifer_hevc_dec::syntax::TransformBlock::explicit_rdpcm`.
 - Structs that only describe a decoded file are now `#[non_exhaustive]`, so later fields are
   not breaking changes: `FrameInfo`, `SequenceInfo`, `Regions`, `AuxiliaryImage`,
   `DepthInfo` and `iptc::Dataset` (heifer), `Track` and `Sample` (heifer-isobmff),
   `SliceHeader`, `LongTermRef` and `PredWeight` (heifer-hevc-dec). They can no longer be
   built with a struct literal outside their crate; reading their fields is unchanged.
+- Sequence frames are numbered in display order: `read_sequence` lists them in that order and
+  `decode_sequence_frame` takes a display index. This only differs from 0.4 for files with B
+  frames, which 0.4 did not decode.
+- New public fields: `heifer_isobmff::track::Sample::composition_offset`,
+  `heifer_hevc_dec::refs::RefPic::long_term` and
+  `heifer_hevc_dec::syntax::TransformBlock::explicit_rdpcm`.
+- Low-level `heifer-hevc-dec` API: `PocState::next` takes whether the picture can be
+  `prevTid0Pic` (a `bool`, from `PocState::is_prev_tid0_candidate`) instead of its
+  `TemporalId`; `inter::merge` takes the number of active references of both lists;
+  `Reconstructor::set_references` takes both lists and their weights, with a long-term flag
+  per picture; `SliceRefs` gains `long_term` and `ColMotion` gains `ref_lt`.
 
 **New**
 
-- Inter prediction, P frames: image sequences, bursts and animations now decode every frame,
-  not only keyframes. `decode_sequence` iterates over the frames in order, and
-  `decode_sequence_frame` decodes one frame from the keyframe before it. The HEVC decoder
-  gains `sequence::SequenceDecoder` (picture order count, reference picture sets, decoded
-  picture buffer, `RefPicList0`) and `nal::access_units`. Supported: merge and skip modes,
-  AMVP with motion vector scaling, temporal motion vector prediction, all partition modes
-  including AMP, 8-tap luma and 4-tap chroma interpolation, explicit weighted prediction,
-  constrained intra prediction, and deblocking boundary strengths of inter blocks, in 4:0:0
-  to 4:4:4 up to 12 bits.
+- P frames: image sequences, bursts and animations decode every frame, not only keyframes.
+  `decode_sequence` iterates over the frames, and `decode_sequence_frame` decodes one frame
+  from the keyframe before it. The HEVC decoder gains `sequence::SequenceDecoder` (picture
+  order count, reference picture sets, decoded picture buffer) and `nal::access_units`.
+  Supported: merge and skip modes, AMVP with motion vector scaling, temporal motion vector
+  prediction, all partition modes including AMP, 8-tap luma and 4-tap chroma interpolation,
+  explicit weighted prediction, constrained intra prediction, and deblocking of inter blocks,
+  in 4:0:0 to 4:4:4 up to 12 bits.
+- B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
+  bi-predictive and zero merge candidates, and the collocated picture from either list.
 - Long-term reference pictures: parsed from the slice header and the SPS, kept in the DPB,
-  appended to both reference lists, and handled by AMVP and temporal prediction (no
-  scaling, no mixing of short- and long-term vectors).
+  appended to both reference lists, and handled by AMVP and temporal prediction (no scaling,
+  no mixing of short- and long-term vectors).
 - Explicit RDPCM (range extension) for inter blocks coded without transform.
+- Frames in display order: `decode_sequence` reorders frames by the composition offsets of
+  the track (`ctts`), and `read_sequence` gives each frame's display duration.
+  `heifer-isobmff`'s `Track` gains `composition_times` and `display_order`.
 - Raw HEVC streams in display order: `SequenceDecoder::decode_in_display_order` and `flush`
   implement the output process (C.5.2): reordering, DPB fullness and latency limits,
-  `no_output_of_prior_pics_flag` and `pic_output_flag`. Frames and frame counts match ffmpeg on
-  17 conformance streams.
-- CLI: `--frames` extracts every frame of an image sequence (`out-001.png`, ...), or writes
-  one animated GIF or APNG when the output is `.gif` or `.apng`; converting a file that holds a
-  sequence prints a note, and `heifer info` describes the sequence.
+  `no_output_of_prior_pics_flag` and `pic_output_flag`.
 - `image` crate: `HeifSequenceDecoder` reads image sequences as an `image::AnimationDecoder`
   (RGBA 8-bit frames in display order, with their durations).
+- CLI: `--frames` extracts every frame of an image sequence (`out-001.png`, ...), or writes
+  one looping GIF or APNG when the output is `.gif` or `.apng`; converting a file that holds a
+  sequence prints a note, and `heifer info` describes the sequence.
 - `check_file_type`: HEVC image sequences (`hevc`, `hevx`) are `Supported`, and generic ones
   (`msf1`) `MayBe`.
-- B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
-  bi-predictive and zero merge candidates on both lists, and the collocated picture from
-  either list.
-- Frames in display order: `decode_sequence` returns frames in display order, reordered by
-  the composition offsets of the track (`ctts`); `read_sequence` lists frames and durations
-  in that order, and `decode_sequence_frame` takes a display index. `heifer-isobmff`'s
-  `Sample` gains `composition_offset`, and `Track` gains `composition_times` and
-  `display_order`.
-- Verified: the 300 frames of the three Nokia sequences and 12 x265 streams (several
+- Verified: the 300 frames of the three Nokia sequences, 12 x265 streams (several
   references, AMP, slices, WPP, CTU sizes, open GOP, lossless, transform skip, 10-bit, 4:2:2,
-  4:4:4, weighted prediction) and three x265 streams with B frames (pyramid, weighted
-  bi-prediction, up to 8 B frames) decode identically to ffmpeg, and 114 official
-  conformance bitstreams (7,115 pictures) match their MD5 picture hashes; none is rejected
-  as unsupported. `scripts/fetch-conformance.sh`
-  fetches the inter streams and a new test decodes every picture of each.
+  4:4:4, weighted prediction) and four x265 streams with B frames (pyramid, weighted
+  bi-prediction, up to 8 B frames) decode identically to ffmpeg; 114 official conformance
+  bitstreams (7,115 pictures) match their MD5 picture hashes, none rejected as unsupported;
+  frames and frame counts in display order match ffmpeg on 17 of them.
+  `scripts/fetch-conformance.sh` fetches the inter streams, and a test decodes every picture.
+- Fuzzing covers the new code, with B frame, long-term and RDPCM seeds.
 
 **Fixed**
 
+- Inter blocks used the intra scaling matrices: P pictures with scaling lists were wrong in
+  0.4 (matrixId is 3 to 5 for inter blocks).
 - POC derivation took a RADL, RASL or sub-layer non-reference picture as `prevTid0Pic`, so
-  some sequences got wrong POCs (and display order). `PocState::next` now takes whether the
-  picture can be `prevTid0Pic`; `PocState::is_prev_tid0_candidate` tells.
-- Inter blocks used the intra scaling matrices: P and B pictures with scaling lists were
-  wrong (matrixId is 3 to 5 for inter blocks).
+  some sequences got wrong POCs, hence a wrong display order or missing references.
 
 **Changed**
 
+- Inter prediction is about 14% faster (references read in place, row filters, reused
+  buffers).
 - A PPS may now arrive before its SPS: it is parsed when the SPS arrives, and again when the
   SPS changes.
+- Documentation: image sequences, regions and reading from `Read + Seek` are listed as
+  supported in the migration guide.
 
 ## 0.4.0 — 2026-11-06
 
