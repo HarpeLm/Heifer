@@ -1,11 +1,11 @@
 //! Image sequences (`.heics`, bursts, animations): pictures stored as the samples of a track.
 //!
 //! [`read_sequence`] describes the main sequence track: picture size, frame timing and which
-//! frames are keyframes. [`decode_sequence`] decodes every frame in order, and
+//! frames are keyframes. [`decode_sequence`] decodes every frame in display order, and
 //! [`decode_sequence_frame`] one frame, decoding from the keyframe before it.
 //!
-//! Frames predicted from earlier ones (P frames) are decoded. Bi-predicted frames (B slices)
-//! are not yet, and return [`Error::Unsupported`].
+//! Frames are numbered in display order. With B frames, a file stores them in another
+//! (decoding) order, given by the composition offsets of the track (`ctts`).
 
 use heifer_hevc_dec::decoder::DecodeOptions;
 use heifer_hevc_dec::recon::Frame;
@@ -34,7 +34,7 @@ pub struct SequenceInfo {
     pub width: u32,
     /// Picture height.
     pub height: u32,
-    /// The frames, in decoding order.
+    /// The frames, in display order.
     pub frames: Vec<FrameInfo>,
 }
 
@@ -63,22 +63,32 @@ pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
         return Ok(None);
     };
     let scale = f64::from(track.timescale.max(1));
+    let times = track.composition_times();
+    let order = track.display_order();
+    // A frame is shown until the next one; the last one for its sample duration.
+    let frames = order
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| {
+            let ticks = match order.get(k + 1) {
+                Some(&next) => times[next] - times[i],
+                None => i64::from(track.samples[i].duration),
+            };
+            FrameInfo {
+                duration: ticks as f64 / scale,
+                keyframe: track.samples[i].sync,
+            }
+        })
+        .collect();
     Ok(Some(SequenceInfo {
         track_id: track.id,
         width: track.width,
         height: track.height,
-        frames: track
-            .samples
-            .iter()
-            .map(|s| FrameInfo {
-                duration: f64::from(s.duration) / scale,
-                keyframe: s.sync,
-            })
-            .collect(),
+        frames,
     }))
 }
 
-/// Decodes every frame of the main sequence, in order.
+/// Decodes every frame of the main sequence, in display order.
 pub fn decode_sequence(bytes: &[u8]) -> Result<SequenceFrames<'_>, Error> {
     decode_sequence_with_options(bytes, &Options::default())
 }
@@ -92,7 +102,8 @@ pub fn decode_sequence_with_options<'a>(
     SequenceFrames::new(bytes, track, 0, options)
 }
 
-/// Decodes frame `index` of the main sequence, from the keyframe before it.
+/// Decodes frame `index` (in display order) of the main sequence, from the keyframe before
+/// it in decoding order.
 pub fn decode_sequence_frame(bytes: &[u8], index: usize) -> Result<Image, Error> {
     decode_sequence_frame_with_options(bytes, index, &Options::default())
 }
@@ -104,20 +115,21 @@ pub fn decode_sequence_frame_with_options(
     options: &Options,
 ) -> Result<Image, Error> {
     let track = main_track(bytes)?.ok_or(Error::Invalid("file has no image sequence"))?;
-    if index >= track.samples.len() {
-        return Err(Error::Invalid("frame index out of range"));
-    }
-    let start = track.samples[..=index]
+    let sample = *track
+        .display_order()
+        .get(index)
+        .ok_or(Error::Invalid("frame index out of range"))?;
+    let start = track.samples[..=sample]
         .iter()
         .rposition(|s| s.sync)
         .ok_or(Error::Invalid("no keyframe before the frame"))?;
     let mut frames = SequenceFrames::new(bytes, track, start, options)?;
-    for _ in start..index {
+    for _ in start..sample {
         frames.decode_next(false)?;
     }
     frames
-        .next()
-        .unwrap_or(Err(Error::Invalid("frame index out of range")))
+        .decode_next(true)?
+        .ok_or(Error::Invalid("frame index out of range"))
 }
 
 /// The frames of an image sequence, decoded one by one (see [`decode_sequence`]).
@@ -125,7 +137,14 @@ pub struct SequenceFrames<'a> {
     bytes: &'a [u8],
     track: Track,
     decoder: SequenceDecoder,
+    /// Next sample to decode, in decoding order.
     next: usize,
+    /// Sample indices in display order.
+    order: Vec<usize>,
+    /// Next frame to return, in display order.
+    shown: usize,
+    /// Decoded frames waiting for their turn: sample index and image.
+    pending: Vec<(usize, Image)>,
 }
 
 impl std::fmt::Debug for SequenceFrames<'_> {
@@ -150,9 +169,12 @@ impl<'a> SequenceFrames<'a> {
         decoder.add_parameter_sets(&hevc_annex_b(config, &[])?)?;
         Ok(Self {
             bytes,
+            order: track.display_order(),
             track,
             decoder,
             next: start,
+            shown: 0,
+            pending: Vec::new(),
         })
     }
 
@@ -206,17 +228,30 @@ impl Iterator for SequenceFrames<'_> {
     type Item = Result<Image, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.track.samples.len() {
-            return None;
+        let &sample = self.order.get(self.shown)?;
+        self.shown += 1;
+        // Decode in decoding order until the frame shown next is ready.
+        loop {
+            if let Some(k) = self.pending.iter().position(|(i, _)| *i == sample) {
+                return Some(Ok(self.pending.swap_remove(k).1));
+            }
+            if self.next >= self.track.samples.len() {
+                return Some(Err(Error::Invalid("frame missing from the decoding order")));
+            }
+            let index = self.next;
+            match self.decode_next(true) {
+                Ok(image) => self.pending.push((index, image.expect("converted"))),
+                Err(e) => {
+                    // Stop after an error.
+                    self.shown = self.order.len();
+                    return Some(Err(e));
+                }
+            }
         }
-        Some(
-            self.decode_next(true)
-                .map(|image| image.expect("converted")),
-        )
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.track.samples.len().saturating_sub(self.next);
+        let n = self.order.len().saturating_sub(self.shown);
         (n, Some(n))
     }
 }
