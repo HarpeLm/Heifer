@@ -277,8 +277,8 @@ pub fn temporal(refs: &SliceRefs<'_>, g: &PuGeom, ref_idx: i8, list: usize) -> O
 
 /// Merge mode (§8.5.3.2.2): the motion of candidate `merge_idx` of the merge candidate list.
 ///
-/// `num_ref_idx` is the number of active entries of each reference list; B slices (combined
-/// bi-predictive candidates) are not supported.
+/// `num_ref_idx` is the number of active entries of each reference list (0 for
+/// `RefPicList1` in P slices).
 pub fn merge(
     src: &impl MotionSource,
     refs: &SliceRefs<'_>,
@@ -347,23 +347,72 @@ pub fn merge(
     let (a1, b1, b0, a0, b2) = (a1_flag, b1_flag, b0_flag, a0_flag, b2_flag);
 
     let mut list: Vec<Motion> = [a1, b1, b0, a0, b2].into_iter().flatten().collect();
+    let is_b = num_ref_idx[1] > 0;
+    // 8×4 and 4×8 blocks are not bi-predicted: their candidate keeps only RefPicList0
+    // (8-161), using the size of the block itself, not of the shared 8×8 list.
+    let restrict = |m: Motion| {
+        if geom.w + geom.h == 12 && m.uses(0) && m.uses(1) {
+            Motion {
+                mv: [m.mv[0], [0; 2]],
+                ref_idx: [m.ref_idx[0], -1],
+            }
+        } else {
+            m
+        }
+    };
     if list.len() > merge_idx {
-        return list[merge_idx];
+        return restrict(list[merge_idx]);
     }
-    if let Some(mv) = temporal(refs, &g, 0, 0) {
-        list.push(Motion::l0(mv, 0));
+    // Temporal candidate, reference index 0 of each list (§8.5.3.2.2 step 4).
+    let mut col = Motion::NONE;
+    for l in 0..if is_b { 2 } else { 1 } {
+        if let Some(mv) = temporal(refs, &g, 0, l) {
+            col.mv[l] = mv;
+            col.ref_idx[l] = 0;
+        }
     }
+    if col.is_inter() {
+        list.push(col);
+    }
+    // Combined bi-predictive candidates (§8.5.3.2.4): L0 motion of one candidate with the L1
+    // motion of another, in the order of Table 8-7.
+    let num_orig = list.len();
+    if is_b && num_orig > 1 && num_orig < max_num_merge_cand {
+        const L0: [usize; 12] = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3];
+        const L1: [usize; 12] = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2];
+        for comb in 0..num_orig * (num_orig - 1) {
+            let (c0, c1) = (list[L0[comb]], list[L1[comb]]);
+            if c0.uses(0)
+                && c1.uses(1)
+                && (refs.poc_of(0, c0.ref_idx[0]) != refs.poc_of(1, c1.ref_idx[1])
+                    || c0.mv[0] != c1.mv[1])
+            {
+                list.push(Motion {
+                    mv: [c0.mv[0], c1.mv[1]],
+                    ref_idx: [c0.ref_idx[0], c1.ref_idx[1]],
+                });
+                if list.len() == max_num_merge_cand {
+                    break;
+                }
+            }
+        }
+    }
+    // Zero candidates (§8.5.3.2.5), on both lists in B slices.
+    let num_zero_ref = if is_b {
+        num_ref_idx[0].min(num_ref_idx[1])
+    } else {
+        num_ref_idx[0]
+    };
     let mut zero_idx = 0;
     while list.len() < max_num_merge_cand.max(merge_idx + 1) {
-        let r = if zero_idx < num_ref_idx[0] {
-            zero_idx
-        } else {
-            0
-        };
-        list.push(Motion::l0([0; 2], r as i8));
+        let r = if zero_idx < num_zero_ref { zero_idx } else { 0 } as i8;
+        list.push(Motion {
+            mv: [[0; 2]; 2],
+            ref_idx: [r, if is_b { r } else { -1 }],
+        });
         zero_idx += 1;
     }
-    list[merge_idx]
+    restrict(list[merge_idx])
 }
 
 /// Luma motion vector prediction (§8.5.3.2.6): the two candidates of `mvpListLX` for a
@@ -623,6 +672,98 @@ pub fn weight_explicit(pred: i32, bit_depth: u8, weight: i32, offset: i32, log2_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neighbours: A1 (left) uses L0, B1 (above) uses L1; the others are unavailable.
+    struct TwoNeighbours;
+    impl MotionSource for TwoNeighbours {
+        fn neighbour(&self, g: &PuGeom, xn: i64, yn: i64) -> Option<Motion> {
+            let (x, y) = (i64::from(g.x), i64::from(g.y));
+            if xn == x - 1 && yn == y + i64::from(g.h) - 1 {
+                Some(Motion::l0([4, 0], 0))
+            } else if yn == y - 1 && xn == x + i64::from(g.w) - 1 {
+                Some(Motion {
+                    mv: [[0; 2], [-8, 2]],
+                    ref_idx: [-1, 0],
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    fn b_refs<'a>(l0: &'a [i32], l1: &'a [i32]) -> SliceRefs<'a> {
+        SliceRefs {
+            poc: 4,
+            lists: [l0, l1],
+            col: None,
+            collocated_from_l0: true,
+            no_backward_pred: false,
+            pic_size: (64, 64),
+            log2_ctb: 4,
+        }
+    }
+
+    fn geom(w: u32, h: u32) -> PuGeom {
+        PuGeom {
+            x_cb: 16,
+            y_cb: 16,
+            n_cb: 16,
+            x: 16,
+            y: 16,
+            w,
+            h,
+            part_idx: 0,
+            part_mode: PartMode::Part2Nx2N,
+        }
+    }
+
+    #[test]
+    fn b_merge_list_combines_and_fills_with_zero_on_both_lists() {
+        let (l0, l1) = ([0, 2], [8]);
+        let refs = b_refs(&l0, &l1);
+        let g = geom(16, 16);
+        let m = |i| merge(&TwoNeighbours, &refs, &g, i, 5, 2, [2, 1]);
+        assert_eq!(m(0), Motion::l0([4, 0], 0));
+        assert_eq!(m(1).ref_idx, [-1, 0]);
+        // A1's L0 motion with B1's L1 motion; the reverse pair has neither.
+        assert_eq!(
+            m(2),
+            Motion {
+                mv: [[4, 0], [-8, 2]],
+                ref_idx: [0, 0],
+            }
+        );
+        // Zero candidates: min(2, 1) = 1 reference index on both lists.
+        let zero = Motion {
+            mv: [[0; 2]; 2],
+            ref_idx: [0, 0],
+        };
+        assert_eq!(m(3), zero);
+        assert_eq!(m(4), zero);
+    }
+
+    #[test]
+    fn small_blocks_are_not_bi_predicted() {
+        let (l0, l1) = ([0], [8]);
+        let refs = b_refs(&l0, &l1);
+        let g = geom(8, 4);
+        let m = merge(&TwoNeighbours, &refs, &g, 2, 5, 2, [1, 1]);
+        assert_eq!(m, Motion::l0([4, 0], 0));
+        let p = merge(
+            &TwoNeighbours,
+            &b_refs(&l0, &[]),
+            &geom(8, 4),
+            1,
+            5,
+            2,
+            [1, 0],
+        );
+        assert_eq!(
+            p.ref_idx,
+            [-1, 0],
+            "spatial candidates are copied as they are"
+        );
+    }
 
     #[test]
     fn scaling_matches_the_spec_formula() {
