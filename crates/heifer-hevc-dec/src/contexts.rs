@@ -139,20 +139,14 @@ pub struct Contexts {
 }
 
 impl Contexts {
-    /// `initType` of a slice (§9.3.2.2): 0 for I slices, 1 for P slices without
-    /// `cabac_init_flag`, 2 for P slices with it. B slices rotate the other way (2 and 0), but
-    /// they are not decoded yet.
+    /// `initType` of a slice (§9.3.2.2): 0 for I slices; 1 for P slices, or 2 with
+    /// `cabac_init_flag`; 2 for B slices, or 1 with `cabac_init_flag`.
     pub fn init_type(slice_type: crate::slice::SliceType, cabac_init_flag: bool) -> u8 {
         use crate::slice::SliceType;
-        let base = match slice_type {
-            SliceType::I => 0,
-            SliceType::P => 1,
-            SliceType::B => 2,
-        };
-        if cabac_init_flag {
-            (base + 1) % 3
-        } else {
-            base
+        match (slice_type, cabac_init_flag) {
+            (SliceType::I, _) => 0,
+            (SliceType::P, false) | (SliceType::B, true) => 1,
+            (SliceType::P, true) | (SliceType::B, false) => 2,
         }
     }
 
@@ -236,6 +230,6 @@ mod tests {
         assert_eq!(Contexts::init_type(SliceType::P, false), 1);
         assert_eq!(Contexts::init_type(SliceType::P, true), 2);
         assert_eq!(Contexts::init_type(SliceType::B, false), 2);
-        assert_eq!(Contexts::init_type(SliceType::B, true), 0);
+        assert_eq!(Contexts::init_type(SliceType::B, true), 1);
     }
 }
