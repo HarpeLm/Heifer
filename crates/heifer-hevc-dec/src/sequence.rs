@@ -11,10 +11,10 @@ use crate::inter::{MotionField, SliceRefs};
 use crate::nal::{NalUnit, NalUnitType, split_annex_b};
 use crate::params::ParameterSets;
 use crate::recon::{Frame, Reconstructor};
-use crate::refs::{PocState, RefPic, build_ref_pic_list0, build_ref_pic_list1};
+use crate::refs::{PocState, RefPic, build_ref_pic_list};
 use crate::scan::tiles_fit;
 use crate::sei::parse_picture_hash;
-use crate::slice::{SliceHeader, SliceType};
+use crate::slice::{LongTermRef, SliceHeader, SliceType};
 use crate::syntax::{Picture, decode_slice_segment};
 
 /// A decoded picture kept for reference.
@@ -25,6 +25,8 @@ struct DecodedPicture {
     frame: Frame,
     /// Its motion, for temporal motion vector prediction.
     motion: MotionField,
+    /// Marked as used for long-term reference.
+    long_term: bool,
 }
 
 /// Decodes the pictures of an HEVC sequence one at a time, in decoding order.
@@ -140,18 +142,37 @@ impl SequenceDecoder {
             first.header.temporal_id,
         );
 
-        // Reference picture set (§8.3.2): keep only the pictures it lists.
+        // Reference picture set (§8.3.2): keep only the pictures it lists, and mark its
+        // long-term pictures.
         if new_sequence {
             self.dpb.clear();
         } else {
-            let kept: Vec<i32> = header
+            let mut long_term = Vec::new();
+            for lt in &header.long_term_refs {
+                match find_long_term(&self.dpb, lt, poc, &header, sps.log2_max_pic_order_cnt_lsb) {
+                    Some(slot) => long_term.push(slot),
+                    None if lt.used_by_curr_pic => {
+                        return Err(Error::Invalid(
+                            "long-term reference picture is not in the decoded picture buffer",
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            let short_term: Vec<i32> = header
                 .st_rps
                 .negative
                 .iter()
                 .chain(&header.st_rps.positive)
                 .map(|r| poc + r.delta_poc)
                 .collect();
-            self.dpb.retain(|p| kept.contains(&p.poc));
+            let mut slot = 0;
+            self.dpb.retain_mut(|p| {
+                let lt = long_term.contains(&slot);
+                slot += 1;
+                p.long_term |= lt;
+                lt || (!p.long_term && short_term.contains(&p.poc))
+            });
         }
         if self.dpb.iter().any(|p| p.poc == poc) {
             return Err(Error::Invalid("two pictures with the same POC"));
@@ -179,7 +200,12 @@ impl SequenceDecoder {
         } else {
             frame.cropped(sps)
         };
-        self.dpb.push(DecodedPicture { poc, frame, motion });
+        self.dpb.push(DecodedPicture {
+            poc,
+            frame,
+            motion,
+            long_term: false,
+        });
         // After an end of sequence NAL unit, the next picture starts a new sequence.
         if nals
             .iter()
@@ -196,7 +222,11 @@ impl SequenceDecoder {
         let pictures: Vec<RefPic> = dpb
             .iter()
             .enumerate()
-            .map(|(slot, p)| RefPic { slot, poc: p.poc })
+            .map(|(slot, p)| RefPic {
+                slot,
+                poc: p.poc,
+                long_term: p.long_term,
+            })
             .collect();
         let mut state: Option<(Picture<'_>, Reconstructor<'_>)> = None;
         let mut previous: Option<SliceHeader> = None;
@@ -222,22 +252,37 @@ impl SequenceDecoder {
             let inter = header.slice_type != SliceType::I;
             let mut lists: [Vec<RefPic>; 2] = [Vec::new(), Vec::new()];
             if inter {
-                lists[0] = build_ref_pic_list0(
-                    poc,
-                    &header.st_rps,
-                    &pictures,
+                let mut lt_curr = Vec::new();
+                for lt in header.long_term_refs.iter().filter(|l| l.used_by_curr_pic) {
+                    let slot =
+                        find_long_term(dpb, lt, poc, &header, sps.log2_max_pic_order_cnt_lsb)
+                            .ok_or(Error::Invalid("long-term reference picture is missing"))?;
+                    lt_curr.push(pictures[slot]);
+                }
+                let num = [
                     usize::from(header.num_ref_idx_l0_active_minus1) + 1,
-                    header.list_entry_l0.as_deref(),
-                )?;
-            }
-            if header.slice_type == SliceType::B {
-                lists[1] = build_ref_pic_list1(
-                    poc,
-                    &header.st_rps,
-                    &pictures,
                     usize::from(header.num_ref_idx_l1_active_minus1) + 1,
+                ];
+                let entries = [
+                    header.list_entry_l0.as_deref(),
                     header.list_entry_l1.as_deref(),
-                )?;
+                ];
+                let used = if header.slice_type == SliceType::B {
+                    2
+                } else {
+                    1
+                };
+                for l in 0..used {
+                    lists[l] = build_ref_pic_list(
+                        l,
+                        poc,
+                        &header.st_rps,
+                        &pictures,
+                        &lt_curr,
+                        num[l],
+                        entries[l],
+                    )?;
+                }
             }
             recon.set_references(
                 [0, 1].map(|l| {
@@ -291,6 +336,26 @@ impl SequenceDecoder {
         }
         Ok(recon.finish_with_motion(self.options.skip_loop_filters, poc))
     }
+}
+
+/// The DPB slot of the long-term picture `lt` of the current picture (POC `poc`): the
+/// picture with that POC, or with those POC LSBs when its MSBs are not coded (§8.3.2).
+fn find_long_term(
+    dpb: &[DecodedPicture],
+    lt: &LongTermRef,
+    poc: i32,
+    header: &SliceHeader,
+    log2_max_poc_lsb: u8,
+) -> Option<usize> {
+    let target = lt.poc(poc, header.slice_pic_order_cnt_lsb, log2_max_poc_lsb);
+    let mask = (1i32 << log2_max_poc_lsb) - 1;
+    dpb.iter().position(|p| {
+        if lt.delta_poc_msb_cycle.is_some() {
+            p.poc == target
+        } else {
+            p.poc & mask == target
+        }
+    })
 }
 
 /// Whether every slice of the access unit is an I slice.

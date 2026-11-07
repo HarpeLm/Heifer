@@ -1,9 +1,6 @@
-//! Reference picture management: picture order count derivation (§8.3.1) and `RefPicList0`
-//! construction (§8.3.4).
-//!
-//! Only short-term references are handled: long-term references and reference list
-//! modification are rejected while parsing the slice header, so `RefPicList0` is the RPS's
-//! used pictures, repeated when the slice activates more references than it has.
+//! Reference picture management: picture order count derivation (§8.3.1) and the
+//! construction of `RefPicList0` and `RefPicList1` (§8.3.4) from the short-term pictures of
+//! the RPS and the long-term pictures of the slice.
 
 use crate::Error;
 use crate::params::ShortTermRps;
@@ -15,6 +12,8 @@ pub struct RefPic {
     pub slot: usize,
     /// `PicOrderCntVal` of the picture.
     pub poc: i32,
+    /// Whether the picture is marked as used for long-term reference.
+    pub long_term: bool,
 }
 
 /// Derives the picture order count of the pictures, in decoding order (§8.3.1).
@@ -87,7 +86,15 @@ pub fn build_ref_pic_list0(
     num_ref_idx_active: usize,
     list_entry_l0: Option<&[u8]>,
 ) -> Result<Vec<RefPic>, Error> {
-    build_list(curr_poc, rps, dpb, num_ref_idx_active, list_entry_l0, false)
+    build_ref_pic_list(
+        0,
+        curr_poc,
+        rps,
+        dpb,
+        &[],
+        num_ref_idx_active,
+        list_entry_l0,
+    )
 }
 
 /// Builds `RefPicList1` of a B slice (§8.3.4): like [`build_ref_pic_list0`], but the
@@ -99,17 +106,30 @@ pub fn build_ref_pic_list1(
     num_ref_idx_active: usize,
     list_entry_l1: Option<&[u8]>,
 ) -> Result<Vec<RefPic>, Error> {
-    build_list(curr_poc, rps, dpb, num_ref_idx_active, list_entry_l1, true)
+    build_ref_pic_list(
+        1,
+        curr_poc,
+        rps,
+        dpb,
+        &[],
+        num_ref_idx_active,
+        list_entry_l1,
+    )
 }
 
-fn build_list(
+/// Builds `RefPicList0` (`list` 0) or `RefPicList1` (`list` 1): the short-term pictures of
+/// the RPS found among the short-term pictures of `dpb`, then `lt_curr`, the long-term
+/// pictures used by the current one (`RefPicSetLtCurr`).
+pub fn build_ref_pic_list(
+    list: usize,
     curr_poc: i32,
     rps: &ShortTermRps,
     dpb: &[RefPic],
+    lt_curr: &[RefPic],
     num_ref_idx_active: usize,
     list_entry: Option<&[u8]>,
-    after_first: bool,
 ) -> Result<Vec<RefPic>, Error> {
+    let after_first = list == 1;
     // StCurrBefore (negative delta POC) and StCurrAfter (positive delta POC), each nearest
     // first; RefPicList0 starts with StCurrBefore, RefPicList1 with StCurrAfter.
     let (first, second) = if after_first {
@@ -122,16 +142,17 @@ fn build_list(
         let poc = curr_poc + pic.delta_poc;
         let entry = dpb
             .iter()
-            .find(|r| r.poc == poc)
+            .find(|r| r.poc == poc && !r.long_term)
             .copied()
             .ok_or(Error::Invalid(
                 "reference picture of the RPS is not in the decoded picture buffer",
             ))?;
         temp.push(entry);
     }
+    temp.extend_from_slice(lt_curr);
     if temp.is_empty() {
         return Err(Error::Invalid(
-            "inter slice without a used short-term reference picture",
+            "inter slice without a used reference picture",
         ));
     }
 
@@ -183,7 +204,11 @@ mod tests {
     fn dpb(pocs: &[i32]) -> Vec<RefPic> {
         pocs.iter()
             .enumerate()
-            .map(|(slot, &poc)| RefPic { slot, poc })
+            .map(|(slot, &poc)| RefPic {
+                slot,
+                poc,
+                long_term: false,
+            })
             .collect()
     }
 
@@ -248,6 +273,28 @@ mod tests {
         let l1 = build_ref_pic_list1(8, &rps, &dpb, 2, Some(&[2, 0])).unwrap();
         let pocs: Vec<i32> = l1.iter().map(|r| r.poc).collect();
         assert_eq!(pocs, [5, 10]);
+    }
+
+    #[test]
+    fn long_term_pictures_follow_the_short_term_ones() {
+        let rps = rps(&[(-1, true)], &[(2, true)]);
+        let mut pics = dpb(&[7, 10, 3]);
+        pics[2].long_term = true;
+        let lt = [pics[2]];
+        let pocs = |l: Vec<RefPic>| l.iter().map(|r| r.poc).collect::<Vec<_>>();
+        let l0 = build_ref_pic_list(0, 8, &rps, &pics, &lt, 4, None).unwrap();
+        assert_eq!(pocs(l0), [7, 10, 3, 7]);
+        let l1 = build_ref_pic_list(1, 8, &rps, &pics, &lt, 3, None).unwrap();
+        assert_eq!(pocs(l1), [10, 7, 3]);
+        let l1 = build_ref_pic_list(1, 8, &rps, &pics, &lt, 1, Some(&[2])).unwrap();
+        assert!(l1[0].long_term);
+        // A short-term entry of the RPS never matches a long-term picture.
+        let st_only = rps_neg_only();
+        assert!(build_ref_pic_list(0, 8, &st_only, &pics, &[], 1, None).is_err());
+    }
+
+    fn rps_neg_only() -> ShortTermRps {
+        rps(&[(-5, true)], &[])
     }
 
     #[test]

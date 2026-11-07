@@ -108,6 +108,7 @@ fn check_fixture(name: &str) -> Option<(usize, usize)> {
             decoded.push(RefPic {
                 slot: decoded.len(),
                 poc: curr_poc,
+                long_term: false,
             });
         }
     }
