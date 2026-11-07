@@ -90,7 +90,13 @@ fn boundary_strength(info: &FilterInfo, ip: usize, iq: usize, transform_edge: bo
     if transform_edge && (info.coded[ip] || info.coded[iq]) {
         return 1;
     }
-    let (p, q) = (info.motion[ip], info.motion[iq]);
+    motion_strength(info.motion[ip], info.motion[iq])
+}
+
+/// Boundary strength between two inter blocks from their motion (§8.7.2.4): 1 when they use
+/// different reference pictures, a different number of vectors, or vectors at least one
+/// integer sample apart; 0 otherwise.
+fn motion_strength(p: EdgeMotion, q: EdgeMotion) -> i32 {
     let far = |a: [i16; 2], b: [i16; 2]| {
         (i32::from(a[0]) - i32::from(b[0])).abs() >= 4
             || (i32::from(a[1]) - i32::from(b[1])).abs() >= 4
@@ -597,4 +603,51 @@ fn sao_neighbour_ok(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(l0: Option<(i32, [i16; 2])>, l1: Option<(i32, [i16; 2])>) -> EdgeMotion {
+        EdgeMotion {
+            mv: [l0.map_or([0; 2], |v| v.1), l1.map_or([0; 2], |v| v.1)],
+            ref_poc: [l0.map(|v| v.0), l1.map(|v| v.0)],
+        }
+    }
+
+    #[test]
+    fn bi_predicted_edges() {
+        let bi = m(Some((0, [0, 0])), Some((8, [16, 0])));
+        // Same pictures in the other list order, vectors paired by picture.
+        assert_eq!(
+            motion_strength(bi, m(Some((8, [17, 0])), Some((0, [3, 0])))),
+            0
+        );
+        assert_eq!(
+            motion_strength(bi, m(Some((8, [20, 0])), Some((0, [0, 0])))),
+            1
+        );
+        // Another picture, or one vector against two.
+        assert_eq!(
+            motion_strength(bi, m(Some((0, [0, 0])), Some((4, [16, 0])))),
+            1
+        );
+        assert_eq!(motion_strength(bi, m(Some((0, [0, 0])), None)), 1);
+        // Both vectors on one picture: either pairing may match.
+        let same = m(Some((0, [0, 0])), Some((0, [8, 0])));
+        assert_eq!(
+            motion_strength(same, m(Some((0, [8, 0])), Some((0, [0, 0])))),
+            0
+        );
+        assert_eq!(
+            motion_strength(same, m(Some((0, [8, 0])), Some((0, [4, 0])))),
+            1
+        );
+        // Uni-prediction from either list compares picture and vector.
+        assert_eq!(
+            motion_strength(m(None, Some((8, [1, 1]))), m(Some((8, [0, 0])), None)),
+            0
+        );
+    }
 }
