@@ -1,8 +1,8 @@
 //! Slice segment header (H.265 §7.3.6.1).
 //!
 //! A picture is split into one or more slices; each starts with this header, followed by the
-//! CABAC-coded slice data. HEIF still images only contain intra (I) slices, so P and B slices
-//! are rejected.
+//! CABAC-coded slice data. HEIF still images only contain intra (I) slices; image sequences
+//! also use P and B slices.
 
 use crate::Error;
 use crate::bitreader::BitReader;
@@ -21,12 +21,14 @@ pub struct PredWeight {
     pub log2_denom: [u8; 2],
 }
 
-/// `pred_weight_table()` for `RefPicList0` (§7.3.6.3).
+/// `pred_weight_table()` (§7.3.6.3): the weights of `RefPicList0`, then those of
+/// `RefPicList1` (`num_l1` is 0 for P slices).
 fn parse_pred_weight_table(
     r: &mut BitReader<'_>,
     sps: &Sps,
     num_l0: usize,
-) -> Result<Vec<PredWeight>, Error> {
+    num_l1: usize,
+) -> Result<(Vec<PredWeight>, Vec<PredWeight>), Error> {
     let luma_denom = r.ue_max(7, "luma_log2_weight_denom")? as u8;
     let chroma = sps.chroma_array_type() != 0;
     let chroma_denom = if chroma {
@@ -46,42 +48,47 @@ fn parse_pred_weight_table(
     let half_y = 1i32 << if high { bd_y - 1 } else { 7 };
     let half_c = 1i32 << if high { bd_c - 1 } else { 7 };
     let (shift_y, shift_c) = if high { (0, 0) } else { (bd_y - 8, bd_c - 8) };
-    // Every entry of RefPicList0 is another picture of the same layer, so both flags are
-    // coded for each one.
-    let mut luma_flags = vec![false; num_l0];
-    for f in &mut luma_flags {
-        *f = r.flag()?;
-    }
-    let mut chroma_flags = vec![false; num_l0];
-    if chroma {
-        for f in &mut chroma_flags {
+    let mut list = |num: usize| -> Result<Vec<PredWeight>, Error> {
+        // Every entry of a list is another picture of the same layer, so both flags are
+        // coded for each one.
+        let mut luma_flags = vec![false; num];
+        for f in &mut luma_flags {
             *f = r.flag()?;
         }
-    }
-    let mut out = Vec::with_capacity(num_l0);
-    for i in 0..num_l0 {
-        let mut weight = [1i32 << luma_denom, 1 << chroma_denom, 1 << chroma_denom];
-        let mut offset = [0i32; 3];
-        if luma_flags[i] {
-            weight[0] += r.se_range(-128, 127, "delta_luma_weight_l0")?;
-            offset[0] = r.se_range(-half_y, half_y - 1, "luma_offset_l0")? << shift_y;
-        }
-        if chroma_flags[i] {
-            for j in 1..3 {
-                weight[j] += r.se_range(-128, 127, "delta_chroma_weight_l0")?;
-                let delta = r.se_range(-4 * half_c, 4 * half_c - 1, "delta_chroma_offset_l0")?;
-                let o = (half_c + delta - ((half_c * weight[j]) >> chroma_denom))
-                    .clamp(-half_c, half_c - 1);
-                offset[j] = o << shift_c;
+        let mut chroma_flags = vec![false; num];
+        if chroma {
+            for f in &mut chroma_flags {
+                *f = r.flag()?;
             }
         }
-        out.push(PredWeight {
-            weight,
-            offset,
-            log2_denom: [luma_denom, chroma_denom],
-        });
-    }
-    Ok(out)
+        let mut out = Vec::with_capacity(num);
+        for i in 0..num {
+            let mut weight = [1i32 << luma_denom, 1 << chroma_denom, 1 << chroma_denom];
+            let mut offset = [0i32; 3];
+            if luma_flags[i] {
+                weight[0] += r.se_range(-128, 127, "delta_luma_weight")?;
+                offset[0] = r.se_range(-half_y, half_y - 1, "luma_offset")? << shift_y;
+            }
+            if chroma_flags[i] {
+                for j in 1..3 {
+                    weight[j] += r.se_range(-128, 127, "delta_chroma_weight")?;
+                    let delta = r.se_range(-4 * half_c, 4 * half_c - 1, "delta_chroma_offset")?;
+                    let o = (half_c + delta - ((half_c * weight[j]) >> chroma_denom))
+                        .clamp(-half_c, half_c - 1);
+                    offset[j] = o << shift_c;
+                }
+            }
+            out.push(PredWeight {
+                weight,
+                offset,
+                log2_denom: [luma_denom, chroma_denom],
+            });
+        }
+        Ok(out)
+    };
+    let l0 = list(num_l0)?;
+    let l1 = list(num_l1)?;
+    Ok((l0, l1))
 }
 
 /// `slice_type` (Table 7-7).
@@ -140,9 +147,14 @@ pub struct SliceHeader {
     pub five_minus_max_num_merge_cand: u8,
     /// `list_entry_l0` when `ref_pic_list_modification_flag_l0` is set.
     pub list_entry_l0: Option<Vec<u8>>,
-    /// Explicit weighted prediction (`pred_weight_table()`) of a P slice, per entry of
-    /// `RefPicList0`.
+    /// `list_entry_l1` when `ref_pic_list_modification_flag_l1` is set (B slices).
+    pub list_entry_l1: Option<Vec<u8>>,
+    /// `mvd_l1_zero_flag` (B slices).
+    pub mvd_l1_zero_flag: bool,
+    /// Explicit weighted prediction (`pred_weight_table()`), per entry of `RefPicList0`.
     pub pred_weights: Option<Vec<PredWeight>>,
+    /// Explicit weighted prediction per entry of `RefPicList1` (B slices).
+    pub pred_weights_l1: Option<Vec<PredWeight>>,
     /// `slice_sao_luma_flag`.
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag`.
@@ -226,9 +238,6 @@ impl SliceHeader {
                 1 => SliceType::P,
                 _ => SliceType::I,
             };
-            if slice_type == SliceType::B {
-                return Err(Error::Unimplemented("B slices (bi-prediction)"));
-            }
             let pic_output_flag = !pps.output_flag_present_flag || r.flag()?;
             let colour_plane_id = if sps.separate_colour_plane_flag {
                 r.bits(2)? as u8
@@ -282,41 +291,81 @@ impl SliceHeader {
 
             // Inter prediction fields of the header, coded before `slice_qp_delta` (§7.3.6.1).
             let mut num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+            let mut num_ref_idx_l1_active_minus1 = 0;
             let mut cabac_init_flag = false;
-            let collocated_from_l0_flag = true;
+            let mut collocated_from_l0_flag = true;
             let mut collocated_ref_idx = 0;
             let mut five_minus_max_num_merge_cand = 0;
             let mut list_entry_l0 = None;
+            let mut list_entry_l1 = None;
+            let mut mvd_l1_zero_flag = false;
             let mut pred_weights = None;
-            if slice_type == SliceType::P {
+            let mut pred_weights_l1 = None;
+            if slice_type != SliceType::I {
+                let is_b = slice_type == SliceType::B;
+                if is_b {
+                    num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+                }
                 if r.flag()? {
                     // num_ref_idx_active_override_flag
                     num_ref_idx_l0_active_minus1 =
                         r.ue_max(14, "num_ref_idx_l0_active_minus1")? as u8;
+                    if is_b {
+                        num_ref_idx_l1_active_minus1 =
+                            r.ue_max(14, "num_ref_idx_l1_active_minus1")? as u8;
+                    }
                 }
                 let num_l0 = usize::from(num_ref_idx_l0_active_minus1) + 1;
+                let num_l1 = if is_b {
+                    usize::from(num_ref_idx_l1_active_minus1) + 1
+                } else {
+                    0
+                };
                 if pps.lists_modification_present_flag && st_rps.used_count() > 1 {
                     let bits = usize::BITS - (st_rps.used_count() - 1).leading_zeros();
-                    if r.flag()? {
-                        // ref_pic_list_modification_flag_l0
-                        let mut entries = Vec::with_capacity(num_l0);
-                        for _ in 0..num_l0 {
-                            entries.push(r.bits(bits)? as u8);
+                    let mut entries = |num: usize| -> Result<Option<Vec<u8>>, Error> {
+                        // ref_pic_list_modification_flag_lX
+                        if !r.flag()? {
+                            return Ok(None);
                         }
-                        list_entry_l0 = Some(entries);
+                        (0..num)
+                            .map(|_| r.bits(bits).map(|e| e as u8))
+                            .collect::<Result<_, _>>()
+                            .map(Some)
+                    };
+                    list_entry_l0 = entries(num_l0)?;
+                    if is_b {
+                        list_entry_l1 = entries(num_l1)?;
                     }
+                }
+                if is_b {
+                    mvd_l1_zero_flag = r.flag()?;
                 }
                 if pps.cabac_init_present_flag {
                     cabac_init_flag = r.flag()?;
                 }
-                if slice_temporal_mvp_enabled_flag && num_ref_idx_l0_active_minus1 > 0 {
-                    collocated_ref_idx = r.ue_max(14, "collocated_ref_idx")? as u8;
-                    if usize::from(collocated_ref_idx) >= num_l0 {
-                        return Err(Error::Invalid("collocated_ref_idx out of range"));
+                if slice_temporal_mvp_enabled_flag {
+                    if is_b {
+                        collocated_from_l0_flag = r.flag()?;
+                    }
+                    let num_col = if collocated_from_l0_flag {
+                        num_l0
+                    } else {
+                        num_l1
+                    };
+                    if num_col > 1 {
+                        collocated_ref_idx = r.ue_max(14, "collocated_ref_idx")? as u8;
+                        if usize::from(collocated_ref_idx) >= num_col {
+                            return Err(Error::Invalid("collocated_ref_idx out of range"));
+                        }
                     }
                 }
-                if pps.weighted_pred_flag {
-                    pred_weights = Some(parse_pred_weight_table(&mut r, sps, num_l0)?);
+                if (pps.weighted_pred_flag && !is_b) || (pps.weighted_bipred_flag && is_b) {
+                    let (l0, l1) = parse_pred_weight_table(&mut r, sps, num_l0, num_l1)?;
+                    pred_weights = Some(l0);
+                    if is_b {
+                        pred_weights_l1 = Some(l1);
+                    }
                 }
                 five_minus_max_num_merge_cand = r.ue_max(4, "five_minus_max_num_merge_cand")? as u8;
             }
@@ -375,13 +424,16 @@ impl SliceHeader {
                 st_rps_from_sps,
                 slice_temporal_mvp_enabled_flag,
                 num_ref_idx_l0_active_minus1,
-                num_ref_idx_l1_active_minus1: 0,
+                num_ref_idx_l1_active_minus1,
                 cabac_init_flag,
                 collocated_from_l0_flag,
                 collocated_ref_idx,
                 five_minus_max_num_merge_cand,
                 list_entry_l0,
+                list_entry_l1,
+                mvd_l1_zero_flag,
                 pred_weights,
+                pred_weights_l1,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
                 slice_qp_delta,

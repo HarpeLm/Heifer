@@ -74,8 +74,8 @@ impl PocState {
     }
 }
 
-/// Builds `RefPicList0` for a P slice (§8.3.4) from the slice's RPS and the pictures present
-/// in the DPB.
+/// Builds `RefPicList0` of a P or B slice (§8.3.4) from the slice's RPS and the pictures
+/// present in the DPB.
 ///
 /// `dpb` must contain every picture the RPS refers to, otherwise the bitstream is invalid.
 /// `num_ref_idx_active` is `num_ref_idx_l0_active_minus1 + 1`; when it exceeds the number of
@@ -87,15 +87,38 @@ pub fn build_ref_pic_list0(
     num_ref_idx_active: usize,
     list_entry_l0: Option<&[u8]>,
 ) -> Result<Vec<RefPic>, Error> {
-    // StCurrBefore (negative delta POC) then StCurrAfter (positive delta POC), nearest first,
-    // as the spec orders them.
+    build_list(curr_poc, rps, dpb, num_ref_idx_active, list_entry_l0, false)
+}
+
+/// Builds `RefPicList1` of a B slice (§8.3.4): like [`build_ref_pic_list0`], but the
+/// pictures after the current one (positive delta POC) come first.
+pub fn build_ref_pic_list1(
+    curr_poc: i32,
+    rps: &ShortTermRps,
+    dpb: &[RefPic],
+    num_ref_idx_active: usize,
+    list_entry_l1: Option<&[u8]>,
+) -> Result<Vec<RefPic>, Error> {
+    build_list(curr_poc, rps, dpb, num_ref_idx_active, list_entry_l1, true)
+}
+
+fn build_list(
+    curr_poc: i32,
+    rps: &ShortTermRps,
+    dpb: &[RefPic],
+    num_ref_idx_active: usize,
+    list_entry: Option<&[u8]>,
+    after_first: bool,
+) -> Result<Vec<RefPic>, Error> {
+    // StCurrBefore (negative delta POC) and StCurrAfter (positive delta POC), each nearest
+    // first; RefPicList0 starts with StCurrBefore, RefPicList1 with StCurrAfter.
+    let (first, second) = if after_first {
+        (&rps.positive, &rps.negative)
+    } else {
+        (&rps.negative, &rps.positive)
+    };
     let mut temp = Vec::with_capacity(8);
-    for pic in rps
-        .negative
-        .iter()
-        .chain(&rps.positive)
-        .filter(|p| p.used_by_curr_pic)
-    {
+    for pic in first.iter().chain(second).filter(|p| p.used_by_curr_pic) {
         let poc = curr_poc + pic.delta_poc;
         let entry = dpb
             .iter()
@@ -108,21 +131,21 @@ pub fn build_ref_pic_list0(
     }
     if temp.is_empty() {
         return Err(Error::Invalid(
-            "P slice without a used short-term reference picture",
+            "inter slice without a used short-term reference picture",
         ));
     }
 
     let mut list = Vec::with_capacity(num_ref_idx_active);
     for i in 0..num_ref_idx_active {
-        let index = match list_entry_l0 {
+        let index = match list_entry {
             Some(entries) => {
                 let entry = usize::from(
                     *entries
                         .get(i)
-                        .ok_or(Error::Invalid("list_entry_l0 out of range"))?,
+                        .ok_or(Error::Invalid("list_entry out of range"))?,
                 );
                 if entry >= temp.len() {
-                    return Err(Error::Invalid("list_entry_l0 out of range"));
+                    return Err(Error::Invalid("list_entry out of range"));
                 }
                 entry
             }
@@ -210,6 +233,21 @@ mod tests {
         let rps = rps(&[(-1, true), (-2, true)], &[]);
         let list = build_ref_pic_list0(5, &rps, &dpb(&[3, 4]), 2, Some(&[1, 0])).unwrap();
         assert_eq!(list.iter().map(|r| r.poc).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    #[test]
+    fn list1_starts_with_the_following_pictures() {
+        let rps = rps(&[(-1, true), (-3, true)], &[(2, true), (4, false)]);
+        let dpb = dpb(&[7, 5, 10, 12]);
+        let l1 = build_ref_pic_list1(8, &rps, &dpb, 4, None).unwrap();
+        let pocs: Vec<i32> = l1.iter().map(|r| r.poc).collect();
+        assert_eq!(pocs, [10, 7, 5, 10]);
+        let l0 = build_ref_pic_list0(8, &rps, &dpb, 3, None).unwrap();
+        let pocs: Vec<i32> = l0.iter().map(|r| r.poc).collect();
+        assert_eq!(pocs, [7, 5, 10]);
+        let l1 = build_ref_pic_list1(8, &rps, &dpb, 2, Some(&[2, 0])).unwrap();
+        let pocs: Vec<i32> = l1.iter().map(|r| r.poc).collect();
+        assert_eq!(pocs, [5, 10]);
     }
 
     #[test]
