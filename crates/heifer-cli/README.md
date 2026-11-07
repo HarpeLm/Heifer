@@ -15,6 +15,7 @@ heifer screenshot.png screenshot.heic --format 444   # full-resolution chroma
 heifer screenshot.png screenshot.heic --lossless     # pixel-exact
 heifer IMG_1234.heic photo.png --depth        # with photo.depth.png next to it
 heifer portrait.heic portrait.png --aux       # every auxiliary image as PNG
+heifer burst.heics frames.png --frames        # frames-001.png, frames-002.png, ...
 heifer info IMG_1234.heic                     # size, tiles, camera, auxiliary images, metadata
 ```
 
@@ -28,6 +29,11 @@ heifer info IMG_1234.heic                     # size, tiles, camera, auxiliary i
   planes and gain maps are written in grayscale at their coded bit depth; other refinements keep
   RGBA. `info` lists auxiliary images with their URN, size and bit depth, the depth representation
   information, the HDR gain map headroom when known, and reports IPTC presence.
+
+- `--frames` writes every frame of an image sequence (bursts, animations, `.heics`) in display
+  order, numbered after the output name, instead of the main image. A file that also holds a
+  sequence gets a note when converted without it, and `info` shows its frames, duration and
+  keyframes.
 
 - EXIF data and ICC colour profiles are kept, and photos are written upright.
 - Existing files are never overwritten unless you pass `--force`.

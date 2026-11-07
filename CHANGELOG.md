@@ -28,6 +28,12 @@
   appended to both reference lists, and handled by AMVP and temporal prediction (no
   scaling, no mixing of short- and long-term vectors).
 - Explicit RDPCM (range extension) for inter blocks coded without transform.
+- Raw HEVC streams in display order: `SequenceDecoder::decode_in_display_order` and `flush`
+  implement the output process (C.5.2): reordering, DPB fullness and latency limits,
+  `no_output_of_prior_pics_flag` and `pic_output_flag`. Frames and frame counts match ffmpeg on
+  17 conformance streams.
+- CLI: `--frames` extracts every frame of an image sequence (`out-001.png`, ...); converting a
+  file that holds a sequence prints a note, and `heifer info` describes the sequence.
 - B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
   bi-predictive and zero merge candidates on both lists, and the collocated picture from
   either list.
@@ -46,6 +52,9 @@
 
 **Fixed**
 
+- POC derivation took a RADL, RASL or sub-layer non-reference picture as `prevTid0Pic`, so
+  some sequences got wrong POCs (and display order). `PocState::next` now takes whether the
+  picture can be `prevTid0Pic`; `PocState::is_prev_tid0_candidate` tells.
 - Inter blocks used the intra scaling matrices: P and B pictures with scaling lists were
   wrong (matrixId is 3 to 5 for inter blocks).
 
