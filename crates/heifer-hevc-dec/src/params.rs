@@ -527,6 +527,13 @@ pub struct Sps {
     pub bit_depth_chroma: u8,
     /// `log2_max_pic_order_cnt_lsb_minus4 + 4`, needed to parse slice headers.
     pub log2_max_pic_order_cnt_lsb: u8,
+    /// `sps_max_num_reorder_pics` of the highest sub-layer: how many pictures may precede
+    /// a picture in decoding order and follow it in output order.
+    pub max_num_reorder_pics: u32,
+    /// `sps_max_dec_pic_buffering_minus1 + 1` of the highest sub-layer: the DPB size.
+    pub max_dec_pic_buffering: u32,
+    /// `sps_max_latency_increase_plus1` of the highest sub-layer (0: no latency limit).
+    pub max_latency_increase_plus1: u32,
     /// `MinCbLog2SizeY`.
     pub log2_min_luma_coding_block_size: u8,
     /// `CtbLog2SizeY`.
@@ -605,10 +612,12 @@ impl Sps {
         } else {
             max_sub_layers_minus1
         };
+        let (mut max_num_reorder_pics, mut max_dec_pic_buffering) = (0, 1);
+        let mut max_latency_increase_plus1 = 0;
         for _ in first..=max_sub_layers_minus1 {
-            r.ue()?; // sps_max_dec_pic_buffering_minus1
-            r.ue()?; // sps_max_num_reorder_pics
-            r.ue()?; // sps_max_latency_increase_plus1
+            max_dec_pic_buffering = r.ue_max(15, "sps_max_dec_pic_buffering_minus1")? + 1;
+            max_num_reorder_pics = r.ue_max(16, "sps_max_num_reorder_pics")?;
+            max_latency_increase_plus1 = r.ue()?;
         }
         let log2_min_cb = r.ue_max(3, "log2_min_luma_coding_block_size_minus3")? + 3;
         let log2_ctb = log2_min_cb + r.ue_max(3, "log2_diff_max_min_luma_coding_block_size")?;
@@ -725,6 +734,9 @@ impl Sps {
             bit_depth_luma,
             bit_depth_chroma,
             log2_max_pic_order_cnt_lsb,
+            max_num_reorder_pics,
+            max_dec_pic_buffering,
+            max_latency_increase_plus1,
             log2_min_luma_coding_block_size: log2_min_cb as u8,
             log2_ctb_size: log2_ctb as u8,
             log2_min_luma_transform_block_size: log2_min_tb as u8,

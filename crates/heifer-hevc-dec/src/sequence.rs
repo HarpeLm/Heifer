@@ -2,8 +2,9 @@
 //! reference picture sets and the decoded picture buffer (§8.3), then each picture's slices
 //! with inter prediction from the pictures kept for reference.
 //!
-//! Pictures are returned in decoding order. P and B slices are supported, with short- and
-//! long-term reference pictures.
+//! [`SequenceDecoder::decode`] returns pictures in decoding order, and
+//! [`SequenceDecoder::decode_in_display_order`] in display order. P and B slices are
+//! supported, with short- and long-term reference pictures.
 
 use crate::Error;
 use crate::decoder::{DEFAULT_MAX_PIXELS, DecodeOptions};
@@ -40,6 +41,26 @@ pub struct SequenceDecoder {
     started: bool,
     /// The last IRAP picture started a new sequence, so its RASL pictures cannot be decoded.
     skip_rasl: bool,
+    /// Decoded pictures waiting to be output in display order: POC, `PicLatencyCount` and
+    /// cropped picture.
+    pending: Vec<(i32, u32, Frame)>,
+    /// Facts about the last decoded picture, for output in display order.
+    last: LastPicture,
+}
+
+/// The last decoded picture: its POC, whether it started a new coded video sequence, whether
+/// it is output (`pic_output_flag`), and `sps_max_num_reorder_pics`.
+#[derive(Debug, Default, Clone, Copy)]
+struct LastPicture {
+    poc: i32,
+    new_sequence: bool,
+    /// `NoOutputOfPriorPicsFlag`: the waiting pictures are dropped, not output.
+    drop_prior: bool,
+    output: bool,
+    max_num_reorder: usize,
+    max_dec_pic_buffering: usize,
+    /// `SpsMaxLatencyPictures`, if limited.
+    max_latency: Option<u32>,
 }
 
 impl SequenceDecoder {
@@ -95,6 +116,7 @@ impl SequenceDecoder {
         // sequences mark such pictures as sync samples): its POC then serves as the origin.
         let intra_start = !self.started && !irap && slices_are_intra(&nals, &self.sets, &header)?;
         let new_sequence = (irap && (nal_type != 21 || !self.started)) || intra_start;
+        let output = header.pic_output_flag;
         if !self.started && !irap && !intra_start {
             return Err(Error::Invalid(
                 "sequence does not start with a random access picture",
@@ -197,6 +219,20 @@ impl SequenceDecoder {
         } else {
             frame.cropped(sps)
         };
+        self.last = LastPicture {
+            poc,
+            new_sequence,
+            // For an IRAP picture that starts a sequence: always for a CRA picture, else as
+            // signalled (§C.5.2.2).
+            drop_prior: irap
+                && new_sequence
+                && (nal_type == 21 || header.no_output_of_prior_pics_flag),
+            output,
+            max_num_reorder: sps.max_num_reorder_pics as usize,
+            max_dec_pic_buffering: sps.max_dec_pic_buffering as usize,
+            max_latency: (sps.max_latency_increase_plus1 != 0)
+                .then(|| sps.max_num_reorder_pics + sps.max_latency_increase_plus1 - 1),
+        };
         self.dpb.push(DecodedPicture {
             poc,
             frame,
@@ -211,6 +247,81 @@ impl SequenceDecoder {
             self.started = false;
         }
         Ok(cropped)
+    }
+
+    /// Like [`decode`](Self::decode), but returns pictures in display order, with the output
+    /// process of §C.5.2 ("bumping"): a picture is output once too many pictures wait, a
+    /// latency limit is reached, or the DPB is full. The result holds zero or more pictures;
+    /// call [`flush`](Self::flush) after the last access unit. Pictures with
+    /// `pic_output_flag` = 0 are not returned.
+    pub fn decode_in_display_order(&mut self, stream: &[u8]) -> Result<Vec<Frame>, Error> {
+        let frame = self.decode(stream)?;
+        let last = self.last;
+        let mut out = Vec::new();
+        if last.drop_prior {
+            // NoOutputOfPriorPicsFlag: the waiting pictures are dropped.
+            self.pending.clear();
+        } else if last.new_sequence {
+            // A new coded video sequence: every waiting picture comes first.
+            out = self.flush();
+        } else {
+            // Before the current picture is stored (§C.5.2.2). The DPB holds the reference
+            // pictures (the current one included, last) and the pictures waiting for output.
+            loop {
+                let refs = &self.dpb[..self.dpb.len() - 1];
+                let waiting_only = self
+                    .pending
+                    .iter()
+                    .filter(|p| !refs.iter().any(|r| r.poc == p.0))
+                    .count();
+                let fullness = refs.len() + waiting_only;
+                if self.pending.is_empty()
+                    || !(self.pending.len() > last.max_num_reorder
+                        || self.latency_exceeded(last.max_latency)
+                        || fullness >= last.max_dec_pic_buffering)
+                {
+                    break;
+                }
+                out.push(self.pop_first());
+            }
+        }
+        // The current picture (§C.5.2.3).
+        if last.output {
+            for p in &mut self.pending {
+                p.1 += 1;
+            }
+            self.pending.push((last.poc, 0, frame));
+        }
+        while !self.pending.is_empty()
+            && (self.pending.len() > last.max_num_reorder
+                || self.latency_exceeded(last.max_latency))
+        {
+            out.push(self.pop_first());
+        }
+        Ok(out)
+    }
+
+    /// Whether a waiting picture has reached `SpsMaxLatencyPictures`.
+    fn latency_exceeded(&self, max_latency: Option<u32>) -> bool {
+        max_latency.is_some_and(|max| self.pending.iter().any(|p| p.1 >= max))
+    }
+
+    /// The pictures still waiting for output, in display order (see
+    /// [`decode_in_display_order`](Self::decode_in_display_order)).
+    pub fn flush(&mut self) -> Vec<Frame> {
+        let mut out = Vec::with_capacity(self.pending.len());
+        while !self.pending.is_empty() {
+            out.push(self.pop_first());
+        }
+        out
+    }
+
+    /// Removes the waiting picture with the smallest POC.
+    fn pop_first(&mut self) -> Frame {
+        let i = (0..self.pending.len())
+            .min_by_key(|&i| self.pending[i].0)
+            .expect("a waiting picture");
+        self.pending.remove(i).2
     }
 
     /// Decodes the slices of the current picture, whose POC is `poc`.
