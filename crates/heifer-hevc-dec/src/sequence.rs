@@ -107,6 +107,9 @@ impl SequenceDecoder {
             ));
         }
 
+        if !header.long_term_refs.is_empty() {
+            return Err(Error::Unimplemented("long-term reference pictures"));
+        }
         let (pps, sps) = self
             .sets
             .get(usize::from(header.slice_pic_parameter_set_id))?;

@@ -557,6 +557,9 @@ pub struct Sps {
     pub long_term_ref_pics_present_flag: bool,
     /// `num_long_term_ref_pics_sps`, needed to parse slice headers.
     pub num_long_term_ref_pics_sps: u8,
+    /// Long-term reference picture candidates of the SPS: `lt_ref_pic_poc_lsb_sps` and
+    /// `used_by_curr_pic_lt_sps_flag`.
+    pub lt_ref_pics_sps: Vec<(u32, bool)>,
     /// `sps_temporal_mvp_enabled_flag`.
     pub sps_temporal_mvp_enabled_flag: bool,
     /// `strong_intra_smoothing_enabled_flag`.
@@ -673,10 +676,12 @@ impl Sps {
         let num_delta_pocs = st_rps.iter().map(ShortTermRps::num_delta_pocs).collect();
         let long_term_ref_pics_present_flag = r.flag()?;
         let mut num_long_term_ref_pics_sps = 0;
+        let mut lt_ref_pics_sps = Vec::new();
         if long_term_ref_pics_present_flag {
             num_long_term_ref_pics_sps = r.ue_max(32, "num_long_term_ref_pics_sps")? as u8;
             for _ in 0..num_long_term_ref_pics_sps {
-                r.skip(usize::from(log2_max_pic_order_cnt_lsb) + 1)?;
+                let lsb = r.bits(u32::from(log2_max_pic_order_cnt_lsb))?;
+                lt_ref_pics_sps.push((lsb, r.flag()?));
             }
         }
         let sps_temporal_mvp_enabled_flag = r.flag()?;
@@ -734,6 +739,7 @@ impl Sps {
             st_rps_num_delta_pocs: num_delta_pocs,
             long_term_ref_pics_present_flag,
             num_long_term_ref_pics_sps,
+            lt_ref_pics_sps,
             sps_temporal_mvp_enabled_flag,
             strong_intra_smoothing_enabled_flag,
             vui,

@@ -128,6 +128,8 @@ pub struct SliceHeader {
     pub slice_pic_order_cnt_lsb: u32,
     /// Short-term reference picture set of this slice.
     pub st_rps: ShortTermRps,
+    /// Long-term reference pictures of this slice.
+    pub long_term_refs: Vec<LongTermRef>,
     /// `short_term_ref_pic_set_sps_flag`: whether `st_rps` comes from the SPS (rather than
     /// being coded in this header).
     pub st_rps_from_sps: bool,
@@ -249,6 +251,7 @@ impl SliceHeader {
             let mut st_rps = ShortTermRps::default();
             let mut st_rps_from_sps = false;
             let mut slice_temporal_mvp_enabled_flag = false;
+            let mut long_term_refs = Vec::new();
             let is_idr = nal_type == 19 || nal_type == 20;
             if !is_idr {
                 slice_pic_order_cnt_lsb = r.bits(u32::from(sps.log2_max_pic_order_cnt_lsb))?;
@@ -269,12 +272,8 @@ impl SliceHeader {
                 } else {
                     st_rps = parse_st_ref_pic_set(&mut r, num_sets, &sps.st_rps, true)?;
                 }
-                let mut num_long_term = 0;
                 if sps.long_term_ref_pics_present_flag {
-                    num_long_term = skip_long_term_refs(&mut r, sps)?;
-                }
-                if slice_type != SliceType::I && num_long_term > 0 {
-                    return Err(Error::Unimplemented("long-term reference pictures"));
+                    long_term_refs = parse_long_term_refs(&mut r, sps)?;
                 }
                 if sps.sps_temporal_mvp_enabled_flag {
                     slice_temporal_mvp_enabled_flag = r.flag()?;
@@ -321,8 +320,11 @@ impl SliceHeader {
                 } else {
                     0
                 };
-                if pps.lists_modification_present_flag && st_rps.used_count() > 1 {
-                    let bits = usize::BITS - (st_rps.used_count() - 1).leading_zeros();
+                // NumPicTotalCurr (7-55): the short- and long-term pictures used by this one.
+                let total = st_rps.used_count()
+                    + long_term_refs.iter().filter(|l| l.used_by_curr_pic).count();
+                if pps.lists_modification_present_flag && total > 1 {
+                    let bits = usize::BITS - (total - 1).leading_zeros();
                     let mut entries = |num: usize| -> Result<Option<Vec<u8>>, Error> {
                         // ref_pic_list_modification_flag_lX
                         if !r.flag()? {
@@ -421,6 +423,7 @@ impl SliceHeader {
                 colour_plane_id,
                 slice_pic_order_cnt_lsb,
                 st_rps,
+                long_term_refs,
                 st_rps_from_sps,
                 slice_temporal_mvp_enabled_flag,
                 num_ref_idx_l0_active_minus1,
@@ -487,7 +490,37 @@ impl SliceHeader {
 
 /// Skips the long-term reference picture part of a slice header and returns how many pictures
 /// it adds to the current reference picture set.
-fn skip_long_term_refs(r: &mut BitReader<'_>, sps: &crate::params::Sps) -> Result<u32, Error> {
+/// A long-term reference picture of the slice (§7.4.7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTermRef {
+    /// `PocLsbLt`.
+    pub poc_lsb: u32,
+    /// `DeltaPocMsbCycleLt`, when `delta_poc_msb_present_flag` is set: the picture is then
+    /// identified by its full POC, otherwise by the LSBs of its POC.
+    pub delta_poc_msb_cycle: Option<u32>,
+    /// `UsedByCurrPicLt`.
+    pub used_by_curr_pic: bool,
+}
+
+impl LongTermRef {
+    /// The full POC of the picture when its MSBs are coded (8-5), otherwise its POC LSBs.
+    pub fn poc(&self, curr_poc: i32, slice_poc_lsb: u32, log2_max_poc_lsb: u8) -> i32 {
+        match self.delta_poc_msb_cycle {
+            Some(cycle) => {
+                curr_poc
+                    - (cycle as i32) * (1 << log2_max_poc_lsb)
+                    - (slice_poc_lsb as i32 - self.poc_lsb as i32)
+            }
+            None => self.poc_lsb as i32,
+        }
+    }
+}
+
+/// The long-term reference pictures of a slice header (§7.3.6.1).
+fn parse_long_term_refs(
+    r: &mut BitReader<'_>,
+    sps: &crate::params::Sps,
+) -> Result<Vec<LongTermRef>, Error> {
     let num_lt_sps = u32::from(sps.num_long_term_ref_pics_sps);
     let num_long_term_sps = if num_lt_sps > 0 {
         r.ue_max(num_lt_sps, "num_long_term_sps")?
@@ -495,19 +528,39 @@ fn skip_long_term_refs(r: &mut BitReader<'_>, sps: &crate::params::Sps) -> Resul
         0
     };
     let num_long_term_pics = r.ue_max(32, "num_long_term_pics")?;
+    let mut refs = Vec::new();
+    let mut cycle = 0u32;
     for i in 0..num_long_term_sps + num_long_term_pics {
-        if i < num_long_term_sps {
-            if num_lt_sps > 1 {
-                r.skip((u32::BITS - (num_lt_sps - 1).leading_zeros()) as usize)?; // lt_idx_sps
-            }
+        let (poc_lsb, used_by_curr_pic) = if i < num_long_term_sps {
+            let idx = if num_lt_sps > 1 {
+                r.bits(u32::BITS - (num_lt_sps - 1).leading_zeros())? as usize
+            } else {
+                0
+            };
+            *sps.lt_ref_pics_sps
+                .get(idx)
+                .ok_or(Error::Invalid("lt_idx_sps out of range"))?
         } else {
-            r.skip(usize::from(sps.log2_max_pic_order_cnt_lsb) + 1)?; // poc_lsb_lt, used_by_curr_pic_lt_flag
+            let lsb = r.bits(u32::from(sps.log2_max_pic_order_cnt_lsb))?;
+            (lsb, r.flag()?)
+        };
+        // DeltaPocMsbCycleLt accumulates, restarting with the slice's own entries (7-52).
+        if i == 0 || i == num_long_term_sps {
+            cycle = 0;
         }
-        if r.flag()? {
-            r.ue()?; // delta_poc_msb_cycle_lt
-        }
+        let delta_poc_msb_cycle = if r.flag()? {
+            cycle = cycle.saturating_add(r.ue_max(1 << 16, "delta_poc_msb_cycle_lt")?);
+            Some(cycle)
+        } else {
+            None
+        };
+        refs.push(LongTermRef {
+            poc_lsb,
+            delta_poc_msb_cycle,
+            used_by_curr_pic,
+        });
     }
-    Ok(num_long_term_sps + num_long_term_pics)
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -630,5 +683,24 @@ mod tests {
         assert_eq!(h.five_minus_max_num_merge_cand, 2);
         assert!(!h.slice_temporal_mvp_enabled_flag);
         assert!(h.list_entry_l0.is_none());
+    }
+}
+
+#[cfg(test)]
+mod long_term_tests {
+    use super::LongTermRef;
+
+    #[test]
+    fn long_term_poc_from_msb_cycle() {
+        let lt = |cycle| LongTermRef {
+            poc_lsb: 3,
+            delta_poc_msb_cycle: cycle,
+            used_by_curr_pic: true,
+        };
+        // MaxPicOrderCntLsb 16, current POC 37 (LSB 5): one cycle back, LSB 3 is POC 19.
+        assert_eq!(lt(Some(1)).poc(37, 5, 4), 19);
+        assert_eq!(lt(Some(0)).poc(37, 5, 4), 35);
+        // Without MSBs, only the LSBs identify the picture.
+        assert_eq!(lt(None).poc(37, 5, 4), 3);
     }
 }
