@@ -18,6 +18,7 @@ use crate::{Error, Image, Options};
 
 /// One frame of a sequence.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FrameInfo {
     /// How long the frame is shown, in seconds.
     pub duration: f64,
@@ -27,6 +28,7 @@ pub struct FrameInfo {
 
 /// The main image sequence of a file.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SequenceInfo {
     /// Track ID of the sequence.
     pub track_id: u32,

@@ -36,6 +36,7 @@ impl fmt::Display for DepthRepresentation {
 
 /// Depth representation information of a depth auxiliary image.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DepthInfo {
     /// Near clipping plane, when the file gives one.
     pub z_near: Option<f64>,

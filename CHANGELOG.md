@@ -4,9 +4,14 @@
 
 **Breaking**
 
-- New public fields, to set in struct literals: `heifer_isobmff::track::Sample::composition_offset`,
+- New public fields: `heifer_isobmff::track::Sample::composition_offset`,
   `heifer_hevc_dec::refs::RefPic::long_term` and
   `heifer_hevc_dec::syntax::TransformBlock::explicit_rdpcm`.
+- Structs that only describe a decoded file are now `#[non_exhaustive]`, so later fields are
+  not breaking changes: `FrameInfo`, `SequenceInfo`, `Regions`, `AuxiliaryImage`,
+  `DepthInfo` and `iptc::Dataset` (heifer), `Track` and `Sample` (heifer-isobmff),
+  `SliceHeader`, `LongTermRef` and `PredWeight` (heifer-hevc-dec). They can no longer be
+  built with a struct literal outside their crate; reading their fields is unchanged.
 
 **New**
 

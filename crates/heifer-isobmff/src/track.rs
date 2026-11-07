@@ -12,6 +12,7 @@ use crate::{Error, FourCC};
 
 /// One sample (picture) of a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Sample {
     /// Absolute offset of the sample data in the file.
     pub offset: u64,
@@ -29,6 +30,7 @@ pub struct Sample {
 
 /// A track of a HEIF file: an image sequence (`pict` handler) or a video (`vide`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Track {
     /// Track ID (`tkhd`).
     pub id: u32,

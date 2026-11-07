@@ -12,6 +12,7 @@ use crate::params::{ParameterSets, ShortTermRps, Sps, parse_st_ref_pic_set};
 /// Explicit weighted prediction of one reference picture (§7.4.7.3): weight and offset of
 /// luma, Cb and Cr, the offsets already scaled to the sample bit depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PredWeight {
     /// `LumaWeightL0`, `ChromaWeightL0[0]`, `ChromaWeightL0[1]`.
     pub weight: [i32; 3],
@@ -107,6 +108,7 @@ pub enum SliceType {
 /// For dependent slice segments, the fields after `slice_segment_address` are copied from the
 /// preceding independent slice segment, as required by the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SliceHeader {
     /// `first_slice_segment_in_pic_flag`.
     pub first_slice_segment_in_pic_flag: bool,
@@ -492,6 +494,7 @@ impl SliceHeader {
 /// it adds to the current reference picture set.
 /// A long-term reference picture of the slice (§7.4.7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LongTermRef {
     /// `PocLsbLt`.
     pub poc_lsb: u32,

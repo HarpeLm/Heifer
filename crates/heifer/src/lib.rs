@@ -258,6 +258,7 @@ pub fn decode_all_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Vec<Imag
 /// Obtain the list with [`auxiliary_images`] for the primary image, or
 /// [`item_auxiliary_images`] for any image.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AuxiliaryImage {
     /// Item ID, to pass to [`decode_auxiliary`].
     pub id: ItemId,

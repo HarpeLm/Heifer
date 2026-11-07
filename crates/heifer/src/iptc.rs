@@ -10,6 +10,7 @@ use crate::Error;
 
 /// One IIM dataset: its record and dataset numbers (e.g. 2:25 for a keyword) and its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Dataset<'a> {
     /// Record number (1 envelope, 2 application).
     pub record: u8,

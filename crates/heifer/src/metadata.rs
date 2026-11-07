@@ -40,6 +40,7 @@ pub fn item_metadata(file: &HeifFile<'_>, id: ItemId) -> Result<Metadata, Error>
 
 /// One region item of an image: its regions (faces, objects, ...) and their descriptions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Regions {
     /// ID of the region item.
     pub item: ItemId,
