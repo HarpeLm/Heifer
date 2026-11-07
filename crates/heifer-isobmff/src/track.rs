@@ -21,6 +21,10 @@ pub struct Sample {
     pub duration: u32,
     /// Whether the sample is a sync sample, decodable without the other samples.
     pub sync: bool,
+    /// Composition offset (`ctts`): display time minus decoding time, in
+    /// [`Track::timescale`] units. Non-zero when frames are stored out of display order
+    /// (B frames).
+    pub composition_offset: i32,
 }
 
 /// A track of a HEIF file: an image sequence (`pict` handler) or a video (`vide`).
@@ -54,6 +58,29 @@ impl Track {
         }
         let total: u64 = self.samples.iter().map(|s| u64::from(s.duration)).sum();
         total as f64 / f64::from(self.timescale)
+    }
+
+    /// Display (composition) time of each sample, in [`timescale`](Self::timescale) units:
+    /// its decoding time plus its composition offset.
+    pub fn composition_times(&self) -> Vec<i64> {
+        let mut decode_time = 0i64;
+        self.samples
+            .iter()
+            .map(|s| {
+                let t = decode_time + i64::from(s.composition_offset);
+                decode_time += i64::from(s.duration);
+                t
+            })
+            .collect()
+    }
+
+    /// The sample indices in display order (by composition time; samples with equal times
+    /// keep their decoding order).
+    pub fn display_order(&self) -> Vec<usize> {
+        let times = self.composition_times();
+        let mut order: Vec<usize> = (0..self.samples.len()).collect();
+        order.sort_by_key(|&i| times[i]);
+        order
     }
 
     /// The data of sample `index` in `file` (the whole file the track was parsed from).
@@ -244,6 +271,7 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
                 size,
                 duration: 0,
                 sync: true,
+                composition_offset: 0,
             });
             offset = offset
                 .checked_add(u64::from(size))
@@ -265,6 +293,22 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
             s.duration = delta;
         }
         index = index.saturating_add(run);
+    }
+
+    // ctts: composition offsets, as runs. Version 0 offsets are unsigned, but writers store
+    // negative ones there too, so both versions are read as signed.
+    if let Some(ctts) = child(stbl, b"ctts")? {
+        let (_, mut r) = full_box(ctts)?;
+        let n = count(&mut r, 8, b"ctts")?;
+        let mut index = 0usize;
+        for _ in 0..n {
+            let run = r.u32()? as usize;
+            let offset = r.u32()? as i32;
+            for s in samples.iter_mut().skip(index).take(run) {
+                s.composition_offset = offset;
+            }
+            index = index.saturating_add(run);
+        }
     }
 
     // stss: sync samples (1-based); without it, every sample is a sync sample.
@@ -293,4 +337,44 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
         samples,
         references,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(offsets: &[i32]) -> Track {
+        Track {
+            id: 1,
+            handler: FourCC(*b"pict"),
+            width: 0,
+            height: 0,
+            timescale: 25,
+            coding: FourCC(*b"hvc1"),
+            hevc_config: None,
+            samples: offsets
+                .iter()
+                .map(|&composition_offset| Sample {
+                    offset: 0,
+                    size: 0,
+                    duration: 1,
+                    sync: false,
+                    composition_offset,
+                })
+                .collect(),
+            references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn display_order_follows_composition_times() {
+        // I P B B stored in decoding order: I0 P3 B1 B2, shown at 1, 4, 2, 3 (offset 1).
+        let t = track(&[1, 3, 0, 0]);
+        assert_eq!(t.composition_times(), [1, 4, 2, 3]);
+        assert_eq!(t.display_order(), [0, 2, 3, 1]);
+        // Negative offsets (version 1, or version 0 written as signed).
+        assert_eq!(track(&[0, 2, -1, -1]).display_order(), [0, 2, 3, 1]);
+        // Without ctts, display order is decoding order.
+        assert_eq!(track(&[0; 3]).display_order(), [0, 1, 2]);
+    }
 }
