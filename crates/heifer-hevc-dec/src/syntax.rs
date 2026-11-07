@@ -339,11 +339,6 @@ pub fn decode_slice_segment(
         SliceType::I => None,
         SliceType::P | SliceType::B => {
             let refs = refs.ok_or(Error::Invalid("inter slice without reference pictures"))?;
-            if pic.sps.range_extension.explicit_rdpcm_enabled_flag {
-                return Err(Error::Unimplemented(
-                    "explicit RDPCM (inter range extension)",
-                ));
-            }
             if pic.sps.bit_depth_luma > 12 || pic.sps.bit_depth_chroma > 12 {
                 return Err(Error::Unimplemented("inter prediction above 12 bits"));
             }

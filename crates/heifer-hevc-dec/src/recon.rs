@@ -938,36 +938,40 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Range extension tools for blocks coded without transform (transform skip or
-    /// transquant bypass): 180° rotation of 4×4 blocks, then implicit RDPCM for intra
-    /// horizontal/vertical blocks (residual accumulated along the prediction direction).
+    /// transquant bypass): 180° rotation of intra 4×4 blocks, then RDPCM, the residual
+    /// accumulated along a direction: implicit for intra horizontal/vertical blocks,
+    /// explicit (signalled) for inter blocks.
     fn rotate_and_rdpcm(&self, tb: &TransformBlock<'_>, r: &mut [i32]) {
         let n = 1usize << tb.log2_size;
         let ext = &self.sps.range_extension;
-        if tb.inter {
-            // Rotation and implicit RDPCM are for intra blocks only.
-            return;
-        }
-        if ext.transform_skip_rotation_enabled_flag && n == 4 {
-            r.reverse();
-        }
-        if ext.implicit_rdpcm_enabled_flag {
-            match tb.intra_mode {
-                10 => {
-                    for y in 0..n {
-                        for x in 1..n {
-                            r[y * n + x] += r[y * n + x - 1];
-                        }
-                    }
-                }
-                26 => {
-                    for y in 1..n {
-                        for x in 0..n {
-                            r[y * n + x] += r[(y - 1) * n + x];
-                        }
-                    }
-                }
-                _ => {}
+        let vertical = if tb.inter {
+            tb.explicit_rdpcm
+        } else {
+            if ext.transform_skip_rotation_enabled_flag && n == 4 {
+                r.reverse();
             }
+            match tb.intra_mode {
+                10 if ext.implicit_rdpcm_enabled_flag => Some(false),
+                26 if ext.implicit_rdpcm_enabled_flag => Some(true),
+                _ => None,
+            }
+        };
+        match vertical {
+            Some(false) => {
+                for y in 0..n {
+                    for x in 1..n {
+                        r[y * n + x] += r[y * n + x - 1];
+                    }
+                }
+            }
+            Some(true) => {
+                for y in 1..n {
+                    for x in 0..n {
+                        r[y * n + x] += r[(y - 1) * n + x];
+                    }
+                }
+            }
+            None => {}
         }
     }
 
