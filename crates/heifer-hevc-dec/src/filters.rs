@@ -1,7 +1,8 @@
 //! In-loop filters (H.265 §8.7): deblocking filter, then sample adaptive offset (SAO).
 //!
-//! Both run on the whole picture after all coding units have been reconstructed. Only intra
-//! pictures are supported, so every filtered edge has boundary strength 2.
+//! Both run on the whole picture after all coding units have been reconstructed. The boundary
+//! strength of each edge (§8.7.2.4) comes from the prediction mode, the coded residual and the
+//! motion on both sides.
 
 use crate::params::{Pps, Sps};
 use crate::recon::Frame;
@@ -28,8 +29,15 @@ pub struct FilterInfo {
     pub w4: usize,
     /// Height of the grid (in 4×4 units).
     pub h4: usize,
-    /// Bit 0: transform/coding block edge on the left of the unit; bit 1: on the top.
+    /// Bit 0: transform/coding block edge on the left of the unit; bit 1: on the top. Bits 2
+    /// and 3: the same for prediction block edges.
     pub edges: Vec<u8>,
+    /// The unit belongs to an intra coding unit.
+    pub intra: Vec<bool>,
+    /// The unit belongs to a luma transform block with non-zero coefficients.
+    pub coded: Vec<bool>,
+    /// Motion of the unit, for the boundary strength of inter blocks.
+    pub motion: Vec<EdgeMotion>,
     /// `QpY` of the coding unit covering each unit.
     pub qp_y: Vec<i8>,
     /// Samples that must not be modified by filters (PCM with loop filter disabled, or
@@ -53,6 +61,9 @@ impl FilterInfo {
             w4,
             h4,
             edges: vec![0; n],
+            intra: vec![true; n],
+            coded: vec![false; n],
+            motion: vec![EdgeMotion::default(); n],
             qp_y: vec![0; n],
             no_filter: vec![false; n],
             slice: vec![0; n],
@@ -63,6 +74,56 @@ impl FilterInfo {
 
     fn at(&self, x: u32, y: u32) -> usize {
         (y as usize >> 2) * self.w4 + (x as usize >> 2)
+    }
+}
+
+/// Motion of a 4×4 unit as the deblocking filter compares it: the vectors and the POC of the
+/// pictures they point to.
+pub use crate::inter::ColMotion as EdgeMotion;
+
+/// Boundary strength of the edge between units `ip` and `iq` (§8.7.2.4); `transform_edge`
+/// tells whether the edge is a transform block edge.
+fn boundary_strength(info: &FilterInfo, ip: usize, iq: usize, transform_edge: bool) -> i32 {
+    if info.intra[ip] || info.intra[iq] {
+        return 2;
+    }
+    if transform_edge && (info.coded[ip] || info.coded[iq]) {
+        return 1;
+    }
+    let (p, q) = (info.motion[ip], info.motion[iq]);
+    let far = |a: [i16; 2], b: [i16; 2]| {
+        (i32::from(a[0]) - i32::from(b[0])).abs() >= 4
+            || (i32::from(a[1]) - i32::from(b[1])).abs() >= 4
+    };
+    let vectors = |m: &EdgeMotion| {
+        (0..2)
+            .filter(|&l| m.ref_poc[l].is_some())
+            .map(|l| (m.ref_poc[l].unwrap_or(0), m.mv[l]))
+            .collect::<Vec<_>>()
+    };
+    let (vp, vq) = (vectors(&p), vectors(&q));
+    match (vp.as_slice(), vq.as_slice()) {
+        ([a], [b]) => i32::from(a.0 != b.0 || far(a.1, b.1)),
+        ([a0, a1], [b0, b1]) => {
+            let mut pocs_p = [a0.0, a1.0];
+            let mut pocs_q = [b0.0, b1.0];
+            pocs_p.sort_unstable();
+            pocs_q.sort_unstable();
+            if pocs_p != pocs_q {
+                return 1;
+            }
+            if a0.0 != a1.0 {
+                // Two different pictures: compare the vectors pointing at the same one.
+                let (q_same, q_other) = if a0.0 == b0.0 { (b0, b1) } else { (b1, b0) };
+                i32::from(far(a0.1, q_same.1) || far(a1.1, q_other.1))
+            } else {
+                // Both vectors point at the same picture: either pairing may match.
+                i32::from(
+                    (far(a0.1, b0.1) || far(a1.1, b1.1)) && (far(a0.1, b1.1) || far(a1.1, b0.1)),
+                )
+            }
+        }
+        _ => 1,
     }
 }
 
@@ -169,6 +230,7 @@ fn deblock_luma<const VERTICAL: bool>(
     let max = (1 << bit_depth) - 1;
     let plane = &mut frame.planes[0];
     let edge_bit = if VERTICAL { 1 } else { 2 };
+    let any_edge = edge_bit | (edge_bit << 2);
 
     // Each segment: 4 lines across an edge on the 8×8 grid.
     let (outer, inner) = if VERTICAL { (h, w) } else { (w, h) };
@@ -177,17 +239,20 @@ fn deblock_luma<const VERTICAL: bool>(
             let (xq, yq) = if VERTICAL { (b, a) } else { (a, b) };
             let (xp, yp) = if VERTICAL { (b - 1, a) } else { (a, b - 1) };
             let iq = info.at(xq, yq);
-            if info.edges[iq] & edge_bit == 0
+            if info.edges[iq] & any_edge == 0
                 || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
             {
                 continue;
             }
             let ip = info.at(xp, yp);
+            let bs = boundary_strength(info, ip, iq, info.edges[iq] & edge_bit != 0);
+            if bs == 0 {
+                continue;
+            }
             let qpl = (i32::from(info.qp_y[iq]) + i32::from(info.qp_y[ip]) + 1) >> 1;
             let slice = &info.slices[usize::from(info.slice[iq])];
             let beta = beta_prime((qpl + (i32::from(slice.beta_offset_div2) << 1)).clamp(0, 51))
                 << (bit_depth - 8);
-            let bs = 2;
             let tc = tc_prime(
                 (qpl + 2 * (bs - 1) + (i32::from(slice.tc_offset_div2) << 1)).clamp(0, 53),
             ) << (bit_depth - 8);
@@ -303,12 +368,16 @@ fn deblock_chroma<const VERTICAL: bool>(
                 let (xq, yq) = (xc * sw, yc * sh);
                 let (xp, yp) = if VERTICAL { (xq - 1, yq) } else { (xq, yq - 1) };
                 let iq = info.at(xq, yq);
-                if info.edges[iq] & edge_bit == 0
+                if info.edges[iq] & (edge_bit | (edge_bit << 2)) == 0
                     || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
                 {
                     continue;
                 }
                 let ip = info.at(xp, yp);
+                // Chroma is only filtered across edges of intra blocks (bS = 2).
+                if !info.intra[ip] && !info.intra[iq] {
+                    continue;
+                }
                 let qpi =
                     ((i32::from(info.qp_y[iq]) + i32::from(info.qp_y[ip]) + 1) >> 1) + pic_offset;
                 let qpc = chroma_qp(qpi, chroma_type);

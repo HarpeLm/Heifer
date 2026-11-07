@@ -535,6 +535,8 @@ pub struct Sps {
     pub log2_min_luma_transform_block_size: u8,
     /// `MaxTbLog2SizeY`.
     pub log2_max_luma_transform_block_size: u8,
+    /// `max_transform_hierarchy_depth_inter`.
+    pub max_transform_hierarchy_depth_inter: u8,
     /// `max_transform_hierarchy_depth_intra`.
     pub max_transform_hierarchy_depth_intra: u8,
     /// Scaling lists in use, if `scaling_list_enabled_flag` is set.
@@ -624,7 +626,8 @@ impl Sps {
             ));
         }
         let depth_max = log2_ctb - log2_min_tb;
-        r.ue_max(depth_max, "max_transform_hierarchy_depth_inter")?;
+        let max_transform_hierarchy_depth_inter =
+            r.ue_max(depth_max, "max_transform_hierarchy_depth_inter")? as u8;
         let max_transform_hierarchy_depth_intra =
             r.ue_max(depth_max, "max_transform_hierarchy_depth_intra")? as u8;
 
@@ -721,6 +724,7 @@ impl Sps {
             log2_ctb_size: log2_ctb as u8,
             log2_min_luma_transform_block_size: log2_min_tb as u8,
             log2_max_luma_transform_block_size: log2_max_tb as u8,
+            max_transform_hierarchy_depth_inter,
             max_transform_hierarchy_depth_intra,
             scaling_list,
             amp_enabled_flag,
@@ -1071,6 +1075,10 @@ pub struct ParameterSets {
     pub sps: [Option<Sps>; 16],
     /// PPS by `pps_pic_parameter_set_id`.
     pub pps: Vec<Option<Pps>>,
+    /// RBSP of each PPS with the ID of its SPS, kept to parse it again when that SPS arrives
+    /// or changes: a PPS may be sent before its SPS, and is interpreted with the SPS active
+    /// when it is used.
+    pps_rbsp: Vec<Option<(u8, Vec<u8>)>>,
 }
 
 impl ParameterSets {
@@ -1086,16 +1094,32 @@ impl ParameterSets {
             }
             NalUnitType::Sps => {
                 let sps = Sps::parse(&nal.rbsp)?;
-                let id = usize::from(sps.sps_seq_parameter_set_id);
-                self.sps[id] = Some(sps);
+                let id = sps.sps_seq_parameter_set_id;
+                self.sps[usize::from(id)] = Some(sps);
+                // The PPSs that refer to this SPS are read again against it.
+                for (pps_id, raw) in self.pps_rbsp.iter().enumerate() {
+                    if let Some((sps_id, rbsp)) = raw
+                        && *sps_id == id
+                    {
+                        self.pps[pps_id] = Pps::parse(rbsp, &self.sps).ok();
+                    }
+                }
             }
             NalUnitType::Pps => {
-                let pps = Pps::parse(&nal.rbsp, &self.sps)?;
-                let id = usize::from(pps.pps_pic_parameter_set_id);
+                let mut r = crate::bitreader::BitReader::new(&nal.rbsp);
+                let id = r.ue_max(63, "pps_pic_parameter_set_id")? as usize;
+                let sps_id = r.ue_max(15, "pps_seq_parameter_set_id")? as u8;
                 if self.pps.len() <= id {
                     self.pps.resize(id + 1, None);
+                    self.pps_rbsp.resize(id + 1, None);
                 }
-                self.pps[id] = Some(pps);
+                // Without its SPS yet, the PPS is parsed when the SPS arrives.
+                self.pps[id] = if self.sps[usize::from(sps_id)].is_some() {
+                    Some(Pps::parse(&nal.rbsp, &self.sps)?)
+                } else {
+                    None
+                };
+                self.pps_rbsp[id] = Some((sps_id, nal.rbsp.to_vec()));
             }
             _ => return Ok(false),
         }

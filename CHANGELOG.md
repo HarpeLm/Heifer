@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- Inter prediction, P frames: image sequences, bursts and animations now decode every frame,
+  not only keyframes. `decode_sequence` iterates over the frames in order, and
+  `decode_sequence_frame` decodes one frame from the keyframe before it. The HEVC decoder
+  gains `sequence::SequenceDecoder` (picture order count, reference picture sets, decoded
+  picture buffer, `RefPicList0`) and `nal::access_units`. Supported: merge and skip modes,
+  AMVP with motion vector scaling, temporal motion vector prediction, all partition modes
+  including AMP, 8-tap luma and 4-tap chroma interpolation, explicit weighted prediction,
+  constrained intra prediction, and deblocking boundary strengths of inter blocks, in 4:0:0
+  to 4:4:4 up to 12 bits. B slices (bi-prediction) and long-term reference pictures return
+  `Error::Unsupported`.
+- Verified: the 300 frames of the three Nokia sequences and 12 x265 streams (several
+  references, AMP, slices, WPP, CTU sizes, open GOP, lossless, transform skip, 10-bit, 4:2:2,
+  4:4:4, weighted prediction) decode identically to ffmpeg, and 52 official conformance
+  bitstreams (2,655 pictures) match their MD5 picture hashes. `scripts/fetch-conformance.sh`
+  fetches the inter streams and a new test decodes every picture of each.
+- A PPS may now arrive before its SPS: it is parsed when the SPS arrives, and again when the
+  SPS changes.
+
 ## 0.4.0 — 2026-11-06
 
 **Breaking**

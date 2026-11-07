@@ -2,10 +2,11 @@
 //! (§8.6), and adding the residual. In-loop filters (deblocking, SAO) are applied afterwards.
 
 use crate::Error;
-use crate::filters::{self, FilterInfo, SliceFilterParams};
+use crate::filters::{self, EdgeMotion, FilterInfo, SliceFilterParams};
+use crate::inter;
 use crate::params::{Pps, ScalingList, Sps};
 use crate::scan::CtbLayout;
-use crate::syntax::{CodingUnit, SaoParams, Sink, TransformBlock};
+use crate::syntax::{CodingUnit, PredictionUnit, SaoParams, Sink, TransformBlock};
 
 /// A decoded picture: three planes of samples (only the first one for monochrome).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,6 +427,10 @@ pub struct Reconstructor<'a> {
     scratch: Vec<i32>,
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
+    /// `RefPicList0` of the current slice: each picture and its POC.
+    refs_l0: Vec<(&'a Frame, i32)>,
+    /// Explicit weighted prediction of the current slice, per entry of `RefPicList0`.
+    weights_l0: Option<Vec<crate::slice::PredWeight>>,
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
 }
@@ -450,6 +455,8 @@ impl<'a> Reconstructor<'a> {
             slice_cr_qp_offset: 0,
             luma_residual: vec![0; 32 * 32],
             scratch: vec![0; 3 * 32 * 32],
+            refs_l0: Vec::new(),
+            weights_l0: None,
             error: None,
         }
     }
@@ -467,6 +474,28 @@ impl<'a> Reconstructor<'a> {
             tc_offset_div2: header.slice_tc_offset_div2,
             loop_filter_across_slices: header.slice_loop_filter_across_slices_enabled_flag,
         });
+    }
+
+    /// Sets `RefPicList0` of the slice whose blocks follow: the reference pictures, already
+    /// filtered, with their POC, and the explicit prediction weights of the slice, if any.
+    pub fn set_references(
+        &mut self,
+        l0: Vec<(&'a Frame, i32)>,
+        weights: Option<Vec<crate::slice::PredWeight>>,
+    ) {
+        self.refs_l0 = l0;
+        self.weights_l0 = weights;
+    }
+
+    /// Like [`finish`](Self::finish), also returning the motion of every 4×4 luma block, for
+    /// the pictures that use this one as collocated picture.
+    pub fn finish_with_motion(self, skip_filters: bool, poc: i32) -> (Frame, inter::MotionField) {
+        let w4 = self.filter_info.w4;
+        let motion = self.filter_info.motion.clone();
+        (
+            self.finish(skip_filters),
+            inter::MotionField::from_blocks(w4, motion, poc),
+        )
     }
 
     /// Applies the in-loop filters (unless `skip_filters`) and returns the decoded picture,
@@ -912,6 +941,10 @@ impl<'a> Reconstructor<'a> {
     fn rotate_and_rdpcm(&self, tb: &TransformBlock<'_>, r: &mut [i32]) {
         let n = 1usize << tb.log2_size;
         let ext = &self.sps.range_extension;
+        if tb.inter {
+            // Rotation and implicit RDPCM are for intra blocks only.
+            return;
+        }
         if ext.transform_skip_rotation_enabled_flag && n == 4 {
             r.reverse();
         }
@@ -1036,7 +1069,7 @@ impl<'a> Reconstructor<'a> {
         }
 
         // Inverse transform (§8.6.4.2): columns, clip, then rows, over the non-zero rectangle.
-        let dst = c == 0 && n == 4;
+        let dst = c == 0 && n == 4 && !tb.inter;
         let rnd2 = 1 << (bd_shift2 - 1);
         if cols == 1 && rows == 1 && !dst {
             // DC only: every DCT basis row 0 coefficient is 64, so the residual is constant.
@@ -1073,6 +1106,16 @@ impl<'a> Reconstructor<'a> {
         let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
         match prediction {
             Some(p) => pred.copy_from_slice(&p[..n * n]),
+            None if tb.inter => {
+                // Motion compensation already wrote the prediction into the picture.
+                let stride = self.frame.widths[c] as usize;
+                for (y, row) in pred.chunks_exact_mut(n).enumerate() {
+                    let start = (tb.y as usize + y) * stride + tb.x as usize;
+                    for (o, &v) in row.iter_mut().zip(&self.frame.planes[c][start..start + n]) {
+                        *o = i32::from(v);
+                    }
+                }
+            }
             None => self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred),
         }
 
@@ -1114,9 +1157,105 @@ impl<'a> Reconstructor<'a> {
         }
         self.scratch = scratch;
         if c == 0 {
-            self.mark_decoded(tb.x, tb.y, n as u32, n as u32);
+            // With constrained intra prediction, inter samples are never intra references.
+            if !(tb.inter && self.pps.constrained_intra_pred_flag) {
+                self.mark_decoded(tb.x, tb.y, n as u32, n as u32);
+            }
             self.mark_edges(tb.x, tb.y, n as u32, n as u32);
+            if tb.coeffs.is_some() {
+                let info = &mut self.filter_info;
+                for yy in (tb.y as usize >> 2)..((tb.y as usize + n).div_ceil(4)).min(info.h4) {
+                    for xx in (tb.x as usize >> 2)..((tb.x as usize + n).div_ceil(4)).min(info.w4) {
+                        info.coded[yy * info.w4 + xx] = true;
+                    }
+                }
+            }
         }
+    }
+
+    /// Motion compensated prediction of an inter block (§8.5.3.3), written into the picture.
+    fn predict_inter(&mut self, pu: &PredictionUnit) -> Result<(), Error> {
+        let m = pu.motion;
+        if m.uses(1) {
+            return Err(Error::Unimplemented("bi-prediction"));
+        }
+        let (reference, ref_poc) = *usize::try_from(m.ref_idx[0])
+            .ok()
+            .and_then(|i| self.refs_l0.get(i))
+            .ok_or(Error::Invalid("reference index outside RefPicList0"))?;
+        if reference.widths != self.frame.widths || reference.heights != self.frame.heights {
+            return Err(Error::Invalid("reference picture of another size"));
+        }
+        let weight = match &self.weights_l0 {
+            Some(w) => Some(
+                *w.get(m.ref_idx[0] as usize)
+                    .ok_or(Error::Invalid("reference index outside the weight table"))?,
+            ),
+            None => None,
+        };
+        let sub = self.sps.chroma_subsampling();
+        let planes = if self.sps.chroma_array_type() == 0 {
+            1
+        } else {
+            3
+        };
+        let mut buf = vec![0i32; (pu.w * pu.h) as usize];
+        for c in 0..planes {
+            let (x, y, w, h) = if c == 0 {
+                (pu.x, pu.y, pu.w, pu.h)
+            } else {
+                (pu.x / sub.0, pu.y / sub.1, pu.w / sub.0, pu.h / sub.1)
+            };
+            let out = &mut buf[..(w * h) as usize];
+            inter::predict_component(reference, c, pu.x, pu.y, pu.w, pu.h, m.mv[0], sub, out);
+            let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
+            let stride = self.frame.widths[c] as usize;
+            let plane = &mut self.frame.planes[c];
+            for (yy, row) in out.chunks_exact(w as usize).enumerate() {
+                let start = (y as usize + yy) * stride + x as usize;
+                let dst = &mut plane[start..start + w as usize];
+                match weight {
+                    None => {
+                        for (o, &p) in dst.iter_mut().zip(row) {
+                            *o = inter::weight_uni(p, bit_depth);
+                        }
+                    }
+                    Some(wt) => {
+                        let denom = wt.log2_denom[usize::from(c > 0)];
+                        for (o, &p) in dst.iter_mut().zip(row) {
+                            *o = inter::weight_explicit(
+                                p,
+                                bit_depth,
+                                wt.weight[c],
+                                wt.offset[c],
+                                denom,
+                            );
+                        }
+                    }
+                }
+            }
+            let _ = h;
+        }
+        if !self.pps.constrained_intra_pred_flag {
+            self.mark_decoded(pu.x, pu.y, pu.w, pu.h);
+        }
+        // Prediction block edges, and the motion the deblocking filter compares.
+        let info = &mut self.filter_info;
+        let (x4, y4) = (pu.x as usize >> 2, pu.y as usize >> 2);
+        let motion = EdgeMotion {
+            mv: [m.mv[0], [0; 2]],
+            ref_poc: [Some(ref_poc), None],
+        };
+        for yy in y4..((pu.y + pu.h) as usize).div_ceil(4).min(info.h4) {
+            info.edges[yy * info.w4 + x4] |= 4;
+            for xx in x4..((pu.x + pu.w) as usize).div_ceil(4).min(info.w4) {
+                info.motion[yy * info.w4 + xx] = motion;
+            }
+        }
+        for xx in x4..((pu.x + pu.w) as usize).div_ceil(4).min(info.w4) {
+            info.edges[y4 * info.w4 + xx] |= 8;
+        }
+        Ok(())
     }
 }
 
@@ -1164,6 +1303,7 @@ impl Sink for Reconstructor<'_> {
     fn coding_unit(&mut self, cu: &CodingUnit) {
         let size = 1u32 << cu.log2_size;
         self.mark_edges(cu.x, cu.y, size, size);
+        let intra = cu.intra;
         let no_filter = cu.transquant_bypass
             || (cu.pcm && self.sps.pcm.is_some_and(|p| p.loop_filter_disabled_flag));
         let slice = (self.filter_info.slices.len().max(1) - 1) as u16;
@@ -1172,9 +1312,18 @@ impl Sink for Reconstructor<'_> {
             for xx in (cu.x as usize >> 2)..((cu.x + size) as usize).div_ceil(4).min(info.w4) {
                 let i = yy * info.w4 + xx;
                 info.qp_y[i] = cu.qp_y as i8;
+                info.intra[i] = intra;
                 info.no_filter[i] = no_filter;
                 info.slice[i] = slice;
             }
+        }
+    }
+
+    fn prediction_unit(&mut self, pu: &PredictionUnit) {
+        if self.error.is_none()
+            && let Err(e) = self.predict_inter(pu)
+        {
+            self.error = Some(e);
         }
     }
 

@@ -47,10 +47,26 @@ fn sequences_describe_and_decode_keyframes() {
                 "{name} frame {k}"
             );
         }
-        assert!(matches!(
-            heifer::decode_sequence_frame(&bytes, 1),
-            Err(heifer::Error::Unsupported(_))
-        ));
+        // Every frame decodes in order, and decoding one frame alone (from its keyframe)
+        // gives the same image.
+        let all: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(all.len(), frames, "{name}");
+        for (i, image) in all.iter().enumerate() {
+            assert_eq!(
+                (image.width, image.height),
+                (width, height),
+                "{name} frame {i}"
+            );
+        }
+        for i in [1, frames / 2 + 1, frames - 1] {
+            let single = heifer::decode_sequence_frame(&bytes, i).unwrap();
+            assert_eq!(single, all[i], "{name} frame {i}");
+        }
+        // The sequence moves: some predicted frame differs from the first one.
+        assert!(all[1..].iter().any(|f| f != &all[0]), "{name}");
         assert!(heifer::decode_sequence_frame(&bytes, frames).is_err());
     }
 }

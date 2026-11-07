@@ -107,7 +107,7 @@ pub fn decode_picture_checked(
             state.get_or_insert_with(|| (Picture::new(sps, pps), Reconstructor::new(sps, pps)));
         recon.start_slice(&header);
         let data = &nal.rbsp[header.header_size..];
-        decode_slice_segment(pic, &header, header.slice_qp_y(&sets)?, data, recon)?;
+        decode_slice_segment(pic, &header, header.slice_qp_y(&sets)?, data, None, recon)?;
         if let Some(e) = recon.error.take() {
             return Err(e);
         }

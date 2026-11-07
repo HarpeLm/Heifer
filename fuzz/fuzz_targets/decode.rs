@@ -15,8 +15,13 @@ fuzz_target!(|data: &[u8]| {
     }
     // IPTC: from the file, and the bytes themselves as an IIM block.
     if let Ok(Some(seq)) = heifer::read_sequence(data) {
-        if let Some(k) = seq.frames.iter().position(|f| f.keyframe) {
-            let _ = heifer::decode_sequence_frame(data, k);
+        if seq.frames.len() > 1 {
+            let _ = heifer::decode_sequence_frame(data, 1);
+        }
+        if let Ok(frames) = heifer::decode_sequence(data) {
+            for frame in frames.take(8) {
+                let _ = frame;
+            }
         }
     }
     if let Ok(Some(block)) = heifer::read_iptc(data) {

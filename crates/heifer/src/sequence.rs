@@ -1,11 +1,15 @@
 //! Image sequences (`.heics`, bursts, animations): pictures stored as the samples of a track.
 //!
 //! [`read_sequence`] describes the main sequence track: picture size, frame timing and which
-//! frames are keyframes. [`decode_sequence_frame`] decodes a keyframe; the other frames are
-//! predicted from earlier ones (inter prediction), which heifer does not decode yet, and return
-//! [`Error::Unsupported`].
+//! frames are keyframes. [`decode_sequence`] decodes every frame in order, and
+//! [`decode_sequence_frame`] one frame, decoding from the keyframe before it.
+//!
+//! Frames predicted from earlier ones (P frames) are decoded. Bi-predicted frames (B slices)
+//! are not yet, and return [`Error::Unsupported`].
 
-use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+use heifer_hevc_dec::decoder::DecodeOptions;
+use heifer_hevc_dec::recon::Frame;
+use heifer_hevc_dec::sequence::SequenceDecoder;
 use heifer_isobmff::hevc_annex_b;
 use heifer_isobmff::track::{Track, parse_tracks};
 
@@ -74,7 +78,21 @@ pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
     }))
 }
 
-/// Decodes frame `index` of the main sequence, which must be a keyframe.
+/// Decodes every frame of the main sequence, in order.
+pub fn decode_sequence(bytes: &[u8]) -> Result<SequenceFrames<'_>, Error> {
+    decode_sequence_with_options(bytes, &Options::default())
+}
+
+/// Like [`decode_sequence`], with decoding options.
+pub fn decode_sequence_with_options<'a>(
+    bytes: &'a [u8],
+    options: &Options,
+) -> Result<SequenceFrames<'a>, Error> {
+    let track = main_track(bytes)?.ok_or(Error::Invalid("file has no image sequence"))?;
+    SequenceFrames::new(bytes, track, 0, options)
+}
+
+/// Decodes frame `index` of the main sequence, from the keyframe before it.
 pub fn decode_sequence_frame(bytes: &[u8], index: usize) -> Result<Image, Error> {
     decode_sequence_frame_with_options(bytes, index, &Options::default())
 }
@@ -86,42 +104,119 @@ pub fn decode_sequence_frame_with_options(
     options: &Options,
 ) -> Result<Image, Error> {
     let track = main_track(bytes)?.ok_or(Error::Invalid("file has no image sequence"))?;
-    let sample = *track
-        .samples
-        .get(index)
-        .ok_or(Error::Invalid("frame index out of range"))?;
-    if !sample.sync {
-        return Err(Error::Unsupported(
-            "sequence frames predicted from other frames (inter prediction)".into(),
-        ));
+    if index >= track.samples.len() {
+        return Err(Error::Invalid("frame index out of range"));
     }
-    let config = track
-        .hevc_config
-        .as_ref()
-        .ok_or_else(|| Error::Unsupported(format!("sequence coding `{}`", track.coding)))?;
-    let stream = hevc_annex_b(config, track.sample_data(bytes, index)?)?;
-    let frame = decode_picture(
-        &stream,
-        DecodeOptions {
+    let start = track.samples[..=index]
+        .iter()
+        .rposition(|s| s.sync)
+        .ok_or(Error::Invalid("no keyframe before the frame"))?;
+    let mut frames = SequenceFrames::new(bytes, track, start, options)?;
+    for _ in start..index {
+        frames.decode_next(false)?;
+    }
+    frames
+        .next()
+        .unwrap_or(Err(Error::Invalid("frame index out of range")))
+}
+
+/// The frames of an image sequence, decoded one by one (see [`decode_sequence`]).
+pub struct SequenceFrames<'a> {
+    bytes: &'a [u8],
+    track: Track,
+    decoder: SequenceDecoder,
+    next: usize,
+}
+
+impl std::fmt::Debug for SequenceFrames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequenceFrames")
+            .field("track_id", &self.track.id)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> SequenceFrames<'a> {
+    fn new(bytes: &'a [u8], track: Track, start: usize, options: &Options) -> Result<Self, Error> {
+        let config = track
+            .hevc_config
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported(format!("sequence coding `{}`", track.coding)))?;
+        let mut decoder = SequenceDecoder::new(DecodeOptions {
             max_pixels: options.max_pixels(),
             ..Default::default()
-        },
-    )?;
-    // The track size is the display size; HEVC may code a slightly larger picture.
-    let width = if track.width == 0 {
-        frame.widths[0]
-    } else {
-        track.width.min(frame.widths[0])
-    };
-    let height = if track.height == 0 {
-        frame.heights[0]
-    } else {
-        track.height.min(frame.heights[0])
-    };
-    Ok(frame_to_rgba_sized(
-        &frame,
-        ColorParams::from_frame(&frame),
-        width,
-        height,
-    ))
+        });
+        decoder.add_parameter_sets(&hevc_annex_b(config, &[])?)?;
+        Ok(Self {
+            bytes,
+            track,
+            decoder,
+            next: start,
+        })
+    }
+
+    /// Number of frames of the sequence.
+    pub fn len(&self) -> usize {
+        self.track.samples.len()
+    }
+
+    /// Whether the sequence has no frame.
+    pub fn is_empty(&self) -> bool {
+        self.track.samples.is_empty()
+    }
+
+    /// Decodes the next sample; converts it to an image when `convert`.
+    fn decode_next(&mut self, convert: bool) -> Result<Option<Image>, Error> {
+        let index = self.next;
+        self.next += 1;
+        let config = self
+            .track
+            .hevc_config
+            .as_ref()
+            .ok_or(Error::Invalid("sequence without HEVC configuration"))?;
+        // Parameter sets come from hvcC: the sample holds the picture's NAL units only.
+        let data = self.track.sample_data(self.bytes, index)?;
+        let stream = hevc_annex_b(
+            &heifer_isobmff::boxes::HevcConfig {
+                nal_units: Vec::new(),
+                ..config.clone()
+            },
+            data,
+        )?;
+        let frame = self.decoder.decode(&stream).map_err(|e| match e {
+            heifer_hevc_dec::Error::Unimplemented(what) => {
+                Error::Unsupported(format!("sequence frame {index}: {what}"))
+            }
+            e => Error::Hevc(e),
+        })?;
+        Ok(convert.then(|| self.image(&frame)))
+    }
+
+    fn image(&self, frame: &Frame) -> Image {
+        // The track size is the display size; HEVC may code a slightly larger picture.
+        let size = |track: u32, coded: u32| if track == 0 { coded } else { track.min(coded) };
+        let width = size(self.track.width, frame.widths[0]);
+        let height = size(self.track.height, frame.heights[0]);
+        frame_to_rgba_sized(frame, ColorParams::from_frame(frame), width, height)
+    }
+}
+
+impl Iterator for SequenceFrames<'_> {
+    type Item = Result<Image, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.track.samples.len() {
+            return None;
+        }
+        Some(
+            self.decode_next(true)
+                .map(|image| image.expect("converted")),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.track.samples.len().saturating_sub(self.next);
+        (n, Some(n))
+    }
 }

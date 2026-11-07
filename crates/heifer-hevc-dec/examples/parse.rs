@@ -52,7 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (pps, sps) = sets.get(usize::from(header.slice_pic_parameter_set_id))?;
         let pic = picture.get_or_insert_with(|| Picture::new(sps, pps));
         let data = &nal.rbsp[header.header_size..];
-        let s = decode_slice_segment(pic, &header, header.slice_qp_y(&sets)?, data, &mut stats)?;
+        let s = decode_slice_segment(
+            pic,
+            &header,
+            header.slice_qp_y(&sets)?,
+            data,
+            None,
+            &mut stats,
+        )?;
         let trailing = &data[s.end_position..];
         println!(
             "slice: {} CTUs, ended at byte {} of {} (trailing: {:?})",

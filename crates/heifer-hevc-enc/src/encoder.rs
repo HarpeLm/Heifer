@@ -1266,6 +1266,7 @@ impl<'a> Encoder<'a> {
                 coeff_bounds: (cols as u8, rows as u8),
                 transform_skip,
                 transquant_bypass: self.lossless,
+                inter: false,
                 qp_y: self.qp,
                 cu_qp_offset: 0,
                 res_scale_val: 0,
@@ -1623,6 +1624,7 @@ impl<'a> Encoder<'a> {
             part_nxn: four,
             transquant_bypass: self.lossless,
             pcm: false,
+            intra: true,
             qp_y: self.qp,
         });
         let (sse, residual) = (tree.sse(), tree.residual());

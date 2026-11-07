@@ -263,7 +263,7 @@ fn parse_all(file: &str, item: u32) -> Option<Counter> {
         let pic = picture.get_or_insert_with(|| Picture::new(sps, pps));
         let data = &nal.rbsp[header.header_size..];
         let qp = header.slice_qp_y(&sets).unwrap();
-        let stats = decode_slice_segment(pic, &header, qp, data, &mut counter)
+        let stats = decode_slice_segment(pic, &header, qp, data, None, &mut counter)
             .unwrap_or_else(|e| panic!("{file} item {item}: {e}"));
         assert_eq!(
             stats.end_position,

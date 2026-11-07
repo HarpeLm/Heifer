@@ -56,8 +56,8 @@ pub use metadata::{
 };
 pub use reader::{ReadError, decode_reader, decode_reader_with_options, read_metadata_reader};
 pub use sequence::{
-    FrameInfo, SequenceInfo, decode_sequence_frame, decode_sequence_frame_with_options,
-    read_sequence,
+    FrameInfo, SequenceFrames, SequenceInfo, decode_sequence, decode_sequence_frame,
+    decode_sequence_frame_with_options, decode_sequence_with_options, read_sequence,
 };
 
 use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};

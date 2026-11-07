@@ -7,7 +7,82 @@
 use crate::Error;
 use crate::bitreader::BitReader;
 use crate::nal::{NalHeader, NalUnitType};
-use crate::params::{ParameterSets, ShortTermRps, parse_st_ref_pic_set};
+use crate::params::{ParameterSets, ShortTermRps, Sps, parse_st_ref_pic_set};
+
+/// Explicit weighted prediction of one reference picture (§7.4.7.3): weight and offset of
+/// luma, Cb and Cr, the offsets already scaled to the sample bit depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredWeight {
+    /// `LumaWeightL0`, `ChromaWeightL0[0]`, `ChromaWeightL0[1]`.
+    pub weight: [i32; 3],
+    /// Offsets of luma, Cb and Cr, shifted by `WpOffsetBdShift` (8-249, 8-250).
+    pub offset: [i32; 3],
+    /// `luma_log2_weight_denom`, `ChromaLog2WeightDenom`.
+    pub log2_denom: [u8; 2],
+}
+
+/// `pred_weight_table()` for `RefPicList0` (§7.3.6.3).
+fn parse_pred_weight_table(
+    r: &mut BitReader<'_>,
+    sps: &Sps,
+    num_l0: usize,
+) -> Result<Vec<PredWeight>, Error> {
+    let luma_denom = r.ue_max(7, "luma_log2_weight_denom")? as u8;
+    let chroma = sps.chroma_array_type() != 0;
+    let chroma_denom = if chroma {
+        let d = i32::from(luma_denom) + r.se_range(-7, 7, "delta_chroma_log2_weight_denom")?;
+        if !(0..=7).contains(&d) {
+            return Err(Error::Invalid("ChromaLog2WeightDenom out of range"));
+        }
+        d as u8
+    } else {
+        0
+    };
+    let high = sps.range_extension.high_precision_offsets_enabled_flag;
+    let (bd_y, bd_c) = (
+        i32::from(sps.bit_depth_luma),
+        i32::from(sps.bit_depth_chroma),
+    );
+    let half_y = 1i32 << if high { bd_y - 1 } else { 7 };
+    let half_c = 1i32 << if high { bd_c - 1 } else { 7 };
+    let (shift_y, shift_c) = if high { (0, 0) } else { (bd_y - 8, bd_c - 8) };
+    // Every entry of RefPicList0 is another picture of the same layer, so both flags are
+    // coded for each one.
+    let mut luma_flags = vec![false; num_l0];
+    for f in &mut luma_flags {
+        *f = r.flag()?;
+    }
+    let mut chroma_flags = vec![false; num_l0];
+    if chroma {
+        for f in &mut chroma_flags {
+            *f = r.flag()?;
+        }
+    }
+    let mut out = Vec::with_capacity(num_l0);
+    for i in 0..num_l0 {
+        let mut weight = [1i32 << luma_denom, 1 << chroma_denom, 1 << chroma_denom];
+        let mut offset = [0i32; 3];
+        if luma_flags[i] {
+            weight[0] += r.se_range(-128, 127, "delta_luma_weight_l0")?;
+            offset[0] = r.se_range(-half_y, half_y - 1, "luma_offset_l0")? << shift_y;
+        }
+        if chroma_flags[i] {
+            for j in 1..3 {
+                weight[j] += r.se_range(-128, 127, "delta_chroma_weight_l0")?;
+                let delta = r.se_range(-4 * half_c, 4 * half_c - 1, "delta_chroma_offset_l0")?;
+                let o = (half_c + delta - ((half_c * weight[j]) >> chroma_denom))
+                    .clamp(-half_c, half_c - 1);
+                offset[j] = o << shift_c;
+            }
+        }
+        out.push(PredWeight {
+            weight,
+            offset,
+            log2_denom: [luma_denom, chroma_denom],
+        });
+    }
+    Ok(out)
+}
 
 /// `slice_type` (Table 7-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +140,9 @@ pub struct SliceHeader {
     pub five_minus_max_num_merge_cand: u8,
     /// `list_entry_l0` when `ref_pic_list_modification_flag_l0` is set.
     pub list_entry_l0: Option<Vec<u8>>,
+    /// Explicit weighted prediction (`pred_weight_table()`) of a P slice, per entry of
+    /// `RefPicList0`.
+    pub pred_weights: Option<Vec<PredWeight>>,
     /// `slice_sao_luma_flag`.
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag`.
@@ -209,6 +287,7 @@ impl SliceHeader {
             let mut collocated_ref_idx = 0;
             let mut five_minus_max_num_merge_cand = 0;
             let mut list_entry_l0 = None;
+            let mut pred_weights = None;
             if slice_type == SliceType::P {
                 if r.flag()? {
                     // num_ref_idx_active_override_flag
@@ -237,7 +316,7 @@ impl SliceHeader {
                     }
                 }
                 if pps.weighted_pred_flag {
-                    return Err(Error::Unimplemented("weighted prediction for P slices"));
+                    pred_weights = Some(parse_pred_weight_table(&mut r, sps, num_l0)?);
                 }
                 five_minus_max_num_merge_cand = r.ue_max(4, "five_minus_max_num_merge_cand")? as u8;
             }
@@ -302,6 +381,7 @@ impl SliceHeader {
                 collocated_ref_idx,
                 five_minus_max_num_merge_cand,
                 list_entry_l0,
+                pred_weights,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
                 slice_qp_delta,

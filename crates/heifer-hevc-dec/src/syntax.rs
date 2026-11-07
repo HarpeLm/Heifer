@@ -11,9 +11,10 @@ use crate::Error;
 use crate::bitreader::BitReader;
 use crate::cabac::{ArithmeticDecoder, ContextModel};
 use crate::contexts::{Contexts, ctx};
+use crate::inter::{self, Motion, MotionSource, PartMode, PuGeom, SliceRefs};
 use crate::params::{Pps, Sps};
 use crate::scan::{CtbLayout, ScanType, scan_index, scan_order, sub_raster};
-use crate::slice::SliceHeader;
+use crate::slice::{SliceHeader, SliceType};
 
 /// `ctxIdxMap` for `sig_coeff_flag` in a 4×4 transform block (Table 9-39), by raster position.
 const SIG_MAP_4X4: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
@@ -129,6 +130,9 @@ pub struct TransformBlock<'a> {
     pub transform_skip: bool,
     /// `cu_transquant_bypass_flag` of the coding unit.
     pub transquant_bypass: bool,
+    /// The coding unit is inter predicted: the prediction is already in the picture, and the
+    /// residual uses neither the DST nor implicit RDPCM.
+    pub inter: bool,
     /// Luma QP of the coding unit (`QpY`).
     pub qp_y: i32,
     /// `CuQpOffsetCb` / `CuQpOffsetCr` (range extension), for chroma blocks.
@@ -152,8 +156,26 @@ pub struct CodingUnit {
     pub transquant_bypass: bool,
     /// `pcm_flag`.
     pub pcm: bool,
+    /// `CuPredMode` is `MODE_INTRA`.
+    pub intra: bool,
     /// Final `QpY` of the coding unit.
     pub qp_y: i32,
+}
+
+/// An inter prediction block, emitted once its motion is known (before the residual of its
+/// coding unit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredictionUnit {
+    /// Top-left luma position.
+    pub x: u32,
+    /// Top-left luma position.
+    pub y: u32,
+    /// Width in luma samples.
+    pub w: u32,
+    /// Height in luma samples.
+    pub h: u32,
+    /// Motion vectors and reference indices.
+    pub motion: Motion,
 }
 
 /// Receives the parsed content of a slice, in decoding order.
@@ -166,6 +188,8 @@ pub trait Sink {
     fn pcm(&mut self, _cu_x: u32, _cu_y: u32, _log2_size: u8, _samples: [&[u16]; 3]) {}
     /// A coding unit is complete.
     fn coding_unit(&mut self, _cu: &CodingUnit) {}
+    /// An inter prediction block.
+    fn prediction_unit(&mut self, _pu: &PredictionUnit) {}
 }
 
 /// Per-picture parsing state, shared by all slice segments of a picture.
@@ -189,6 +213,10 @@ pub struct Picture<'a> {
     intra_mode: Vec<u8>,
     pcm: Vec<bool>,
     qp_y: Vec<i8>,
+    /// `cu_skip_flag` of each 4×4 block.
+    skip: Vec<bool>,
+    /// Motion of each 4×4 block ([`Motion::NONE`] for intra blocks).
+    pub motion: Vec<Motion>,
     wpp_saved: Option<Contexts>,
     ds_saved: Option<Contexts>,
     slice_addr_rs: u32,
@@ -215,6 +243,8 @@ impl<'a> Picture<'a> {
             intra_mode: vec![1; n],
             pcm: vec![false; n],
             qp_y: vec![0; n],
+            skip: vec![false; n],
+            motion: vec![Motion::NONE; n],
             wpp_saved: None,
             ds_saved: None,
             slice_addr_rs: 0,
@@ -287,11 +317,14 @@ pub struct SliceStats {
 }
 
 /// Parses the data of one slice segment. `data` is the RBSP after the slice header.
+///
+/// `refs` describes the reference pictures of a P slice; it is ignored for I slices.
 pub fn decode_slice_segment(
     pic: &mut Picture<'_>,
     header: &SliceHeader,
     slice_qp_y: i32,
     data: &[u8],
+    refs: Option<&SliceRefs<'_>>,
     sink: &mut impl Sink,
 ) -> Result<SliceStats, Error> {
     if pic.sps.range_extension.extended_precision_processing_flag {
@@ -299,12 +332,27 @@ pub fn decode_slice_segment(
             "range extension tools: extended precision processing",
         ));
     }
-    if header.slice_type != crate::slice::SliceType::I {
-        // The coding unit syntax is still intra-only: stop before misparsing inter blocks.
-        return Err(Error::Unimplemented(
-            "slice data of P slices (inter prediction)",
-        ));
-    }
+    let refs = match header.slice_type {
+        SliceType::I => None,
+        SliceType::B => return Err(Error::Unimplemented("B slices (bi-prediction)")),
+        SliceType::P => {
+            let refs = refs.ok_or(Error::Invalid("P slice without reference pictures"))?;
+            if pic.sps.range_extension.explicit_rdpcm_enabled_flag {
+                return Err(Error::Unimplemented(
+                    "explicit RDPCM (inter range extension)",
+                ));
+            }
+            if pic.sps.bit_depth_luma > 12 || pic.sps.bit_depth_chroma > 12 {
+                return Err(Error::Unimplemented("inter prediction above 12 bits"));
+            }
+            if refs.lists[0].len() < usize::from(header.num_ref_idx_l0_active_minus1) + 1 {
+                return Err(Error::Invalid(
+                    "RefPicList0 shorter than the active references",
+                ));
+            }
+            Some(*refs)
+        }
+    };
     let (sps, pps) = (pic.sps, pic.pps);
     let init_type = Contexts::init_type(header.slice_type, header.cabac_init_flag);
     let mut p = Parser {
@@ -332,6 +380,9 @@ pub fn decode_slice_segment(
         sao_luma: header.slice_sao_luma_flag,
         sao_chroma: header.slice_sao_chroma_flag,
         cu_chroma_qp_offset_enabled: header.cu_chroma_qp_offset_enabled_flag,
+        refs,
+        max_num_merge_cand: 5 - usize::from(header.five_minus_max_num_merge_cand),
+        num_ref_idx_l0: usize::from(header.num_ref_idx_l0_active_minus1) + 1,
     };
     if header.dependent_slice_segment_flag {
         // QP prediction continues across the segments of a slice (§8.6.1).
@@ -373,6 +424,12 @@ struct Parser<'p, 'a> {
     sao_luma: bool,
     sao_chroma: bool,
     cu_chroma_qp_offset_enabled: bool,
+    /// Reference pictures of a P slice; `None` for I slices.
+    refs: Option<SliceRefs<'p>>,
+    /// `MaxNumMergeCand`.
+    max_num_merge_cand: usize,
+    /// `num_ref_idx_l0_active_minus1 + 1`.
+    num_ref_idx_l0: usize,
 }
 
 /// Helpers to decode bins with a context index.
@@ -711,7 +768,7 @@ impl Parser<'_, '_> {
         ((self.qp_y_pred + self.cu_qp_delta_val + 52 + 2 * b) % (52 + b)) - b
     }
 
-    /// `coding_unit()` (§7.3.8.5), intra only.
+    /// `coding_unit()` (§7.3.8.5).
     fn coding_unit(
         &mut self,
         x0: u32,
@@ -727,40 +784,103 @@ impl Parser<'_, '_> {
         Picture::fill(|p| &mut p.ct_depth, self.pic, x0, y0, size, depth);
         Picture::fill(|p| &mut p.intra_mode, self.pic, x0, y0, size, 1);
         Picture::fill(|p| &mut p.pcm, self.pic, x0, y0, size, false);
+        Picture::fill(|p| &mut p.motion, self.pic, x0, y0, size, Motion::NONE);
 
         self.predict_qp(x0, y0);
         self.cu_transquant_bypass =
             self.pps.transquant_bypass_enabled_flag && self.flag(ctx::CU_TRANSQUANT_BYPASS_FLAG);
-        // part_mode: one bin, only at the minimum CB size (1 = 2Nx2N, 0 = NxN).
-        let part_nxn =
-            log2_size == self.sps.log2_min_luma_coding_block_size && !self.flag(ctx::PART_MODE);
 
-        let mut pcm = false;
-        if let Some(pcm_params) = self.sps.pcm
-            && !part_nxn
-            && (pcm_params.log2_min_size..=pcm_params.log2_max_size).contains(&log2_size)
-        {
-            pcm = self.engine.decode_terminate() == 1;
-            if pcm {
-                Picture::fill(|p| &mut p.pcm, self.pic, x0, y0, size, true);
-                self.pcm_sample(x0, y0, log2_size, pcm_params, sink)?;
+        let inter_slice = self.refs.is_some();
+        let skip = inter_slice && {
+            // ctxInc: cu_skip_flag of the left and above neighbours (§9.3.4.2.2).
+            let mut inc = 0;
+            for (xn, yn) in [
+                (i64::from(x0) - 1, i64::from(y0)),
+                (i64::from(x0), i64::from(y0) - 1),
+            ] {
+                if self.pic.available(x0, y0, xn, yn)
+                    && self.pic.skip[self.pic.idx(xn as u32, yn as u32)]
+                {
+                    inc += 1;
+                }
             }
-        }
+            self.flag(ctx::CU_SKIP_FLAG + inc)
+        };
+        Picture::fill(|p| &mut p.skip, self.pic, x0, y0, size, skip);
 
-        if !pcm {
-            let (luma_modes, chroma_modes) = self.intra_modes(x0, y0, log2_size, part_nxn)?;
-            let ctx = TreeCtx {
-                x_cu: x0,
-                y_cu: y0,
-                log2_cb: log2_size,
-                part_nxn,
-                luma_modes,
-                chroma_modes,
-                max_depth: self.sps.max_transform_hierarchy_depth_intra + u8::from(part_nxn),
-            };
-            self.transform_tree(
-                &ctx, x0, y0, x0, y0, log2_size, 0, 0, [false; 2], [false; 2], sink,
-            )?;
+        let intra = !skip && (!inter_slice || self.flag(ctx::PRED_MODE_FLAG));
+        let mut part_nxn = false;
+        let mut pcm = false;
+        if skip {
+            // A skipped CU is one merge-predicted block without residual.
+            let g = self.geom(x0, y0, size, PartMode::Part2Nx2N, 0);
+            self.prediction_unit(&g, true, sink)?;
+        } else if intra {
+            // part_mode: one bin, only at the minimum CB size (1 = 2Nx2N, 0 = NxN).
+            part_nxn =
+                log2_size == self.sps.log2_min_luma_coding_block_size && !self.flag(ctx::PART_MODE);
+
+            if let Some(pcm_params) = self.sps.pcm
+                && !part_nxn
+                && (pcm_params.log2_min_size..=pcm_params.log2_max_size).contains(&log2_size)
+            {
+                pcm = self.engine.decode_terminate() == 1;
+                if pcm {
+                    Picture::fill(|p| &mut p.pcm, self.pic, x0, y0, size, true);
+                    self.pcm_sample(x0, y0, log2_size, pcm_params, sink)?;
+                }
+            }
+
+            if !pcm {
+                let (luma_modes, chroma_modes) = self.intra_modes(x0, y0, log2_size, part_nxn)?;
+                let ctx = TreeCtx {
+                    x_cu: x0,
+                    y_cu: y0,
+                    log2_cb: log2_size,
+                    part_nxn,
+                    luma_modes,
+                    chroma_modes,
+                    max_depth: self.sps.max_transform_hierarchy_depth_intra + u8::from(part_nxn),
+                    inter: false,
+                    inter_split: false,
+                };
+                self.transform_tree(
+                    &ctx, x0, y0, x0, y0, log2_size, 0, 0, [false; 2], [false; 2], sink,
+                )?;
+            }
+        } else {
+            let part_mode = self.inter_part_mode(log2_size);
+            let mut merge_2nx2n = false;
+            for (i, (x, y, w, h)) in part_mode.blocks(x0, y0, size).into_iter().enumerate() {
+                let g = PuGeom {
+                    x,
+                    y,
+                    w,
+                    h,
+                    part_idx: i as u8,
+                    ..self.geom(x0, y0, size, part_mode, 0)
+                };
+                let merge = self.prediction_unit(&g, false, sink)?;
+                merge_2nx2n = merge && part_mode == PartMode::Part2Nx2N;
+            }
+            let rqt_root_cbf = merge_2nx2n || self.flag(ctx::NO_RESIDUAL_DATA_FLAG);
+            if rqt_root_cbf {
+                let max_depth = self.sps.max_transform_hierarchy_depth_inter;
+                let ctx = TreeCtx {
+                    x_cu: x0,
+                    y_cu: y0,
+                    log2_cb: log2_size,
+                    part_nxn: false,
+                    luma_modes: [1; 4],
+                    chroma_modes: [1; 4],
+                    max_depth,
+                    inter: true,
+                    inter_split: max_depth == 0 && part_mode != PartMode::Part2Nx2N,
+                };
+                self.transform_tree(
+                    &ctx, x0, y0, x0, y0, log2_size, 0, 0, [false; 2], [false; 2], sink,
+                )?;
+            }
         }
 
         let qp_y = self.current_qp_y();
@@ -773,9 +893,162 @@ impl Parser<'_, '_> {
             part_nxn,
             transquant_bypass: self.cu_transquant_bypass,
             pcm,
+            intra,
             qp_y,
         });
         Ok(())
+    }
+
+    fn geom(&self, x0: u32, y0: u32, size: u32, part_mode: PartMode, part_idx: u8) -> PuGeom {
+        PuGeom {
+            x_cb: x0,
+            y_cb: y0,
+            n_cb: size,
+            x: x0,
+            y: y0,
+            w: size,
+            h: size,
+            part_idx,
+            part_mode,
+        }
+    }
+
+    /// `part_mode` of an inter coding unit (binarization of Table 9-43, contexts of
+    /// Table 9-41).
+    fn inter_part_mode(&mut self, log2_size: u8) -> PartMode {
+        if self.flag(ctx::PART_MODE) {
+            return PartMode::Part2Nx2N;
+        }
+        let horizontal = self.flag(ctx::PART_MODE + 1);
+        let min = log2_size == self.sps.log2_min_luma_coding_block_size;
+        if min {
+            // At the minimum size: no AMP; NxN only above 8×8.
+            if horizontal {
+                PartMode::Part2NxN
+            } else if log2_size == 3 || self.flag(ctx::PART_MODE + 2) {
+                PartMode::PartNx2N
+            } else {
+                PartMode::PartNxN
+            }
+        } else if !self.sps.amp_enabled_flag {
+            if horizontal {
+                PartMode::Part2NxN
+            } else {
+                PartMode::PartNx2N
+            }
+        } else {
+            let symmetric = self.flag(ctx::PART_MODE + 3);
+            match (horizontal, symmetric) {
+                (true, true) => PartMode::Part2NxN,
+                (false, true) => PartMode::PartNx2N,
+                (true, false) if self.bypass() == 0 => PartMode::Part2NxnU,
+                (true, false) => PartMode::Part2NxnD,
+                (false, false) if self.bypass() == 0 => PartMode::PartnLx2N,
+                (false, false) => PartMode::PartnRx2N,
+            }
+        }
+    }
+
+    /// `prediction_unit()` (§7.3.8.6) and the derivation of its motion (§8.5.3.2), which is
+    /// stored for the following blocks and emitted. Returns `merge_flag`.
+    fn prediction_unit(
+        &mut self,
+        g: &PuGeom,
+        skip: bool,
+        sink: &mut impl Sink,
+    ) -> Result<bool, Error> {
+        let refs = self
+            .refs
+            .ok_or(Error::Invalid("inter block in an I slice"))?;
+        let merge = skip || self.flag(ctx::MERGE_FLAG);
+        let motion = if merge {
+            let mut merge_idx = 0;
+            if self.max_num_merge_cand > 1 && self.flag(ctx::MERGE_IDX) {
+                merge_idx = 1;
+                while merge_idx < self.max_num_merge_cand - 1 && self.bypass() == 1 {
+                    merge_idx += 1;
+                }
+            }
+            inter::merge(
+                &*self,
+                &refs,
+                g,
+                merge_idx,
+                self.max_num_merge_cand,
+                self.pps.log2_parallel_merge_level,
+                self.num_ref_idx_l0,
+            )
+        } else {
+            // P slices: inter_pred_idc is not coded, the block uses RefPicList0.
+            let mut ref_idx = 0usize;
+            if self.num_ref_idx_l0 > 1 {
+                // Truncated Rice, cMax = num_ref_idx - 1: two context-coded bins, then bypass.
+                let c_max = self.num_ref_idx_l0 - 1;
+                while ref_idx < c_max {
+                    let bin = if ref_idx < 2 {
+                        self.flag(ctx::REF_IDX_L0 + ref_idx)
+                    } else {
+                        self.bypass() == 1
+                    };
+                    if !bin {
+                        break;
+                    }
+                    ref_idx += 1;
+                }
+            }
+            let mvd = self.mvd_coding()?;
+            let mvp_flag = self.flag(ctx::MVP_LX_FLAG);
+            let candidates = inter::amvp(&*self, &refs, g, ref_idx as i8, 0);
+            let mvp = candidates[usize::from(mvp_flag)];
+            // (mvp + mvd) wrapped to 16 bits (8-197 to 8-200).
+            let mv = [0, 1].map(|k| (i32::from(mvp[k]) + mvd[k]) as u16 as i16);
+            Motion::l0(mv, ref_idx as i8)
+        };
+        let (w4, x4, y4) = (self.pic.w4, g.x as usize >> 2, g.y as usize >> 2);
+        let h4 = self.pic.motion.len() / w4;
+        for yy in y4..(y4 + (g.h as usize).div_ceil(4)).min(h4) {
+            for xx in x4..(x4 + (g.w as usize).div_ceil(4)).min(w4) {
+                self.pic.motion[yy * w4 + xx] = motion;
+            }
+        }
+        sink.prediction_unit(&PredictionUnit {
+            x: g.x,
+            y: g.y,
+            w: g.w,
+            h: g.h,
+            motion,
+        });
+        Ok(merge)
+    }
+
+    /// `mvd_coding()` (§7.3.8.9): the motion vector difference.
+    fn mvd_coding(&mut self) -> Result<[i32; 2], Error> {
+        let greater0 = [
+            self.flag(ctx::ABS_MVD_GREATER0_FLAG),
+            self.flag(ctx::ABS_MVD_GREATER0_FLAG),
+        ];
+        let mut greater1 = [false; 2];
+        for k in 0..2 {
+            if greater0[k] {
+                greater1[k] = self.flag(ctx::ABS_MVD_GREATER1_FLAG + 1);
+            }
+        }
+        let mut mvd = [0i32; 2];
+        for k in 0..2 {
+            if greater0[k] {
+                let abs = if greater1[k] {
+                    i64::from(self.eg_bypass(1)?) + 2
+                } else {
+                    1
+                };
+                if abs > 1 << 15 {
+                    return Err(Error::Invalid("motion vector difference out of range"));
+                }
+                let negative = self.bypass() == 1;
+                mvd[k] = if negative { -(abs as i32) } else { abs as i32 };
+            }
+        }
+        Ok(mvd)
     }
 
     /// `pcm_sample()` (§7.3.8.7): raw samples after byte alignment, then CABAC restarts.
@@ -955,14 +1228,18 @@ impl Parser<'_, '_> {
         sink: &mut impl Sink,
     ) -> Result<(), Error> {
         let chroma_type = self.sps.chroma_array_type();
+        let inter_split = t.inter_split && depth == 0;
         let split = if log2_size <= self.sps.log2_max_luma_transform_block_size
             && log2_size > self.sps.log2_min_luma_transform_block_size
             && depth < t.max_depth
             && !(t.part_nxn && depth == 0)
+            && !inter_split
         {
             self.flag(ctx::SPLIT_TRANSFORM_FLAG + usize::from(5 - log2_size))
         } else {
-            log2_size > self.sps.log2_max_luma_transform_block_size || (t.part_nxn && depth == 0)
+            log2_size > self.sps.log2_max_luma_transform_block_size
+                || (t.part_nxn && depth == 0)
+                || (inter_split && log2_size > self.sps.log2_min_luma_transform_block_size)
         };
 
         let mut cbf_cb = [false; 2];
@@ -1008,8 +1285,14 @@ impl Parser<'_, '_> {
             }
             Ok(())
         } else {
-            // Intra: cbf_luma is always coded.
-            let cbf_luma = self.flag(ctx::CBF_LUMA + usize::from(depth == 0));
+            // cbf_luma is inferred to be 1 for the root of an inter tree without chroma
+            // residual: rqt_root_cbf already said there is a residual.
+            let cbf_luma =
+                if !t.inter || depth != 0 || cbf_cb.contains(&true) || cbf_cr.contains(&true) {
+                    self.flag(ctx::CBF_LUMA + usize::from(depth == 0))
+                } else {
+                    true
+                };
             self.transform_unit(
                 t,
                 x0,
@@ -1099,6 +1382,7 @@ impl Parser<'_, '_> {
             y: y0,
             log2_size,
             intra_mode: luma_mode,
+            inter: t.inter,
             qp_y,
             cu_qp_offset: 0,
             res_scale: 0,
@@ -1155,6 +1439,7 @@ impl Parser<'_, '_> {
                     y,
                     log2_size: log2_c,
                     intra_mode: chroma_mode,
+                    inter: t.inter,
                     qp_y,
                     cu_qp_offset: offset,
                     res_scale,
@@ -1196,6 +1481,7 @@ impl Parser<'_, '_> {
             coeff_bounds: (cols as u8, rows as u8),
             transform_skip,
             transquant_bypass: self.cu_transquant_bypass,
+            inter: b.inter,
             qp_y: b.qp_y,
             cu_qp_offset: b.cu_qp_offset,
             res_scale_val: b.res_scale,
@@ -1514,6 +1800,30 @@ fn chroma_qp_offset(list: &[(i8, i8)], flag: bool, idx: usize) -> (i8, i8) {
     }
 }
 
+impl MotionSource for Parser<'_, '_> {
+    /// Availability of a neighbouring prediction block (§6.4.2), then its motion.
+    fn neighbour(&self, g: &PuGeom, xn: i64, yn: i64) -> Option<Motion> {
+        let (xc, yc, n) = (i64::from(g.x_cb), i64::from(g.y_cb), i64::from(g.n_cb));
+        let inside = xn >= xc && yn >= yc && xn < xc + n && yn < yc + n;
+        let available = if inside {
+            // Inside the same coding block: available, except the second NxN block looking at
+            // the third one, which is decoded after it.
+            !(i64::from(g.w) << 1 == n
+                && i64::from(g.h) << 1 == n
+                && g.part_idx == 1
+                && yc + i64::from(g.h) <= yn
+                && xc + i64::from(g.w) > xn)
+        } else {
+            self.pic.available(g.x, g.y, xn, yn)
+        };
+        if !available {
+            return None;
+        }
+        let m = self.pic.motion[self.pic.idx(xn as u32, yn as u32)];
+        m.is_inter().then_some(m)
+    }
+}
+
 /// Position and parameters of one transform block.
 #[derive(Clone, Copy)]
 struct BlockInfo {
@@ -1522,6 +1832,7 @@ struct BlockInfo {
     y: u32,
     log2_size: u8,
     intra_mode: u8,
+    inter: bool,
     qp_y: i32,
     cu_qp_offset: i8,
     res_scale: i8,
@@ -1536,6 +1847,11 @@ struct TreeCtx {
     luma_modes: [u8; 4],
     chroma_modes: [u8; 4],
     max_depth: u8,
+    /// `CuPredMode` is `MODE_INTER`.
+    inter: bool,
+    /// `interSplitFlag` at depth 0: an inter CU with several prediction blocks and no
+    /// transform hierarchy splits its transform tree once.
+    inter_split: bool,
 }
 
 #[cfg(test)]

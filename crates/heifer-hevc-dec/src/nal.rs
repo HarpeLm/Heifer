@@ -153,9 +153,71 @@ pub fn split_annex_b(stream: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
+/// Splits an Annex B byte stream into access units (§7.4.2.4.4): each one holds the NAL units
+/// of one picture, from the parameter sets, delimiter and prefix SEI before its first slice to
+/// the suffix SEI and end of sequence or bitstream units after its slices. Each access unit is
+/// a contiguous part of `stream`, start codes included, ready for
+/// [`SequenceDecoder::decode`](crate::sequence::SequenceDecoder::decode).
+pub fn access_units(stream: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= stream.len() {
+        if stream[i..i + 3] == [0, 0, 1] {
+            starts.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut units = Vec::new();
+    let mut unit_start = 0;
+    let mut has_slice = false;
+    // Start of the first NAL unit after the slices that opens the next access unit.
+    let mut next_start: Option<usize> = None;
+    for &at in &starts {
+        let Some(&b0) = stream.get(at + 3) else { break };
+        let t = (b0 >> 1) & 63;
+        if t <= 31 {
+            let first = stream.get(at + 5).is_some_and(|b| b & 0x80 != 0);
+            if has_slice && (first || next_start.is_some()) {
+                let cut = next_start.unwrap_or(at);
+                units.push(&stream[unit_start..cut]);
+                unit_start = cut;
+            }
+            next_start = None;
+            has_slice = true;
+        } else if has_slice && !matches!(t, 36..=38 | 40 | 45..=47) && next_start.is_none() {
+            next_start = Some(at);
+        }
+    }
+    if unit_start < stream.len() && has_slice {
+        units.push(&stream[unit_start..]);
+    }
+    units
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_units_start_at_parameter_sets_and_keep_suffix_sei() {
+        // VPS, slice (first), suffix SEI, PPS, slice (first), slice (not first).
+        let s: Vec<u8> = [
+            &[0, 0, 1, 32 << 1, 1, 0][..],
+            &[0, 0, 1, 19 << 1, 1, 0x80],
+            &[0, 0, 1, 40 << 1, 1, 5],
+            &[0, 0, 1, 34 << 1, 1, 7],
+            &[0, 0, 1, 1 << 1, 1, 0x80],
+            &[0, 0, 1, 1 << 1, 1, 0x00],
+        ]
+        .concat();
+        let units = access_units(&s);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &s[..18]);
+        assert_eq!(units[1], &s[18..]);
+        assert!(access_units(&[]).is_empty());
+    }
 
     #[test]
     fn unescape_removes_emulation_bytes() {
