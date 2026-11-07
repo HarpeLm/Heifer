@@ -39,16 +39,25 @@ impl Default for PocState {
 }
 
 impl PocState {
+    /// Whether a picture can be `prevTid0Pic` (§8.3.1): `TemporalId` 0, and neither a RADL
+    /// or RASL picture nor a sub-layer non-reference picture (even NAL unit types below 16).
+    pub fn is_prev_tid0_candidate(nal_unit_type: u8, temporal_id: u8) -> bool {
+        temporal_id == 0
+            && !(6..=9).contains(&nal_unit_type)
+            && !(nal_unit_type < 16 && nal_unit_type % 2 == 0)
+    }
+
     /// Derives `PicOrderCntVal` of a picture and updates the state.
     ///
-    /// `is_irap` resets the state; a picture with a non-zero `temporal_id` is derived from the
-    /// last temporal sub-layer 0 picture and does not update it.
+    /// `is_irap` resets the state. Only pictures that may serve as `prevTid0Pic` (see
+    /// [`is_prev_tid0_candidate`](Self::is_prev_tid0_candidate)) update it; the others are
+    /// derived from the last such picture.
     pub fn next(
         &mut self,
         slice_pic_order_cnt_lsb: u32,
         log2_max_poc_lsb: u8,
         is_irap: bool,
-        temporal_id: u8,
+        prev_tid0_candidate: bool,
     ) -> i32 {
         let max_lsb = 1i32 << log2_max_poc_lsb;
         let lsb = slice_pic_order_cnt_lsb as i32;
@@ -64,7 +73,7 @@ impl PocState {
         } else {
             prev_msb
         };
-        if temporal_id == 0 {
+        if prev_tid0_candidate {
             self.prev_lsb = slice_pic_order_cnt_lsb;
             self.prev_msb = msb;
             self.prev_none = false;
@@ -215,24 +224,24 @@ mod tests {
     #[test]
     fn poc_wraps_after_half_the_lsb_range() {
         let mut state = PocState::default();
-        assert_eq!(state.next(0, 4, true, 0), 0);
-        assert_eq!(state.next(1, 4, false, 0), 1);
-        assert_eq!(state.next(2, 4, false, 0), 2);
+        assert_eq!(state.next(0, 4, true, true), 0);
+        assert_eq!(state.next(1, 4, false, true), 1);
+        assert_eq!(state.next(2, 4, false, true), 2);
         // A small step back does not cross half the range.
-        assert_eq!(state.next(1, 4, false, 0), 1);
-        assert_eq!(state.next(9, 4, false, 0), 9);
+        assert_eq!(state.next(1, 4, false, true), 1);
+        assert_eq!(state.next(9, 4, false, true), 9);
         // 9 - 1 >= 8: the LSB wrapped, so the MSB increases by the range.
-        assert_eq!(state.next(1, 4, false, 0), 17);
+        assert_eq!(state.next(1, 4, false, true), 17);
     }
 
     #[test]
     fn poc_ignores_higher_temporal_layers() {
         let mut state = PocState::default();
-        assert_eq!(state.next(0, 8, true, 0), 0);
-        assert_eq!(state.next(8, 8, false, 0), 8);
-        assert_eq!(state.next(4, 8, false, 2), 4);
+        assert_eq!(state.next(0, 8, true, true), 0);
+        assert_eq!(state.next(8, 8, false, true), 8);
+        assert_eq!(state.next(4, 8, false, false), 4);
         // The state still refers to POC 8, so 16 continues from it.
-        assert_eq!(state.next(16, 8, false, 0), 16);
+        assert_eq!(state.next(16, 8, false, true), 16);
     }
 
     #[test]
@@ -258,6 +267,27 @@ mod tests {
         let rps = rps(&[(-1, true), (-2, true)], &[]);
         let list = build_ref_pic_list0(5, &rps, &dpb(&[3, 4]), 2, Some(&[1, 0])).unwrap();
         assert_eq!(list.iter().map(|r| r.poc).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    #[test]
+    fn non_reference_pictures_are_not_prev_tid0() {
+        // TRAIL_R, CRA, IDR: yes; TRAIL_N, RADL_N, RADL_R, RASL_R, or TemporalId 1: no.
+        for t in [1, 21, 19] {
+            assert!(PocState::is_prev_tid0_candidate(t, 0), "{t}");
+        }
+        for t in [0, 6, 7, 9] {
+            assert!(!PocState::is_prev_tid0_candidate(t, 0), "{t}");
+        }
+        assert!(!PocState::is_prev_tid0_candidate(1, 1));
+        // POC_A: IDR 0, leading RADL_N -7, TRAIL_R 8, TRAIL_N 16, then 1 derived from POC 8
+        // (the TRAIL_N picture is not prevTid0Pic).
+        let mut state = PocState::default();
+        let pics = [(0, 19), (9, 7), (8, 1), (0, 0), (1, 0)];
+        let pocs: Vec<i32> = pics
+            .iter()
+            .map(|&(lsb, t)| state.next(lsb, 4, t == 19, PocState::is_prev_tid0_candidate(t, 0)))
+            .collect();
+        assert_eq!(pocs, [0, -7, 8, 16, 1]);
     }
 
     #[test]

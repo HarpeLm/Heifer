@@ -80,7 +80,13 @@ fn check_fixture(name: &str) -> Option<(usize, usize)> {
                 header.slice_pic_order_cnt_lsb,
                 sps.log2_max_pic_order_cnt_lsb,
                 is_irap,
-                nal.header.temporal_id,
+                PocState::is_prev_tid0_candidate(
+                    match nal.header.unit_type {
+                        NalUnitType::IrapSlice(t) | NalUnitType::OtherSlice(t) => t,
+                        _ => unreachable!("a slice"),
+                    },
+                    nal.header.temporal_id,
+                ),
             );
             match header.slice_type {
                 SliceType::I => {}

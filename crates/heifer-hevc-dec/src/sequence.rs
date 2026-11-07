@@ -136,7 +136,7 @@ impl SequenceDecoder {
             header.slice_pic_order_cnt_lsb,
             sps.log2_max_pic_order_cnt_lsb,
             new_sequence,
-            first.header.temporal_id,
+            PocState::is_prev_tid0_candidate(nal_type, first.header.temporal_id),
         );
 
         // Reference picture set (§8.3.2): keep only the pictures it lists, and mark its
