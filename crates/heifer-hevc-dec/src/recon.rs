@@ -431,6 +431,8 @@ pub struct Reconstructor<'a> {
     refs: [Vec<(&'a Frame, i32, bool)>; 2],
     /// Explicit weighted prediction of the current slice, per entry of each list.
     weights: [Option<Vec<crate::slice::PredWeight>>; 2],
+    /// Prediction buffers of inter blocks (two lists), reused across blocks.
+    inter_scratch: Vec<i32>,
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
 }
@@ -457,6 +459,7 @@ impl<'a> Reconstructor<'a> {
             scratch: vec![0; 3 * 32 * 32],
             refs: [Vec::new(), Vec::new()],
             weights: [None, None],
+            inter_scratch: Vec::new(),
             error: None,
         }
     }
@@ -1224,7 +1227,8 @@ impl<'a> Reconstructor<'a> {
             3
         };
         let n = (pu.w * pu.h) as usize;
-        let mut buf = vec![0i32; 2 * n];
+        let mut buf = std::mem::take(&mut self.inter_scratch);
+        buf.resize(2 * n, 0);
         let (buf0, buf1) = buf.split_at_mut(n);
         for c in 0..planes {
             let (x, y, w, h) = if c == 0 {
@@ -1294,6 +1298,7 @@ impl<'a> Reconstructor<'a> {
                 }
             }
         }
+        self.inter_scratch = buf;
         if !self.pps.constrained_intra_pred_flag {
             self.mark_decoded(pu.x, pu.y, pu.w, pu.h);
         }

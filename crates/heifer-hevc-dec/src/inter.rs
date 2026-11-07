@@ -549,63 +549,77 @@ fn interpolate<const TAPS: usize>(
     let shift1 = (i32::from(bit_depth) - 8).min(4);
     let shift3 = (14 - i32::from(bit_depth)).max(2);
     let before = (TAPS / 2 - 1) as i64;
-    let max_x = stride as i64 - 1;
-    let max_y = plane_h as i64 - 1;
-    let sample = |x: i64, y: i64| -> i32 {
-        i32::from(plane[y.clamp(0, max_y) as usize * stride + x.clamp(0, max_x) as usize])
-    };
+    // The source area: the block and the filter margins. When it lies inside the plane
+    // (most blocks), the plane is read in place; otherwise the area is copied once with its
+    // coordinates clamped to the plane, as the spec does.
+    let (sw, sh) = (w + TAPS - 1, h + TAPS - 1);
+    let (x0, y0) = (xi - before, yi - before);
+    let padded: Vec<u16>;
+    let (src, src_stride) =
+        if x0 >= 0 && y0 >= 0 && x0 as usize + sw <= stride && y0 as usize + sh <= plane_h {
+            (&plane[y0 as usize * stride + x0 as usize..], stride)
+        } else {
+            let (max_x, max_y) = (stride as i64 - 1, plane_h as i64 - 1);
+            padded = (0..sh as i64)
+                .flat_map(|r| {
+                    let row = (y0 + r).clamp(0, max_y) as usize * stride;
+                    (0..sw as i64).map(move |c| plane[row + (x0 + c).clamp(0, max_x) as usize])
+                })
+                .collect();
+            (&padded[..], sw)
+        };
+    let b = before as usize;
+    let row = |r: usize| &src[r * src_stride..r * src_stride + sw];
     let (cx, cy) = (&filters[fx], &filters[fy]);
+    let horizontal = |row: &[u16], out: &mut [i32]| {
+        for (xx, o) in out.iter_mut().enumerate() {
+            let taps = &row[xx..xx + TAPS];
+            let s: i32 = cx.iter().zip(taps).map(|(&c, &v)| c * i32::from(v)).sum();
+            *o = s >> shift1;
+        }
+    };
     match (fx, fy) {
         (0, 0) => {
-            for yy in 0..h {
-                for xx in 0..w {
-                    out[yy * w + xx] = sample(xi + xx as i64, yi + yy as i64) << shift3;
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                for (o, &v) in out.iter_mut().zip(&row(yy + b)[b..b + w]) {
+                    *o = i32::from(v) << shift3;
                 }
             }
         }
         (_, 0) => {
-            for yy in 0..h {
-                for xx in 0..w {
-                    let mut s = 0;
-                    for (t, &c) in cx.iter().enumerate() {
-                        s += c * sample(xi + xx as i64 + t as i64 - before, yi + yy as i64);
-                    }
-                    out[yy * w + xx] = s >> shift1;
-                }
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                horizontal(row(yy + b), out);
             }
         }
         (0, _) => {
-            for yy in 0..h {
-                for xx in 0..w {
-                    let mut s = 0;
-                    for (t, &c) in cy.iter().enumerate() {
-                        s += c * sample(xi + xx as i64, yi + yy as i64 + t as i64 - before);
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                out.fill(0);
+                for (t, &c) in cy.iter().enumerate() {
+                    for (o, &v) in out.iter_mut().zip(&row(yy + t)[b..b + w]) {
+                        *o += c * i32::from(v);
                     }
-                    out[yy * w + xx] = s >> shift1;
+                }
+                for o in out.iter_mut() {
+                    *o >>= shift1;
                 }
             }
         }
         _ => {
             // Horizontal pass over the rows the vertical filter needs, then vertical pass.
-            let rows = h + TAPS - 1;
-            let mut tmp = vec![0i32; rows * w];
-            for r in 0..rows {
-                let yy = yi + r as i64 - before;
-                for xx in 0..w {
-                    let mut s = 0;
-                    for (t, &c) in cx.iter().enumerate() {
-                        s += c * sample(xi + xx as i64 + t as i64 - before, yy);
-                    }
-                    tmp[r * w + xx] = s >> shift1;
-                }
+            let mut tmp = [0i32; 64 * (64 + 7)];
+            let tmp = &mut tmp[..sh * w];
+            for (r, t) in tmp.chunks_exact_mut(w).enumerate() {
+                horizontal(row(r), t);
             }
-            for yy in 0..h {
-                for xx in 0..w {
-                    let mut s = 0;
-                    for (t, &c) in cy.iter().enumerate() {
-                        s += c * tmp[(yy + t) * w + xx];
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                out.fill(0);
+                for (t, &c) in cy.iter().enumerate() {
+                    for (o, &v) in out.iter_mut().zip(&tmp[(yy + t) * w..(yy + t + 1) * w]) {
+                        *o += c * v;
                     }
-                    out[yy * w + xx] = s >> 6;
+                }
+                for o in out.iter_mut() {
+                    *o >>= 6;
                 }
             }
         }

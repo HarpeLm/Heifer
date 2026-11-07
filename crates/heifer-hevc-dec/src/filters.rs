@@ -101,14 +101,20 @@ fn motion_strength(p: EdgeMotion, q: EdgeMotion) -> i32 {
         (i32::from(a[0]) - i32::from(b[0])).abs() >= 4
             || (i32::from(a[1]) - i32::from(b[1])).abs() >= 4
     };
+    // The (POC, vector) pairs of the lists used, without allocating.
     let vectors = |m: &EdgeMotion| {
-        (0..2)
-            .filter(|&l| m.ref_poc[l].is_some())
-            .map(|l| (m.ref_poc[l].unwrap_or(0), m.mv[l]))
-            .collect::<Vec<_>>()
+        let mut v = [(0, [0i16; 2]); 2];
+        let mut n = 0;
+        for l in 0..2 {
+            if let Some(poc) = m.ref_poc[l] {
+                v[n] = (poc, m.mv[l]);
+                n += 1;
+            }
+        }
+        (v, n)
     };
-    let (vp, vq) = (vectors(&p), vectors(&q));
-    match (vp.as_slice(), vq.as_slice()) {
+    let ((vp, np), (vq, nq)) = (vectors(&p), vectors(&q));
+    match (&vp[..np], &vq[..nq]) {
         ([a], [b]) => i32::from(a.0 != b.0 || far(a.1, b.1)),
         ([a0, a1], [b0, b1]) => {
             let mut pocs_p = [a0.0, a1.0];
