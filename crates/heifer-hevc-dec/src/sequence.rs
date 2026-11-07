@@ -2,8 +2,8 @@
 //! reference picture sets and the decoded picture buffer (§8.3), then each picture's slices
 //! with inter prediction from the pictures kept for reference.
 //!
-//! Pictures are returned in decoding order. P and B slices are supported; long-term
-//! reference pictures are rejected with [`Error::Unimplemented`].
+//! Pictures are returned in decoding order. P and B slices are supported, with short- and
+//! long-term reference pictures.
 
 use crate::Error;
 use crate::decoder::{DEFAULT_MAX_PIXELS, DecodeOptions};
@@ -109,9 +109,6 @@ impl SequenceDecoder {
             ));
         }
 
-        if !header.long_term_refs.is_empty() {
-            return Err(Error::Unimplemented("long-term reference pictures"));
-        }
         let (pps, sps) = self
             .sets
             .get(usize::from(header.slice_pic_parameter_set_id))?;
@@ -288,12 +285,14 @@ impl SequenceDecoder {
                 [0, 1].map(|l| {
                     lists[l]
                         .iter()
-                        .map(|r| (&dpb[r.slot].frame, r.poc))
+                        .map(|r| (&dpb[r.slot].frame, r.poc, r.long_term))
                         .collect()
                 }),
                 [header.pred_weights.clone(), header.pred_weights_l1.clone()],
             );
             let pocs = [0, 1].map(|l| lists[l].iter().map(|r| r.poc).collect::<Vec<i32>>());
+            let long_term =
+                [0, 1].map(|l| lists[l].iter().map(|r| r.long_term).collect::<Vec<bool>>());
             let mut col = None;
             if inter && header.slice_temporal_mvp_enabled_flag {
                 let from = usize::from(!header.collocated_from_l0_flag);
@@ -305,6 +304,7 @@ impl SequenceDecoder {
             let refs = SliceRefs {
                 poc,
                 lists: [&pocs[0], &pocs[1]],
+                long_term: [&long_term[0], &long_term[1]],
                 col,
                 collocated_from_l0: header.collocated_from_l0_flag,
                 no_backward_pred: pocs.iter().flatten().all(|&p| p <= poc),

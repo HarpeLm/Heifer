@@ -613,6 +613,7 @@ mod tests {
         EdgeMotion {
             mv: [l0.map_or([0; 2], |v| v.1), l1.map_or([0; 2], |v| v.1)],
             ref_poc: [l0.map(|v| v.0), l1.map(|v| v.0)],
+            ref_lt: [false; 2],
         }
     }
 

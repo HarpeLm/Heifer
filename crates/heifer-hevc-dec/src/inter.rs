@@ -145,6 +145,8 @@ pub struct ColMotion {
     pub mv: [Mv; 2],
     /// POC of the reference picture of each list, `None` when the list is not used.
     pub ref_poc: [Option<i32>; 2],
+    /// Whether the reference picture of each list was a long-term one.
+    pub ref_lt: [bool; 2],
 }
 
 impl ColMotion {
@@ -152,6 +154,7 @@ impl ColMotion {
     pub const INTRA: Self = Self {
         mv: [[0; 2]; 2],
         ref_poc: [None; 2],
+        ref_lt: [false; 2],
     };
 }
 
@@ -199,6 +202,8 @@ pub struct SliceRefs<'a> {
     pub poc: i32,
     /// POC of each entry of `RefPicList0` and `RefPicList1`.
     pub lists: [&'a [i32]; 2],
+    /// Whether each entry of the lists is a long-term reference picture.
+    pub long_term: [&'a [bool]; 2],
     /// Motion of the collocated picture, when `slice_temporal_mvp_enabled_flag` is set.
     pub col: Option<&'a MotionField>,
     /// `collocated_from_l0_flag`.
@@ -218,6 +223,15 @@ impl SliceRefs<'_> {
             .and_then(|i| self.lists[list].get(i))
             .copied()
     }
+
+    /// `LongTermRefPic()`: whether `RefPicListX[ref_idx]` is a long-term picture.
+    fn is_long_term(&self, list: usize, ref_idx: i8) -> bool {
+        usize::try_from(ref_idx)
+            .ok()
+            .and_then(|i| self.long_term[list].get(i))
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// Scales a motion vector by the ratio of two POC distances (8-205 to 8-208).
@@ -236,29 +250,29 @@ fn scale(mv: Mv, td: i32, tb: i32) -> Mv {
 }
 
 /// Temporal luma motion vector prediction (§8.5.3.2.8): the vector of the collocated block,
-/// scaled to point at `RefPicListX[ref_idx]`.
+/// scaled to point at `RefPicListX[ref_idx]`. A collocated vector is used only if it points
+/// at a long-term picture exactly when the target is one; long-term vectors are not scaled.
 pub fn temporal(refs: &SliceRefs<'_>, g: &PuGeom, ref_idx: i8, list: usize) -> Option<Mv> {
     let col = refs.col?;
     let target = refs.poc_of(list, ref_idx)?;
+    let target_lt = refs.is_long_term(list, ref_idx);
     let (pw, ph) = refs.pic_size;
     let collocated = |x: u32, y: u32| -> Option<Mv> {
         let c = col.at((x >> 4) << 4, (y >> 4) << 4);
-        let (mv, ref_poc) = match c.ref_poc {
+        let n = match c.ref_poc {
             [None, None] => return None,
-            [None, Some(p)] => (c.mv[1], p),
-            [Some(p), None] => (c.mv[0], p),
-            [Some(p0), Some(p1)] => {
-                let n = if refs.no_backward_pred {
-                    list
-                } else {
-                    usize::from(refs.collocated_from_l0)
-                };
-                (c.mv[n], if n == 0 { p0 } else { p1 })
-            }
+            [None, Some(_)] => 1,
+            [Some(_), None] => 0,
+            [Some(_), Some(_)] if refs.no_backward_pred => list,
+            [Some(_), Some(_)] => usize::from(refs.collocated_from_l0),
         };
+        let (mv, ref_poc) = (c.mv[n], c.ref_poc[n]?);
+        if c.ref_lt[n] != target_lt {
+            return None;
+        }
         let col_diff = col.poc - ref_poc;
         let curr_diff = refs.poc - target;
-        Some(if col_diff == curr_diff {
+        Some(if target_lt || col_diff == curr_diff {
             mv
         } else {
             scale(mv, col_diff, curr_diff)
@@ -441,16 +455,21 @@ pub fn amvp(
             .find(|&l| m.uses(l) && refs.poc_of(l, m.ref_idx[l]) == Some(target))
             .map(|l| m.mv[l])
     };
-    // Any vector of the neighbour, scaled to the target picture's distance.
+    // A vector of the neighbour pointing at a picture of the same kind (short- or long-term)
+    // as the target, scaled to the target's distance when both are short-term.
+    let target_lt = refs.is_long_term(list, ref_idx);
     let scaled = |m: &Motion| {
-        [list, other].into_iter().find(|&l| m.uses(l)).map(|l| {
-            let poc = refs.poc_of(l, m.ref_idx[l]).unwrap_or(target);
-            if poc == target {
-                m.mv[l]
-            } else {
-                scale(m.mv[l], refs.poc - poc, refs.poc - target)
-            }
-        })
+        [list, other]
+            .into_iter()
+            .find(|&l| m.uses(l) && refs.is_long_term(l, m.ref_idx[l]) == target_lt)
+            .map(|l| {
+                let poc = refs.poc_of(l, m.ref_idx[l]).unwrap_or(target);
+                if target_lt || poc == target {
+                    m.mv[l]
+                } else {
+                    scale(m.mv[l], refs.poc - poc, refs.poc - target)
+                }
+            })
     };
 
     let a = [(x - 1, y + h), (x - 1, y + h - 1)].map(|(xn, yn)| src.neighbour(g, xn, yn));
@@ -717,6 +736,7 @@ mod tests {
         SliceRefs {
             poc: 4,
             lists: [l0, l1],
+            long_term: [&[], &[]],
             col: None,
             collocated_from_l0: true,
             no_backward_pred: false,

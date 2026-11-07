@@ -428,7 +428,7 @@ pub struct Reconstructor<'a> {
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
     /// `RefPicList0` and `RefPicList1` of the current slice: each picture and its POC.
-    refs: [Vec<(&'a Frame, i32)>; 2],
+    refs: [Vec<(&'a Frame, i32, bool)>; 2],
     /// Explicit weighted prediction of the current slice, per entry of each list.
     weights: [Option<Vec<crate::slice::PredWeight>>; 2],
     /// Deferred error (the sink interface cannot return errors).
@@ -477,11 +477,12 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Sets `RefPicList0` and `RefPicList1` of the slice whose blocks follow: the reference
-    /// pictures, already filtered, with their POC, and the explicit prediction weights of
+    /// pictures, already filtered, with their POC and whether they are long-term pictures,
+    /// and the explicit prediction weights of
     /// each list, if any. `RefPicList1` is empty for P slices.
     pub fn set_references(
         &mut self,
-        lists: [Vec<(&'a Frame, i32)>; 2],
+        lists: [Vec<(&'a Frame, i32, bool)>; 2],
         weights: [Option<Vec<crate::slice::PredWeight>>; 2],
     ) {
         self.refs = lists;
@@ -1187,12 +1188,13 @@ impl<'a> Reconstructor<'a> {
         let m = pu.motion;
         // The reference picture, its POC and its explicit weights, for each list used.
         let mut used = [None, None];
+        let mut ref_lt = [false; 2];
         for (list, slot) in used.iter_mut().enumerate() {
             if !m.uses(list) {
                 continue;
             }
             let i = m.ref_idx[list] as usize;
-            let (reference, poc) = *self.refs[list]
+            let (reference, poc, lt) = *self.refs[list]
                 .get(i)
                 .ok_or(Error::Invalid("reference index outside the reference list"))?;
             if reference.widths != self.frame.widths || reference.heights != self.frame.heights {
@@ -1206,6 +1208,7 @@ impl<'a> Reconstructor<'a> {
                 None => None,
             };
             *slot = Some((reference, poc, weight));
+            ref_lt[list] = lt;
         }
         if used == [None, None] {
             return Err(Error::Invalid("inter block without a reference list"));
@@ -1296,6 +1299,7 @@ impl<'a> Reconstructor<'a> {
         let motion = EdgeMotion {
             mv: [0, 1].map(|l| if m.uses(l) { m.mv[l] } else { [0; 2] }),
             ref_poc: used.map(|u| u.map(|(_, poc, _)| poc)),
+            ref_lt,
         };
         for yy in y4..((pu.y + pu.h) as usize).div_ceil(4).min(info.h4) {
             info.edges[yy * info.w4 + x4] |= 4;
