@@ -15,8 +15,11 @@ fuzz_target!(|data: &[u8]| {
     }
     // IPTC: from the file, and the bytes themselves as an IIM block.
     if let Ok(Some(seq)) = heifer::read_sequence(data) {
+        // Frames are in display order: the second and the last one exercise the reordering
+        // (ctts) and the decoding from the keyframe before them.
         if seq.frames.len() > 1 {
             let _ = heifer::decode_sequence_frame(data, 1);
+            let _ = heifer::decode_sequence_frame(data, seq.frames.len() - 1);
         }
         if let Ok(frames) = heifer::decode_sequence(data) {
             for frame in frames.take(8) {
