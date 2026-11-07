@@ -143,8 +143,9 @@ pub enum FileTypeResult {
 /// `libheif`'s `heif_check_filetype`, for gating or validation before a full decode.
 ///
 /// The first 12 bytes are enough (box size, `ftyp`, major brand); any more are ignored. Only
-/// the major brand is read, as in `libheif`: a generic `mif1`/`mif2` file is
-/// [`FileTypeResult::MayBe`] even when it holds HEVC.
+/// the major brand is read, as in `libheif`: HEVC images and image sequences (`heic`, `heix`,
+/// `hevc`, `hevx`) are [`FileTypeResult::Supported`], and a generic `mif1`/`mif2`/`msf1` file
+/// is [`FileTypeResult::MayBe`] even when it holds HEVC.
 ///
 /// ```
 /// let heic = b"\0\0\0\x18ftypheic";
@@ -166,8 +167,10 @@ pub fn check_file_type(data: &[u8]) -> FileTypeResult {
         return FileTypeResult::MayBe;
     }
     match &data[8..12] {
-        b"heic" | b"heix" => FileTypeResult::Supported,
-        b"mif1" | b"mif2" => FileTypeResult::MayBe,
+        // HEVC images, and HEVC image sequences.
+        b"heic" | b"heix" | b"hevc" | b"hevx" => FileTypeResult::Supported,
+        // Generic images and sequences: the codec is not known from the brand.
+        b"mif1" | b"mif2" | b"msf1" => FileTypeResult::MayBe,
         _ => FileTypeResult::Unsupported,
     }
 }
