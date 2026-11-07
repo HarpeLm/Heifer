@@ -1024,6 +1024,8 @@ impl<'a> Reconstructor<'a> {
             .as_ref()
             .or(self.sps.scaling_list.as_ref());
         let flat = list.is_none() || (tb.transform_skip && n > 4);
+        // matrixId: intra Y, Cb, Cr then inter Y, Cb, Cr (Table 7-4).
+        let matrix_id = c + if tb.inter { 3 } else { 0 };
         // Only the rectangle holding the non-zero coefficients is scaled, padded with zeros to
         // the width the transform reads; transform skip uses the whole block.
         let (cols, rows) = if tb.transform_skip {
@@ -1051,7 +1053,13 @@ impl<'a> Reconstructor<'a> {
                 let factor = if flat {
                     flat_factor
                 } else {
-                    i64::from(Self::scaling_factor(list.unwrap(), tb.log2_size, c, x, y)) * scale
+                    i64::from(Self::scaling_factor(
+                        list.unwrap(),
+                        tb.log2_size,
+                        matrix_id,
+                        x,
+                        y,
+                    )) * scale
                 };
                 // A zero level scales to `rnd >> bd_shift`, which is zero for every `bd_shift`
                 // in range, so no special case is needed here.
