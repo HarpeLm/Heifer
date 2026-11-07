@@ -91,7 +91,8 @@ pure-Rust, lightweight and HEVC-only promise.
 - JPEG and JPEG 2000 inside HEIF.
 - Image sequences: P and B frames are done (DPB, merge/AMVP, TMVP, bi-prediction, weighted
   prediction, verified against ffmpeg and the conformance MD5s). Frames come out in display
-  order (`ctts`). Remaining: long-term references, explicit RDPCM.
+  order (`ctts`); long-term references and explicit RDPCM are supported. 114
+  conformance streams match their MD5.
 - Uncompressed images as primary images.
 
 The target is a credible HEIC/HEVC alternative to libheif, not a libheif clone.

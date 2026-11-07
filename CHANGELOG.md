@@ -4,8 +4,9 @@
 
 **Breaking**
 
-- `heifer_isobmff::track::Sample` gains a public field, `composition_offset`: code that
-  builds a `Sample` with a struct literal must set it.
+- New public fields, to set in struct literals: `heifer_isobmff::track::Sample::composition_offset`,
+  `heifer_hevc_dec::refs::RefPic::long_term` and
+  `heifer_hevc_dec::syntax::TransformBlock::explicit_rdpcm`.
 
 **New**
 
@@ -17,7 +18,11 @@
   AMVP with motion vector scaling, temporal motion vector prediction, all partition modes
   including AMP, 8-tap luma and 4-tap chroma interpolation, explicit weighted prediction,
   constrained intra prediction, and deblocking boundary strengths of inter blocks, in 4:0:0
-  to 4:4:4 up to 12 bits. Long-term reference pictures return `Error::Unsupported`.
+  to 4:4:4 up to 12 bits.
+- Long-term reference pictures: parsed from the slice header and the SPS, kept in the DPB,
+  appended to both reference lists, and handled by AMVP and temporal prediction (no
+  scaling, no mixing of short- and long-term vectors).
+- Explicit RDPCM (range extension) for inter blocks coded without transform.
 - B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
   bi-predictive and zero merge candidates on both lists, and the collocated picture from
   either list.
@@ -29,8 +34,9 @@
 - Verified: the 300 frames of the three Nokia sequences and 12 x265 streams (several
   references, AMP, slices, WPP, CTU sizes, open GOP, lossless, transform skip, 10-bit, 4:2:2,
   4:4:4, weighted prediction) and three x265 streams with B frames (pyramid, weighted
-  bi-prediction, up to 8 B frames) decode identically to ffmpeg, and 84 official conformance
-  bitstreams (3,735 pictures) match their MD5 picture hashes. `scripts/fetch-conformance.sh`
+  bi-prediction, up to 8 B frames) decode identically to ffmpeg, and 114 official
+  conformance bitstreams (7,115 pictures) match their MD5 picture hashes; none is rejected
+  as unsupported. `scripts/fetch-conformance.sh`
   fetches the inter streams and a new test decodes every picture of each.
 
 **Fixed**
