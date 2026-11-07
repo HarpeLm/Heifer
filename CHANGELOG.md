@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Breaking**
+
+- `heifer_isobmff::track::Sample` gains a public field, `composition_offset`: code that
+  builds a `Sample` with a struct literal must set it.
+
 **New**
 
 - Inter prediction, P frames: image sequences, bursts and animations now decode every frame,
@@ -15,8 +20,12 @@
   to 4:4:4 up to 12 bits. Long-term reference pictures return `Error::Unsupported`.
 - B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
   bi-predictive and zero merge candidates on both lists, and the collocated picture from
-  either list. Frames are returned in decoding order; with B frames this differs from the
-  display order.
+  either list.
+- Frames in display order: `decode_sequence` returns frames in display order, reordered by
+  the composition offsets of the track (`ctts`); `read_sequence` lists frames and durations
+  in that order, and `decode_sequence_frame` takes a display index. `heifer-isobmff`'s
+  `Sample` gains `composition_offset`, and `Track` gains `composition_times` and
+  `display_order`.
 - Verified: the 300 frames of the three Nokia sequences and 12 x265 streams (several
   references, AMP, slices, WPP, CTU sizes, open GOP, lossless, transform skip, 10-bit, 4:2:2,
   4:4:4, weighted prediction) and three x265 streams with B frames (pyramid, weighted
