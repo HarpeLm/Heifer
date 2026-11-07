@@ -1,6 +1,7 @@
-//! HEVC (H.265) intra-only decoder for HEIF still images.
+//! HEVC (H.265) decoder for HEIF still images and image sequences.
 //!
-//! Spec: ITU-T H.265. Only intra coding is needed for still images.
+//! Spec: ITU-T H.265. Still images use intra coding only; [`sequence`] adds inter prediction
+//! (P and B frames) for image sequences.
 
 pub mod bitreader;
 pub mod cabac;

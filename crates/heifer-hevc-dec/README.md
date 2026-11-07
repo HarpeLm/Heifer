@@ -1,8 +1,9 @@
 # heifer-hevc-dec
 
-Pure-Rust HEVC (H.265) intra decoder for still images: Main, Main 10, Main Still Picture and
-intra Range Extensions (8–12 bit, 4:0:0 to 4:4:4), tiles, WPP, PCM, scaling lists, deblocking and
-SAO. No C, no `unsafe`, runs in WebAssembly. Inter prediction (video) is not supported.
+Pure-Rust HEVC (H.265) decoder for HEIF images and image sequences: Main, Main 10, Main Still
+Picture and Range Extensions (8–16 bit, 4:0:0 to 4:4:4), tiles, WPP, PCM, scaling lists,
+deblocking and SAO, and P and B frames with long-term references (`sequence::SequenceDecoder`,
+in decoding or display order). No C, no `unsafe`, runs in WebAssembly.
 
 Part of [Heifer](https://github.com/HarpeLm/Heifer). To decode HEIC photos, use the
 [`heifer`](https://crates.io/crates/heifer) crate.

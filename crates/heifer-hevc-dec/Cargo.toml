@@ -1,6 +1,6 @@
 [package]
 name = "heifer-hevc-dec"
-description = "Pure-Rust HEVC (H.265) intra decoder for still images"
+description = "Pure-Rust HEVC (H.265) decoder for HEIF images and image sequences"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

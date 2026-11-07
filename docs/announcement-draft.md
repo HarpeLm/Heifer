@@ -71,11 +71,13 @@ trust. If something looks wrong, please open an issue.
 
 ## What's missing / next
 
-- HDR gain maps (Apple and ISO 21496-1) and ICC colour management;
+Since the first draft, HDR gain maps (Apple and ISO 21496-1), ICC colour management, an
+encoder (HEIF writing and an HEVC intra encoder) and image sequences (P and B frames, verified
+against 114 conformance bitstreams) have landed. Next:
+
 - faster single-threaded decoding;
-- an encoder: HEIF writing plus an HEVC intra encoder. As far as I know, it would be the first
-  pure-Rust HEIC encoder;
-- image sequences (inter prediction) are out of scope for now.
+- image sequences in the `image` crate integration and as GIF/APNG in the CLI;
+- encoding image sequences.
 
 ## Feedback welcome
 

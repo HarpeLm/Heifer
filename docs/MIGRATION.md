@@ -16,8 +16,7 @@ The two APIs are shaped differently, so the switch is a rewrite of the call site
 one-line rename. This guide keeps the change mechanical.
 
 > `heifer` targets **HEIC/HEIF with HEVC**. It is not a drop-in for `libheif` pipelines
-> that rely on AVIF, VVC, AVC, JPEG/J2K, image sequences, region annotations, runtime
-> plugins or a streaming reader. See [What you give up](#what-you-give-up) before you start.
+> that rely on AVIF, VVC, AVC, JPEG/J2K, multi-layer HEVC or runtime plugins. See [What you give up](#what-you-give-up) before you start.
 
 ## Contents
 
@@ -121,8 +120,9 @@ match check_file_type(&head) {
 
 Only the first 12 bytes are needed (box size, `ftyp`, major brand); any more are ignored. As
 in `libheif`, only the major brand is read: `heic`/`heix` are `Supported`, a generic
-`mif1`/`mif2` is `MayBe`, and AVIF, JPEG, JPEG 2000 and image sequences are `Unsupported`
-because `heifer` does not decode them.
+`mif1`/`mif2`/`msf1` is `MayBe`, HEVC image sequences (`hevc`, `hevx`) are `Supported`, and
+AVIF, JPEG, JPEG 2000 and multi-layer HEVC (`heim`, `heis`) are `Unsupported` because `heifer`
+does not decode them.
 
 ## Multiple images
 
@@ -376,7 +376,11 @@ match heifer::decode(&bytes) {
 - **`u16` samples by default.** `decode` keeps the coded precision in `u16`; use
   `decode_rgba8` for 8-bit output. `bit_depth` tells you what is meaningful.
 - **No stride.** Rows are packed contiguously; `width * 4` samples per row.
-- **No sequences.** `has_sequence`, `sequence_timescale`, `track_ids` have no equivalent.
+- **Sequences: the main track only.** `heifer::read_sequence` replaces `has_sequence`
+  (`Some` when there is one) and gives the size, the track ID and each frame's duration in
+  seconds (no `sequence_timescale` to divide by). `decode_sequence` iterates over the frames
+  in display order, and `decode_sequence_frame` decodes one. Thumbnail and auxiliary tracks
+  are not exposed, so there is no `track_ids` list.
 
 ## What you give up
 
@@ -392,10 +396,10 @@ match heifer::decode(&bytes) {
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
 | Uncompressed (ISO/IEC 23001-17) | ✓ | auxiliary images only (`unci`) | primary images out of scope |
 | 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
-| Inter-prediction / image sequences (tracks, MP4) | ✓ | — | out of scope (still images only) |
+| Image sequences (tracks, bursts, animations, MP4 with HEVC) | ✓ | ✓ (`read_sequence`, `decode_sequence`) | ready: P and B frames, long-term references, display order; main track only |
 | Depth maps, non-alpha auxiliary images | ✓ | ✓ (`auxiliary_images`, `decode_auxiliary`) | ready |
-| Region annotations / masks | ✓ | — | not implemented |
-| Streaming / network `Reader` | ✓ | — (whole `&[u8]`) | not implemented |
+| Region annotations / masks | ✓ | ✓ (`read_regions`, `add_region_item`) | ready |
+| Streaming / network `Reader` | ✓ | ✓ (`decode_reader`, `Read + Seek`) | ready: only the needed items are read |
 | Runtime codec plugins | ✓ | — | by design (pure Rust, wasm, no `unsafe`) |
 | LUT-based ICC for an RGB input (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) | ✓ | ✓ | ready |
 | ICC output tables (`B2A`) / soft proofing | ✓ | — | not needed to decode |
