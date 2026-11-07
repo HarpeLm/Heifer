@@ -23,6 +23,7 @@
   bi-prediction, up to 8 B frames) decode identically to ffmpeg, and 84 official conformance
   bitstreams (3,735 pictures) match their MD5 picture hashes. `scripts/fetch-conformance.sh`
   fetches the inter streams and a new test decodes every picture of each.
+
 **Fixed**
 
 - Inter blocks used the intra scaling matrices: P and B pictures with scaling lists were
