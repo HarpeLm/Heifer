@@ -427,10 +427,10 @@ pub struct Reconstructor<'a> {
     scratch: Vec<i32>,
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
-    /// `RefPicList0` of the current slice: each picture and its POC.
-    refs_l0: Vec<(&'a Frame, i32)>,
-    /// Explicit weighted prediction of the current slice, per entry of `RefPicList0`.
-    weights_l0: Option<Vec<crate::slice::PredWeight>>,
+    /// `RefPicList0` and `RefPicList1` of the current slice: each picture and its POC.
+    refs: [Vec<(&'a Frame, i32)>; 2],
+    /// Explicit weighted prediction of the current slice, per entry of each list.
+    weights: [Option<Vec<crate::slice::PredWeight>>; 2],
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
 }
@@ -455,8 +455,8 @@ impl<'a> Reconstructor<'a> {
             slice_cr_qp_offset: 0,
             luma_residual: vec![0; 32 * 32],
             scratch: vec![0; 3 * 32 * 32],
-            refs_l0: Vec::new(),
-            weights_l0: None,
+            refs: [Vec::new(), Vec::new()],
+            weights: [None, None],
             error: None,
         }
     }
@@ -476,15 +476,16 @@ impl<'a> Reconstructor<'a> {
         });
     }
 
-    /// Sets `RefPicList0` of the slice whose blocks follow: the reference pictures, already
-    /// filtered, with their POC, and the explicit prediction weights of the slice, if any.
+    /// Sets `RefPicList0` and `RefPicList1` of the slice whose blocks follow: the reference
+    /// pictures, already filtered, with their POC, and the explicit prediction weights of
+    /// each list, if any. `RefPicList1` is empty for P slices.
     pub fn set_references(
         &mut self,
-        l0: Vec<(&'a Frame, i32)>,
-        weights: Option<Vec<crate::slice::PredWeight>>,
+        lists: [Vec<(&'a Frame, i32)>; 2],
+        weights: [Option<Vec<crate::slice::PredWeight>>; 2],
     ) {
-        self.refs_l0 = l0;
-        self.weights_l0 = weights;
+        self.refs = lists;
+        self.weights = weights;
     }
 
     /// Like [`finish`](Self::finish), also returning the motion of every 4×4 luma block, for
@@ -1176,65 +1177,107 @@ impl<'a> Reconstructor<'a> {
     /// Motion compensated prediction of an inter block (§8.5.3.3), written into the picture.
     fn predict_inter(&mut self, pu: &PredictionUnit) -> Result<(), Error> {
         let m = pu.motion;
-        if m.uses(1) {
-            return Err(Error::Unimplemented("bi-prediction"));
+        // The reference picture, its POC and its explicit weights, for each list used.
+        let mut used = [None, None];
+        for (list, slot) in used.iter_mut().enumerate() {
+            if !m.uses(list) {
+                continue;
+            }
+            let i = m.ref_idx[list] as usize;
+            let (reference, poc) = *self.refs[list]
+                .get(i)
+                .ok_or(Error::Invalid("reference index outside the reference list"))?;
+            if reference.widths != self.frame.widths || reference.heights != self.frame.heights {
+                return Err(Error::Invalid("reference picture of another size"));
+            }
+            let weight = match &self.weights[list] {
+                Some(w) => Some(
+                    *w.get(i)
+                        .ok_or(Error::Invalid("reference index outside the weight table"))?,
+                ),
+                None => None,
+            };
+            *slot = Some((reference, poc, weight));
         }
-        let (reference, ref_poc) = *usize::try_from(m.ref_idx[0])
-            .ok()
-            .and_then(|i| self.refs_l0.get(i))
-            .ok_or(Error::Invalid("reference index outside RefPicList0"))?;
-        if reference.widths != self.frame.widths || reference.heights != self.frame.heights {
-            return Err(Error::Invalid("reference picture of another size"));
+        if used == [None, None] {
+            return Err(Error::Invalid("inter block without a reference list"));
         }
-        let weight = match &self.weights_l0 {
-            Some(w) => Some(
-                *w.get(m.ref_idx[0] as usize)
-                    .ok_or(Error::Invalid("reference index outside the weight table"))?,
-            ),
-            None => None,
-        };
         let sub = self.sps.chroma_subsampling();
         let planes = if self.sps.chroma_array_type() == 0 {
             1
         } else {
             3
         };
-        let mut buf = vec![0i32; (pu.w * pu.h) as usize];
+        let n = (pu.w * pu.h) as usize;
+        let mut buf = vec![0i32; 2 * n];
+        let (buf0, buf1) = buf.split_at_mut(n);
         for c in 0..planes {
             let (x, y, w, h) = if c == 0 {
                 (pu.x, pu.y, pu.w, pu.h)
             } else {
                 (pu.x / sub.0, pu.y / sub.1, pu.w / sub.0, pu.h / sub.1)
             };
-            let out = &mut buf[..(w * h) as usize];
-            inter::predict_component(reference, c, pu.x, pu.y, pu.w, pu.h, m.mv[0], sub, out);
-            let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
-            let stride = self.frame.widths[c] as usize;
-            let plane = &mut self.frame.planes[c];
-            for (yy, row) in out.chunks_exact(w as usize).enumerate() {
-                let start = (y as usize + yy) * stride + x as usize;
-                let dst = &mut plane[start..start + w as usize];
-                match weight {
-                    None => {
-                        for (o, &p) in dst.iter_mut().zip(row) {
-                            *o = inter::weight_uni(p, bit_depth);
-                        }
-                    }
-                    Some(wt) => {
-                        let denom = wt.log2_denom[usize::from(c > 0)];
-                        for (o, &p) in dst.iter_mut().zip(row) {
-                            *o = inter::weight_explicit(
-                                p,
-                                bit_depth,
-                                wt.weight[c],
-                                wt.offset[c],
-                                denom,
-                            );
-                        }
-                    }
+            let len = (w * h) as usize;
+            let (out0, out1) = (&mut buf0[..len], &mut buf1[..len]);
+            for (list, out) in [(0, &mut *out0), (1, &mut *out1)] {
+                if let Some((reference, _, _)) = used[list] {
+                    inter::predict_component(
+                        reference, c, pu.x, pu.y, pu.w, pu.h, m.mv[list], sub, out,
+                    );
                 }
             }
-            let _ = h;
+            let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
+            let denom_c = usize::from(c > 0);
+            let stride = self.frame.widths[c] as usize;
+            let plane = &mut self.frame.planes[c];
+            for yy in 0..h as usize {
+                let start = (y as usize + yy) * stride + x as usize;
+                let dst = &mut plane[start..start + w as usize];
+                let row = yy * w as usize..(yy + 1) * w as usize;
+                let (r0, r1) = (&out0[row.clone()], &out1[row]);
+                match (used[0], used[1]) {
+                    (Some((_, _, w0)), Some((_, _, w1))) => match (w0, w1) {
+                        (Some(w0), Some(w1)) => {
+                            for (o, (&p0, &p1)) in dst.iter_mut().zip(r0.iter().zip(r1)) {
+                                *o = inter::weight_explicit_bi(
+                                    [p0, p1],
+                                    bit_depth,
+                                    [w0.weight[c], w1.weight[c]],
+                                    [w0.offset[c], w1.offset[c]],
+                                    w0.log2_denom[denom_c],
+                                );
+                            }
+                        }
+                        _ => {
+                            for (o, (&p0, &p1)) in dst.iter_mut().zip(r0.iter().zip(r1)) {
+                                *o = inter::weight_bi(p0, p1, bit_depth);
+                            }
+                        }
+                    },
+                    (Some((_, _, wt)), None) | (None, Some((_, _, wt))) => {
+                        let r = if used[0].is_some() { r0 } else { r1 };
+                        match wt {
+                            None => {
+                                for (o, &p) in dst.iter_mut().zip(r) {
+                                    *o = inter::weight_uni(p, bit_depth);
+                                }
+                            }
+                            Some(wt) => {
+                                for (o, &p) in dst.iter_mut().zip(r) {
+                                    *o = inter::weight_explicit(
+                                        p,
+                                        bit_depth,
+                                        wt.weight[c],
+                                        wt.offset[c],
+                                        wt.log2_denom[denom_c],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    (None, None) => unreachable!("checked above"),
+                }
+            }
         }
         if !self.pps.constrained_intra_pred_flag {
             self.mark_decoded(pu.x, pu.y, pu.w, pu.h);
@@ -1243,8 +1286,8 @@ impl<'a> Reconstructor<'a> {
         let info = &mut self.filter_info;
         let (x4, y4) = (pu.x as usize >> 2, pu.y as usize >> 2);
         let motion = EdgeMotion {
-            mv: [m.mv[0], [0; 2]],
-            ref_poc: [Some(ref_poc), None],
+            mv: [0, 1].map(|l| if m.uses(l) { m.mv[l] } else { [0; 2] }),
+            ref_poc: used.map(|u| u.map(|(_, poc, _)| poc)),
         };
         for yy in y4..((pu.y + pu.h) as usize).div_ceil(4).min(info.h4) {
             info.edges[yy * info.w4 + x4] |= 4;

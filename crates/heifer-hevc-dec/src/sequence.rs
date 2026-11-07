@@ -227,8 +227,11 @@ impl SequenceDecoder {
                     header.list_entry_l0.as_deref(),
                 )?;
                 recon.set_references(
-                    l0.iter().map(|r| (&dpb[r.slot].frame, r.poc)).collect(),
-                    header.pred_weights.clone(),
+                    [
+                        l0.iter().map(|r| (&dpb[r.slot].frame, r.poc)).collect(),
+                        Vec::new(),
+                    ],
+                    [header.pred_weights.clone(), None],
                 );
                 l0_pocs = l0.iter().map(|r| r.poc).collect();
                 if header.slice_temporal_mvp_enabled_flag {

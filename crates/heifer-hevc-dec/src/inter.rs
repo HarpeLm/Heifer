@@ -669,6 +669,28 @@ pub fn weight_explicit(pred: i32, bit_depth: u8, weight: i32, offset: i32, log2_
     v.clamp(0, max) as u16
 }
 
+/// Default weighted sample prediction of a bi-predicted block (8-264): the average of the
+/// two predictions.
+pub fn weight_bi(p0: i32, p1: i32, bit_depth: u8) -> u16 {
+    let shift = 15 - i32::from(bit_depth);
+    ((p0 + p1 + (1 << (shift - 1))) >> shift).clamp(0, (1 << bit_depth) - 1) as u16
+}
+
+/// Explicit weighted sample prediction of a bi-predicted block (8-270): the two
+/// predictions weighted, with the average of the two offsets.
+pub fn weight_explicit_bi(
+    pred: [i32; 2],
+    bit_depth: u8,
+    weight: [i32; 2],
+    offset: [i32; 2],
+    log2_denom: u8,
+) -> u16 {
+    let log2_wd = i32::from(log2_denom) + 14 - i32::from(bit_depth);
+    let v = (pred[0] * weight[0] + pred[1] * weight[1] + ((offset[0] + offset[1] + 1) << log2_wd))
+        >> (log2_wd + 1);
+    v.clamp(0, (1 << bit_depth) - 1) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +785,22 @@ mod tests {
             [-1, 0],
             "spatial candidates are copied as they are"
         );
+    }
+
+    #[test]
+    fn bi_prediction_averages_and_weights() {
+        // 8-bit samples at 14-bit precision: 100 << 6 and 103 << 6.
+        let (p0, p1) = (100 << 6, 103 << 6);
+        assert_eq!(weight_bi(p0, p1, 8), 102); // (100 + 103 + 1) / 2, rounded up
+        assert_eq!(weight_bi(p0, p0, 8), 100);
+        // Weights 1/1 with denominator 0 and no offset give the plain average.
+        assert_eq!(weight_explicit_bi([p0, p1], 8, [1, 1], [0, 0], 0), 102);
+        // Each weight is over 2^denom and the sum is halved: 6 and 2 over 4 blend 100 and
+        // 200 as 3/4 and 1/4, plus the average of offsets 4 and 6.
+        let p = [100 << 6, 200 << 6];
+        assert_eq!(weight_explicit_bi(p, 8, [6, 2], [4, 6], 2), 130);
+        assert_eq!(weight_bi(0, 0, 10), 0);
+        assert_eq!(weight_bi(i32::from(u16::MAX), 1 << 14, 8), 255);
     }
 
     #[test]
