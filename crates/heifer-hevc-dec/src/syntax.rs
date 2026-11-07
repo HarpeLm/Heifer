@@ -318,7 +318,7 @@ pub struct SliceStats {
 
 /// Parses the data of one slice segment. `data` is the RBSP after the slice header.
 ///
-/// `refs` describes the reference pictures of a P slice; it is ignored for I slices.
+/// `refs` describes the reference pictures of a P or B slice; it is ignored for I slices.
 pub fn decode_slice_segment(
     pic: &mut Picture<'_>,
     header: &SliceHeader,
@@ -334,9 +334,8 @@ pub fn decode_slice_segment(
     }
     let refs = match header.slice_type {
         SliceType::I => None,
-        SliceType::B => return Err(Error::Unimplemented("B slices (bi-prediction)")),
-        SliceType::P => {
-            let refs = refs.ok_or(Error::Invalid("P slice without reference pictures"))?;
+        SliceType::P | SliceType::B => {
+            let refs = refs.ok_or(Error::Invalid("inter slice without reference pictures"))?;
             if pic.sps.range_extension.explicit_rdpcm_enabled_flag {
                 return Err(Error::Unimplemented(
                     "explicit RDPCM (inter range extension)",
@@ -345,9 +344,12 @@ pub fn decode_slice_segment(
             if pic.sps.bit_depth_luma > 12 || pic.sps.bit_depth_chroma > 12 {
                 return Err(Error::Unimplemented("inter prediction above 12 bits"));
             }
-            if refs.lists[0].len() < usize::from(header.num_ref_idx_l0_active_minus1) + 1 {
+            if refs.lists[0].len() < usize::from(header.num_ref_idx_l0_active_minus1) + 1
+                || (header.slice_type == SliceType::B
+                    && refs.lists[1].len() < usize::from(header.num_ref_idx_l1_active_minus1) + 1)
+            {
                 return Err(Error::Invalid(
-                    "RefPicList0 shorter than the active references",
+                    "reference list shorter than the active references",
                 ));
             }
             Some(*refs)
@@ -432,7 +434,7 @@ struct Parser<'p, 'a> {
     sao_luma: bool,
     sao_chroma: bool,
     cu_chroma_qp_offset_enabled: bool,
-    /// Reference pictures of a P slice; `None` for I slices.
+    /// Reference pictures of a P or B slice; `None` for I slices.
     refs: Option<SliceRefs<'p>>,
     /// `MaxNumMergeCand`.
     max_num_merge_cand: usize,

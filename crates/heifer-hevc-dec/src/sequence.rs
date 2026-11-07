@@ -2,8 +2,8 @@
 //! reference picture sets and the decoded picture buffer (§8.3), then each picture's slices
 //! with inter prediction from the pictures kept for reference.
 //!
-//! Pictures are returned in decoding order. P slices are supported; B slices, long-term
-//! reference pictures and weighted prediction are rejected with [`Error::Unimplemented`].
+//! Pictures are returned in decoding order. P and B slices are supported; long-term
+//! reference pictures are rejected with [`Error::Unimplemented`].
 
 use crate::Error;
 use crate::decoder::{DEFAULT_MAX_PIXELS, DecodeOptions};
@@ -11,7 +11,7 @@ use crate::inter::{MotionField, SliceRefs};
 use crate::nal::{NalUnit, NalUnitType, split_annex_b};
 use crate::params::ParameterSets;
 use crate::recon::{Frame, Reconstructor};
-use crate::refs::{PocState, RefPic, build_ref_pic_list0};
+use crate::refs::{PocState, RefPic, build_ref_pic_list0, build_ref_pic_list1};
 use crate::scan::tiles_fit;
 use crate::sei::parse_picture_hash;
 use crate::slice::{SliceHeader, SliceType};
@@ -215,38 +215,51 @@ impl SequenceDecoder {
             }
             recon.start_slice(&header);
 
-            let mut l0_pocs = Vec::new();
-            let mut col = None;
-            if header.slice_type == SliceType::P {
-                let num_active = usize::from(header.num_ref_idx_l0_active_minus1) + 1;
-                let l0 = build_ref_pic_list0(
+            // Reference picture lists (§8.3.4) and the collocated picture (§8.5.3.2.8).
+            let inter = header.slice_type != SliceType::I;
+            let mut lists: [Vec<RefPic>; 2] = [Vec::new(), Vec::new()];
+            if inter {
+                lists[0] = build_ref_pic_list0(
                     poc,
                     &header.st_rps,
                     &pictures,
-                    num_active,
+                    usize::from(header.num_ref_idx_l0_active_minus1) + 1,
                     header.list_entry_l0.as_deref(),
                 )?;
-                recon.set_references(
-                    [
-                        l0.iter().map(|r| (&dpb[r.slot].frame, r.poc)).collect(),
-                        Vec::new(),
-                    ],
-                    [header.pred_weights.clone(), None],
-                );
-                l0_pocs = l0.iter().map(|r| r.poc).collect();
-                if header.slice_temporal_mvp_enabled_flag {
-                    let r = l0
-                        .get(usize::from(header.collocated_ref_idx))
-                        .ok_or(Error::Invalid("collocated_ref_idx out of range"))?;
-                    col = Some(&dpb[r.slot].motion);
-                }
+            }
+            if header.slice_type == SliceType::B {
+                lists[1] = build_ref_pic_list1(
+                    poc,
+                    &header.st_rps,
+                    &pictures,
+                    usize::from(header.num_ref_idx_l1_active_minus1) + 1,
+                    header.list_entry_l1.as_deref(),
+                )?;
+            }
+            recon.set_references(
+                [0, 1].map(|l| {
+                    lists[l]
+                        .iter()
+                        .map(|r| (&dpb[r.slot].frame, r.poc))
+                        .collect()
+                }),
+                [header.pred_weights.clone(), header.pred_weights_l1.clone()],
+            );
+            let pocs = [0, 1].map(|l| lists[l].iter().map(|r| r.poc).collect::<Vec<i32>>());
+            let mut col = None;
+            if inter && header.slice_temporal_mvp_enabled_flag {
+                let from = usize::from(!header.collocated_from_l0_flag);
+                let r = lists[from]
+                    .get(usize::from(header.collocated_ref_idx))
+                    .ok_or(Error::Invalid("collocated_ref_idx out of range"))?;
+                col = Some(&dpb[r.slot].motion);
             }
             let refs = SliceRefs {
                 poc,
-                lists: [&l0_pocs, &[]],
+                lists: [&pocs[0], &pocs[1]],
                 col,
                 collocated_from_l0: header.collocated_from_l0_flag,
-                no_backward_pred: l0_pocs.iter().all(|&p| p <= poc),
+                no_backward_pred: pocs.iter().flatten().all(|&p| p <= poc),
                 pic_size: (
                     sps.pic_width_in_luma_samples,
                     sps.pic_height_in_luma_samples,
@@ -259,7 +272,7 @@ impl SequenceDecoder {
                 &header,
                 header.slice_qp_y(&self.sets)?,
                 data,
-                (header.slice_type == SliceType::P).then_some(&refs),
+                inter.then_some(&refs),
                 recon,
             )?;
             if let Some(e) = recon.error.take() {
