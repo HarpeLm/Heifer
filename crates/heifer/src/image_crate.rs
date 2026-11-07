@@ -7,6 +7,19 @@
 //!
 //! [`HeifDecoder`] can also be used directly with `image::DynamicImage::from_decoder`.
 //!
+//! [`HeifSequenceDecoder`] reads image sequences (bursts, animations, `.heics`) as an
+//! [`image::AnimationDecoder`], frame by frame in display order:
+//!
+//! ```no_run
+//! use image::AnimationDecoder;
+//! let file = std::fs::File::open("burst.heics").unwrap();
+//! let decoder = heifer::image_crate::HeifSequenceDecoder::new(file).unwrap();
+//! for frame in decoder.into_frames() {
+//!     let frame = frame.unwrap();
+//!     println!("{:?} {}×{}", frame.delay(), frame.buffer().width(), frame.buffer().height());
+//! }
+//! ```
+//!
 //! With the `encoder` feature (default), `HeifEncoder` writes HEIC files from any image of the
 //! `image` crate:
 //!
@@ -113,6 +126,81 @@ impl HeifDecoder {
         let image = crate::decode_with_options(bytes, options).map_err(decoding_error)?;
         let metadata = crate::read_metadata(bytes).map_err(decoding_error)?;
         Ok(Self { image, metadata })
+    }
+}
+
+/// An [`image::AnimationDecoder`] for the image sequence of a HEIF file (see the module
+/// documentation). Frames are RGBA 8-bit, in display order, each with its duration.
+pub struct HeifSequenceDecoder {
+    bytes: Vec<u8>,
+    options: Options,
+    /// Duration of each frame, in display order.
+    delays: Vec<image::Delay>,
+}
+
+impl HeifSequenceDecoder {
+    /// Reads a whole HEIF file; fails if it holds no image sequence.
+    pub fn new(reader: impl Read) -> ImageResult<Self> {
+        Self::with_options(reader, &Options::default())
+    }
+
+    /// Like [`new`](Self::new), with heifer options.
+    pub fn with_options(mut reader: impl Read, options: &Options) -> ImageResult<Self> {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(ImageError::IoError)?;
+        Self::from_bytes(bytes, options)
+    }
+
+    /// A decoder for a HEIF file held in memory.
+    pub fn from_bytes(bytes: Vec<u8>, options: &Options) -> ImageResult<Self> {
+        let info = crate::read_sequence(&bytes)
+            .map_err(decoding_error)?
+            .ok_or_else(|| decoding_error(crate::Error::Invalid("file has no image sequence")))?;
+        let delays = info
+            .frames
+            .iter()
+            .map(|f| {
+                // Microseconds keep the timing of any timescale within a microsecond.
+                let micros = (f.duration * 1e6).round().clamp(0.0, f64::from(u32::MAX)) as u32;
+                image::Delay::from_numer_denom_ms(micros, 1000)
+            })
+            .collect();
+        Ok(Self {
+            bytes,
+            options: *options,
+            delays,
+        })
+    }
+
+    /// Number of frames.
+    pub fn len(&self) -> usize {
+        self.delays.len()
+    }
+
+    /// Whether the sequence has no frame.
+    pub fn is_empty(&self) -> bool {
+        self.delays.is_empty()
+    }
+}
+
+impl<'a> image::AnimationDecoder<'a> for HeifSequenceDecoder {
+    fn into_frames(self) -> image::Frames<'a> {
+        let delays = self.delays;
+        let frames = match crate::sequence::decode_sequence_owned(self.bytes, &self.options) {
+            Ok(frames) => frames,
+            Err(e) => return image::Frames::new(Box::new(std::iter::once(Err(decoding_error(e))))),
+        };
+        let iter = frames.zip(delays).map(|(frame, delay)| {
+            let frame = frame.map_err(decoding_error)?;
+            let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.to_rgba8())
+                .ok_or_else(|| {
+                    decoding_error(crate::Error::Invalid("frame of an unexpected size"))
+                })?;
+            Ok(image::Frame::from_parts(buffer, 0, 0, delay))
+        });
+        image::Frames::new(Box::new(iter))
     }
 }
 

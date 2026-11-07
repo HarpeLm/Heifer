@@ -209,3 +209,44 @@ fn decoder_with_options() {
     };
     assert!(heifer::image_crate::HeifDecoder::with_options(&heic[..], &small).is_err());
 }
+
+#[test]
+fn sequences_decode_as_animations() {
+    use heifer::image_crate::HeifSequenceDecoder;
+    use image::AnimationDecoder;
+
+    // 24 frames of 40 ms whose brightness grows with the display index (see sequence.rs).
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+    )
+    .unwrap();
+    let decoder = HeifSequenceDecoder::new(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(decoder.len(), 24);
+    let frames = decoder.into_frames().collect_frames().unwrap();
+    assert_eq!(frames.len(), 24);
+    let mean = |f: &image::Frame| {
+        let b = f.buffer();
+        b.pixels().map(|p| f64::from(p.0[1])).sum::<f64>() / f64::from(b.width() * b.height())
+    };
+    for pair in frames.windows(2) {
+        assert!(mean(&pair[1]) > mean(&pair[0]) + 3.0, "frames out of order");
+    }
+    for f in &frames {
+        assert_eq!(f.delay().numer_denom_ms(), (40, 1));
+        assert_eq!(f.buffer().dimensions(), (128, 96));
+        assert_eq!((f.left(), f.top()), (0, 0));
+    }
+    // The same pixels as heifer's own iterator.
+    let own: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(frames[5].buffer().as_raw(), &own[5].to_rgba8());
+
+    // A still image without a sequence is refused.
+    if let Some(p) = path("single_image.heic") {
+        let still = std::fs::read(p).unwrap();
+        assert!(heifer::decode(&still).is_ok());
+        assert!(HeifSequenceDecoder::from_bytes(still, &heifer::Options::default()).is_err());
+    }
+}

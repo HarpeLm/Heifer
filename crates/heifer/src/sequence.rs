@@ -104,6 +104,16 @@ pub fn decode_sequence_with_options<'a>(
     SequenceFrames::new(bytes, track, 0, options)
 }
 
+/// Like [`decode_sequence_with_options`], taking ownership of the file.
+#[cfg(feature = "image")]
+pub(crate) fn decode_sequence_owned(
+    bytes: Vec<u8>,
+    options: &Options,
+) -> Result<SequenceFrames<'static>, Error> {
+    let track = main_track(&bytes)?.ok_or(Error::Invalid("file has no image sequence"))?;
+    SequenceFrames::new(bytes, track, 0, options)
+}
+
 /// Decodes frame `index` (in display order) of the main sequence, from the keyframe before
 /// it in decoding order.
 pub fn decode_sequence_frame(bytes: &[u8], index: usize) -> Result<Image, Error> {
@@ -136,7 +146,8 @@ pub fn decode_sequence_frame_with_options(
 
 /// The frames of an image sequence, decoded one by one (see [`decode_sequence`]).
 pub struct SequenceFrames<'a> {
-    bytes: &'a [u8],
+    /// The file: borrowed, or owned by the `image` crate integration.
+    bytes: std::borrow::Cow<'a, [u8]>,
     track: Track,
     decoder: SequenceDecoder,
     /// Next sample to decode, in decoding order.
@@ -159,7 +170,13 @@ impl std::fmt::Debug for SequenceFrames<'_> {
 }
 
 impl<'a> SequenceFrames<'a> {
-    fn new(bytes: &'a [u8], track: Track, start: usize, options: &Options) -> Result<Self, Error> {
+    fn new(
+        bytes: impl Into<std::borrow::Cow<'a, [u8]>>,
+        track: Track,
+        start: usize,
+        options: &Options,
+    ) -> Result<Self, Error> {
+        let bytes = bytes.into();
         let config = track
             .hevc_config
             .as_ref()
@@ -200,7 +217,7 @@ impl<'a> SequenceFrames<'a> {
             .as_ref()
             .ok_or(Error::Invalid("sequence without HEVC configuration"))?;
         // Parameter sets come from hvcC: the sample holds the picture's NAL units only.
-        let data = self.track.sample_data(self.bytes, index)?;
+        let data = self.track.sample_data(&self.bytes, index)?;
         let stream = hevc_annex_b(
             &heifer_isobmff::boxes::HevcConfig {
                 nal_units: Vec::new(),
