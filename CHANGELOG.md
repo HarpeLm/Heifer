@@ -12,13 +12,24 @@
   AMVP with motion vector scaling, temporal motion vector prediction, all partition modes
   including AMP, 8-tap luma and 4-tap chroma interpolation, explicit weighted prediction,
   constrained intra prediction, and deblocking boundary strengths of inter blocks, in 4:0:0
-  to 4:4:4 up to 12 bits. B slices (bi-prediction) and long-term reference pictures return
-  `Error::Unsupported`.
+  to 4:4:4 up to 12 bits. Long-term reference pictures return `Error::Unsupported`.
+- B frames: `RefPicList1`, bi-prediction (default and explicit weights), combined
+  bi-predictive and zero merge candidates on both lists, and the collocated picture from
+  either list. Frames are returned in decoding order; with B frames this differs from the
+  display order.
 - Verified: the 300 frames of the three Nokia sequences and 12 x265 streams (several
   references, AMP, slices, WPP, CTU sizes, open GOP, lossless, transform skip, 10-bit, 4:2:2,
-  4:4:4, weighted prediction) decode identically to ffmpeg, and 52 official conformance
-  bitstreams (2,655 pictures) match their MD5 picture hashes. `scripts/fetch-conformance.sh`
+  4:4:4, weighted prediction) and three x265 streams with B frames (pyramid, weighted
+  bi-prediction, up to 8 B frames) decode identically to ffmpeg, and 84 official conformance
+  bitstreams (3,735 pictures) match their MD5 picture hashes. `scripts/fetch-conformance.sh`
   fetches the inter streams and a new test decodes every picture of each.
+**Fixed**
+
+- Inter blocks used the intra scaling matrices: P and B pictures with scaling lists were
+  wrong (matrixId is 3 to 5 for inter blocks).
+
+**Changed**
+
 - A PPS may now arrive before its SPS: it is parsed when the SPS arrives, and again when the
   SPS changes.
 

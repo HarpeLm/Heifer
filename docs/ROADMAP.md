@@ -89,8 +89,9 @@ pure-Rust, lightweight and HEVC-only promise.
 - AVIF / AV1: a separate crate could reuse the container, not the core codec.
 - VVC / H.266, AVC / H.264: no mature pure-Rust implementation.
 - JPEG and JPEG 2000 inside HEIF.
-- Image sequences: P frames are done (DPB, merge/AMVP, TMVP, weighted prediction, verified
-  against ffmpeg and the conformance MD5s); B frames and long-term references remain.
+- Image sequences: P and B frames are done (DPB, merge/AMVP, TMVP, bi-prediction, weighted
+  prediction, verified against ffmpeg and the conformance MD5s). Remaining: frames in display
+  order (`ctts`), long-term references, explicit RDPCM.
 - Uncompressed images as primary images.
 
 The target is a credible HEIC/HEVC alternative to libheif, not a libheif clone.
