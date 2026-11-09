@@ -548,14 +548,6 @@ fn decode_item_with<S: Sample>(
         return Err(Error::Invalid("derived images nested too deeply"));
     }
     let item = file.item(id)?;
-    // Uncompressed items are only decoded as auxiliary images: heifer is an HEVC codec, not a
-    // general uncompressed image decoder.
-    if item.item_type.0 == *b"unci" && !is_auxiliary_item(file, id)? {
-        return Err(Error::Unsupported(format!(
-            "image item type `{}`",
-            item.item_type
-        )));
-    }
     let mut image = match &item.item_type.0 {
         b"hvc1" => decode_hvc1(file, id, options)?,
         b"unci" => uncompressed::decode(file, id, options)?,
@@ -703,17 +695,6 @@ fn is_depth_urn(urn: &str) -> bool {
         urn,
         "urn:mpeg:hevc:2015:auxid:2" | "urn:mpeg:mpegB:cicp:systems:auxiliary:depth"
     )
-}
-
-/// Whether an item is an auxiliary image: it has an `auxC` type and points to the image it
-/// refines with an `auxl` reference.
-fn is_auxiliary_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
-    if file.referenced_items(id, b"auxl").is_empty() {
-        return Ok(false);
-    }
-    Ok(file
-        .item_properties(id)?
-        .any(|p| matches!(p, Property::AuxiliaryType(_))))
 }
 
 /// Whether an item is an auxiliary image of type alpha.

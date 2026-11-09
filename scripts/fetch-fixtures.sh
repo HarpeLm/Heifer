@@ -27,3 +27,10 @@ fetch "$CONFORMANCE/C039.heic"                 iden_nested.heic
 fetch https://raw.githubusercontent.com/strukturag/libheif/master/examples/example.heic libheif_example.heic
 # A Samsung photo with an ISO 21496-1 gain map (tmap item).
 fetch "$PILLOW/tests/images/heif_special/aux_YCbCr.heic" real/heif_special__aux_YCbCr.heic
+# Uncompressed images (ISO/IEC 23001-17), from libheif's (LGPL-3.0) test data.
+LIBHEIF_UNCOMPRESSED=https://raw.githubusercontent.com/strukturag/libheif/bb5e04a1c93d5e421e0936374fc11e01930f6768/tests/data
+for name in uncompressed_comp_RGB uncompressed_comp_RGB_tiled uncompressed_pix_RGB_tiled \
+            uncompressed_row_RGB_tiled uncompressed_tile_RGB_tiled uncompressed_comp_ABGR \
+            uncompressed_comp_M uncompressed_comp_B16R16G16 uncompressed_comp_YUV_420; do
+  fetch "$LIBHEIF_UNCOMPRESSED/$name.heif" "real/libheif__$name.heif"
+done

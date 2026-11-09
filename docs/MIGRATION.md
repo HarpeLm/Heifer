@@ -310,10 +310,14 @@ Each auxiliary image is decoded with its own `clap`/`irot`/`imir` properties; th
 the primary image are not applied on top. `item_auxiliary_images` does the same for an image
 other than the primary, and `decode_all` still returns only top-level images.
 
-Uncompressed auxiliary images (`unci`, ISO/IEC 23001-17) are decoded the same way. Single
-component, unsigned frames of 1 to 16 bits are supported, with the component, pixel and row
-alignment declared by `uncC`. Uncompressed primary images stay unsupported: `heifer` remains an
-HEVC codec.
+Uncompressed images (`unci`, ISO/IEC 23001-17) are decoded by `decode`, and by `decode_auxiliary`
+when they are auxiliary images. One to four unsigned components of 1 to 16 bits are supported,
+with the component, pixel, row, mixed and tile-component interleave modes, tiles, 4:2:2 / 4:2:0 /
+4:1:1 subsampling, and the component, pixel, row and tile alignments declared by `uncC`. The
+`cmpd` component descriptions say what each component holds; without `cmpd`, the usual RGB, RGBA,
+mono and mono plus alpha layouts are assumed. RGB is copied as is, and YCbCr uses the same colour
+conversion as HEVC. Blocks, floating-point or signed samples, little-endian samples and generic
+compression (`cmpC`) are refused as `Unsupported`.
 
 ## Error handling
 
@@ -394,7 +398,7 @@ match heifer::decode(&bytes) {
 | EXIF / XMP / ICC | ✓ | ✓ | ready |
 | Multiple top-level images (burst, collection, dynamic HEIF) | ✓ | ✓ (`decode_all`) | ready |
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
-| Uncompressed (ISO/IEC 23001-17) | ✓ | auxiliary images only (`unci`) | primary images out of scope |
+| Uncompressed (ISO/IEC 23001-17) | ✓ | ✓ (`unci` as primary and auxiliary images) | ready for the supported layouts |
 | 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
 | Image sequences (tracks, bursts, animations, MP4 with HEVC) | ✓ | ✓ (`read_sequence`, `decode_sequence`) | ready: P and B frames, long-term references, display order; main track only |
 | Depth maps, non-alpha auxiliary images | ✓ | ✓ (`auxiliary_images`, `decode_auxiliary`) | ready |

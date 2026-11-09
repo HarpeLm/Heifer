@@ -11,7 +11,7 @@ Items are ordered by user impact.
 
 - Latest release: 0.3.29, IPTC metadata, decoding from a reader, faster CABAC.
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
-  auxiliary planes.
+  images (`unci`).
 - Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
 - Conformance: 66 official HEVC bitstreams, no unsupported stream.
 
@@ -34,16 +34,18 @@ The CLI now codes HEIC in 4:2:0, 4:4:4 or lossless, with the default unchanged.
 - `--format 420|444|lossless`.
 - `--lossless` as a shortcut.
 
-### Uncompressed auxiliary images (`unci`)
+### Uncompressed images (`unci`)
 
-Decode ISO/IEC 23001-17 uncompressed items when they are auxiliary images (depth maps, alpha
-planes, gain maps). Uncompressed items stay unsupported as primary images: heifer remains an
-HEVC codec, not a general uncompressed image container.
+Decode ISO/IEC 23001-17 uncompressed items, as primary images and as auxiliary images (depth
+maps, alpha planes, gain maps). This is the one deliberate exception to heifer being an HEVC
+codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 
-- Parse the `uncC` frame configuration.
-- Support unsigned single-component frames, 1 to 16 bits, no subsampling, one tile.
-- Honour component alignment, pixel size and row alignment.
-- Keep a clear `Unsupported` error for layouts outside that subset.
+- Parse the `uncC` frame configuration and the `cmpd` component descriptions.
+- Support one to four unsigned components of 1 to 16 bits, the component, pixel, row, mixed and
+  tile-component interleave modes, tiles, 4:2:2 / 4:2:0 / 4:1:1 subsampling, and the alignment
+  fields.
+- Refuse blocks, floating-point or signed samples, little-endian samples and generic compression
+  (`cmpC`) with a clear `Unsupported` error.
 
 ### IPTC metadata (#4)
 
@@ -93,6 +95,5 @@ pure-Rust, lightweight and HEVC-only promise.
   prediction, verified against ffmpeg and the conformance MD5s). Frames come out in display
   order (`ctts`); long-term references and explicit RDPCM are supported. 114
   conformance streams match their MD5.
-- Uncompressed images as primary images.
 
 The target is a credible HEIC/HEVC alternative to libheif, not a libheif clone.

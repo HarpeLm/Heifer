@@ -538,8 +538,8 @@ fn uncompressed_depth_auxiliary_honours_pixel_size() {
 }
 
 #[test]
-fn uncompressed_primary_image_stays_unsupported() {
-    let samples = [0u8; 4 * 3];
+fn uncompressed_primary_image_is_decoded() {
+    let samples: Vec<u8> = (0..4 * 3).map(|i| (i * 17) as u8).collect();
     let layout = Uncompressed {
         width: 4,
         height: 3,
@@ -551,11 +551,17 @@ fn uncompressed_primary_image_stays_unsupported() {
     };
     let bytes = uncompressed_file(&layout, &samples, false);
     assert!(heifer::auxiliary_images(&bytes).unwrap().is_empty());
-    let error = heifer::decode(&bytes).expect_err("unci is not a primary image codec");
-    assert!(
-        matches!(&error, Error::Unsupported(message) if message.contains("unci")),
-        "unexpected error: {error}"
-    );
+    let image = heifer::decode(&bytes).expect("unci is decoded as a primary image");
+    assert_eq!((image.width, image.height, image.bit_depth), (4, 3, 8));
+    assert!(!image.has_alpha);
+    for (i, &sample) in samples.iter().enumerate() {
+        let pixel = &image.data[i * 4..i * 4 + 4];
+        assert_eq!(
+            pixel,
+            [u16::from(sample), u16::from(sample), u16::from(sample), 255],
+            "pixel {i}"
+        );
+    }
 }
 
 #[test]

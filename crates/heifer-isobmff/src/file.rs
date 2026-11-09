@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 
 use crate::boxes::{
-    self, ConstructionMethod, FileType, Grid, HevcConfig, ItemLocation, ItemReference, Property,
-    PropertyAssociation, UncompressedConfig,
+    self, ComponentDescriptions, ConstructionMethod, FileType, Grid, HevcConfig, ItemLocation,
+    ItemReference, Property, PropertyAssociation, UncompressedConfig,
 };
 use crate::{BoxIter, Error, FourCC};
 
@@ -215,6 +215,17 @@ impl<'a> HeifFile<'a> {
     pub fn uncompressed_config(&self, id: ItemId) -> Result<Option<&UncompressedConfig>, Error> {
         Ok(self.item_properties(id)?.find_map(|p| match p {
             Property::UncompressedConfig(config) => Some(config),
+            _ => None,
+        }))
+    }
+
+    /// Component descriptions from the `cmpd` property (ISO/IEC 23001-17).
+    pub fn component_descriptions(
+        &self,
+        id: ItemId,
+    ) -> Result<Option<&ComponentDescriptions>, Error> {
+        Ok(self.item_properties(id)?.find_map(|p| match p {
+            Property::ComponentDescriptions(components) => Some(components),
             _ => None,
         }))
     }

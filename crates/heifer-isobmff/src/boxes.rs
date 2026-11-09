@@ -438,6 +438,50 @@ pub struct UncompressedComponent {
     pub align_size: u8,
 }
 
+/// One component description of a `cmpd` box (ISO/IEC 23001-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentDescription {
+    /// Component type code: 0 monochrome, 1 Y, 2 Cb, 3 Cr, 4 red, 5 green, 6 blue, 7 alpha,
+    /// 8 depth, 9 disparity, 10 palette, 11 filter array, 12 padded, 13 to 16 CMYK.
+    pub component_type: u16,
+    /// Type URI when the component type code is 0x8000 or above.
+    pub uri: Option<String>,
+}
+
+/// `cmpd`: component descriptions of an uncompressed frame (ISO/IEC 23001-17).
+///
+/// The `uncC` components index into this list to say what each coded component holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentDescriptions {
+    /// Components, in the order `uncC` indexes them.
+    pub components: Vec<ComponentDescription>,
+}
+
+impl ComponentDescriptions {
+    /// Parses the content of a `cmpd` box.
+    pub fn parse(content: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(content);
+        let count = r.u32()?;
+        if count > 256 {
+            return Err(invalid(b"cmpd", "too many components"));
+        }
+        let mut components = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let component_type = r.u16()?;
+            let uri = if component_type >= 0x8000 {
+                Some(r.cstring())
+            } else {
+                None
+            };
+            components.push(ComponentDescription {
+                component_type,
+                uri,
+            });
+        }
+        Ok(Self { components })
+    }
+}
+
 /// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
 ///
 /// Version 0 describes the components explicitly. Version 1 uses a four-character profile code
@@ -593,6 +637,8 @@ pub enum Property {
     PixelInfo(Vec<u8>),
     /// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
     UncompressedConfig(UncompressedConfig),
+    /// `cmpd`: component descriptions of an uncompressed frame (ISO/IEC 23001-17).
+    ComponentDescriptions(ComponentDescriptions),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
     /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
@@ -643,6 +689,7 @@ impl Property {
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
             b"uncC" => Self::UncompressedConfig(UncompressedConfig::parse(content)?),
+            b"cmpd" => Self::ComponentDescriptions(ComponentDescriptions::parse(content)?),
             b"irot" => Self::Rotation(r.u8()? & 0x03),
             b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {

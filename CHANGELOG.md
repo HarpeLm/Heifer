@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- Uncompressed images (`unci`, ISO/IEC 23001-17) are decoded as primary images, not only as
+  auxiliary ones. One to four unsigned components of 1 to 16 bits are supported, with the
+  component, pixel, row, mixed and tile-component interleave modes, tiles, 4:2:2 / 4:2:0 / 4:1:1
+  subsampling, and the component, pixel, row and tile alignments. RGB and RGBA are copied straight
+  into the RGBA image, mono is replicated, and YCbCr goes through the same colour conversion as
+  HEVC. Blocks, floating-point or signed samples, little-endian samples and generic compression
+  (`cmpC`) are refused with `Error::Unsupported`.
+- `heifer_isobmff::boxes::ComponentDescriptions` parses the `cmpd` box and
+  `HeifFile::component_descriptions` returns it, so an uncompressed frame can say what each
+  component holds (red, green, blue, alpha, Y, Cb, Cr, mono). Without `cmpd`, the usual component
+  counts are assumed (1 mono, 2 mono and alpha, 3 RGB, 4 RGBA).
+
 ## 0.5.0 — 2026-11-07
 
 Image sequences decode completely: P and B frames, long-term references, in display order,
