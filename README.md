@@ -429,6 +429,17 @@ the only place breaking changes go, and they are listed first in the
 releases are kept to a few a year, so pinning an exact version stays practical. Public enums
 that may grow are `#[non_exhaustive]`.
 
+**What semver covers.** The `heifer` crate, `heifer-isobmff`, the `encoder` module of
+`heifer-hevc-enc`, and the documented items of `heifer-hevc-dec` (`decoder`, `sequence`, and the
+items re-exported at its root: `Frame`, `DecodeOptions`, `SequenceDecoder`, `access_units`, ...).
+The other modules of the two codec crates are hidden from the documentation: they are public only
+because heifer's own crates and fuzz targets share them, and they may change in any release.
+Modules marked `#[deprecated]` will become private in 0.6.
+
+Prefer the construction methods of the option structs to struct literals:
+`Options::new().with_max_threads(1)` keeps compiling when options are added, `Options { .. }`
+may not.
+
 ## <img src="docs/icons/map.svg" width="24" height="24" align="top"> Roadmap
 
 - [x] **0.1 — Decoder**: container, HEVC, conformance, real photos, metadata, `image`, WebAssembly, fuzzing

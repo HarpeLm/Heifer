@@ -18,12 +18,24 @@
 //! assert_eq!(frame.planes[0][0], 128);
 //! ```
 
+// Inside the crate, the deprecated modules are used freely: the deprecation is a notice for
+// other crates.
+#![allow(deprecated)]
+
+// `encoder` is the stable API. `cabac` is internal (used by the fuzz targets) and hidden from
+// the documentation; `transform` is used by nothing outside the crate.
+#[doc(hidden)]
 pub mod cabac;
 pub mod encoder;
 mod estimate;
 mod params;
 mod rdo;
 mod sao;
+#[doc(hidden)]
+#[deprecated(
+    since = "0.5.1",
+    note = "internal to the encoder; it will become private in 0.6"
+)]
 pub mod transform;
 
 /// Errors produced while encoding an image.

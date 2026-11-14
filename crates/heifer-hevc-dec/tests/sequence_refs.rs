@@ -4,6 +4,8 @@
 //! This checks the reference picture set parsing, the POC state and the list construction
 //! without decoding any sample data, which is the state of the decoder before inter prediction
 //! lands. Missing fixtures are skipped.
+// These tests check internal modules directly; they move into the crate in 0.6.
+#![allow(deprecated)]
 
 use heifer_hevc_dec::nal::{NalUnit, NalUnitType, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;

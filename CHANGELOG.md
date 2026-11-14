@@ -2,7 +2,20 @@
 
 ## Unreleased
 
+**Deprecated**
+
+- Internal modules that nothing outside their crate uses will become private in 0.6:
+  `bitreader`, `filters`, `inter`, `refs` and `sei` of `heifer-hevc-dec`, and `transform` of
+  `heifer-hevc-enc`. They are now `#[deprecated]` and hidden from the documentation, as are the
+  other internal modules of the two codec crates (see "What semver covers" in the README).
+
 **New**
+
+- `Options`, `EncodeOptions` and `DecodeOptions` gain `new()` and `with_*` construction methods,
+  which keep compiling when options are added, unlike struct literals.
+- `heifer-hevc-dec` re-exports its stable API at the crate root: `Frame`, `DecodeOptions`,
+  `decode_picture`, `decode_picture_checked`, `HashCheck`, `DEFAULT_MAX_PIXELS`,
+  `SequenceDecoder`, `access_units` and `split_annex_b`.
 
 - Uncompressed images (`unci`, ISO/IEC 23001-17) are decoded as primary images, not only as
   auxiliary ones. One to four unsigned components of 1 to 16 bits are supported, with the

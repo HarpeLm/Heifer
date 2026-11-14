@@ -127,7 +127,7 @@ impl Options {
         self
     }
 
-    /// Sets [`max_pixels`](Self::max_pixels): `0` means the default limit.
+    /// Sets [`max_pixels`](#structfield.max_pixels): `0` means the default limit.
     #[must_use]
     pub const fn with_max_pixels(mut self, max_pixels: u64) -> Self {
         self.max_pixels = max_pixels;

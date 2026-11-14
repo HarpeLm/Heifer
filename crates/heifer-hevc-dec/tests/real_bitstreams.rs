@@ -1,5 +1,7 @@
 //! Reads the start of real parameter sets with the bit reader and checks the values
 //! against what ffprobe reports. Run `scripts/fetch-fixtures.sh` first; missing files are skipped.
+// These tests check internal modules directly; they move into the crate in 0.6.
+#![allow(deprecated)]
 
 use heifer_hevc_dec::bitreader::BitReader;
 use heifer_hevc_dec::nal::{NalUnit, NalUnitType, split_annex_b};
