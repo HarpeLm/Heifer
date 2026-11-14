@@ -1822,7 +1822,10 @@ impl Parser<'_, '_> {
                         level = -level;
                     }
                 }
-                self.coeffs[yc * size + xc] = level;
+                // TransCoeffLevel is limited to CoeffMinY..=CoeffMaxY (7.4.9.11). A crafted stream
+                // can code larger levels; without a transform (transquant bypass) they would
+                // reach the residual unchanged and overflow when added to the prediction.
+                self.coeffs[yc * size + xc] = level.clamp(-32768, 32767);
                 self.coeff_bounds.1 = self.coeff_bounds.1.max(xc + 1);
                 self.coeff_bounds.2 = self.coeff_bounds.2.max(yc + 1);
             }

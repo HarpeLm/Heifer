@@ -111,3 +111,19 @@ fn absurd_tile_size_is_rejected() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn oversized_lossless_levels_do_not_overflow() {
+    // Found by fuzzing: a transquant-bypass block codes coefficient levels near 2^31, which
+    // reached the residual unchanged and overflowed when added to the prediction. Levels are
+    // now limited to the range the spec allows (CoeffMinY..=CoeffMaxY).
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/bypass_level_overflow.heic");
+    let data = std::fs::read(path).unwrap();
+    let options = heifer::Options {
+        max_threads: 1,
+        max_pixels: 1 << 17,
+    };
+    let _ = heifer::decode_with_options(&data, &options);
+    let _ = heifer::decode_reader_with_options(std::io::Cursor::new(&data), &options);
+}
