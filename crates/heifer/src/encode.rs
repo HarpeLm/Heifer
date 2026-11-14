@@ -59,10 +59,38 @@ pub struct EncodeOptions {
 
 impl Default for EncodeOptions {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Construction methods: they keep working when new options are added, unlike a struct
+/// literal, so prefer them to setting the fields directly.
+///
+/// ```
+/// let options = heifer::EncodeOptions::new().with_quality(70).with_max_threads(2);
+/// assert_eq!((options.quality, options.max_threads), (70, 2));
+/// ```
+impl EncodeOptions {
+    /// The default options: quality 80, all cores.
+    pub const fn new() -> Self {
         Self {
             quality: 80,
             max_threads: 0,
         }
+    }
+
+    /// Sets [`quality`](Self::quality), from 0 (smallest files) to 100 (best quality).
+    #[must_use]
+    pub const fn with_quality(mut self, quality: u8) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// Sets [`max_threads`](Self::max_threads): `0` uses all available cores.
+    #[must_use]
+    pub const fn with_max_threads(mut self, max_threads: usize) -> Self {
+        self.max_threads = max_threads;
+        self
     }
 }
 

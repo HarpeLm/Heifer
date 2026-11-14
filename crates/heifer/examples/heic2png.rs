@@ -77,10 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let image = heifer::decode_with_options(
         &std::fs::read(input)?,
-        &heifer::Options {
-            max_threads,
-            ..Default::default()
-        },
+        &heifer::Options::new().with_max_threads(max_threads),
     )?;
     let elapsed = start.elapsed();
     let (channels, pixels) = if image.has_alpha {

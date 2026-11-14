@@ -36,10 +36,7 @@ fn conformance_bitstreams() {
         let Some(path) = stream else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         let data = std::fs::read(&path).unwrap();
-        let options = DecodeOptions {
-            verify_hash: true,
-            ..Default::default()
-        };
+        let options = DecodeOptions::new().with_verify_hash(true);
         match decode_picture_checked(&data, options) {
             Ok((_, HashCheck::Verified(_))) => verified += 1,
             Ok((_, HashCheck::NotChecked)) => unchecked += 1,
@@ -87,10 +84,7 @@ fn conformance_sequences() {
         let Some(path) = stream else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         let data = std::fs::read(&path).unwrap();
-        let mut decoder = SequenceDecoder::new(DecodeOptions {
-            verify_hash: true,
-            ..Default::default()
-        });
+        let mut decoder = SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
         let mut ok = true;
         for (i, unit) in access_units(&data).into_iter().enumerate() {
             match decoder.decode(unit) {

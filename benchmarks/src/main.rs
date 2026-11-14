@@ -50,10 +50,9 @@ fn decoders(threads: usize) -> Vec<(&'static str, Decoder)> {
         (
             "heifer",
             Box::new(move |data: &[u8]| {
-                let o = heifer::Options {
-                    max_threads: threads,
-                    max_pixels: 1 << 30,
-                };
+                let o = heifer::Options::new()
+                    .with_max_threads(threads)
+                    .with_max_pixels(1 << 30);
                 let img = heifer::decode_with_options(data, &o).map_err(|e| e.to_string())?;
                 Ok((img.width, img.height, img.to_rgba8()))
             }),
@@ -61,10 +60,9 @@ fn decoders(threads: usize) -> Vec<(&'static str, Decoder)> {
         (
             "heifer8",
             Box::new(move |data: &[u8]| {
-                let o = heifer::Options {
-                    max_threads: threads,
-                    max_pixels: 1 << 30,
-                };
+                let o = heifer::Options::new()
+                    .with_max_threads(threads)
+                    .with_max_pixels(1 << 30);
                 let img = heifer::decode_rgba8(data, &o).map_err(|e| e.to_string())?;
                 Ok((img.width, img.height, img.data))
             }),
@@ -143,17 +141,15 @@ fn main() {
             std::fs::create_dir_all(out).unwrap();
             for q in [40u8, 55, 70, 82, 90] {
                 let t = Instant::now();
-                let o = heifer::EncodeOptions {
-                    quality: q,
-                    max_threads: 0,
-                };
+                let o = heifer::EncodeOptions::new()
+                    .with_quality(q)
+                    .with_max_threads(0);
                 let heic = heifer::encode_rgb8(w, h, img.as_raw(), &o).unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 let t1 = Instant::now();
-                let o1 = heifer::EncodeOptions {
-                    quality: q,
-                    max_threads: 1,
-                };
+                let o1 = heifer::EncodeOptions::new()
+                    .with_quality(q)
+                    .with_max_threads(1);
                 heifer::encode_rgb8(w, h, img.as_raw(), &o1).unwrap();
                 let ms1 = t1.elapsed().as_secs_f64() * 1000.0;
                 let p = out.join(format!("heifer_q{q}.heic"));
@@ -243,8 +239,7 @@ fn main() {
             let iters: usize = a[5].parse().unwrap();
             let all = decoders(1);
             let find = |name: &str| -> &Decoder {
-                &all
-                    .iter()
+                &all.iter()
                     .find(|(n, _)| *n == name)
                     .unwrap_or_else(|| panic!("unknown decoder {name}"))
                     .1

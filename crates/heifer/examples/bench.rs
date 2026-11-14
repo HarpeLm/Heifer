@@ -11,10 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runs: usize = args.get(1).map_or(Ok(5), |s| s.parse())?;
     let threads: usize = args.get(2).map_or(Ok(0), |s| s.parse())?;
     let bytes = std::fs::read(path)?;
-    let options = heifer::Options {
-        max_threads: threads,
-        ..Default::default()
-    };
+    let options = heifer::Options::new().with_max_threads(threads);
     let mut times = Vec::with_capacity(runs);
     for _ in 0..runs {
         let start = std::time::Instant::now();

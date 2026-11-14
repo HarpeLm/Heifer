@@ -2210,11 +2210,10 @@ mod tests {
         let stream = picture.annex_b();
 
         // Without in-loop filters, the decoder reproduces the encoder's reconstruction exactly.
-        let options = DecodeOptions {
-            skip_loop_filters: true,
-            verify_hash: false,
-            max_pixels: 0,
-        };
+        let options = DecodeOptions::new()
+            .with_skip_loop_filters(true)
+            .with_verify_hash(false)
+            .with_max_pixels(0);
         let unfiltered = decode_picture(&stream, options).unwrap();
         let unit = if monochrome { 1 } else { 2 };
         assert_eq!(
@@ -2334,11 +2333,10 @@ mod tests {
             .unwrap();
             assert_eq!(picture.profile_idc, 2, "Main 10");
             let stream = picture.annex_b();
-            let options = DecodeOptions {
-                skip_loop_filters: true,
-                verify_hash: false,
-                max_pixels: 0,
-            };
+            let options = DecodeOptions::new()
+                .with_skip_loop_filters(true)
+                .with_verify_hash(false)
+                .with_max_pixels(0);
             let unfiltered = decode_picture(&stream, options).unwrap();
             assert_eq!(unfiltered.bit_depth, [10, 10]);
             for c in 0..3 {
@@ -2433,11 +2431,10 @@ mod tests {
 
             let unfiltered = decode_picture(
                 &stream,
-                DecodeOptions {
-                    skip_loop_filters: true,
-                    verify_hash: false,
-                    max_pixels: 0,
-                },
+                DecodeOptions::new()
+                    .with_skip_loop_filters(true)
+                    .with_verify_hash(false)
+                    .with_max_pixels(0),
             )
             .unwrap();
             assert_eq!(unfiltered.chroma_format, 3);
@@ -2520,11 +2517,10 @@ mod tests {
                 // The decoder reproduces the encoder's reconstruction exactly.
                 let unfiltered = decode_picture(
                     &stream,
-                    DecodeOptions {
-                        skip_loop_filters: true,
-                        verify_hash: false,
-                        max_pixels: 0,
-                    },
+                    DecodeOptions::new()
+                        .with_skip_loop_filters(true)
+                        .with_verify_hash(false)
+                        .with_max_pixels(0),
                 )
                 .unwrap();
                 assert_eq!(unfiltered.chroma_format, 2);
@@ -2626,11 +2622,10 @@ mod tests {
             .unwrap();
             let frame = decode_picture(
                 &picture.annex_b(),
-                DecodeOptions {
-                    skip_loop_filters: true,
-                    verify_hash: false,
-                    max_pixels: 0,
-                },
+                DecodeOptions::new()
+                    .with_skip_loop_filters(true)
+                    .with_verify_hash(false)
+                    .with_max_pixels(0),
             )
             .unwrap();
             assert_eq!(crop(&frame, 0, w, h), y, "{w}×{h}: monochrome not lossless");

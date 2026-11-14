@@ -333,14 +333,8 @@ fn reconstruction_matches_ffmpeg_without_loop_filters() {
         let Some(stream) = bitstream(file, item) else {
             continue;
         };
-        let frame = decode_picture(
-            &stream,
-            DecodeOptions {
-                skip_loop_filters: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let frame =
+            decode_picture(&stream, DecodeOptions::new().with_skip_loop_filters(true)).unwrap();
         assert_eq!(
             frame_hash(&frame),
             expected,

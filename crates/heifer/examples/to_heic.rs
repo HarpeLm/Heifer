@@ -28,10 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let start = Instant::now();
-    let options = heifer::EncodeOptions {
-        quality,
-        ..Default::default()
-    };
+    let options = heifer::EncodeOptions::new().with_quality(quality);
     let heic = heifer::encode(&image, &options)?;
     let elapsed = start.elapsed();
     std::fs::write(output, &heic)?;

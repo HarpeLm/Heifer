@@ -174,23 +174,12 @@ fn parallel_and_sequential_decoding_match() {
     let Some(bytes) = load("grid.heic") else {
         return;
     };
-    let sequential = heifer::decode_with_options(
-        &bytes,
-        &heifer::Options {
-            max_threads: 1,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let sequential =
+        heifer::decode_with_options(&bytes, &heifer::Options::new().with_max_threads(1)).unwrap();
     for threads in [0, 2, 3, 16] {
-        let parallel = heifer::decode_with_options(
-            &bytes,
-            &heifer::Options {
-                max_threads: threads,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let parallel =
+            heifer::decode_with_options(&bytes, &heifer::Options::new().with_max_threads(threads))
+                .unwrap();
         assert_eq!(parallel, sequential, "max_threads = {threads}");
     }
 }

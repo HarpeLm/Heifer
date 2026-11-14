@@ -62,6 +62,6 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, JsError> {
 /// Encodes 8-bit RGBA pixels as a HEIC file, on the calling thread.
 #[wasm_bindgen]
 pub fn encode(rgba: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, JsError> {
-    let options = heifer::EncodeOptions { quality, max_threads: 1 };
+    let options = heifer::EncodeOptions::new().with_quality(quality).with_max_threads(1);
     heifer::encode_rgba8(width, height, rgba, &options).map_err(|e| JsError::new(&e.to_string()))
 }

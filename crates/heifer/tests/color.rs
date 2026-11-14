@@ -153,10 +153,7 @@ fn srgb_icc_conversion_is_nearly_the_identity() {
         icc_profile: Some(icc),
         ..Default::default()
     };
-    let options = EncodeOptions {
-        quality: 100,
-        ..Default::default()
-    };
+    let options = EncodeOptions::new().with_quality(100);
     let bytes = heifer::encode_with_metadata(&image, &metadata, &options).unwrap();
 
     // The file is tagged sRGB (through its profile): converting to sRGB must not move the

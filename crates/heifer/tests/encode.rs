@@ -45,10 +45,7 @@ fn psnr(a: &[u8], b: &[u8], channels: impl Fn(usize) -> bool) -> f64 {
 
 fn round_trip(w: u32, h: u32, alpha: bool, quality: u8) -> (Vec<u8>, Image, f64) {
     let rgba = test_image(w, h, alpha);
-    let options = EncodeOptions {
-        quality,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(quality);
     let heic = encode_rgba8(w, h, &rgba, &options).unwrap();
     let image = decode(&heic).unwrap();
     assert_eq!((image.width, image.height, image.bit_depth), (w, h, 8));
@@ -80,10 +77,7 @@ fn tiny_images() {
                 [v, v, v, 255]
             })
             .collect();
-        let options = EncodeOptions {
-            quality: 100,
-            ..EncodeOptions::default()
-        };
+        let options = EncodeOptions::new().with_quality(100);
         let image = decode(&encode_rgba8(w, h, &rgba, &options).unwrap()).unwrap();
         assert_eq!((image.width, image.height), (w, h));
         let error = rgba
@@ -191,10 +185,7 @@ fn deep_images_are_coded_in_10_bits() {
         has_alpha: true,
         data,
     };
-    let options = EncodeOptions {
-        quality: 90,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(90);
     let heic = encode(&image, &options).unwrap();
     let file = heifer::heifer_isobmff::HeifFile::parse(&heic).unwrap();
     let tiles = file.referenced_items(file.primary_id, b"dimg");
@@ -350,10 +341,7 @@ fn four_four_four_keeps_full_resolution_chroma() {
             }
         })
         .collect();
-    let options = EncodeOptions {
-        quality: 90,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(90);
     let heic =
         heifer::encode_rgba8_with_format(w, h, &rgba, heifer::EncodeFormat::Ycbcr444, &options)
             .unwrap();
@@ -382,10 +370,7 @@ fn four_two_two_keeps_full_height_chroma() {
             }
         })
         .collect();
-    let options = EncodeOptions {
-        quality: 90,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(90);
     let encode = |format| {
         let heic = heifer::encode_rgba8_with_format(w, h, &rgba, format, &options).unwrap();
         (
@@ -484,10 +469,7 @@ fn encode_to_size_fits_the_budget() {
             &image,
             &meta,
             heifer::EncodeFormat::Ycbcr420,
-            &EncodeOptions {
-                quality: q,
-                ..options
-            },
+            &options.with_quality(q),
         )
         .unwrap()
         .len()

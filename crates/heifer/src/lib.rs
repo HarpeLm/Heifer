@@ -104,6 +104,37 @@ pub struct Options {
     pub max_pixels: u64,
 }
 
+/// Construction methods: they keep working when new options are added, unlike a struct
+/// literal, so prefer them to setting the fields directly.
+///
+/// ```
+/// let options = heifer::Options::new().with_max_threads(1).with_max_pixels(1 << 24);
+/// assert_eq!((options.max_threads, options.max_pixels), (1, 1 << 24));
+/// ```
+impl Options {
+    /// The default options: all cores, the default size limit.
+    pub const fn new() -> Self {
+        Self {
+            max_threads: 0,
+            max_pixels: 0,
+        }
+    }
+
+    /// Sets [`max_threads`](Self::max_threads): `0` uses all available cores.
+    #[must_use]
+    pub const fn with_max_threads(mut self, max_threads: usize) -> Self {
+        self.max_threads = max_threads;
+        self
+    }
+
+    /// Sets [`max_pixels`](Self::max_pixels): `0` means the default limit.
+    #[must_use]
+    pub const fn with_max_pixels(mut self, max_pixels: u64) -> Self {
+        self.max_pixels = max_pixels;
+        self
+    }
+}
+
 impl Options {
     fn max_pixels(&self) -> u64 {
         if self.max_pixels == 0 {

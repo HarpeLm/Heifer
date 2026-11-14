@@ -23,6 +23,40 @@ pub struct DecodeOptions {
     pub max_pixels: u64,
 }
 
+/// Construction methods: they keep working when new options are added, unlike a struct
+/// literal, so prefer them to setting the fields directly.
+impl DecodeOptions {
+    /// The default options: loop filters on, no hash check, the default size limit.
+    pub const fn new() -> Self {
+        Self {
+            skip_loop_filters: false,
+            verify_hash: false,
+            max_pixels: 0,
+        }
+    }
+
+    /// Sets [`skip_loop_filters`](Self::skip_loop_filters).
+    #[must_use]
+    pub const fn with_skip_loop_filters(mut self, skip: bool) -> Self {
+        self.skip_loop_filters = skip;
+        self
+    }
+
+    /// Sets [`verify_hash`](Self::verify_hash).
+    #[must_use]
+    pub const fn with_verify_hash(mut self, verify: bool) -> Self {
+        self.verify_hash = verify;
+        self
+    }
+
+    /// Sets [`max_pixels`](Self::max_pixels): `0` means [`DEFAULT_MAX_PIXELS`].
+    #[must_use]
+    pub const fn with_max_pixels(mut self, max_pixels: u64) -> Self {
+        self.max_pixels = max_pixels;
+        self
+    }
+}
+
 /// Default limit on the picture size: 2^27 luma samples (e.g. 16384×8192), well above the
 /// largest HEVC level (8192×4320) and HEIF tiles.
 pub const DEFAULT_MAX_PIXELS: u64 = 1 << 27;

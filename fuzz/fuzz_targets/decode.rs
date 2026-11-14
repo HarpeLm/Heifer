@@ -3,10 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let options = heifer::Options {
-        max_threads: 1,
-        max_pixels: 1 << 17,
-    };
+    let options = heifer::Options::new().with_max_threads(1).with_max_pixels(1 << 17);
     let from_slice = heifer::decode_with_options(data, &options);
     // The reader path must agree with the slice path.
     let from_reader = heifer::decode_reader_with_options(std::io::Cursor::new(data), &options);

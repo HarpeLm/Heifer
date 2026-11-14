@@ -7,7 +7,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Small size limit so that each run is fast; larger pictures are rejected early.
-    let options = DecodeOptions { verify_hash: true, max_pixels: 1 << 17, ..Default::default() };
+    let options = DecodeOptions::new().with_verify_hash(true).with_max_pixels(1 << 17);
     let _ = decode_picture(data, options);
     // The same bytes as a sequence: inter prediction, reference pictures, POC.
     let mut decoder = SequenceDecoder::new(options);

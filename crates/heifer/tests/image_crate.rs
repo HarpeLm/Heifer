@@ -190,10 +190,7 @@ fn decoder_with_options() {
         .map(|i| (i % 4 * 60 + i / 4 % w / 5) as u8)
         .collect();
     let heic = heifer::encode_rgba8(w, h, &rgba, &heifer::EncodeOptions::default()).unwrap();
-    let options = heifer::Options {
-        max_threads: 1,
-        ..Default::default()
-    };
+    let options = heifer::Options::new().with_max_threads(1);
     let dec = heifer::image_crate::HeifDecoder::with_options(&heic[..], &options).unwrap();
     assert_eq!(dec.dimensions(), (w, h));
     let img = DynamicImage::from_decoder(dec).unwrap();
@@ -203,10 +200,7 @@ fn decoder_with_options() {
     );
 
     // Too many pixels for the limit: an error, not a panic.
-    let small = heifer::Options {
-        max_pixels: 1000,
-        ..Default::default()
-    };
+    let small = heifer::Options::new().with_max_pixels(1000);
     assert!(heifer::image_crate::HeifDecoder::with_options(&heic[..], &small).is_err());
 }
 

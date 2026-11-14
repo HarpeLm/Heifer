@@ -4,7 +4,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let opts = |max_threads| heifer::Options { max_threads, max_pixels: 1 << 17 };
+    let opts = |max_threads| heifer::Options::new().with_max_threads(max_threads).with_max_pixels(1 << 17);
     let sequential = heifer::decode_with_options(data, &opts(1));
     let parallel = heifer::decode_with_options(data, &opts(4));
     match (sequential, parallel) {

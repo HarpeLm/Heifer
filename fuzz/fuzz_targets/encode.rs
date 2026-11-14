@@ -47,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
 
     // The whole file, with alpha when some pixel is transparent.
     let rgba: Vec<u8> = (0..n * 4).map(|i| if i % 4 == 3 && flags & 2 == 0 { 255 } else { sample(i) }).collect();
-    let options = heifer::EncodeOptions { quality: qp % 101, max_threads: 1 };
+    let options = heifer::EncodeOptions::new().with_quality(qp % 101).with_max_threads(1);
     let heic = heifer::encode_rgba8(w, h, &rgba, &options).expect("valid input must encode");
     let image = heifer::decode(&heic).expect("the encoder's file must decode");
     assert_eq!((image.width, image.height), (w, h));

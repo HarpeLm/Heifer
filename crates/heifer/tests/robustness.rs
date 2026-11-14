@@ -120,10 +120,9 @@ fn oversized_lossless_levels_do_not_overflow() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/bypass_level_overflow.heic");
     let data = std::fs::read(path).unwrap();
-    let options = heifer::Options {
-        max_threads: 1,
-        max_pixels: 1 << 17,
-    };
+    let options = heifer::Options::new()
+        .with_max_threads(1)
+        .with_max_pixels(1 << 17);
     let _ = heifer::decode_with_options(&data, &options);
     let _ = heifer::decode_reader_with_options(std::io::Cursor::new(&data), &options);
 }
@@ -152,4 +151,27 @@ fn slice_and_reader_agree_on_a_short_junk_tail() {
         assert_eq!(from_slice, from_reader);
         assert_eq!(from_slice, heifer::decode(&still).unwrap());
     }
+}
+
+#[test]
+fn option_constructors_match_the_defaults() {
+    let (o, d) = (heifer::Options::new(), heifer::Options::default());
+    assert_eq!((o.max_threads, o.max_pixels), (d.max_threads, d.max_pixels));
+    let (o, d) = (
+        heifer::EncodeOptions::new(),
+        heifer::EncodeOptions::default(),
+    );
+    assert_eq!((o.quality, o.max_threads), (d.quality, d.max_threads));
+    let (o, d) = (
+        heifer::heifer_hevc_dec::decoder::DecodeOptions::new(),
+        heifer::heifer_hevc_dec::decoder::DecodeOptions::default(),
+    );
+    assert_eq!(
+        (o.skip_loop_filters, o.verify_hash, o.max_pixels),
+        (d.skip_loop_filters, d.verify_hash, d.max_pixels)
+    );
+    let o = heifer::Options::new()
+        .with_max_threads(3)
+        .with_max_pixels(7);
+    assert_eq!((o.max_threads, o.max_pixels), (3, 7));
 }

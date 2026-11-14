@@ -10,11 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [input, output, rest @ ..] = args.as_slice() else {
         return Err("usage: decode <in.h265> <out.yuv> [--no-filters]".into());
     };
-    let options = DecodeOptions {
-        skip_loop_filters: rest.iter().any(|a| a == "--no-filters"),
-        verify_hash: true,
-        ..Default::default()
-    };
+    let options = DecodeOptions::new()
+        .with_skip_loop_filters(rest.iter().any(|a| a == "--no-filters"))
+        .with_verify_hash(true);
     let (frame, check) = decode_picture_checked(&std::fs::read(input)?, options)?;
     let mut out = Vec::new();
     for (c, plane) in frame.planes.iter().enumerate() {

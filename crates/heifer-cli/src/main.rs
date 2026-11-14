@@ -319,10 +319,7 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
             let max = args.max_size.expect("checked");
             let encode = |quality: u8| -> Result<Vec<u8>, String> {
                 let mut bytes = Vec::new();
-                let options = EncodeOptions {
-                    quality,
-                    ..Default::default()
-                };
+                let options = EncodeOptions::new().with_quality(quality);
                 let heif = args.format.unwrap_or_default();
                 write(
                     HeifEncoder::with_format(&mut bytes, options, heif),
@@ -344,10 +341,7 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
             }
         }
         None => {
-            let options = EncodeOptions {
-                quality: args.quality.unwrap_or(80),
-                ..Default::default()
-            };
+            let options = EncodeOptions::new().with_quality(args.quality.unwrap_or(80));
             write(
                 HeifEncoder::with_format(&mut writer, options, args.format.unwrap_or_default()),
                 &image,

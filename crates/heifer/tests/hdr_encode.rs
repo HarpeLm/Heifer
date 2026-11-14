@@ -49,10 +49,7 @@ fn synthetic(w: u32, h: u32) -> (Image, HdrImage) {
 #[test]
 fn gain_map_round_trips() {
     let (base, hdr) = synthetic(64, 48);
-    let options = EncodeOptions {
-        quality: 90,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(90);
     let bytes = encode_hdr(&base, &hdr, &options).unwrap();
 
     let file = HeifFile::parse(&bytes).unwrap();
@@ -108,10 +105,7 @@ fn gain_map_round_trips() {
 #[test]
 fn gain_map_of_a_grid_is_a_hidden_half_size_grid() {
     let (base, hdr) = synthetic(1100, 700);
-    let options = EncodeOptions {
-        quality: 60,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(60);
     let bytes = encode_hdr(&base, &hdr, &options).unwrap();
 
     let file = HeifFile::parse(&bytes).unwrap();
@@ -200,10 +194,7 @@ fn reencodes_a_real_samsung_gain_map() {
         data,
     };
 
-    let options = EncodeOptions {
-        quality: 90,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_quality(90);
     let out = encode_hdr(&base, &crop, &options).unwrap();
     let back =
         heifer::hdr::decode_hdr_with_options(&out, &Default::default(), f32::INFINITY).unwrap();
