@@ -54,7 +54,7 @@ impl<'a> HeifFile<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         let mut file_type = None;
         let mut meta = None;
-        for b in BoxIter::new(data) {
+        for b in crate::header::top_level_boxes(data) {
             let b = b?;
             match &b.header.box_type.0 {
                 b"ftyp" => file_type = Some(FileType::parse(b.content)?),

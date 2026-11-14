@@ -155,6 +155,21 @@ impl<'a> Iterator for BoxIter<'a> {
     }
 }
 
+/// The top-level boxes of a whole file. Like [`BoxIter`], except that fewer bytes than a box
+/// header (8) after the last box are ignored instead of being an error: such a tail (padding, a
+/// truncated copy) holds no box. The reader-based API applies the same rule.
+pub(crate) fn top_level_boxes(data: &[u8]) -> impl Iterator<Item = Result<RawBox<'_>, Error>> {
+    let mut end = 0;
+    BoxIter::new(data).map_while(move |b| match b {
+        Ok(b) => {
+            end = b.offset + b.header.header_size as usize + b.content.len();
+            Some(Ok(b))
+        }
+        Err(_) if data.len() - end < 8 => None,
+        Err(e) => Some(Err(e)),
+    })
+}
+
 fn read_array<const N: usize>(data: &[u8], at: usize) -> Result<[u8; N], Error> {
     data.get(at..at + N)
         .and_then(|s| s.try_into().ok())
@@ -251,5 +266,38 @@ mod tests {
             read_box_header(&data),
             Err(Error::InvalidBoxSize { size: 4, .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod top_level_tests {
+    use super::top_level_boxes;
+
+    fn boxes(data: &[u8]) -> Result<Vec<[u8; 4]>, crate::Error> {
+        top_level_boxes(data)
+            .map(|b| b.map(|b| b.header.box_type.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_header_is_ignored() {
+        let mut file = Vec::new();
+        file.extend_from_slice(b"\0\0\0\x0cftypheic");
+        file.extend_from_slice(b"\0\0\0\x08free");
+        assert_eq!(boxes(&file).unwrap(), [*b"ftyp", *b"free"]);
+        // 1 to 7 junk bytes after the last box: no box, no error.
+        for n in 1..8 {
+            let mut padded = file.clone();
+            padded.extend(std::iter::repeat_n(0xAB, n));
+            assert_eq!(boxes(&padded).unwrap(), [*b"ftyp", *b"free"], "{n} bytes");
+        }
+        // A box running past the end is still an error, at any length.
+        let mut cut = file.clone();
+        cut.extend_from_slice(b"\0\0\0\x40mdat\x01\x02");
+        assert!(boxes(&cut).is_err());
+        // So is a full header with an impossible size.
+        let mut bad = file.clone();
+        bad.extend_from_slice(b"\0\0\0\x02junk");
+        assert!(boxes(&bad).is_err());
     }
 }

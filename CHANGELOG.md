@@ -16,6 +16,15 @@
   component holds (red, green, blue, alpha, Y, Cb, Cr, mono). Without `cmpd`, the usual component
   counts are assumed (1 mono, 2 mono and alpha, 3 RGB, 4 RGBA).
 
+**Fixed**
+
+- A file with a few junk bytes (fewer than a box header) after its last box was rejected by
+  `decode`, `read_sequence` and the other slice-based functions, while `decode_reader` read it.
+  Both now ignore such a tail; a box that runs past the end of the file is still an error.
+- Coefficient levels are limited to the range the spec allows. A crafted lossless block with
+  levels near 2^31 overflowed when added to the prediction: a panic in debug builds, wrong
+  samples in release builds. Found by fuzzing.
+
 ## 0.5.0 — 2026-11-07
 
 Image sequences decode completely: P and B frames, long-term references, in display order,

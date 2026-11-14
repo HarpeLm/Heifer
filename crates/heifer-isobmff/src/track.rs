@@ -109,7 +109,7 @@ const MAX_SAMPLES: usize = 1 << 22;
 /// Parses the tracks of the `moov` box of a file, or none if it has no `moov`.
 pub fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, Error> {
     let mut tracks = Vec::new();
-    for b in BoxIter::new(data) {
+    for b in crate::header::top_level_boxes(data) {
         let b = b?;
         if b.header.box_type.0 != *b"moov" {
             continue;

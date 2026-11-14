@@ -127,3 +127,29 @@ fn oversized_lossless_levels_do_not_overflow() {
     let _ = heifer::decode_with_options(&data, &options);
     let _ = heifer::decode_reader_with_options(std::io::Cursor::new(&data), &options);
 }
+
+#[test]
+fn slice_and_reader_agree_on_a_short_junk_tail() {
+    // A few bytes after the last box (padding, a truncated copy) are ignored by both paths:
+    // the slice path used to reject the whole file while the reader decoded it.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4");
+    let mut data = std::fs::read(path).unwrap();
+    assert!(heifer::read_sequence(&data).unwrap().is_some());
+    data.extend_from_slice(&[0xAB; 7]);
+    let seq = heifer::read_sequence(&data)
+        .unwrap()
+        .expect("sequence still found");
+    assert_eq!(seq.frames.len(), 24);
+    assert!(heifer::decode_sequence_frame(&data, 3).is_ok());
+    if let Ok(still) = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/single_image.heic"),
+    ) {
+        let mut padded = still.clone();
+        padded.extend_from_slice(&[0xAB; 7]);
+        let from_slice = heifer::decode(&padded).unwrap();
+        let from_reader = heifer::decode_reader(std::io::Cursor::new(&padded)).unwrap();
+        assert_eq!(from_slice, from_reader);
+        assert_eq!(from_slice, heifer::decode(&still).unwrap());
+    }
+}
