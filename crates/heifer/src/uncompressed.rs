@@ -359,7 +359,7 @@ fn layout<'a>(
     let mut entries = Vec::with_capacity(count);
     let mut seen = [false; 8];
     for (position, component) in config.components.iter().enumerate() {
-        let role = match descriptions {
+        let role = match &descriptions {
             Some(descriptions) => {
                 let description = descriptions
                     .components

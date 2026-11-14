@@ -637,8 +637,6 @@ pub enum Property {
     PixelInfo(Vec<u8>),
     /// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
     UncompressedConfig(UncompressedConfig),
-    /// `cmpd`: component descriptions of an uncompressed frame (ISO/IEC 23001-17).
-    ComponentDescriptions(ComponentDescriptions),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
     /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
@@ -689,7 +687,6 @@ impl Property {
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
             b"uncC" => Self::UncompressedConfig(UncompressedConfig::parse(content)?),
-            b"cmpd" => Self::ComponentDescriptions(ComponentDescriptions::parse(content)?),
             b"irot" => Self::Rotation(r.u8()? & 0x03),
             b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {
