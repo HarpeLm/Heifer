@@ -523,8 +523,42 @@ fn sao_plane(
                 2 => (1, 1),
                 _ => (-1, 1),
             };
+            // Inside a CTB, the neighbours of a sample that is not on the CTB's border are in
+            // the picture, in the same slice and the same tile: when no block of the CTB is
+            // excluded from filtering, those samples need none of the checks below.
+            let clean = (y0 * sh..y1 * sh).step_by(4).all(|yl| {
+                (x0 * sw..x1 * sw)
+                    .step_by(4)
+                    .all(|xl| !info.no_filter[info.at(xl, yl)])
+            });
+            // Distance, in the plane, from a sample to its neighbour b (and from a to the sample).
+            let step = dy as isize * stride as isize + dx as isize;
             for y in y0..y1 {
+                if clean && y > y0 && y + 1 < y1 && x1 > x0 + 2 {
+                    let row = y as usize * stride;
+                    for x in (x0 + 1) as usize..(x1 - 1) as usize {
+                        let i = row + x;
+                        let v = i32::from(src[i]);
+                        let a = i32::from(src[(i as isize - step) as usize]);
+                        let b = i32::from(src[(i as isize + step) as usize]);
+                        let edge = 2 + (v - a).signum() + (v - b).signum();
+                        // edgeIdx 0, 1, 2 are remapped to 1, 2, 0 (§8.7.3.2).
+                        let edge_idx = match edge {
+                            0 => 1,
+                            1 => 2,
+                            2 => 0,
+                            e => e,
+                        };
+                        if edge_idx != 0 {
+                            dst[i] = (v + i32::from(offsets[edge_idx as usize - 1])).clamp(0, max)
+                                as u16;
+                        }
+                    }
+                }
                 for x in x0..x1 {
+                    if clean && y > y0 && y + 1 < y1 && x > x0 && x + 1 < x1 {
+                        continue;
+                    }
                     let (xl, yl) = (x * sw, y * sh);
                     if info.no_filter[info.at(xl, yl)] {
                         continue;
