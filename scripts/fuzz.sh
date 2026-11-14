@@ -46,6 +46,19 @@ for t in decode container parallel hevc cabac encode; do
 done
 [ -d "$ROOT/tests/conformance" ] && find "$ROOT/tests/conformance" \( -name '*.bit' -o -name '*.bin' \) -size -100k \
   -exec cp -n {} corpus/hevc/ \; 2>/dev/null || true
+# Larger conformance streams (most inter ones: B frames, long-term references, RDPCM) are cut
+# to their first 30 KB, a few pictures: whole streams make each run slow.
+[ -d "$ROOT/tests/conformance" ] && find "$ROOT/tests/conformance" \( -name '*.bit' -o -name '*.bin' \) -size +99k \
+  | while read -r f; do
+      out="corpus/hevc/head30k-$(basename "$f")"
+      [ -e "$out" ] || head -c 30000 "$f" > "$out"
+    done
+# Small x265 streams with B frames, lossless and AMP, and the test data of the crates.
+seed hevc "$ROOT/fuzz/inter-seeds"
+seed hevc "$ROOT/crates/heifer-hevc-dec/tests/data"
+for t in decode container parallel; do
+  seed "$t" "$ROOT/crates/heifer/tests/data"
+done
 [ -n "$(ls corpus/cabac)" ] || printf '\x1a\x00\x01\x02' > corpus/cabac/seed
 [ -n "$(ls corpus/encode)" ] || printf '\x10\x0c\x16\x00\x40\x80\xc0\xff\x20' > corpus/encode/seed
 
