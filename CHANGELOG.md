@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 — 2026-11-14
+
+Fixes found by fuzzing, uncompressed primary images, and a clearer line between the stable
+API and the internals. No breaking change.
 
 **Deprecated**
 
@@ -25,7 +28,8 @@
   HEVC. Blocks, floating-point or signed samples, little-endian samples and generic compression
   (`cmpC`) are refused with `Error::Unsupported`.
 - `heifer_isobmff::boxes::ComponentDescriptions` parses the `cmpd` box and
-  `HeifFile::component_descriptions` returns it, so an uncompressed frame can say what each
+  `HeifFile::component_descriptions` returns it (the box stays a `Property::Unknown` in
+  `item_properties`, as in 0.5.0), so an uncompressed frame can say what each
   component holds (red, green, blue, alpha, Y, Cb, Cr, mono). Without `cmpd`, the usual component
   counts are assumed (1 mono, 2 mono and alpha, 3 RGB, 4 RGBA).
 
@@ -37,6 +41,11 @@
 - Coefficient levels are limited to the range the spec allows. A crafted lossless block with
   levels near 2^31 overflowed when added to the prediction: a panic in debug builds, wrong
   samples in release builds. Found by fuzzing.
+
+**Changed**
+
+- The crates' `homepage` is now the in-browser converter, <https://harpelm.github.io/Heifer/>.
+- The fuzzing CI seeds the inter decoder with B frame, long-term and RDPCM streams.
 
 ## 0.5.0 — 2026-11-07
 
