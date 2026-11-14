@@ -365,13 +365,12 @@ fn deblock_chroma<const VERTICAL: bool>(
     let edge_bit = if VERTICAL { 1 } else { 2 };
     let chroma_type = sps.chroma_array_type();
 
-    for c in 1..3 {
+    for (c, plane) in frame.planes.iter_mut().enumerate().skip(1) {
         let pic_offset = i32::from(if c == 1 {
             pps.pps_cb_qp_offset
         } else {
             pps.pps_cr_qp_offset
         });
-        let plane = &mut frame.planes[c];
         // Chroma edges lie on an 8×8 grid of chroma samples.
         let (outer, inner) = if VERTICAL { (ch, cw) } else { (cw, ch) };
         for a in 0..outer {
