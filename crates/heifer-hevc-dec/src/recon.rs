@@ -643,6 +643,13 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Availability of a luma sample position for intra prediction of the block at (`x`, `y`).
+    /// Whether the luma sample (`xn`, `yn`) may be used to predict the block at (`x`, `y`)
+    /// (§6.4.1): inside the picture, already reconstructed, in the same slice and tile. For
+    /// encoders deriving the motion vector candidates of a block.
+    pub fn is_available(&self, x: u32, y: u32, xn: i64, yn: i64) -> bool {
+        self.available(x, y, xn, yn)
+    }
+
     fn available(&self, x: u32, y: u32, xn: i64, yn: i64) -> bool {
         let (pw, ph) = (
             self.sps.pic_width_in_luma_samples,

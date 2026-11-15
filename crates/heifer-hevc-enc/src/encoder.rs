@@ -16,7 +16,7 @@
 //! levels are the raw residual samples, and the in-loop filters are off.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
-use heifer_hevc_dec::inter::Motion;
+use heifer_hevc_dec::inter::{Motion, MotionSource, Mv, PartMode, PuGeom, SliceRefs};
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
 use heifer_hevc_dec::recon::FilterState;
@@ -37,6 +37,27 @@ use crate::sao::{self, CtbSao};
 use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
 const LOG2_CTB: u8 = 6;
+
+/// Half the side of the window searched exhaustively around zero motion, in quarter samples
+/// (8 samples).
+const SEARCH_RANGE: i16 = 32;
+
+/// `MaxNumMergeCand` of P pictures (`five_minus_max_num_merge_cand` 0).
+const MAX_MERGE_CANDIDATES: usize = 5;
+
+/// Approximate bits of a motion vector difference (quarter samples), for the motion search.
+fn mvd_bits(mvd: [i32; 2]) -> f64 {
+    mvd.iter()
+        .map(|&v| {
+            let a = v.unsigned_abs();
+            if a == 0 {
+                1.0
+            } else {
+                2.0 * f64::from(32 - a.leading_zeros()) + 1.0
+            }
+        })
+        .sum()
+}
 /// Largest transform blocks: 32×32 (64×64 coding units split their transform).
 const LOG2_MAX_TB: u8 = 5;
 const LOG2_MIN_CB: u8 = 3;
@@ -399,6 +420,10 @@ pub(crate) fn encode_kind(
             [vec![(reference, previous, false)], Vec::new()],
             [None, None],
         );
+        enc.reference = Some(reference);
+        enc.poc = previous + 1;
+        enc.ref_pocs = vec![previous];
+        enc.ref_long_term = vec![false];
     }
     let (pw, ph) = (params.width, params.height);
     let ctb = 1u32 << LOG2_CTB;
@@ -589,7 +614,7 @@ struct Snapshot {
     edges: Vec<u8>,
     /// In P pictures: the deblocking filter's state of the block (intra and coded flags,
     /// motion), and which of its 4×4 blocks are skipped.
-    inter: Option<(FilterState, Vec<bool>)>,
+    inter: Option<(FilterState, Vec<bool>, Vec<Motion>)>,
 }
 
 struct Encoder<'a> {
@@ -623,8 +648,18 @@ struct Encoder<'a> {
     modes: Vec<u8>,
     /// Whether each 4×4 block belongs to a skipped coding unit (P pictures).
     skipped: Vec<bool>,
-    /// Skipped coding units chosen, for tests.
+    /// Motion of each 4×4 block (P pictures), for the candidates of the following blocks.
+    motion: Vec<Motion>,
+    /// Skipped and other inter coding units chosen, for tests.
     skipped_cus: usize,
+    inter_cus: usize,
+    /// The reference picture of a P picture (the previous picture's filtered reconstruction),
+    /// the POCs of the current and reference pictures, and `Log2ParMrgLevel`.
+    reference: Option<&'a Frame>,
+    poc: i32,
+    ref_pocs: Vec<i32>,
+    ref_long_term: Vec<bool>,
+    par_mrg_level: u8,
     grid_w: usize,
     // Scratch buffers.
     diff: Vec<i32>,
@@ -727,7 +762,14 @@ impl<'a> Encoder<'a> {
             sqrt_lambda: lambda.sqrt(),
             depth: vec![0; grid_w * (ph / 4)],
             skipped: vec![false; grid_w * (ph / 4)],
+            motion: vec![Motion::NONE; grid_w * (ph / 4)],
             skipped_cus: 0,
+            inter_cus: 0,
+            reference: None,
+            poc: 0,
+            ref_pocs: Vec::new(),
+            ref_long_term: Vec::new(),
+            par_mrg_level: pps.log2_parallel_merge_level,
             modes: vec![1; grid_w * (ph / 4)],
             grid_w,
             diff: vec![0; 32 * 32],
@@ -837,13 +879,19 @@ impl<'a> Encoder<'a> {
             }
         }
         let inter = self.p_slice.then(|| {
-            let mut skipped = Vec::new();
+            let (mut skipped, mut motion) = (Vec::new(), Vec::new());
             for y in (y0..y0 + size).step_by(4) {
                 for x in (x0..x0 + size).step_by(4) {
-                    skipped.push(self.skipped[self.grid(x, y)]);
+                    let i = self.grid(x, y);
+                    skipped.push(self.skipped[i]);
+                    motion.push(self.motion[i]);
                 }
             }
-            (self.recon.save_filter_state(x0, y0, size, size), skipped)
+            (
+                self.recon.save_filter_state(x0, y0, size, size),
+                skipped,
+                motion,
+            )
         });
         Snapshot {
             coded,
@@ -884,13 +932,14 @@ impl<'a> Encoder<'a> {
                 let i = self.grid(x, y);
                 self.depth[i] = s.depth[k];
                 self.modes[i] = s.modes[k];
-                if let Some((_, skipped)) = &s.inter {
+                if let Some((_, skipped, motion)) = &s.inter {
                     self.skipped[i] = skipped[k];
+                    self.motion[i] = motion[k];
                 }
                 k += 1;
             }
         }
-        if let Some((filter, _)) = &s.inter {
+        if let Some((filter, ..)) = &s.inter {
             self.recon.restore_filter_state(x0, y0, size, size, filter);
         }
     }
@@ -901,14 +950,68 @@ impl<'a> Encoder<'a> {
             + usize::from(y0 > 0 && self.skipped[self.grid(x0, y0 - 1)])
     }
 
-    /// Codes a skipped coding unit: the reference picture copied, zero motion, no residual
-    /// (merge candidate 0, the zero vector: no neighbour has any other motion). Returns its
-    /// distortion.
-    fn code_skip(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> f64 {
+    /// The reference pictures of the current P picture, for motion vector prediction.
+    fn slice_refs(&self) -> SliceRefs<'_> {
+        SliceRefs {
+            poc: self.poc,
+            lists: [&self.ref_pocs, &[]],
+            long_term: [&self.ref_long_term, &[]],
+            col: None,
+            collocated_from_l0: true,
+            no_backward_pred: true,
+            pic_size: (self.width, self.height),
+            log2_ctb: LOG2_CTB,
+        }
+    }
+
+    /// The single prediction block (2N×2N) of a coding unit.
+    fn geom(x0: u32, y0: u32, size: u32) -> PuGeom {
+        PuGeom {
+            x_cb: x0,
+            y_cb: y0,
+            n_cb: size,
+            x: x0,
+            y: y0,
+            w: size,
+            h: size,
+            part_idx: 0,
+            part_mode: PartMode::Part2Nx2N,
+        }
+    }
+
+    /// The distinct merge candidates of a 2N×2N coding unit, with their `merge_idx`.
+    fn merge_candidates(&self, x0: u32, y0: u32, size: u32) -> Vec<(usize, Motion)> {
+        let (refs, g) = (self.slice_refs(), Self::geom(x0, y0, size));
+        let mut out: Vec<(usize, Motion)> = Vec::new();
+        for idx in 0..MAX_MERGE_CANDIDATES {
+            let m = heifer_hevc_dec::inter::merge(
+                self,
+                &refs,
+                &g,
+                idx,
+                MAX_MERGE_CANDIDATES,
+                self.par_mrg_level,
+                [1, 0],
+            );
+            if !out.iter().any(|(_, o)| *o == m) {
+                out.push((idx, m));
+            }
+        }
+        out
+    }
+
+    /// Tells the reconstruction about an inter coding unit with `motion`, and records it in the
+    /// grids; returns its distortion.
+    fn reconstruct_inter(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        motion: Motion,
+        skipped: bool,
+    ) -> f64 {
         let size = 1u32 << log2_size;
-        let inc = self.skip_ctx(x0, y0);
-        self.bin(ctx::CU_SKIP_FLAG + inc, true);
-        self.bin(ctx::MERGE_IDX, false); // merge_idx 0 (MaxNumMergeCand is 5)
         self.recon.coding_unit(&CodingUnit {
             x: x0,
             y: y0,
@@ -924,14 +1027,15 @@ impl<'a> Encoder<'a> {
             y: y0,
             w: size,
             h: size,
-            motion: Motion::l0([0, 0], 0),
+            motion,
         });
         // Not intra: neighbours take DC as its intra mode (§8.4.2).
         self.fill_grid(x0, y0, size, Some(depth), Some(1));
         for y in (y0..y0 + size).step_by(4) {
             for x in (x0..x0 + size).step_by(4) {
                 let i = self.grid(x, y);
-                self.skipped[i] = true;
+                self.skipped[i] = skipped;
+                self.motion[i] = motion;
             }
         }
         let mut d = self.block_sse(0, x0, y0, size as usize) as f64;
@@ -945,6 +1049,180 @@ impl<'a> Encoder<'a> {
             d += self.chroma_weight() * dc as f64;
         }
         d
+    }
+
+    /// Codes a skipped coding unit: the motion of merge candidate `merge_idx`, no residual.
+    /// Returns its distortion.
+    fn code_skip(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        merge_idx: usize,
+        motion: Motion,
+    ) -> f64 {
+        let inc = self.skip_ctx(x0, y0);
+        self.bin(ctx::CU_SKIP_FLAG + inc, true);
+        // merge_idx: truncated unary, the first bin with a context, the others bypass.
+        self.bin(ctx::MERGE_IDX, merge_idx > 0);
+        if merge_idx > 0 {
+            for _ in 1..merge_idx {
+                self.log.encode_bypass(1);
+            }
+            if merge_idx < MAX_MERGE_CANDIDATES - 1 {
+                self.log.encode_bypass(0);
+            }
+        }
+        self.reconstruct_inter(x0, y0, log2_size, depth, motion, true)
+    }
+
+    /// Codes an inter coding unit with motion vector `mv` (AMVP, one reference picture) and no
+    /// residual. Returns its distortion.
+    fn code_amvp(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8, mv: Mv) -> f64 {
+        let size = 1u32 << log2_size;
+        let candidates =
+            heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), &Self::geom(x0, y0, size), 0, 0);
+        let mvd_of = |p: Mv| {
+            [
+                i32::from(mv[0]) - i32::from(p[0]),
+                i32::from(mv[1]) - i32::from(p[1]),
+            ]
+        };
+        let flag = usize::from(mvd_bits(mvd_of(candidates[1])) < mvd_bits(mvd_of(candidates[0])));
+        let inc = self.skip_ctx(x0, y0);
+        self.bin(ctx::CU_SKIP_FLAG + inc, false);
+        self.bin(ctx::PRED_MODE_FLAG, false); // inter
+        self.bin(ctx::PART_MODE, true); // PART_2Nx2N
+        self.bin(ctx::MERGE_FLAG, false);
+        self.mvd_coding(mvd_of(candidates[flag]));
+        self.bin(ctx::MVP_LX_FLAG, flag == 1);
+        self.bin(ctx::NO_RESIDUAL_DATA_FLAG, false); // rqt_root_cbf: no residual
+        self.reconstruct_inter(x0, y0, log2_size, depth, Motion::l0(mv, 0), false)
+    }
+
+    /// `mvd_coding()` (§7.3.8.9).
+    fn mvd_coding(&mut self, mvd: [i32; 2]) {
+        let a = [mvd[0].unsigned_abs(), mvd[1].unsigned_abs()];
+        self.bin(ctx::ABS_MVD_GREATER0_FLAG, a[0] > 0);
+        self.bin(ctx::ABS_MVD_GREATER0_FLAG, a[1] > 0);
+        for &v in &a {
+            if v > 0 {
+                // The decoder's table holds this flag's context second.
+                self.bin(ctx::ABS_MVD_GREATER1_FLAG + 1, v > 1);
+            }
+        }
+        for k in 0..2 {
+            if a[k] > 0 {
+                if a[k] > 1 {
+                    self.exp_golomb_bypass(a[k] - 2, 1);
+                }
+                self.log.encode_bypass(u8::from(mvd[k] < 0));
+            }
+        }
+    }
+
+    /// `k`-th order Exp-Golomb code in bypass bins (§9.3.3.5).
+    fn exp_golomb_bypass(&mut self, mut value: u32, mut k: u32) {
+        while value >= 1 << k {
+            self.log.encode_bypass(1);
+            value -= 1 << k;
+            k += 1;
+        }
+        self.log.encode_bypass(0);
+        self.log.encode_bypass_bits(value, k);
+    }
+
+    /// Integer motion search of a 2N×2N block from the `starts` (quarter-sample vectors): the
+    /// best start or vector of the window around zero motion ([`SEARCH_RANGE`]), then a
+    /// diamond search with steps of 8, 4, 2 and 1 samples. The cost is the
+    /// luma SAD plus √λ times the vector difference's bits from `predictor`.
+    fn search_motion(&self, x0: u32, y0: u32, size: u32, starts: &[Mv], predictor: Mv) -> Mv {
+        let Some(reference) = self.reference else {
+            return [0, 0];
+        };
+        let plane = &reference.planes[0];
+        let (stride, plane_h) = (
+            i64::from(reference.widths[0]),
+            i64::from(reference.heights[0]),
+        );
+        let src = &self.src[0];
+        let n = size as usize;
+        let sad = |mv: Mv| -> u64 {
+            let (dx, dy) = (i64::from(mv[0]) >> 2, i64::from(mv[1]) >> 2);
+            let (rx, ry) = (i64::from(x0) + dx, i64::from(y0) + dy);
+            let inside = rx >= 0 && ry >= 0 && rx + n as i64 <= stride && ry + n as i64 <= plane_h;
+            let mut total = 0u64;
+            for row in 0..n {
+                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..n];
+                if inside {
+                    let r = &plane[((ry + row as i64) * stride + rx) as usize..][..n];
+                    total += s
+                        .iter()
+                        .zip(r)
+                        .map(|(&a, &b)| u64::from((a - i32::from(b)).unsigned_abs()))
+                        .sum::<u64>();
+                } else {
+                    let yy = (ry + row as i64).clamp(0, plane_h - 1) * stride;
+                    for (col, &a) in s.iter().enumerate() {
+                        let xx = (rx + col as i64).clamp(0, stride - 1);
+                        total +=
+                            u64::from((a - i32::from(plane[(yy + xx) as usize])).unsigned_abs());
+                    }
+                }
+            }
+            total
+        };
+        let limit = 4 * 256;
+        let cost = |mv: Mv| -> f64 {
+            let mvd = [
+                i32::from(mv[0]) - i32::from(predictor[0]),
+                i32::from(mv[1]) - i32::from(predictor[1]),
+            ];
+            sad(mv) as f64 + self.sqrt_lambda * mvd_bits(mvd)
+        };
+        let integer = |mv: Mv| [mv[0] & !3, mv[1] & !3];
+        let mut best = [0, 0];
+        let mut best_cost = cost(best);
+        for &s in starts {
+            let s = integer(s);
+            if s[0].unsigned_abs() > limit || s[1].unsigned_abs() > limit {
+                continue;
+            }
+            let c = cost(s);
+            if c < best_cost {
+                (best, best_cost) = (s, c);
+            }
+        }
+        // Every integer vector of a small window around zero motion: a diamond search alone
+        // gets lost in textures, whose cost has no slope to follow.
+        for dy in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
+            for dx in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
+                let c = cost([dx, dy]);
+                if c < best_cost {
+                    (best, best_cost) = ([dx, dy], c);
+                }
+            }
+        }
+        for step in [32i16, 16, 8, 4] {
+            loop {
+                let mut moved = false;
+                for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
+                    let mv = [best[0].saturating_add(dx), best[1].saturating_add(dy)];
+                    if mv[0].unsigned_abs() > limit || mv[1].unsigned_abs() > limit {
+                        continue;
+                    }
+                    let c = cost(mv);
+                    if c < best_cost {
+                        (best, best_cost, moved) = (mv, c, true);
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        best
     }
 
     /// Like [`block_sse`](Self::block_sse), for a `w`×`h` rectangle.
@@ -1577,15 +1855,41 @@ impl<'a> Encoder<'a> {
         let size = 1u32 << log2_size;
         let start_bits = self.log.bit_count();
         let start = self.snapshot(x0, y0, size, false, self.log.checkpoint());
-        // In a P picture, the skipped coding first: a copy of the reference picture.
-        let skip = (self.p_slice && !self.lossless).then(|| {
-            let d = self.code_skip(x0, y0, log2_size, depth);
-            let j = d + self.lambda * (self.log.bit_count() - start_bits);
-            let after = self.log.checkpoint_since(&start.log);
-            let snapshot = self.snapshot(x0, y0, size, true, after);
-            self.restore(x0, y0, size, &start);
-            (j, d, snapshot)
-        });
+        // In a P picture, the inter codings first: skipped with each merge candidate, then a
+        // searched motion vector. The best one is kept to compare with intra.
+        let mut skip: Option<(f64, f64, Snapshot, bool)> = None;
+        if self.p_slice && !self.lossless {
+            let mut keep = |enc: &mut Self, d: f64, is_skip: bool| {
+                let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
+                if skip.as_ref().is_none_or(|b| j < b.0) {
+                    let after = enc.log.checkpoint_since(&start.log);
+                    let snapshot = enc.snapshot(x0, y0, size, true, after);
+                    if let Some(old) = skip.replace((j, d, snapshot, is_skip)) {
+                        enc.recycle(old.2);
+                    }
+                }
+                enc.restore(x0, y0, size, &start);
+            };
+            let candidates = self.merge_candidates(x0, y0, size);
+            for &(idx, motion) in &candidates {
+                let d = self.code_skip(x0, y0, log2_size, depth, idx, motion);
+                keep(self, d, true);
+            }
+            if self.reference.is_some() {
+                let predictors = heifer_hevc_dec::inter::amvp(
+                    &*self,
+                    &self.slice_refs(),
+                    &Self::geom(x0, y0, size),
+                    0,
+                    0,
+                );
+                let mut starts = vec![[0, 0], predictors[0], predictors[1]];
+                starts.extend(candidates.iter().map(|(_, m)| m.mv[0]));
+                let mv = self.search_motion(x0, y0, size, &starts, predictors[0]);
+                let d = self.code_amvp(x0, y0, log2_size, depth, mv);
+                keep(self, d, false);
+            }
+        }
         let mpm = self.mpm_candidates(x0, y0);
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
@@ -1647,16 +1951,20 @@ impl<'a> Encoder<'a> {
         }
         let (j_intra, d, kind, mode, residual, snapshot, deferred) =
             best.expect("a mode was tried");
-        if let Some((j_skip, d_skip, skip_snapshot)) = skip {
-            if j_skip <= j_intra {
-                self.restore(x0, y0, size, &skip_snapshot);
-                self.recycle(skip_snapshot);
+        if let Some((j_inter, d_inter, inter_snapshot, is_skip)) = skip {
+            if j_inter <= j_intra {
+                self.restore(x0, y0, size, &inter_snapshot);
+                self.recycle(inter_snapshot);
                 self.recycle(snapshot);
                 self.recycle(start);
-                self.skipped_cus += 1;
-                return (d_skip, false);
+                if is_skip {
+                    self.skipped_cus += 1;
+                } else {
+                    self.inter_cus += 1;
+                }
+                return (d_inter, false);
             }
-            self.recycle(skip_snapshot);
+            self.recycle(inter_snapshot);
         }
         self.kinds[kind as usize] += 1;
         if current != Some((kind, mode)) {
@@ -2287,6 +2595,18 @@ fn scan_type(log2_size: u8, luma: bool, intra_mode: u8) -> ScanType {
         }
     } else {
         ScanType::Diagonal
+    }
+}
+
+impl MotionSource for Encoder<'_> {
+    /// Availability of a neighbouring block (§6.4.2) and its motion. Only 2N×2N prediction
+    /// blocks are coded, so a neighbour is never inside the current coding block.
+    fn neighbour(&self, g: &PuGeom, xn: i64, yn: i64) -> Option<Motion> {
+        if !self.recon.is_available(g.x, g.y, xn, yn) {
+            return None;
+        }
+        let m = self.motion[self.grid(xn as u32, yn as u32)];
+        m.is_inter().then_some(m)
     }
 }
 
@@ -2986,5 +3306,36 @@ mod tests {
                 "qp {qp}: {sizes:?}"
             );
         }
+    }
+
+    #[test]
+    fn moving_content_is_coded_with_motion_vectors() {
+        // A larger scene moving 3 samples right and 2 down per picture.
+        let (sw, sh) = (160, 120);
+        let scene = test_picture(sw, sh, 21);
+        let (w, h) = (128, 96);
+        let window = |dx: usize, dy: usize| {
+            let cut =
+                |p: &[u8], pw: usize, x0: usize, y0: usize, ww: usize, hh: usize| -> Vec<u8> {
+                    (0..hh)
+                        .flat_map(|y| p[(y0 + y) * pw + x0..][..ww].to_vec())
+                        .collect()
+                };
+            let (cw, chh, scw) = (w / 2, h / 2, sw / 2);
+            (
+                cut(&scene.0, sw, dx, dy, w, h),
+                cut(&scene.1, scw, dx / 2, dy / 2, cw, chh),
+                cut(&scene.2, scw, dx / 2, dy / 2, cw, chh),
+            )
+        };
+        // Even steps keep the chroma aligned with the luma.
+        let pictures: Vec<_> = (0..4).map(|n| window(20 - 4 * n, 16 - 2 * n)).collect();
+        let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 30);
+        if let Ok(path) = std::env::var("HEIFER_DUMP_P") {
+            std::fs::write(path, &stream).unwrap();
+        }
+        check_sequence(&stream, &recons);
+        eprintln!("slice sizes: {sizes:?}");
+        assert!(sizes[1..].iter().all(|&s| s * 3 < sizes[0]), "{sizes:?}");
     }
 }
