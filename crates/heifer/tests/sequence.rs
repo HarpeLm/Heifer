@@ -129,3 +129,75 @@ fn b_frames_come_out_in_display_order() {
     }
     assert!(heifer::decode_sequence_frame(&bytes, 24).is_err());
 }
+
+#[test]
+fn parallel_decoding_gives_the_sequential_frames() {
+    // Groups of pictures decoded on several threads must give exactly the frames of one
+    // thread, in the same (display) order.
+    let mut files = vec![(
+        "bframes.mp4",
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+        )
+        .unwrap(),
+    )];
+    for name in [
+        "sea1_animation.heic",
+        "candle_animation.heic",
+        "rally_burst.heic",
+    ] {
+        if let Some(bytes) = fixture(name) {
+            files.push((name, bytes));
+        }
+    }
+    for (name, bytes) in &files {
+        let decode = |threads| -> Vec<heifer::Image> {
+            let options = heifer::Options::new().with_max_threads(threads);
+            heifer::decode_sequence_with_options(bytes, &options)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let one = decode(1);
+        for threads in [2, 3, 8] {
+            let many = decode(threads);
+            assert_eq!(many.len(), one.len(), "{name}, {threads} threads");
+            assert!(many == one, "{name}: frames differ with {threads} threads");
+        }
+    }
+}
+
+#[test]
+fn parallel_decoding_stops_at_the_same_error() {
+    // Garbage in a frame of the second group of pictures: both ways stop with an error after
+    // the same frames, and parallel decoding neither hangs nor panics.
+    let mut bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+    )
+    .unwrap();
+    let track = heifer::heifer_isobmff::track::parse_tracks(&bytes)
+        .unwrap()
+        .remove(0);
+    let s = track.samples[14];
+    let at = s.offset as usize + 8;
+    for b in &mut bytes[at..at + 40] {
+        *b ^= 0x5A;
+    }
+    let decode = |threads| -> (Vec<heifer::Image>, bool) {
+        let options = heifer::Options::new().with_max_threads(threads);
+        let mut ok = Vec::new();
+        for frame in heifer::decode_sequence_with_options(&bytes, &options).unwrap() {
+            match frame {
+                Ok(image) => ok.push(image),
+                Err(_) => return (ok, true),
+            }
+        }
+        (ok, false)
+    };
+    let (one, one_failed) = decode(1);
+    let (many, many_failed) = decode(4);
+    assert_eq!(one_failed, many_failed);
+    assert_eq!(one.len(), many.len());
+    assert!(one == many);
+    eprintln!("{} frames before the error, error: {one_failed}", one.len());
+}

@@ -96,8 +96,8 @@ const MAX_DEPTH: u32 = 4;
 /// Decoding options.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    /// Maximum number of threads used to decode grid tiles in parallel. `0` uses all
-    /// available cores; `1` decodes sequentially.
+    /// Maximum number of threads used to decode grid tiles, and the groups of pictures of an
+    /// image sequence, in parallel. `0` uses all available cores; `1` decodes sequentially.
     pub max_threads: usize,
     /// Maximum size, in pixels, of any decoded or assembled image (protects against malicious
     /// files). `0` means the default, 2^28 pixels (e.g. a 16384×16384 image).

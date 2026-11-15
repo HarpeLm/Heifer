@@ -91,6 +91,11 @@ pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
 }
 
 /// Decodes every frame of the main sequence, in display order.
+///
+/// When the sequence is made of closed groups of pictures (no RASL picture), several groups are
+/// decoded at once, on up to [`Options::max_threads`] threads. Their frames wait, as decoded
+/// pictures, until the groups before them are shown: the number of groups decoded at once is
+/// limited so that this stays under 1 GiB. The frames are the same as with one thread.
 pub fn decode_sequence(bytes: &[u8]) -> Result<SequenceFrames<'_>, Error> {
     decode_sequence_with_options(bytes, &Options::default())
 }
@@ -144,6 +149,41 @@ pub fn decode_sequence_frame_with_options(
         .ok_or(Error::Invalid("frame index out of range"))
 }
 
+/// The groups of pictures of a track, as ranges of sample indices from one sync sample to the
+/// next, when each can be decoded on its own: the track starts with a sync sample and holds no
+/// RASL picture (NAL unit types 8 and 9), the only pictures after a sync sample that may refer
+/// to the group before it. `None` otherwise, or when a sample cannot be read.
+fn closed_gops(track: &Track, bytes: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    let len_size = usize::from(track.hevc_config.as_ref()?.nal_length_size);
+    if !(1..=4).contains(&len_size) || !track.samples.first()?.sync {
+        return None;
+    }
+    for index in 0..track.samples.len() {
+        let mut data = track.sample_data(bytes, index).ok()?;
+        while data.len() > len_size {
+            let (len, rest) = data.split_at(len_size);
+            let len = len
+                .iter()
+                .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+            let nal = rest.get(..len)?;
+            if matches!(nal.first().map(|b| (b >> 1) & 0x3f), Some(8 | 9)) {
+                return None;
+            }
+            data = &rest[len..];
+        }
+    }
+    let starts: Vec<usize> = (0..track.samples.len())
+        .filter(|&i| track.samples[i].sync)
+        .collect();
+    Some(
+        starts
+            .iter()
+            .zip(starts.iter().skip(1).chain([&track.samples.len()]))
+            .map(|(&a, &b)| a..b)
+            .collect(),
+    )
+}
+
 /// The frames of an image sequence, decoded one by one (see [`decode_sequence`]).
 pub struct SequenceFrames<'a> {
     /// The file: borrowed, or owned by the `image` crate integration.
@@ -158,6 +198,160 @@ pub struct SequenceFrames<'a> {
     shown: usize,
     /// Decoded frames waiting for their turn: sample index and image.
     pending: Vec<(usize, Image)>,
+    /// Groups of pictures decoded on other threads, when the sequence allows it.
+    parallel: Option<Parallel>,
+    /// `Options::max_pixels`, for the group-of-pictures threads.
+    max_pixels: u64,
+}
+
+/// Most memory, in bytes, for the decoded frames of the groups of pictures decoded ahead.
+/// Frames wait as decoded pictures (16-bit planes: 3 bytes per pixel in 4:2:0), and a group
+/// started is decoded to its end: the number of groups decoded at once follows from this
+/// budget, e.g. five groups of 30 frames of 4:2:0 1080p.
+const PARALLEL_BUDGET_BYTES: u64 = 1 << 30;
+
+/// A frame sent back by a group-of-pictures thread: its sample index and the decoded picture.
+type DecodedFrame = (usize, Result<Frame, Error>);
+
+/// A frame in decoding order, with its sample index, converted to an image.
+type Decoded = (usize, Result<Image, Error>);
+
+/// Closed groups of pictures decoded on worker threads, each sending its frames back in
+/// decoding order. At most `running_max` groups are decoded at once, so that their frames,
+/// which wait until the groups before them are shown, stay within the memory budget.
+struct Parallel {
+    /// Groups not started yet, in decoding order.
+    todo: std::collections::VecDeque<std::ops::Range<usize>>,
+    /// Groups being decoded, in decoding order: the frames of the first one come next.
+    running: std::collections::VecDeque<std::sync::mpsc::Receiver<DecodedFrame>>,
+    running_max: usize,
+}
+
+/// What a group-of-pictures thread needs, owned: it outlives no borrow.
+struct GroupJob {
+    config: heifer_isobmff::boxes::HevcConfig,
+    /// The samples of the group, with the index of the first one.
+    samples: Vec<Vec<u8>>,
+    first: usize,
+    max_pixels: u64,
+}
+
+impl GroupJob {
+    /// Decodes the group from its sync sample, sending each frame in decoding order. Stops at
+    /// the first error, or when the receiver is gone.
+    fn run(self, tx: &std::sync::mpsc::Sender<DecodedFrame>) {
+        let mut decoder =
+            SequenceDecoder::new(DecodeOptions::new().with_max_pixels(self.max_pixels));
+        let mut result = hevc_annex_b(&self.config, &[])
+            .map_err(Error::from)
+            .and_then(|sets| decoder.add_parameter_sets(&sets).map_err(Error::from));
+        let picture_config = heifer_isobmff::boxes::HevcConfig {
+            nal_units: Vec::new(),
+            ..self.config.clone()
+        };
+        for (k, data) in self.samples.iter().enumerate() {
+            let index = self.first + k;
+            let frame = result.and_then(|()| {
+                let stream = hevc_annex_b(&picture_config, data)?;
+                decoder.decode(&stream).map_err(|e| decode_error(e, index))
+            });
+            let failed = frame.is_err();
+            if tx.send((index, frame)).is_err() || failed {
+                return;
+            }
+            result = Ok(());
+        }
+    }
+}
+
+impl Parallel {
+    /// The decoded frames of the sequence in decoding order, from worker threads, or `None`
+    /// when the sequence cannot be split or one thread would do.
+    fn new(track: &Track, bytes: &[u8], options: &Options) -> Option<Self> {
+        let threads = options.threads();
+        let groups = closed_gops(track, bytes)?;
+        let longest = groups.iter().map(|g| g.len()).max().unwrap_or(1) as u64;
+        // 16-bit samples: a luma plane and two chroma planes, a quarter, half or full size.
+        let chroma_quarters = match track.hevc_config.as_ref().map_or(3, |c| c.chroma_format) {
+            0 => 0,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        let pixels = u64::from(track.width.max(1)) * u64::from(track.height.max(1));
+        let frame_bytes = 2 * pixels * (4 + chroma_quarters) / 4;
+        let running_max = threads.min((PARALLEL_BUDGET_BYTES / (longest * frame_bytes)) as usize);
+        if running_max < 2 || groups.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            todo: groups.into(),
+            running: std::collections::VecDeque::new(),
+            running_max,
+        })
+    }
+
+    /// Starts groups until `threads` are running.
+    fn fill(&mut self, track: &Track, bytes: &[u8], max_pixels: u64) -> Result<(), Error> {
+        while self.running.len() < self.running_max {
+            let Some(range) = self.todo.pop_front() else {
+                break;
+            };
+            let samples = range
+                .clone()
+                .map(|i| track.sample_data(bytes, i).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?;
+            let job = GroupJob {
+                config: track
+                    .hevc_config
+                    .clone()
+                    .ok_or(Error::Invalid("sequence without HEVC configuration"))?,
+                samples,
+                first: range.start,
+                max_pixels,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || job.run(&tx));
+            self.running.push_back(rx);
+        }
+        Ok(())
+    }
+
+    /// The next decoded frame in decoding order, or `None` after the last one.
+    fn next(&mut self, track: &Track, bytes: &[u8], max_pixels: u64) -> Option<DecodedFrame> {
+        loop {
+            if let Err(e) = self.fill(track, bytes, max_pixels) {
+                return Some((usize::MAX, Err(e)));
+            }
+            let rx = self.running.front()?;
+            match rx.recv() {
+                Ok(decoded) => return Some(decoded),
+                // The group is finished: move on to the next one.
+                Err(_) => {
+                    self.running.pop_front();
+                }
+            }
+        }
+    }
+}
+
+/// The error of decoding sample `index`.
+fn decode_error(e: heifer_hevc_dec::Error, index: usize) -> Error {
+    match e {
+        heifer_hevc_dec::Error::Unimplemented(what) => {
+            Error::Unsupported(format!("sequence frame {index}: {what}"))
+        }
+        e => Error::Hevc(e),
+    }
+}
+
+/// The image of a decoded frame, at the track's display size.
+fn frame_image(frame: &Frame, (track_width, track_height): (u32, u32)) -> Image {
+    // The track size is the display size; HEVC may code a slightly larger picture.
+    let size = |track: u32, coded: u32| if track == 0 { coded } else { track.min(coded) };
+    let width = size(track_width, frame.widths[0]);
+    let height = size(track_height, frame.heights[0]);
+    frame_to_rgba_sized(frame, ColorParams::from_frame(frame), width, height)
 }
 
 impl std::fmt::Debug for SequenceFrames<'_> {
@@ -181,12 +375,18 @@ impl<'a> SequenceFrames<'a> {
             .hevc_config
             .as_ref()
             .ok_or_else(|| Error::Unsupported(format!("sequence coding `{}`", track.coding)))?;
-        let mut decoder = SequenceDecoder::new(DecodeOptions {
-            max_pixels: options.max_pixels(),
-            ..Default::default()
-        });
+        let mut decoder =
+            SequenceDecoder::new(DecodeOptions::new().with_max_pixels(options.max_pixels()));
         decoder.add_parameter_sets(&hevc_annex_b(config, &[])?)?;
+        // Several groups of pictures at once, when decoding the whole sequence.
+        let parallel = if start == 0 {
+            Parallel::new(&track, &bytes, options)
+        } else {
+            None
+        };
         Ok(Self {
+            parallel,
+            max_pixels: options.max_pixels(),
             bytes,
             order: track.display_order(),
             track,
@@ -225,21 +425,26 @@ impl<'a> SequenceFrames<'a> {
             },
             data,
         )?;
-        let frame = self.decoder.decode(&stream).map_err(|e| match e {
-            heifer_hevc_dec::Error::Unimplemented(what) => {
-                Error::Unsupported(format!("sequence frame {index}: {what}"))
-            }
-            e => Error::Hevc(e),
-        })?;
-        Ok(convert.then(|| self.image(&frame)))
+        let frame = self
+            .decoder
+            .decode(&stream)
+            .map_err(|e| decode_error(e, index))?;
+        Ok(convert.then(|| frame_image(&frame, (self.track.width, self.track.height))))
     }
 
-    fn image(&self, frame: &Frame) -> Image {
-        // The track size is the display size; HEVC may code a slightly larger picture.
-        let size = |track: u32, coded: u32| if track == 0 { coded } else { track.min(coded) };
-        let width = size(self.track.width, frame.widths[0]);
-        let height = size(self.track.height, frame.heights[0]);
-        frame_to_rgba_sized(frame, ColorParams::from_frame(frame), width, height)
+    /// The next frame in decoding order, with its sample index: from the worker threads, or
+    /// decoded here.
+    fn next_decoded(&mut self) -> Option<Decoded> {
+        if let Some(parallel) = &mut self.parallel {
+            let (index, frame) = parallel.next(&self.track, &self.bytes, self.max_pixels)?;
+            let size = (self.track.width, self.track.height);
+            return Some((index, frame.map(|f| frame_image(&f, size))));
+        }
+        if self.next >= self.track.samples.len() {
+            return None;
+        }
+        let index = self.next;
+        Some((index, self.decode_next(true).map(|i| i.expect("converted"))))
     }
 }
 
@@ -254,13 +459,10 @@ impl Iterator for SequenceFrames<'_> {
             if let Some(k) = self.pending.iter().position(|(i, _)| *i == sample) {
                 return Some(Ok(self.pending.swap_remove(k).1));
             }
-            if self.next >= self.track.samples.len() {
-                return Some(Err(Error::Invalid("frame missing from the decoding order")));
-            }
-            let index = self.next;
-            match self.decode_next(true) {
-                Ok(image) => self.pending.push((index, image.expect("converted"))),
-                Err(e) => {
+            match self.next_decoded() {
+                None => return Some(Err(Error::Invalid("frame missing from the decoding order"))),
+                Some((index, Ok(image))) => self.pending.push((index, image)),
+                Some((_, Err(e))) => {
                     // Stop after an error.
                     self.shown = self.order.len();
                     return Some(Err(e));
@@ -272,5 +474,106 @@ impl Iterator for SequenceFrames<'_> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = self.order.len().saturating_sub(self.shown);
         (n, Some(n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heifer_isobmff::track::Sample;
+
+    /// A track whose samples are single NAL units of the given types (4-byte lengths), and the
+    /// file bytes holding them.
+    fn track(samples: &[(u8, bool)]) -> (Track, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut list = Vec::new();
+        for &(nal_type, sync) in samples {
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(&[0, 0, 0, 3, nal_type << 1, 1, 0xAB]);
+            list.push((offset, sync));
+        }
+        let mut t = test_track();
+        t.samples = list
+            .into_iter()
+            .map(|(offset, sync)| sample(offset, sync))
+            .collect();
+        (t, bytes)
+    }
+
+    fn sample(offset: u64, sync: bool) -> Sample {
+        let mut s = test_track().samples[0];
+        s.offset = offset;
+        s.size = 7;
+        s.sync = sync;
+        s
+    }
+
+    fn test_track() -> Track {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+        )
+        .unwrap();
+        main_track(&bytes).unwrap().unwrap()
+    }
+
+    #[test]
+    fn groups_split_at_sync_samples_unless_open() {
+        // IDR, TRAIL_R, TRAIL_N, then a CRA with a RADL: three closed groups of pictures.
+        let (t, bytes) = track(&[
+            (19, true),
+            (1, false),
+            (0, false),
+            (21, true),
+            (7, false),
+            (19, true),
+        ]);
+        assert_eq!(closed_gops(&t, &bytes), Some(vec![0..3, 3..5, 5..6]));
+        // A RASL picture refers to the group before: no split.
+        let (t, bytes) = track(&[(19, true), (1, false), (21, true), (8, false), (1, false)]);
+        assert_eq!(closed_gops(&t, &bytes), None);
+        // A track that does not start with a sync sample: no split.
+        let (t, bytes) = track(&[(1, false), (19, true)]);
+        assert_eq!(closed_gops(&t, &bytes), None);
+    }
+
+    #[test]
+    fn parallel_decoding_is_used_when_it_can_be() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+        )
+        .unwrap();
+        let t = main_track(&bytes).unwrap().unwrap();
+        let options = |n| Options::new().with_max_threads(n);
+        assert!(Parallel::new(&t, &bytes, &options(2)).is_some());
+        // One thread, or a single frame decoded from its keyframe: sequential.
+        assert!(Parallel::new(&t, &bytes, &options(1)).is_none());
+        let frames = SequenceFrames::new(bytes.as_slice(), t, 5, &options(4)).unwrap();
+        assert!(frames.parallel.is_none());
+        for name in [
+            "sea1_animation.heic",
+            "candle_animation.heic",
+            "rally_burst.heic",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures")
+                .join(name);
+            if let Ok(bytes) = std::fs::read(path) {
+                let t = main_track(&bytes).unwrap().unwrap();
+                eprintln!(
+                    "{name}: groups {:?}",
+                    closed_gops(&t, &bytes).map(|g| g.len())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_test_stream_has_two_closed_groups() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+        )
+        .unwrap();
+        let t = main_track(&bytes).unwrap().unwrap();
+        assert_eq!(closed_gops(&t, &bytes), Some(vec![0..12, 12..24]));
     }
 }

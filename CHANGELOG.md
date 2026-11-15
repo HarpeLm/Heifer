@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**New**
+
+- Image sequences decode in parallel: when a sequence is made of closed groups of pictures,
+  `decode_sequence` decodes several groups at once on up to `Options::max_threads` threads,
+  with the same frames as one thread. Waiting frames are kept as decoded pictures and the
+  number of groups decoded at once is limited to stay under 1 GiB. About 3 times faster on a
+  1080p stream with a keyframe every 30 frames (130 instead of 43 frames per second).
+- `examples/seqbench.rs` measures sequence decoding.
+
+**Changed**
+
+- The SAO filter skips its per-sample checks inside CTBs: 6 to 10% faster on sequences,
+  identical output.
+
 ## 0.5.1 — 2026-11-14
 
 Fixes found by fuzzing, uncompressed primary images, and a clearer line between the stable
