@@ -45,6 +45,24 @@ const SEARCH_RANGE: i16 = 32;
 /// `MaxNumMergeCand` of P pictures (`five_minus_max_num_merge_cand` 0).
 const MAX_MERGE_CANDIDATES: usize = 5;
 
+/// Whether any block of a transform tree has a residual.
+fn tree_coded(tree: &TNode) -> bool {
+    match tree {
+        TNode::Leaf(luma, chroma) => luma.coded() || chroma.iter().flatten().any(Tb::coded),
+        TNode::Split(blocks, _) => blocks.iter().any(tree_coded),
+    }
+}
+
+/// Weighted sum of squared errors of the blocks of a transform tree.
+fn tree_sse(tree: &TNode) -> f64 {
+    match tree {
+        TNode::Leaf(luma, chroma) => {
+            luma.sse + chroma.iter().flatten().map(|tb| tb.sse).sum::<f64>()
+        }
+        TNode::Split(blocks, _) => blocks.iter().map(tree_sse).sum(),
+    }
+}
+
 /// Approximate bits of a motion vector difference (quarter samples), for the motion search.
 fn mvd_bits(mvd: [i32; 2]) -> f64 {
     mvd.iter()
@@ -653,6 +671,9 @@ struct Encoder<'a> {
     /// Skipped and other inter coding units chosen, for tests.
     skipped_cus: usize,
     inter_cus: usize,
+    /// Whether the transform blocks being coded belong to an inter coding unit: DCT only,
+    /// prediction taken from the picture.
+    inter_block: bool,
     /// The reference picture of a P picture (the previous picture's filtered reconstruction),
     /// the POCs of the current and reference pictures, and `Log2ParMrgLevel`.
     reference: Option<&'a Frame>,
@@ -765,6 +786,7 @@ impl<'a> Encoder<'a> {
             motion: vec![Motion::NONE; grid_w * (ph / 4)],
             skipped_cus: 0,
             inter_cus: 0,
+            inter_block: false,
             reference: None,
             poc: 0,
             ref_pocs: Vec::new(),
@@ -1077,9 +1099,18 @@ impl<'a> Encoder<'a> {
         self.reconstruct_inter(x0, y0, log2_size, depth, motion, true)
     }
 
-    /// Codes an inter coding unit with motion vector `mv` (AMVP, one reference picture) and no
-    /// residual. Returns its distortion.
-    fn code_amvp(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8, mv: Mv) -> f64 {
+    /// Codes an inter coding unit with motion vector `mv` (AMVP, one reference picture), with
+    /// a residual when `residual` and the residual has any level. Returns its distortion, or
+    /// `None` when a residual was asked for and none is worth coding.
+    fn code_amvp(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        mv: Mv,
+        residual: bool,
+    ) -> Option<f64> {
         let size = 1u32 << log2_size;
         let candidates =
             heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), &Self::geom(x0, y0, size), 0, 0);
@@ -1097,8 +1128,109 @@ impl<'a> Encoder<'a> {
         self.bin(ctx::MERGE_FLAG, false);
         self.mvd_coding(mvd_of(candidates[flag]));
         self.bin(ctx::MVP_LX_FLAG, flag == 1);
-        self.bin(ctx::NO_RESIDUAL_DATA_FLAG, false); // rqt_root_cbf: no residual
-        self.reconstruct_inter(x0, y0, log2_size, depth, Motion::l0(mv, 0), false)
+        let d = self.reconstruct_inter(x0, y0, log2_size, depth, Motion::l0(mv, 0), false);
+        if !residual {
+            self.bin(ctx::NO_RESIDUAL_DATA_FLAG, false); // rqt_root_cbf: no residual
+            return Some(d);
+        }
+        // The residual of the prediction just written to the picture.
+        self.inter_block = true;
+        let tree = self.inter_tree(x0, y0, log2_size);
+        self.inter_block = false;
+        if !tree_coded(&tree) {
+            return None;
+        }
+        self.bin(ctx::NO_RESIDUAL_DATA_FLAG, true); // rqt_root_cbf
+        self.write_inter_tree(&tree, log2_size, 0, (false, false));
+        Some(tree_sse(&tree))
+    }
+
+    /// The transform tree of an inter coding unit's residual: one transform block per
+    /// component (`max_transform_hierarchy_depth_inter` is 0), split only above 32×32. Each
+    /// block is reconstructed as it is quantized.
+    fn inter_tree(&mut self, x0: u32, y0: u32, log2_size: u8) -> TNode {
+        if log2_size > LOG2_MAX_TB {
+            let half = 1u32 << (log2_size - 1);
+            let blocks = [(0, 0), (half, 0), (0, half), (half, half)]
+                .iter()
+                .map(|&(dx, dy)| self.inter_tree(x0 + dx, y0 + dy, log2_size - 1))
+                .collect();
+            return TNode::Split(blocks, None);
+        }
+        let luma = self.inter_tb(0, x0, y0, log2_size);
+        let chroma = self.chroma.then(|| {
+            let (xc, yc) = self.chroma_pos(x0, y0);
+            let log2_c = log2_size - u8::from(self.csx == 2);
+            (1..3)
+                .map(|c| self.inter_tb(c, xc, yc, log2_c))
+                .collect::<Vec<_>>()
+        });
+        TNode::Leaf(luma, chroma)
+    }
+
+    /// Quantizes and reconstructs one transform block of an inter coding unit, whose
+    /// prediction is already in the picture.
+    fn inter_tb(&mut self, c: usize, x: u32, y: u32, log2_size: u8) -> Tb {
+        let n = 1usize << log2_size;
+        let mut pred = std::mem::take(&mut self.pred);
+        let stride = self.recon.frame.widths[c] as usize;
+        for row in 0..n {
+            let start = (y as usize + row) * stride + x as usize;
+            for (p, &v) in pred[row * n..][..n]
+                .iter_mut()
+                .zip(&self.recon.frame.planes[c][start..start + n])
+            {
+                *p = i32::from(v);
+            }
+        }
+        self.pred = pred;
+        self.diff_from_prediction(c, x, y, n);
+        // Mode 1 (DC) gives the diagonal scan of inter blocks.
+        let levels = self.quantize(c, log2_size, 1, false);
+        let sse = self.reconstruct(c, x, y, log2_size, 1, &levels, false);
+        let w = if c == 0 { 1.0 } else { self.chroma_weight() };
+        Tb {
+            c,
+            x,
+            y,
+            log2_size,
+            mode: 1,
+            levels,
+            transform_skip: false,
+            sse: sse as f64 * w,
+        }
+    }
+
+    /// `transform_tree()` of an inter coding unit (§7.3.8.8): no `split_transform_flag`, the
+    /// split above 32×32 is inferred, and the root's `cbf_luma` is inferred to be 1 without
+    /// chroma residual.
+    fn write_inter_tree(&mut self, tree: &TNode, log2_size: u8, depth: u8, parent: (bool, bool)) {
+        let cbf = (tree.chroma_cbf(0), tree.chroma_cbf(1));
+        if self.chroma && (log2_size > 2 || self.csx == 1) {
+            for (coded, parent_cbf) in [(cbf.0, parent.0), (cbf.1, parent.1)] {
+                if depth == 0 || parent_cbf {
+                    self.bin(ctx::CBF_CHROMA + usize::from(depth), coded);
+                }
+            }
+        }
+        match tree {
+            TNode::Split(blocks, _) => {
+                for block in blocks {
+                    self.write_inter_tree(block, log2_size - 1, depth + 1, cbf);
+                }
+            }
+            TNode::Leaf(luma, chroma) => {
+                if depth != 0 || cbf.0 || cbf.1 {
+                    self.bin(ctx::CBF_LUMA + usize::from(depth == 0), luma.coded());
+                }
+                if luma.coded() {
+                    self.residual_coding(luma);
+                }
+                for tb in chroma.iter().flatten().filter(|tb| tb.coded()) {
+                    self.residual_coding(tb);
+                }
+            }
+        }
     }
 
     /// `mvd_coding()` (§7.3.8.9).
@@ -1618,7 +1750,7 @@ impl<'a> Encoder<'a> {
                 *o = d << shift;
             }
         } else {
-            let dst = c == 0 && log2_size == 2;
+            let dst = c == 0 && log2_size == 2 && !self.inter_block;
             forward_transform(
                 &self.diff[..n * n],
                 log2_size,
@@ -1699,7 +1831,7 @@ impl<'a> Encoder<'a> {
                 transform_skip,
                 transquant_bypass: self.lossless,
                 explicit_rdpcm: None,
-                inter: false,
+                inter: self.inter_block,
                 qp_y: self.qp,
                 cu_qp_offset: 0,
                 res_scale_val: 0,
@@ -1886,8 +2018,17 @@ impl<'a> Encoder<'a> {
                 let mut starts = vec![[0, 0], predictors[0], predictors[1]];
                 starts.extend(candidates.iter().map(|(_, m)| m.mv[0]));
                 let mv = self.search_motion(x0, y0, size, &starts, predictors[0]);
-                let d = self.code_amvp(x0, y0, log2_size, depth, mv);
+                let d = self
+                    .code_amvp(x0, y0, log2_size, depth, mv, false)
+                    .expect("always coded without residual");
                 keep(self, d, false);
+                // With a residual (4:2:2 chroma trees are not handled).
+                if !self.is_422() {
+                    match self.code_amvp(x0, y0, log2_size, depth, mv, true) {
+                        Some(d) => keep(self, d, false),
+                        None => self.restore(x0, y0, size, &start),
+                    }
+                }
             }
         }
         let mpm = self.mpm_candidates(x0, y0);
@@ -3337,5 +3478,48 @@ mod tests {
         check_sequence(&stream, &recons);
         eprintln!("slice sizes: {sizes:?}");
         assert!(sizes[1..].iter().all(|&s| s * 3 < sizes[0]), "{sizes:?}");
+    }
+
+    #[test]
+    fn inter_blocks_code_a_residual() {
+        // A scene moving 4 samples right and 2 down per picture, and getting brighter: the
+        // motion predicts it well, but not exactly.
+        let (sw, sh) = (160, 120);
+        let scene = test_picture(sw, sh, 33);
+        let (w, h) = (128, 96);
+        let frame = |n: usize| {
+            let (dx, dy) = (20 - 4 * n, 16 - 2 * n);
+            let gain = 6 * n as i32;
+            let cut = |p: &[u8],
+                       pw: usize,
+                       x0: usize,
+                       y0: usize,
+                       ww: usize,
+                       hh: usize,
+                       add: i32|
+             -> Vec<u8> {
+                (0..hh)
+                    .flat_map(|y| {
+                        p[(y0 + y) * pw + x0..][..ww]
+                            .iter()
+                            .map(|&v| (i32::from(v) + add).clamp(0, 255) as u8)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            (
+                cut(&scene.0, sw, dx, dy, w, h, gain),
+                cut(&scene.1, sw / 2, dx / 2, dy / 2, w / 2, h / 2, 0),
+                cut(&scene.2, sw / 2, dx / 2, dy / 2, w / 2, h / 2, 0),
+            )
+        };
+        let pictures: Vec<_> = (0..4).map(frame).collect();
+        let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 30);
+        if let Ok(path) = std::env::var("HEIFER_DUMP_P") {
+            std::fs::write(path, &stream).unwrap();
+        }
+        check_sequence(&stream, &recons);
+        eprintln!("slice sizes: {sizes:?}");
+        assert!(sizes[1..].iter().all(|&s| s * 2 < sizes[0]), "{sizes:?}");
     }
 }
