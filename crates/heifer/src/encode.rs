@@ -23,7 +23,7 @@ use heifer_hevc_enc::encoder::{
 };
 use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
-use heifer_isobmff::writer::{ALPHA_URN, HeifWriter, ImageSpec};
+use heifer_isobmff::writer::{ALPHA_URN, HeifWriter, ImageSpec, SequenceTrack};
 
 use crate::{Error, HdrImage, Image, Metadata};
 
@@ -266,6 +266,137 @@ pub fn encode_to_size(
             "the image does not fit in {max_bytes} bytes, even at quality 0"
         ))
     })
+}
+
+/// Units per second of the durations of an encoded sequence: milliseconds.
+const SEQUENCE_TIMESCALE: u32 = 1000;
+
+/// Encodes an image sequence (a burst or an animation) as a HEIF file: `frames`, all the same
+/// size, each shown for the matching entry of `durations`, in seconds.
+///
+/// Every frame is coded on its own (intra only), so the frames are encoded in parallel on
+/// [`EncodeOptions::max_threads`] threads, and any frame can be decoded without the others;
+/// files are larger than with motion prediction. The first frame is also stored as the
+/// primary image, for viewers of still images. Frames with transparency are refused: their
+/// alpha would need a track of its own.
+///
+/// ```
+/// let red = heifer::Image::filled(64, 48, 8, [255, 0, 0, 255]);
+/// let blue = heifer::Image::filled(64, 48, 8, [0, 0, 255, 255]);
+/// let bytes = heifer::encode_sequence(&[red, blue], &[0.5, 0.5], &heifer::EncodeOptions::new())
+///     .unwrap();
+/// let sequence = heifer::read_sequence(&bytes).unwrap().unwrap();
+/// assert_eq!(sequence.frames.len(), 2);
+/// ```
+pub fn encode_sequence(
+    frames: &[Image],
+    durations: &[f64],
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
+    let first = frames
+        .first()
+        .ok_or(Error::Invalid("image sequence without frames"))?;
+    if durations.len() != frames.len() {
+        return Err(Error::Invalid("one duration per frame is needed"));
+    }
+    if durations.iter().any(|d| !(d.is_finite() && *d >= 0.0)) {
+        return Err(Error::Invalid(
+            "frame durations must be finite and not negative",
+        ));
+    }
+    let (width, height, bit_depth) = (first.width, first.height, first.bit_depth);
+    for frame in frames {
+        if (frame.width, frame.height, frame.bit_depth) != (width, height, bit_depth) {
+            return Err(Error::Invalid(
+                "the frames of a sequence must have the same size and bit depth",
+            ));
+        }
+        check_input(width, height, frame.data.len(), 4)?;
+        if frame.has_alpha
+            && frame
+                .data
+                .chunks_exact(4)
+                .any(|p| p[3] != (1 << bit_depth) - 1)
+        {
+            return Err(Error::Unsupported("transparency in image sequences".into()));
+        }
+    }
+
+    let mut writer = HeifWriter::new();
+    // The first frame as a still image, coded like a photo (tiles, thumbnail).
+    encode_into(
+        &mut writer,
+        width,
+        height,
+        bit_depth,
+        false,
+        None,
+        EncodeFormat::Ycbcr420,
+        options,
+        |i| rgba_at(first, i),
+    )?;
+
+    // Every frame as one intra picture, in parallel.
+    let config = EncoderConfig {
+        qp: options.qp(),
+        colour: (1, 13, 6),
+        ..EncoderConfig::default()
+    };
+    let threads = options.threads().clamp(1, frames.len());
+    let per_thread = frames.len().div_ceil(threads);
+    let pictures: Vec<Result<EncodedPicture, Error>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = frames
+            .chunks(per_thread)
+            .map(|chunk| {
+                scope.spawn(|| {
+                    chunk
+                        .iter()
+                        .map(|frame| {
+                            let source = Source {
+                                width,
+                                height,
+                                bit_depth,
+                                pixel: |i: usize| rgba_at(frame, i),
+                            };
+                            encode_region(
+                                &source,
+                                (0, 0),
+                                (width, height),
+                                false,
+                                &config,
+                                EncodeFormat::Ycbcr420,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("encoding thread panicked"))
+            .collect()
+    });
+    let pictures = pictures.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let hevc = hevc_config(&pictures[0], bit_depth);
+    if pictures
+        .iter()
+        .any(|p| p.parameter_sets != pictures[0].parameter_sets)
+    {
+        return Err(Error::Invalid("frames coded with different parameter sets"));
+    }
+    let mut track = SequenceTrack::new(width, height, SEQUENCE_TIMESCALE, hevc);
+    for (picture, &duration) in pictures.iter().zip(durations) {
+        let ticks = (duration * f64::from(SEQUENCE_TIMESCALE)).round();
+        track.add_sample(&picture.slices, ticks.min(f64::from(u32::MAX)) as u32, true);
+    }
+    writer.set_sequence(track);
+    Ok(writer.finish())
+}
+
+/// Pixel `i` of an RGBA image.
+fn rgba_at(image: &Image, i: usize) -> [u16; 4] {
+    let p = &image.data[4 * i..4 * i + 4];
+    [p[0], p[1], p[2], p[3]]
 }
 
 fn too_large(size: usize, max_bytes: usize) -> Error {

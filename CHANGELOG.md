@@ -10,6 +10,12 @@
   number of groups decoded at once is limited to stay under 1 GiB. About 3 times faster on a
   1080p stream with a keyframe every 30 frames (130 instead of 43 frames per second).
 - `examples/seqbench.rs` measures sequence decoding.
+- Image sequences can be written: `heifer::encode_sequence` encodes frames, each with its
+  duration, as a HEIF file with a sequence track (and the first frame as the primary image),
+  read back by heifer, libheif and ffmpeg. Frames are coded intra only, in parallel; files are
+  larger than with motion prediction, which is planned. `heifer_isobmff::writer::SequenceTrack`
+  and `HeifWriter::set_sequence` write the track (`moov`, `pict` handler, `ccst`, 32-bit
+  chunk offsets unless the file passes 4 GiB).
 
 **Changed**
 

@@ -201,3 +201,79 @@ fn parallel_decoding_stops_at_the_same_error() {
     assert!(one == many);
     eprintln!("{} frames before the error, error: {one_failed}", one.len());
 }
+
+#[cfg(feature = "encoder")]
+#[test]
+fn encoded_sequences_read_back() {
+    // 12 frames whose brightness grows, of an odd size (rounded up in 4:2:0, then cropped).
+    let (w, h) = (97u32, 61u32);
+    let frames: Vec<heifer::Image> = (0..12u16)
+        .map(|n| {
+            let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+            for (i, p) in image.data.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                let v = ((x + 2 * y) % 64) as u16 + 15 * n;
+                p[..3].copy_from_slice(&[v, v / 2 + 40, 200 - v / 2]);
+            }
+            image
+        })
+        .collect();
+    let durations: Vec<f64> = (0..12).map(|n| if n == 11 { 0.5 } else { 0.04 }).collect();
+    let options = heifer::EncodeOptions::new().with_quality(90);
+    let bytes = heifer::encode_sequence(&frames, &durations, &options).unwrap();
+
+    // Brands, primary image and track.
+    assert_eq!(
+        heifer::check_file_type(&bytes),
+        heifer::FileTypeResult::Supported
+    );
+    let still = heifer::decode(&bytes).unwrap();
+    assert_eq!((still.width, still.height), (w, h));
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    assert_eq!((seq.width, seq.height, seq.frames.len()), (w, h, 12));
+    assert!(seq.frames.iter().all(|f| f.keyframe));
+    assert!((seq.frames[0].duration - 0.04).abs() < 1e-9);
+    assert!((seq.frames[11].duration - 0.5).abs() < 1e-9);
+
+    // Every frame decodes close to its original, on one thread or several.
+    for threads in [1, 4] {
+        let decoded: Vec<heifer::Image> = heifer::decode_sequence_with_options(
+            &bytes,
+            &heifer::Options::new().with_max_threads(threads),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+        assert_eq!(decoded.len(), 12);
+        for (n, (a, b)) in frames.iter().zip(&decoded).enumerate() {
+            assert_eq!((b.width, b.height), (w, h));
+            let mse: f64 = a
+                .data
+                .iter()
+                .zip(&b.data)
+                .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+                .sum::<f64>()
+                / a.data.len() as f64;
+            let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+            assert!(psnr > 35.0, "frame {n}: {psnr:.1} dB");
+        }
+    }
+    // A frame decoded alone (every frame is a keyframe).
+    assert!(heifer::decode_sequence_frame(&bytes, 7).is_ok());
+}
+
+#[cfg(feature = "encoder")]
+#[test]
+fn encode_sequence_refuses_bad_input() {
+    let a = heifer::Image::filled(32, 32, 8, [10, 20, 30, 255]);
+    let b = heifer::Image::filled(16, 32, 8, [10, 20, 30, 255]);
+    let o = heifer::EncodeOptions::new();
+    assert!(heifer::encode_sequence(&[], &[], &o).is_err());
+    assert!(heifer::encode_sequence(&[a.clone(), b], &[0.1, 0.1], &o).is_err());
+    assert!(heifer::encode_sequence(std::slice::from_ref(&a), &[0.1, 0.1], &o).is_err());
+    assert!(heifer::encode_sequence(std::slice::from_ref(&a), &[f64::NAN], &o).is_err());
+    let mut transparent = a.clone();
+    transparent.has_alpha = true;
+    transparent.data[3] = 0;
+    assert!(heifer::encode_sequence(&[transparent], &[0.1], &o).is_err());
+}
