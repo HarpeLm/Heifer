@@ -17,6 +17,7 @@ heifer IMG_1234.heic photo.png --depth        # with photo.depth.png next to it
 heifer portrait.heic portrait.png --aux       # every auxiliary image as PNG
 heifer burst.heics frames.png --frames        # frames-001.png, frames-002.png, ...
 heifer burst.heics burst.gif --frames         # one animated GIF (or .apng)
+heifer animation.gif animation.heics -q 70     # a GIF, APNG or HEIF sequence as .heics
 heifer info IMG_1234.heic                     # size, tiles, camera, auxiliary images, metadata
 ```
 

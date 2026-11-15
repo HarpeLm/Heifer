@@ -16,6 +16,8 @@
   larger than with motion prediction, which is planned. `heifer_isobmff::writer::SequenceTrack`
   and `HeifWriter::set_sequence` write the track (`moov`, `pict` handler, `ccst`, 32-bit
   chunk offsets unless the file passes 4 GiB).
+- CLI: a `.heics` output writes an animated GIF, an APNG or a HEIF sequence as a HEIF image
+  sequence, with each frame's duration (transparency is flattened onto white).
 
 **Changed**
 

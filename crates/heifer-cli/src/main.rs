@@ -37,6 +37,8 @@ Options:
       --frames           write every frame of an image sequence (burst, animation) instead
                          of the main image: out.png gives out-001.png, out-002.png, ...;
                          out.gif or out.apng gives one animated file
+                         A .heics output writes an animated GIF, APNG or HEIF sequence as a
+                         HEIF image sequence (transparency is flattened onto white)
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
@@ -52,6 +54,7 @@ Examples:
   heifer *.HEIC --to jpg -o converted --gain-map
   heifer burst.heics frames.png --frames
   heifer burst.heics burst.gif --frames
+  heifer animation.gif animation.heics -q 70
   heifer screenshot.png screenshot.heic -q 70
   heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
@@ -231,6 +234,104 @@ fn output_path(input: &Path, args: &Args) -> Result<PathBuf, String> {
     Ok(dir.join(stem).with_extension(to))
 }
 
+fn is_heics(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_lowercase().as_str(), "heics" | "heifs" | "hifs"))
+}
+
+/// The frames of an animation (GIF, APNG, or a HEIF image sequence) and their durations in
+/// seconds, as 8-bit RGBA.
+fn animation_frames(input: &Path) -> Result<Vec<image::Frame>, String> {
+    use image::AnimationDecoder;
+    let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+    let reader = std::io::Cursor::new(&bytes);
+    let frames = match image::guess_format(&bytes).ok() {
+        Some(ImageFormat::Gif) => image::codecs::gif::GifDecoder::new(reader)
+            .map_err(|e| e.to_string())?
+            .into_frames()
+            .collect_frames(),
+        Some(ImageFormat::Png) => {
+            let decoder = image::codecs::png::PngDecoder::new(reader).map_err(|e| e.to_string())?;
+            if !decoder.is_apng().map_err(|e| e.to_string())? {
+                return Err("not an animation: a PNG image sequence needs an APNG".into());
+            }
+            decoder
+                .apng()
+                .map_err(|e| e.to_string())?
+                .into_frames()
+                .collect_frames()
+        }
+        _ if heifer::read_sequence(&bytes).ok().flatten().is_some() => {
+            heifer::image_crate::HeifSequenceDecoder::from_bytes(bytes, &heifer::Options::default())
+                .map_err(|e| e.to_string())?
+                .into_frames()
+                .collect_frames()
+        }
+        _ => {
+            return Err(
+                "not an animation: give an animated GIF, an APNG or a HEIF sequence".into(),
+            );
+        }
+    };
+    frames.map_err(|e| e.to_string())
+}
+
+/// A `.heics` output: the frames of an animated input, each with its duration, as a HEIF image
+/// sequence. Transparent pixels are flattened onto white.
+fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
+    if args.format.is_some() || args.max_size.is_some() || args.wants_aux() {
+        return Err("a .heics output takes only -q among the HEIC options".into());
+    }
+    if output.exists() && !args.force {
+        return Err(format!(
+            "{} exists (use --force to overwrite)",
+            output.display()
+        ));
+    }
+    let start = Instant::now();
+    let frames = animation_frames(input)?;
+    let mut flattened = false;
+    let mut images = Vec::with_capacity(frames.len());
+    let mut durations = Vec::with_capacity(frames.len());
+    for frame in &frames {
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        durations.push(f64::from(numer) / f64::from(denom.max(1)) / 1000.0);
+        let buffer = frame.buffer();
+        let (w, h) = buffer.dimensions();
+        let mut image = heifer::Image::filled(w, h, 8, [255, 255, 255, 255]);
+        for (o, p) in image.data.chunks_exact_mut(4).zip(buffer.pixels()) {
+            let [r, g, b, a] = p.0.map(u32::from);
+            if a < 255 {
+                flattened = true;
+            }
+            // Over white: c * a + 255 * (255 - a), rounded, divided by 255.
+            let over = |c: u32| ((c * a + 255 * (255 - a) + 127) / 255) as u16;
+            o[..3].copy_from_slice(&[over(r), over(g), over(b)]);
+        }
+        images.push(image);
+    }
+    let options = heifer::EncodeOptions::new().with_quality(args.quality.unwrap_or(80));
+    let bytes =
+        heifer::encode_sequence(&images, &durations, &options).map_err(|e| e.to_string())?;
+    std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+    let total: f64 = durations.iter().sum();
+    println!(
+        "{} → {} ({} frames {}×{}, {total:.2} s, {}, {:.2?})",
+        input.display(),
+        output.display(),
+        images.len(),
+        images.first().map_or(0, |i| i.width),
+        images.first().map_or(0, |i| i.height),
+        human(bytes.len() as u64),
+        start.elapsed()
+    );
+    if flattened {
+        println!("  transparent pixels were flattened onto white");
+    }
+    Ok(())
+}
+
 fn is_heif(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -280,6 +381,9 @@ fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
 fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
     if args.frames {
         return write_frames(input, output, args);
+    }
+    if is_heics(output) {
+        return write_sequence(input, output, args);
     }
     check_heic_only(args, output)?;
     if args.wants_aux() && !is_heif(input) {
@@ -1334,6 +1438,43 @@ mod tests {
         let err = write_frames(&bframes(), &gif, &args).unwrap_err();
         assert!(err.contains("exists"), "{err}");
         assert!(!dir.join("a.partial").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn animations_become_heif_sequences() {
+        let dir = temp_dir("heics");
+        let out = dir.join("a.heics");
+        let args = parse("in out.heics -q 85").unwrap().unwrap();
+        write_sequence(&bframes(), &out, &args).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+        assert_eq!((seq.width, seq.height, seq.frames.len()), (128, 96, 24));
+        assert!(
+            seq.frames
+                .iter()
+                .all(|f| f.keyframe && (f.duration - 0.04).abs() < 1e-9)
+        );
+        // The brightness of the test stream grows with the display index: still in order.
+        let means: Vec<f64> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .map(|f| {
+                let f = f.unwrap();
+                f.data.chunks_exact(4).map(|p| f64::from(p[1])).sum::<f64>() / f64::from(128 * 96)
+            })
+            .collect();
+        assert!(means.windows(2).all(|m| m[1] > m[0] + 3.0), "{means:?}");
+        // No overwrite without --force; a still image is not an animation.
+        assert!(
+            write_sequence(&bframes(), &out, &args)
+                .unwrap_err()
+                .contains("exists")
+        );
+        let still = fixture("single_image.heic");
+        if still.exists() {
+            let err = write_sequence(&still, &dir.join("b.heics"), &args).unwrap_err();
+            assert!(err.contains("not an animation"), "{err}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
