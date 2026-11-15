@@ -253,6 +253,35 @@ fn encode_with_reconstruction(
     options: &CodingOptions,
     config: &EncoderConfig,
 ) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
+    encode_kind(width, height, planes, options, config, Kind::Still)
+}
+
+/// What to encode: a still image, or a picture of an image sequence.
+// The sequence kinds are only tested until the sequence encoder uses them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Kind<'r> {
+    /// A still image: an IDR picture, in a stream without reference pictures.
+    Still,
+    /// The first picture of a group of an image sequence: an IDR picture, in a stream whose
+    /// SPS keeps one reference picture.
+    SequenceIdr,
+    /// A P picture of POC `poc`, predicted from `reference`, the filtered reconstruction of
+    /// the previous picture (POC `poc - 1`).
+    P { poc: u32, reference: &'r Frame },
+}
+
+/// Encodes a picture of the given [`Kind`]. Returns the encoded picture, the reconstruction
+/// (before the in-loop filters for a still image; filtered, as decoders keep it for reference,
+/// for a picture of a sequence) and how many coding units of each [`CuKind`] were chosen.
+pub(crate) fn encode_kind(
+    width: u32,
+    height: u32,
+    planes: Planes16<'_>,
+    options: &CodingOptions,
+    config: &EncoderConfig,
+    kind: Kind<'_>,
+) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
         return Err(Error::InvalidInput(
             "picture size must be 1 to 16384 pixels",
@@ -336,6 +365,7 @@ fn encode_with_reconstruction(
         full_range: config.full_range,
         colour: config.colour,
         lossless: options.lossless,
+        inter: !matches!(kind, Kind::Still),
     };
     let parameter_sets = vec![params.vps(), params.sps(), params.pps()];
 
@@ -344,8 +374,11 @@ fn encode_with_reconstruction(
     for nal in &parameter_sets {
         sets.add(&NalUnit::parse(nal)?)?;
     }
-    let header_rbsp = params.slice_header();
-    let header_nal = nal_unit(NalType::IdrWRadl, &header_rbsp);
+    let (header_rbsp, nal_type) = match kind {
+        Kind::P { poc, .. } => (params.p_slice_header(poc), NalType::TrailR),
+        _ => (params.slice_header(), NalType::IdrWRadl),
+    };
+    let header_nal = nal_unit(nal_type, &header_rbsp);
     let header = SliceHeader::parse(
         &header_rbsp,
         &NalUnit::parse(&header_nal)?.header,
@@ -355,6 +388,16 @@ fn encode_with_reconstruction(
     let (pps, sps) = sets.get(0)?;
 
     let mut enc = Encoder::new(sps, pps, &params, (w, h), planes, &header);
+    if let Kind::P { poc, reference } = kind {
+        if (reference.widths[0], reference.heights[0]) != (params.width, params.height) {
+            return Err(Error::InvalidInput("reference picture of another size"));
+        }
+        let previous = i32::try_from(poc).unwrap_or(i32::MAX) - 1;
+        enc.recon.set_references(
+            [vec![(reference, previous, false)], Vec::new()],
+            [None, None],
+        );
+    }
     let (pw, ph) = (params.width, params.height);
     let ctb = 1u32 << LOG2_CTB;
     let (ctbs_x, ctbs_y) = (pw.div_ceil(ctb), ph.div_ceil(ctb));
@@ -370,12 +413,13 @@ fn encode_with_reconstruction(
         return Err(e.into());
     }
 
+    let enc_init_type = Contexts::init_type(header.slice_type, header.cabac_init_flag);
     // Slice data: the SAO parameters of each block, then its bins. SAO has its own contexts,
     // so the bins decided without it stay valid. Lossless streams disable SAO in the SPS.
     let bit_depth = planes.bit_depth;
     let chroma = format != ChromaFormat::Monochrome;
     let write = |sao: &[(CtbSao, SaoParams)]| -> Vec<u8> {
-        let mut ctx = Contexts::new(params.qp);
+        let mut ctx = Contexts::new_with_type(params.qp, enc_init_type);
         let mut coder = ArithmeticEncoder::new();
         for (i, bins) in blocks.iter().enumerate() {
             if !sao.is_empty() {
@@ -414,10 +458,16 @@ fn encode_with_reconstruction(
     };
     let mut rbsp = header_rbsp;
     rbsp.extend_from_slice(&write(&decisions));
+    // The SAO parameters go to the reconstruction too, so that its filtered picture, the
+    // reference of the next picture of a sequence, is the decoder's.
+    for (i, (_, params)) in decisions.iter().enumerate() {
+        let (cx, cy) = (i as u32 % ctbs_x, i as u32 / ctbs_x);
+        enc.recon.sao(cx, cy, params);
+    }
 
     let picture = EncodedPicture {
         parameter_sets,
-        slices: vec![nal_unit(NalType::IdrWRadl, &rbsp)],
+        slices: vec![nal_unit(nal_type, &rbsp)],
         profile_idc: params.profile_idc(),
         level_idc: params.level_idc(),
         chroma_format: params.chroma_format,
@@ -425,7 +475,8 @@ fn encode_with_reconstruction(
         height: params.output_height,
     };
     let kinds = enc.kinds;
-    Ok((picture, enc.recon.finish(true), kinds))
+    let skip_filters = matches!(kind, Kind::Still);
+    Ok((picture, enc.recon.finish(skip_filters), kinds))
 }
 
 /// The ways a coding unit can be coded.
@@ -538,6 +589,9 @@ struct Snapshot {
 
 struct Encoder<'a> {
     recon: Reconstructor<'a>,
+    /// Whether the picture is a P picture: coding units start with `cu_skip_flag` and
+    /// `pred_mode_flag`.
+    p_slice: bool,
     /// Bins of the trials, with their estimated rates.
     log: BinLog,
     ctx: Contexts,
@@ -644,7 +698,11 @@ impl<'a> Encoder<'a> {
         Self {
             recon,
             log: BinLog::new(),
-            ctx: Contexts::new(qp),
+            ctx: Contexts::new_with_type(
+                qp,
+                Contexts::init_type(header.slice_type, header.cabac_init_flag),
+            ),
+            p_slice: header.slice_type == heifer_hevc_dec::slice::SliceType::P,
             src: [y, cb, cr],
             chroma: planes.chroma.is_some(),
             csx,
@@ -1587,6 +1645,12 @@ impl<'a> Encoder<'a> {
         if self.lossless {
             // The PPS enables the flag only for lossless streams.
             self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
+        if self.p_slice {
+            // Not skipped (no coding unit of the picture is, so both neighbours give ctxInc 0),
+            // and intra.
+            self.bin(ctx::CU_SKIP_FLAG, false);
+            self.bin(ctx::PRED_MODE_FLAG, true);
         }
         if log2_size == LOG2_MIN_CB {
             self.bin(ctx::PART_MODE, !four); // 1: PART_2Nx2N, 0: PART_NxN
@@ -2656,5 +2720,82 @@ mod tests {
             bit_depth: 12,
         };
         assert!(encode_picture16(2, 2, planes16, &config).is_err());
+    }
+
+    /// Encodes `pictures` (8-bit 4:2:0 planes of `w`×`h`) as an IDR picture then P pictures,
+    /// each predicted from the previous reconstruction. Returns the Annex B stream and the
+    /// encoder's reconstructions, cropped to the picture.
+    fn encode_sequence_stream(
+        w: usize,
+        h: usize,
+        pictures: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        qp: u8,
+    ) -> (Vec<u8>, Vec<[Vec<u16>; 3]>) {
+        let options = CodingOptions::default();
+        let config = EncoderConfig {
+            qp,
+            ..EncoderConfig::default()
+        };
+        let wide = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        let mut reference: Option<Frame> = None;
+        for (poc, (y, cb, cr)) in pictures.iter().enumerate() {
+            let (y, cb, cr) = (wide(y), wide(cb), wide(cr));
+            let planes = Planes16 {
+                y: &y,
+                chroma: Some((&cb, &cr)),
+                bit_depth: 8,
+            };
+            let kind = match &reference {
+                None => Kind::SequenceIdr,
+                Some(frame) => Kind::P {
+                    poc: poc as u32,
+                    reference: frame,
+                },
+            };
+            let (picture, recon, _) =
+                encode_kind(w as u32, h as u32, planes, &options, &config, kind).unwrap();
+            if poc == 0 {
+                for nal in &picture.parameter_sets {
+                    stream.extend_from_slice(&[0, 0, 0, 1]);
+                    stream.extend_from_slice(nal);
+                }
+            }
+            for nal in &picture.slices {
+                stream.extend_from_slice(&[0, 0, 0, 1]);
+                stream.extend_from_slice(nal);
+            }
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            recons.push([
+                crop(&recon, 0, w, h),
+                crop(&recon, 1, cw, ch),
+                crop(&recon, 2, cw, ch),
+            ]);
+            reference = Some(recon);
+        }
+        (stream, recons)
+    }
+
+    #[test]
+    fn p_pictures_decode_as_the_encoder_reconstructs_them() {
+        let (w, h) = (96, 72);
+        let pictures: Vec<_> = (0..3).map(|n| test_picture(w, h, 7 + n)).collect();
+        let (stream, recons) = encode_sequence_stream(w, h, &pictures, 30);
+        let mut decoder =
+            heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+        let units = heifer_hevc_dec::access_units(&stream);
+        assert_eq!(units.len(), 3);
+        for (n, unit) in units.into_iter().enumerate() {
+            let frame = decoder.decode(unit).unwrap();
+            for c in 0..3 {
+                let (cw, ch) = (frame.widths[c] as usize, frame.heights[c] as usize);
+                assert_eq!(
+                    crop(&frame, c, cw, ch),
+                    recons[n][c],
+                    "picture {n}, plane {c}"
+                );
+            }
+        }
     }
 }

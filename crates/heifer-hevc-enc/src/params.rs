@@ -64,6 +64,8 @@ impl BitWriter {
 /// NAL unit types used by the encoder.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NalType {
+    /// A reference picture that is not a random access point (P pictures).
+    TrailR = 1,
     IdrWRadl = 19,
     Vps = 32,
     Sps = 33,
@@ -105,6 +107,9 @@ pub(crate) struct StreamParams {
     pub colour: (u8, u8, u8),
     /// Whether coding units bypass the transform and quantization (`cu_transquant_bypass_flag`).
     pub lossless: bool,
+    /// Whether the stream holds P pictures (image sequences): the SPS then keeps one reference
+    /// picture, the previous one.
+    pub inter: bool,
 }
 
 impl StreamParams {
@@ -168,7 +173,8 @@ impl StreamParams {
             .bit(true);
         w.bits(0xFFFF, 16);
         self.profile_tier_level(&mut w);
-        w.bit(true).ue(0).ue(0).ue(0); // sub-layer ordering info
+        // Sub-layer ordering info, as in the SPS (which must not exceed it).
+        w.bit(true).ue(u32::from(self.inter)).ue(0).ue(0);
         w.bits(0, 6).ue(0); // vps_max_layer_id, vps_num_layer_sets_minus1
         w.bit(false).bit(false); // vps_timing_info_present_flag, vps_extension_flag
         nal_unit(NalType::Vps, &w.finish())
@@ -207,12 +213,20 @@ impl StreamParams {
         let bd = u32::from(self.bit_depth - 8);
         w.ue(bd).ue(bd); // bit_depth_luma_minus8, bit_depth_chroma_minus8
         w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
-        w.bit(true).ue(0).ue(0).ue(0); // sub-layer ordering info
+        // Sub-layer ordering info: one picture buffered, two with a reference picture; no
+        // reordering.
+        w.bit(true).ue(u32::from(self.inter)).ue(0).ue(0);
         w.ue(0).ue(3); // coding blocks 8×8 to 64×64
         w.ue(0).ue(3); // transform blocks 4×4 to 32×32
         w.ue(0).ue(u32::from(crate::encoder::MAX_TU_DEPTH)); // max_transform_hierarchy_depth_inter / intra
         w.bit(false).bit(false).bit(!self.lossless).bit(false); // scaling lists, AMP, SAO, PCM
-        w.ue(0).bit(false).bit(false); // no RPS, no long-term pictures, no TMVP
+        if self.inter {
+            // One short-term RPS: the previous picture (delta POC -1), used for reference.
+            w.ue(1).ue(1).ue(0).ue(0).bit(true);
+        } else {
+            w.ue(0); // no RPS
+        }
+        w.bit(false).bit(false); // no long-term pictures, no TMVP
         w.bit(true); // strong_intra_smoothing_enabled_flag
         w.bit(true); // vui_parameters_present_flag
         {
@@ -253,6 +267,27 @@ impl StreamParams {
         w.ue(0).bit(false); // log2_parallel_merge_level_minus2, header extension
         w.bit(false); // pps_extension_present_flag
         nal_unit(NalType::Pps, &w.finish())
+    }
+
+    /// The slice segment header of a P picture whose POC LSBs are `poc_lsb`, predicted from
+    /// the previous picture (the SPS's RPS).
+    pub(crate) fn p_slice_header(&self, poc_lsb: u32) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.bit(true); // first_slice_segment_in_pic_flag
+        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(1); // slice_type: P
+        w.bits(poc_lsb & 0xFF, 8); // slice_pic_order_cnt_lsb (log2_max_pic_order_cnt_lsb 8)
+        w.bit(true); // short_term_ref_pic_set_sps_flag: the SPS's only RPS
+        if !self.lossless {
+            w.bit(true); // slice_sao_luma_flag
+            if self.chroma_format != 0 {
+                w.bit(true); // slice_sao_chroma_flag
+            }
+        }
+        w.bit(false); // num_ref_idx_active_override_flag: one reference (PPS default)
+        w.ue(0); // five_minus_max_num_merge_cand: 5 merge candidates
+        w.se(0); // slice_qp_delta
+        w.finish()
     }
 
     /// The slice segment header, up to and including `byte_alignment()`.
