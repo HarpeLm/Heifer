@@ -15,6 +15,8 @@
 
 - The SAO filter skips its per-sample checks inside CTBs: 6 to 10% faster on sequences,
   identical output.
+- Motion compensation copies reference blocks that cross the picture edge row by row instead
+  of sample by sample: about 14% faster on a 1080p sequence with motion near the edges.
 
 ## 0.5.1 — 2026-11-14
 

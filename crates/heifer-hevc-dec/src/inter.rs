@@ -560,12 +560,19 @@ fn interpolate<const TAPS: usize>(
             (&plane[y0 as usize * stride + x0 as usize..], stride)
         } else {
             let (max_x, max_y) = (stride as i64 - 1, plane_h as i64 - 1);
-            padded = (0..sh as i64)
-                .flat_map(|r| {
-                    let row = (y0 + r).clamp(0, max_y) as usize * stride;
-                    (0..sw as i64).map(move |c| plane[row + (x0 + c).clamp(0, max_x) as usize])
-                })
-                .collect();
+            // Row by row: a plain copy when the row lies inside horizontally, clamped
+            // samples otherwise (only the columns past an edge need it, but this case is rare).
+            let inside_x = x0 >= 0 && x0 as usize + sw <= stride;
+            let mut copy = Vec::with_capacity(sw * sh);
+            for r in 0..sh as i64 {
+                let line = &plane[(y0 + r).clamp(0, max_y) as usize * stride..][..stride];
+                if inside_x {
+                    copy.extend_from_slice(&line[x0 as usize..x0 as usize + sw]);
+                } else {
+                    copy.extend((0..sw as i64).map(|c| line[(x0 + c).clamp(0, max_x) as usize]));
+                }
+            }
+            padded = copy;
             (&padded[..], sw)
         };
     let b = before as usize;
