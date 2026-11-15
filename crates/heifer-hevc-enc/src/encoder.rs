@@ -16,13 +16,15 @@
 //! levels are the raw residual samples, and the in-loop filters are off.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
+use heifer_hevc_dec::inter::Motion;
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
+use heifer_hevc_dec::recon::FilterState;
 use heifer_hevc_dec::recon::Frame;
 use heifer_hevc_dec::recon::{IntraReferences, Reconstructor};
 use heifer_hevc_dec::scan::{ScanType, scan_order};
 use heifer_hevc_dec::slice::SliceHeader;
-use heifer_hevc_dec::syntax::{CodingUnit, SaoParams, Sink, TransformBlock};
+use heifer_hevc_dec::syntax::{CodingUnit, PredictionUnit, SaoParams, Sink, TransformBlock};
 
 use crate::Error;
 use crate::cabac::ArithmeticEncoder;
@@ -585,6 +587,9 @@ struct Snapshot {
     modes: Vec<u8>,
     /// Block edge flags of the deblocking filter.
     edges: Vec<u8>,
+    /// In P pictures: the deblocking filter's state of the block (intra and coded flags,
+    /// motion), and which of its 4×4 blocks are skipped.
+    inter: Option<(FilterState, Vec<bool>)>,
 }
 
 struct Encoder<'a> {
@@ -616,6 +621,10 @@ struct Encoder<'a> {
     /// Coding tree depth and luma intra mode of each 4×4 block.
     depth: Vec<u8>,
     modes: Vec<u8>,
+    /// Whether each 4×4 block belongs to a skipped coding unit (P pictures).
+    skipped: Vec<bool>,
+    /// Skipped coding units chosen, for tests.
+    skipped_cus: usize,
     grid_w: usize,
     // Scratch buffers.
     diff: Vec<i32>,
@@ -717,6 +726,8 @@ impl<'a> Encoder<'a> {
             lambda,
             sqrt_lambda: lambda.sqrt(),
             depth: vec![0; grid_w * (ph / 4)],
+            skipped: vec![false; grid_w * (ph / 4)],
+            skipped_cus: 0,
             modes: vec![1; grid_w * (ph / 4)],
             grid_w,
             diff: vec![0; 32 * 32],
@@ -825,6 +836,15 @@ impl<'a> Encoder<'a> {
                 modes.push(self.modes[i]);
             }
         }
+        let inter = self.p_slice.then(|| {
+            let mut skipped = Vec::new();
+            for y in (y0..y0 + size).step_by(4) {
+                for x in (x0..x0 + size).step_by(4) {
+                    skipped.push(self.skipped[self.grid(x, y)]);
+                }
+            }
+            (self.recon.save_filter_state(x0, y0, size, size), skipped)
+        });
         Snapshot {
             coded,
             log,
@@ -833,6 +853,7 @@ impl<'a> Encoder<'a> {
             depth,
             modes,
             edges,
+            inter,
         }
     }
 
@@ -863,9 +884,84 @@ impl<'a> Encoder<'a> {
                 let i = self.grid(x, y);
                 self.depth[i] = s.depth[k];
                 self.modes[i] = s.modes[k];
+                if let Some((_, skipped)) = &s.inter {
+                    self.skipped[i] = skipped[k];
+                }
                 k += 1;
             }
         }
+        if let Some((filter, _)) = &s.inter {
+            self.recon.restore_filter_state(x0, y0, size, size, filter);
+        }
+    }
+
+    /// `ctxInc` of `cu_skip_flag` (§9.3.4.2.2): skipped neighbours on the left and above.
+    fn skip_ctx(&self, x0: u32, y0: u32) -> usize {
+        usize::from(x0 > 0 && self.skipped[self.grid(x0 - 1, y0)])
+            + usize::from(y0 > 0 && self.skipped[self.grid(x0, y0 - 1)])
+    }
+
+    /// Codes a skipped coding unit: the reference picture copied, zero motion, no residual
+    /// (merge candidate 0, the zero vector: no neighbour has any other motion). Returns its
+    /// distortion.
+    fn code_skip(&mut self, x0: u32, y0: u32, log2_size: u8, depth: u8) -> f64 {
+        let size = 1u32 << log2_size;
+        let inc = self.skip_ctx(x0, y0);
+        self.bin(ctx::CU_SKIP_FLAG + inc, true);
+        self.bin(ctx::MERGE_IDX, false); // merge_idx 0 (MaxNumMergeCand is 5)
+        self.recon.coding_unit(&CodingUnit {
+            x: x0,
+            y: y0,
+            log2_size,
+            part_nxn: false,
+            transquant_bypass: false,
+            pcm: false,
+            intra: false,
+            qp_y: self.qp,
+        });
+        self.recon.prediction_unit(&PredictionUnit {
+            x: x0,
+            y: y0,
+            w: size,
+            h: size,
+            motion: Motion::l0([0, 0], 0),
+        });
+        // Not intra: neighbours take DC as its intra mode (§8.4.2).
+        self.fill_grid(x0, y0, size, Some(depth), Some(1));
+        for y in (y0..y0 + size).step_by(4) {
+            for x in (x0..x0 + size).step_by(4) {
+                let i = self.grid(x, y);
+                self.skipped[i] = true;
+            }
+        }
+        let mut d = self.block_sse(0, x0, y0, size as usize) as f64;
+        if self.chroma {
+            let (xc, yc) = self.chroma_pos(x0, y0);
+            let (cw, ch) = (size as usize / self.csx, size as usize / self.csy);
+            let mut dc = 0i64;
+            for c in 1..3 {
+                dc += self.block_sse_rect(c, xc, yc, cw, ch);
+            }
+            d += self.chroma_weight() * dc as f64;
+        }
+        d
+    }
+
+    /// Like [`block_sse`](Self::block_sse), for a `w`×`h` rectangle.
+    fn block_sse_rect(&self, c: usize, x: u32, y: u32, w: usize, h: usize) -> i64 {
+        let stride = self.recon.frame.widths[c] as usize;
+        let rec = &self.recon.frame.planes[c];
+        let src = &self.src[c];
+        let mut sse = 0i64;
+        for row in 0..h {
+            let r = (y as usize + row) * stride + x as usize;
+            let s = (y as usize + row) * src.width + x as usize;
+            for col in 0..w {
+                let d = i64::from(src.samples[s + col]) - i64::from(rec[r + col]);
+                sse += d * d;
+            }
+        }
+        sse
     }
 
     /// `coding_quadtree()`: chooses and encodes the coding tree of a block. Returns its
@@ -1481,6 +1577,15 @@ impl<'a> Encoder<'a> {
         let size = 1u32 << log2_size;
         let start_bits = self.log.bit_count();
         let start = self.snapshot(x0, y0, size, false, self.log.checkpoint());
+        // In a P picture, the skipped coding first: a copy of the reference picture.
+        let skip = (self.p_slice && !self.lossless).then(|| {
+            let d = self.code_skip(x0, y0, log2_size, depth);
+            let j = d + self.lambda * (self.log.bit_count() - start_bits);
+            let after = self.log.checkpoint_since(&start.log);
+            let snapshot = self.snapshot(x0, y0, size, true, after);
+            self.restore(x0, y0, size, &start);
+            (j, d, snapshot)
+        });
         let mpm = self.mpm_candidates(x0, y0);
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
@@ -1540,7 +1645,19 @@ impl<'a> Encoder<'a> {
                 try_kind(self, &mut best, &mut current, CuKind::FourBlocks, mode);
             }
         }
-        let (_, d, kind, mode, residual, snapshot, deferred) = best.expect("a mode was tried");
+        let (j_intra, d, kind, mode, residual, snapshot, deferred) =
+            best.expect("a mode was tried");
+        if let Some((j_skip, d_skip, skip_snapshot)) = skip {
+            if j_skip <= j_intra {
+                self.restore(x0, y0, size, &skip_snapshot);
+                self.recycle(skip_snapshot);
+                self.recycle(snapshot);
+                self.recycle(start);
+                self.skipped_cus += 1;
+                return (d_skip, false);
+            }
+            self.recycle(skip_snapshot);
+        }
         self.kinds[kind as usize] += 1;
         if current != Some((kind, mode)) {
             self.restore(x0, y0, size, &snapshot);
@@ -1647,9 +1764,9 @@ impl<'a> Encoder<'a> {
             self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
         }
         if self.p_slice {
-            // Not skipped (no coding unit of the picture is, so both neighbours give ctxInc 0),
-            // and intra.
-            self.bin(ctx::CU_SKIP_FLAG, false);
+            // Not skipped, and intra.
+            let inc = self.skip_ctx(x0, y0);
+            self.bin(ctx::CU_SKIP_FLAG + inc, false);
             self.bin(ctx::PRED_MODE_FLAG, true);
         }
         if log2_size == LOG2_MIN_CB {
@@ -2730,7 +2847,7 @@ mod tests {
         h: usize,
         pictures: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
         qp: u8,
-    ) -> (Vec<u8>, Vec<[Vec<u16>; 3]>) {
+    ) -> (Vec<u8>, Vec<[Vec<u16>; 3]>, Vec<usize>) {
         let options = CodingOptions::default();
         let config = EncoderConfig {
             qp,
@@ -2739,6 +2856,7 @@ mod tests {
         let wide = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
         let mut stream = Vec::new();
         let mut recons = Vec::new();
+        let mut sizes = Vec::new();
         let mut reference: Option<Frame> = None;
         for (poc, (y, cb, cr)) in pictures.iter().enumerate() {
             let (y, cb, cr) = (wide(y), wide(cb), wide(cr));
@@ -2766,6 +2884,7 @@ mod tests {
                 stream.extend_from_slice(&[0, 0, 0, 1]);
                 stream.extend_from_slice(nal);
             }
+            sizes.push(picture.slices.iter().map(Vec::len).sum());
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
             recons.push([
                 crop(&recon, 0, w, h),
@@ -2774,14 +2893,49 @@ mod tests {
             ]);
             reference = Some(recon);
         }
-        (stream, recons)
+        (stream, recons, sizes)
+    }
+
+    /// Decodes `stream` and checks every picture against the encoder's reconstruction.
+    fn check_sequence(stream: &[u8], recons: &[[Vec<u16>; 3]]) {
+        let mut decoder = heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new());
+        let units = heifer_hevc_dec::access_units(stream);
+        assert_eq!(units.len(), recons.len());
+        for (n, unit) in units.into_iter().enumerate() {
+            let frame = decoder.decode(unit).unwrap();
+            for c in 0..3 {
+                let (cw, ch) = (frame.widths[c] as usize, frame.heights[c] as usize);
+                assert!(
+                    crop(&frame, c, cw, ch) == recons[n][c],
+                    "picture {n}, plane {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_still_scene_is_coded_with_skipped_blocks() {
+        let (w, h) = (96, 72);
+        let picture = test_picture(w, h, 11);
+        let pictures = vec![picture.clone(), picture.clone(), picture];
+        let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 30);
+        if let Ok(path) = std::env::var("HEIFER_DUMP_P") {
+            std::fs::write(path, &stream).unwrap();
+        }
+        check_sequence(&stream, &recons);
+        // The P pictures copy the first one: a few bytes against hundreds.
+        assert!(
+            sizes[1] * 20 < sizes[0] && sizes[2] * 20 < sizes[0],
+            "{sizes:?}"
+        );
+        eprintln!("slice sizes: {sizes:?}");
     }
 
     #[test]
     fn p_pictures_decode_as_the_encoder_reconstructs_them() {
         let (w, h) = (96, 72);
         let pictures: Vec<_> = (0..3).map(|n| test_picture(w, h, 7 + n)).collect();
-        let (stream, recons) = encode_sequence_stream(w, h, &pictures, 30);
+        let (stream, recons, _) = encode_sequence_stream(w, h, &pictures, 30);
         let mut decoder =
             heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
         let units = heifer_hevc_dec::access_units(&stream);
@@ -2796,6 +2950,41 @@ mod tests {
                     "picture {n}, plane {c}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn skipped_and_intra_blocks_side_by_side() {
+        // The left half stays, the right half changes: skipped blocks next to intra blocks,
+        // and the deblocking filter between them, must match the decoder.
+        let (w, h) = (128, 64);
+        let base = test_picture(w, h, 3);
+        let pictures: Vec<_> = (0..4u32)
+            .map(|n| {
+                let other = test_picture(w, h, 50 + n);
+                let mix = |a: &[u8], b: &[u8], pw: usize| -> Vec<u8> {
+                    a.iter()
+                        .zip(b)
+                        .enumerate()
+                        .map(|(i, (&x, &y))| if i % pw < pw / 2 { x } else { y })
+                        .collect()
+                };
+                let cw = w.div_ceil(2);
+                (
+                    mix(&base.0, &other.0, w),
+                    mix(&base.1, &other.1, cw),
+                    mix(&base.2, &other.2, cw),
+                )
+            })
+            .collect();
+        for qp in [22, 34] {
+            let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, qp);
+            check_sequence(&stream, &recons);
+            // Half of each P picture is a copy: noticeably smaller than the IDR picture.
+            assert!(
+                sizes[1..].iter().all(|&s| s < sizes[0] * 3 / 4),
+                "qp {qp}: {sizes:?}"
+            );
         }
     }
 }

@@ -437,6 +437,15 @@ pub struct Reconstructor<'a> {
     pub error: Option<Error>,
 }
 
+/// The deblocking filter's state of an area, saved by [`Reconstructor::save_filter_state`].
+#[derive(Debug, Clone, Default)]
+pub struct FilterState {
+    edges: Vec<u8>,
+    intra: Vec<bool>,
+    coded: Vec<bool>,
+    motion: Vec<EdgeMotion>,
+}
+
 impl<'a> Reconstructor<'a> {
     /// Creates a reconstructor for a picture.
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
@@ -559,6 +568,40 @@ impl<'a> Reconstructor<'a> {
             let row = &mut info.edges[yy * info.w4 + x0..yy * info.w4 + x1];
             row.copy_from_slice(&saved[k..k + row.len()]);
             k += row.len();
+        }
+    }
+
+    /// Saves what the deblocking filter knows of a luma area: edge flags, intra and coded
+    /// flags and motion of each 4×4 block. For encoders that try inter and intra codings of
+    /// the same area, with [`restore_filter_state`](Self::restore_filter_state).
+    pub fn save_filter_state(&self, x: u32, y: u32, w: u32, h: u32) -> FilterState {
+        let info = &self.filter_info;
+        let (x0, x1) = (x as usize >> 2, ((x + w) as usize).div_ceil(4).min(info.w4));
+        let mut state = FilterState::default();
+        for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(info.h4) {
+            let r = yy * info.w4 + x0..yy * info.w4 + x1;
+            state.edges.extend_from_slice(&info.edges[r.clone()]);
+            state.intra.extend_from_slice(&info.intra[r.clone()]);
+            state.coded.extend_from_slice(&info.coded[r.clone()]);
+            state.motion.extend_from_slice(&info.motion[r]);
+        }
+        state
+    }
+
+    /// Puts back a state saved by [`save_filter_state`](Self::save_filter_state) for the same
+    /// area.
+    pub fn restore_filter_state(&mut self, x: u32, y: u32, w: u32, h: u32, state: &FilterState) {
+        let info = &mut self.filter_info;
+        let (x0, x1) = (x as usize >> 2, ((x + w) as usize).div_ceil(4).min(info.w4));
+        let mut k = 0;
+        for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(info.h4) {
+            let r = yy * info.w4 + x0..yy * info.w4 + x1;
+            let n = r.len();
+            info.edges[r.clone()].copy_from_slice(&state.edges[k..k + n]);
+            info.intra[r.clone()].copy_from_slice(&state.intra[k..k + n]);
+            info.coded[r.clone()].copy_from_slice(&state.coded[k..k + n]);
+            info.motion[r].copy_from_slice(&state.motion[k..k + n]);
+            k += n;
         }
     }
 

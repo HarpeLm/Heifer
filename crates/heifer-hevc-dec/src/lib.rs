@@ -36,10 +36,6 @@ pub mod contexts;
 )]
 pub mod filters;
 #[doc(hidden)]
-#[deprecated(
-    since = "0.5.1",
-    note = "internal to the decoder; it will become private in 0.6"
-)]
 pub mod inter;
 #[doc(hidden)]
 pub mod nal;

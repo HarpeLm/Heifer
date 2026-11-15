@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Changed**
+
+- `heifer_hevc_dec::inter` is no longer deprecated: the encoder now uses its `Motion` type. It
+  stays internal and hidden from the documentation.
+
 **New**
 
 - Image sequences decode in parallel: when a sequence is made of closed groups of pictures,
