@@ -70,6 +70,213 @@ impl<'a> ImageSpec<'a> {
     }
 }
 
+/// An image sequence track (`moov`/`trak`, handler `pict`) to add to a file with
+/// [`HeifWriter::set_sequence`]: one HEVC configuration, then the pictures in decoding order.
+#[derive(Debug, Clone)]
+pub struct SequenceTrack {
+    width: u32,
+    height: u32,
+    timescale: u32,
+    config: HevcConfig,
+    /// Each sample's data (length-prefixed NAL units), duration and sync flag.
+    samples: Vec<(Vec<u8>, u32, bool)>,
+}
+
+impl SequenceTrack {
+    /// An empty track of `width`×`height` pictures, with durations counted in `timescale`
+    /// units per second. `config` holds the parameter sets shared by every picture; its
+    /// `nal_length_size` must be 4.
+    pub fn new(width: u32, height: u32, timescale: u32, config: HevcConfig) -> Self {
+        Self {
+            width,
+            height,
+            timescale,
+            config,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Adds a picture: its slice segment NAL units (without start codes or length prefixes),
+    /// how long it is shown, and whether it is a sync sample (decodable on its own).
+    pub fn add_sample(&mut self, slices: &[Vec<u8>], duration: u32, sync: bool) {
+        let mut data = Vec::new();
+        for nal in slices {
+            data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            data.extend_from_slice(nal);
+        }
+        self.samples.push((data, duration, sync));
+    }
+
+    /// Number of pictures added.
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether no picture was added.
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    fn data_size(&self) -> u64 {
+        self.samples.iter().map(|s| s.0.len() as u64).sum()
+    }
+
+    /// The `moov` box, with the samples stored as one chunk at `chunk_offset`, a 64-bit
+    /// offset (`co64`) when `large`, else 32-bit (`stco`, the one every reader supports). Its
+    /// size does not depend on the offset.
+    fn moov_box(&self, chunk_offset: u64, large: bool) -> Vec<u8> {
+        let duration: u64 = self.samples.iter().map(|s| u64::from(s.1)).sum();
+        let duration32 = u32::try_from(duration).unwrap_or(u32::MAX);
+        const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+        let matrix = |b: &mut Vec<u8>| {
+            for v in MATRIX {
+                b.extend_from_slice(&v.to_be_bytes());
+            }
+        };
+        make_box(b"moov", |moov| {
+            moov.extend(full_box(b"mvhd", 0, 0, |b| {
+                b.extend_from_slice(&[0; 8]); // creation and modification times
+                b.extend_from_slice(&self.timescale.to_be_bytes());
+                b.extend_from_slice(&duration32.to_be_bytes());
+                b.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+                b.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
+                b.extend_from_slice(&[0; 10]); // reserved
+                matrix(b);
+                b.extend_from_slice(&[0; 24]); // pre_defined
+                b.extend_from_slice(&2u32.to_be_bytes()); // next_track_ID
+            }));
+            moov.extend(make_box(b"trak", |trak| {
+                // Enabled, in the movie and in the preview.
+                trak.extend(full_box(b"tkhd", 0, 7, |b| {
+                    b.extend_from_slice(&[0; 8]); // creation and modification times
+                    b.extend_from_slice(&1u32.to_be_bytes()); // track_ID
+                    b.extend_from_slice(&[0; 4]); // reserved
+                    b.extend_from_slice(&duration32.to_be_bytes());
+                    b.extend_from_slice(&[0; 8]); // reserved
+                    b.extend_from_slice(&[0; 8]); // layer, alternate_group, volume, reserved
+                    matrix(b);
+                    b.extend_from_slice(&(self.width << 16).to_be_bytes());
+                    b.extend_from_slice(&(self.height << 16).to_be_bytes());
+                }));
+                trak.extend(make_box(b"mdia", |mdia| {
+                    mdia.extend(full_box(b"mdhd", 0, 0, |b| {
+                        b.extend_from_slice(&[0; 8]); // creation and modification times
+                        b.extend_from_slice(&self.timescale.to_be_bytes());
+                        b.extend_from_slice(&duration32.to_be_bytes());
+                        b.extend_from_slice(&0x55C4u16.to_be_bytes()); // language `und`
+                        b.extend_from_slice(&[0; 2]); // pre_defined
+                    }));
+                    mdia.extend(full_box(b"hdlr", 0, 0, |b| {
+                        b.extend_from_slice(&[0; 4]); // pre_defined
+                        b.extend_from_slice(b"pict");
+                        b.extend_from_slice(&[0; 12]); // reserved
+                        b.push(0); // empty name
+                    }));
+                    mdia.extend(make_box(b"minf", |minf| {
+                        minf.extend(full_box(b"vmhd", 0, 1, |b| b.extend_from_slice(&[0; 8])));
+                        minf.extend(make_box(b"dinf", |dinf| {
+                            dinf.extend(full_box(b"dref", 0, 0, |b| {
+                                b.extend_from_slice(&1u32.to_be_bytes());
+                                // The data is in this file.
+                                b.extend(full_box(b"url ", 0, 1, |_| {}));
+                            }));
+                        }));
+                        minf.extend(self.stbl_box(chunk_offset, large));
+                    }));
+                }));
+            }));
+        })
+    }
+
+    fn stbl_box(&self, chunk_offset: u64, large: bool) -> Vec<u8> {
+        make_box(b"stbl", |stbl| {
+            stbl.extend(full_box(b"stsd", 0, 0, |b| {
+                b.extend_from_slice(&1u32.to_be_bytes());
+                b.extend(make_box(b"hvc1", |e| {
+                    // VisualSampleEntry (ISO/IEC 14496-12 §12.1.3): 78 bytes before the boxes.
+                    e.extend_from_slice(&[0; 6]); // reserved
+                    e.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+                    e.extend_from_slice(&[0; 16]); // pre_defined and reserved
+                    e.extend_from_slice(&(self.width as u16).to_be_bytes());
+                    e.extend_from_slice(&(self.height as u16).to_be_bytes());
+                    e.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // 72 dpi
+                    e.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+                    e.extend_from_slice(&[0; 4]); // reserved
+                    e.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+                    e.extend_from_slice(&[0; 32]); // compressorname
+                    e.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
+                    e.extend_from_slice(&0xFFFFu16.to_be_bytes()); // pre_defined -1
+                    e.extend(hvcc_box(&self.config));
+                    // Coding constraints (ISO/IEC 23008-12 §7.3.4): intra prediction is used;
+                    // with only sync samples, no picture refers to another one.
+                    let all_intra = self.samples.iter().all(|s| s.2);
+                    e.extend(full_box(b"ccst", 0, 0, |c| {
+                        let mut v = 1u32 << 30; // intra_pred_used
+                        if all_intra {
+                            v |= 1 << 31; // all_ref_pics_intra, max_ref_per_pic 0
+                        } else {
+                            v |= 15 << 26; // max_ref_per_pic: any
+                        }
+                        c.extend_from_slice(&v.to_be_bytes());
+                    }));
+                }));
+            }));
+            // Durations, as runs of equal values.
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            for s in &self.samples {
+                match runs.last_mut() {
+                    Some((n, d)) if *d == s.1 => *n += 1,
+                    _ => runs.push((1, s.1)),
+                }
+            }
+            stbl.extend(full_box(b"stts", 0, 0, |b| {
+                b.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+                for (n, d) in &runs {
+                    b.extend_from_slice(&n.to_be_bytes());
+                    b.extend_from_slice(&d.to_be_bytes());
+                }
+            }));
+            // Without `stss`, every sample is a sync sample.
+            if self.samples.iter().any(|s| !s.2) {
+                stbl.extend(full_box(b"stss", 0, 0, |b| {
+                    let sync: Vec<u32> = (1..=self.samples.len() as u32)
+                        .filter(|&i| self.samples[i as usize - 1].2)
+                        .collect();
+                    b.extend_from_slice(&(sync.len() as u32).to_be_bytes());
+                    for i in sync {
+                        b.extend_from_slice(&i.to_be_bytes());
+                    }
+                }));
+            }
+            // One chunk holding every sample.
+            stbl.extend(full_box(b"stsc", 0, 0, |b| {
+                b.extend_from_slice(&1u32.to_be_bytes());
+                b.extend_from_slice(&1u32.to_be_bytes()); // first_chunk
+                b.extend_from_slice(&(self.samples.len() as u32).to_be_bytes());
+                b.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index
+            }));
+            stbl.extend(full_box(b"stsz", 0, 0, |b| {
+                b.extend_from_slice(&0u32.to_be_bytes()); // sizes listed
+                b.extend_from_slice(&(self.samples.len() as u32).to_be_bytes());
+                for s in &self.samples {
+                    b.extend_from_slice(&(s.0.len() as u32).to_be_bytes());
+                }
+            }));
+            if large {
+                stbl.extend(full_box(b"co64", 0, 0, |b| {
+                    b.extend_from_slice(&1u32.to_be_bytes());
+                    b.extend_from_slice(&chunk_offset.to_be_bytes());
+                }));
+            } else {
+                stbl.extend(full_box(b"stco", 0, 0, |b| {
+                    b.extend_from_slice(&1u32.to_be_bytes());
+                    b.extend_from_slice(&(chunk_offset as u32).to_be_bytes());
+                }));
+            }
+        })
+    }
+}
+
 #[derive(Debug)]
 struct WriterItem {
     id: ItemId,
@@ -95,6 +302,8 @@ pub struct HeifWriter {
     primary: Option<ItemId>,
     /// Whether the file has a `tmap` item, which adds the `tmap` compatible brand.
     has_tmap: bool,
+    /// The image sequence track, if any.
+    sequence: Option<SequenceTrack>,
 }
 
 impl HeifWriter {
@@ -381,6 +590,12 @@ impl HeifWriter {
         self.primary = Some(id);
     }
 
+    /// Adds an image sequence track: the file gets a `moov` box and the `msf1` and `hevc`
+    /// brands. Its samples are stored after the item data, in the same `mdat`.
+    pub fn set_sequence(&mut self, track: SequenceTrack) {
+        self.sequence = Some(track);
+    }
+
     fn property(&mut self, b: Vec<u8>) -> u16 {
         // Identical properties (e.g. the `ispe` of an image and its alpha plane) are shared.
         let index = match self.properties.iter().position(|p| *p == b) {
@@ -417,7 +632,8 @@ impl HeifWriter {
 
     /// Writes the file: `ftyp`, `meta`, then all item data in one `mdat`.
     pub fn finish(self) -> Vec<u8> {
-        let data_size: u64 = self.items.iter().map(|i| i.data.len() as u64).sum();
+        let items_size: u64 = self.items.iter().map(|i| i.data.len() as u64).sum();
+        let data_size = items_size + self.sequence.as_ref().map_or(0, SequenceTrack::data_size);
         // 64-bit offsets and lengths only when needed.
         let field_size: u8 = if data_size > u64::from(u32::MAX) - (1 << 20) {
             8
@@ -432,6 +648,9 @@ impl HeifWriter {
             if self.has_tmap {
                 b.extend_from_slice(b"tmap");
             }
+            if self.sequence.is_some() {
+                b.extend_from_slice(b"msf1hevc");
+            }
         });
         // The `iloc` offsets depend on the size of `meta`, which does not depend on their
         // values: write it once with placeholder offsets, then again with the real ones.
@@ -441,12 +660,27 @@ impl HeifWriter {
         } else {
             8
         };
-        let first_offset = ftyp.len() as u64 + meta_size + mdat_header;
+        // The `moov` box goes between `meta` and `mdat`; its size does not depend on offsets.
+        // 32-bit chunk offsets unless the file may pass 4 GiB (the headers take far less
+        // than the 1 MiB margin).
+        let large = data_size > u64::from(u32::MAX) - (1 << 20);
+        let moov_size = self
+            .sequence
+            .as_ref()
+            .map_or(0, |t| t.moov_box(0, large).len() as u64);
+        let first_offset = ftyp.len() as u64 + meta_size + moov_size + mdat_header;
         let meta = self.meta_box(first_offset, field_size);
+        let moov = self
+            .sequence
+            .as_ref()
+            .map(|t| t.moov_box(first_offset + items_size, large));
 
         let mut out = Vec::with_capacity((first_offset + data_size) as usize);
         out.extend_from_slice(&ftyp);
         out.extend_from_slice(&meta);
+        if let Some(moov) = &moov {
+            out.extend_from_slice(moov);
+        }
         if mdat_header == 16 {
             out.extend_from_slice(&1u32.to_be_bytes());
             out.extend_from_slice(b"mdat");
@@ -457,6 +691,11 @@ impl HeifWriter {
         }
         for item in &self.items {
             out.extend_from_slice(&item.data);
+        }
+        if let Some(track) = &self.sequence {
+            for sample in &track.samples {
+                out.extend_from_slice(&sample.0);
+            }
         }
         out
     }
@@ -888,5 +1127,50 @@ mod tests {
             .filter(|p| matches!(p, Property::ImageSize { .. }))
             .count();
         assert_eq!(ispe, 1);
+    }
+
+    #[test]
+    fn sequence_tracks_read_back() {
+        let config = HevcConfig {
+            profile_idc: 1,
+            level_idc: 93,
+            chroma_format: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            nal_length_size: 4,
+            nal_units: vec![vec![0x40, 1, 2], vec![0x42, 1, 3], vec![0x44, 1, 4]],
+        };
+        let mut track = SequenceTrack::new(64, 48, 1000, config.clone());
+        track.add_sample(&[vec![0x26, 1, 0xAA, 0xBB]], 40, true);
+        track.add_sample(&[vec![0x26, 1, 0xCC], vec![0x26, 1, 0xDD]], 40, true);
+        track.add_sample(&[vec![0x02, 1, 0xEE]], 500, false);
+        let mut w = HeifWriter::new();
+        w.add_image(&ImageSpec::new(64, 48, config, &[vec![0x26, 1, 0x11]]));
+        w.set_sequence(track);
+        let bytes = w.finish();
+
+        let file = HeifFile::parse(&bytes).unwrap();
+        assert!(file.file_type.has_brand(b"msf1") && file.file_type.has_brand(b"hevc"));
+        let tracks = crate::track::parse_tracks(&bytes).unwrap();
+        assert_eq!(tracks.len(), 1);
+        let t = &tracks[0];
+        assert_eq!(
+            (&t.handler.0, t.width, t.height, t.timescale),
+            (b"pict", 64, 48, 1000)
+        );
+        assert_eq!(&t.coding.0, b"hvc1");
+        assert_eq!(t.hevc_config.as_ref().unwrap().nal_units.len(), 3);
+        let durations: Vec<u32> = t.samples.iter().map(|s| s.duration).collect();
+        assert_eq!(durations, [40, 40, 500]);
+        let sync: Vec<bool> = t.samples.iter().map(|s| s.sync).collect();
+        assert_eq!(sync, [true, true, false]);
+        // Samples are length-prefixed NAL units, after the item data.
+        assert_eq!(
+            t.sample_data(&bytes, 1).unwrap(),
+            [0, 0, 0, 3, 0x26, 1, 0xCC, 0, 0, 0, 3, 0x26, 1, 0xDD]
+        );
+        // 32-bit chunk offsets, which every reader supports.
+        let has = |kind: &[u8]| bytes.windows(4).any(|w| w == kind);
+        assert!(has(b"stco") && !has(b"co64") && has(b"ccst"));
     }
 }
