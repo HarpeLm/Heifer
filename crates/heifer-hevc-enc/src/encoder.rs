@@ -1267,7 +1267,7 @@ impl<'a> Encoder<'a> {
 
     /// Integer motion search of a 2N×2N block from the `starts` (quarter-sample vectors): the
     /// best start or vector of the window around zero motion ([`SEARCH_RANGE`]), then a
-    /// diamond search with steps of 8, 4, 2 and 1 samples. The cost is the
+    /// diamond search with steps of 8, 4, 2 and 1 samples, then half and quarter samples. The cost is the
     /// luma SAD plus √λ times the vector difference's bits from `predictor`.
     fn search_motion(&self, x0: u32, y0: u32, size: u32, starts: &[Mv], predictor: Mv) -> Mv {
         let Some(reference) = self.reference else {
@@ -1351,6 +1351,55 @@ impl<'a> Encoder<'a> {
                 }
                 if !moved {
                     break;
+                }
+            }
+        }
+        // Half then quarter samples around the best integer vector, with the luma predicted
+        // as the decoder interpolates it (8-tap filter).
+        let bit_depth = self.bit_depth;
+        let mut pred = vec![0i32; n * n];
+        let mut fractional = |mv: Mv| -> f64 {
+            heifer_hevc_dec::inter::predict_component(
+                reference,
+                0,
+                x0,
+                y0,
+                size,
+                size,
+                mv,
+                (1, 1),
+                &mut pred,
+            );
+            let mut total = 0u64;
+            for row in 0..n {
+                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..n];
+                for (&a, &p) in s.iter().zip(&pred[row * n..][..n]) {
+                    let v = i32::from(heifer_hevc_dec::inter::weight_uni(p, bit_depth));
+                    total += u64::from((a - v).unsigned_abs());
+                }
+            }
+            let mvd = [
+                i32::from(mv[0]) - i32::from(predictor[0]),
+                i32::from(mv[1]) - i32::from(predictor[1]),
+            ];
+            total as f64 + self.sqrt_lambda * mvd_bits(mvd)
+        };
+        let mut best_cost = fractional(best);
+        for step in [2i16, 1] {
+            let centre = best;
+            for dy in [-step, 0, step] {
+                for dx in [-step, 0, step] {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let mv = [centre[0] + dx, centre[1] + dy];
+                    if mv[0].unsigned_abs() > limit || mv[1].unsigned_abs() > limit {
+                        continue;
+                    }
+                    let c = fractional(mv);
+                    if c < best_cost {
+                        (best, best_cost) = (mv, c);
+                    }
                 }
             }
         }
@@ -3521,5 +3570,45 @@ mod tests {
         check_sequence(&stream, &recons);
         eprintln!("slice sizes: {sizes:?}");
         assert!(sizes[1..].iter().all(|&s| s * 2 < sizes[0]), "{sizes:?}");
+    }
+
+    #[test]
+    fn sub_sample_motion_is_found() {
+        // A smooth scene moving 1.25 samples right and 0.5 down per picture.
+        let (w, h) = (128, 96);
+        let value = |x: f64, y: f64, k: f64| -> u8 {
+            (128.0
+                + 50.0 * (x * 0.23 + k).sin()
+                + 40.0 * (y * 0.19 - k).cos()
+                + 20.0 * ((x + y) * 0.41).sin())
+            .round()
+            .clamp(0.0, 255.0) as u8
+        };
+        let frame = |n: usize| {
+            let (ox, oy) = (1.25 * n as f64, 0.5 * n as f64);
+            let luma: Vec<u8> = (0..w * h)
+                .map(|i| value((i % w) as f64 - ox, (i / w) as f64 - oy, 0.0))
+                .collect();
+            let chroma = |k: f64| -> Vec<u8> {
+                (0..(w / 2) * (h / 2))
+                    .map(|i| {
+                        value(
+                            2.0 * (i % (w / 2)) as f64 - ox,
+                            2.0 * (i / (w / 2)) as f64 - oy,
+                            k,
+                        )
+                    })
+                    .collect()
+            };
+            (luma, chroma(1.0), chroma(2.0))
+        };
+        let pictures: Vec<_> = (0..4).map(frame).collect();
+        let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 30);
+        if let Ok(path) = std::env::var("HEIFER_DUMP_P") {
+            std::fs::write(path, &stream).unwrap();
+        }
+        check_sequence(&stream, &recons);
+        eprintln!("slice sizes: {sizes:?}");
+        assert!(sizes[1..].iter().all(|&s| s * 4 < sizes[0]), "{sizes:?}");
     }
 }
