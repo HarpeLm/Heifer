@@ -1450,11 +1450,10 @@ mod tests {
         let bytes = std::fs::read(&out).unwrap();
         let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
         assert_eq!((seq.width, seq.height, seq.frames.len()), (128, 96, 24));
-        assert!(
-            seq.frames
-                .iter()
-                .all(|f| f.keyframe && (f.duration - 0.04).abs() < 1e-9)
-        );
+        assert!(seq.frames.iter().all(|f| (f.duration - 0.04).abs() < 1e-9));
+        // One keyframe every 30 frames: the first of 24; P pictures after it.
+        let keys: Vec<usize> = (0..24).filter(|&i| seq.frames[i].keyframe).collect();
+        assert_eq!(keys, [0]);
         // The brightness of the test stream grows with the display index: still in order.
         let means: Vec<f64> = heifer::decode_sequence(&bytes)
             .unwrap()

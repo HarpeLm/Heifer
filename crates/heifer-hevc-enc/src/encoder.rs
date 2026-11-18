@@ -285,6 +285,88 @@ pub fn encode_picture16_with(
     encode_with_reconstruction(width, height, planes, options, config).map(|(picture, ..)| picture)
 }
 
+/// Encodes the pictures of an image sequence in order: an IDR picture every
+/// `keyframe_interval` pictures, and P pictures predicted from the previous picture in
+/// between (skipped blocks, motion vectors to a quarter sample, residuals, or intra blocks,
+/// whichever costs least). Every picture of the sequence shares the same parameter sets.
+///
+/// ```
+/// use heifer_hevc_enc::encoder::{CodingOptions, EncoderConfig, Planes16, SequenceEncoder};
+///
+/// let (w, h) = (64u32, 48u32);
+/// let mut encoder = SequenceEncoder::new(w, h, CodingOptions::default(), EncoderConfig::default(), 30);
+/// for n in 0..3u16 {
+///     let y = vec![100 + 10 * n; (w * h) as usize];
+///     let c = vec![128u16; (w * h / 4) as usize];
+///     let planes = Planes16 { y: &y, chroma: Some((&c, &c)), bit_depth: 8 };
+///     let (picture, keyframe) = encoder.encode(planes).unwrap();
+///     assert_eq!(keyframe, n == 0);
+///     assert_eq!(picture.slices.len(), 1);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct SequenceEncoder {
+    width: u32,
+    height: u32,
+    options: CodingOptions,
+    config: EncoderConfig,
+    keyframe_interval: usize,
+    /// Pictures encoded so far.
+    count: usize,
+    /// POC of the next picture.
+    poc: u32,
+    /// The filtered reconstruction of the previous picture.
+    reference: Option<Frame>,
+}
+
+impl SequenceEncoder {
+    /// An encoder of `width`×`height` pictures, with an IDR picture every
+    /// `keyframe_interval` pictures (at least 1: 1 codes every picture as an IDR picture).
+    pub fn new(
+        width: u32,
+        height: u32,
+        options: CodingOptions,
+        config: EncoderConfig,
+        keyframe_interval: usize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            options,
+            config,
+            keyframe_interval: keyframe_interval.max(1),
+            count: 0,
+            poc: 0,
+            reference: None,
+        }
+    }
+
+    /// Encodes the next picture. Returns it, and whether it is an IDR picture (a sync sample:
+    /// decodable without the pictures before it).
+    pub fn encode(&mut self, planes: Planes16<'_>) -> Result<(EncodedPicture, bool), Error> {
+        let keyframe = self.count % self.keyframe_interval == 0;
+        let kind = match &self.reference {
+            Some(reference) if !keyframe => Kind::P {
+                poc: self.poc,
+                reference,
+            },
+            _ => Kind::SequenceIdr,
+        };
+        let (picture, recon, _) = encode_kind(
+            self.width,
+            self.height,
+            planes,
+            &self.options,
+            &self.config,
+            kind,
+        )?;
+        self.poc = if keyframe { 1 } else { self.poc + 1 };
+        self.reference = Some(recon);
+        self.count += 1;
+        Ok((picture, keyframe))
+    }
+}
+
 /// Like [`encode_picture`], also returning the encoder's reconstruction of the picture (coded
 /// size, before the in-loop filters) and how many coding units of each [`CuKind`] it chose.
 fn encode_with_reconstruction(
@@ -298,8 +380,6 @@ fn encode_with_reconstruction(
 }
 
 /// What to encode: a still image, or a picture of an image sequence.
-// The sequence kinds are only tested until the sequence encoder uses them.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Kind<'r> {
     /// A still image: an IDR picture, in a stream without reference pictures.

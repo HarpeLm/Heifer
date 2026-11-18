@@ -231,7 +231,9 @@ fn encoded_sequences_read_back() {
     assert_eq!((still.width, still.height), (w, h));
     let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
     assert_eq!((seq.width, seq.height, seq.frames.len()), (w, h, 12));
-    assert!(seq.frames.iter().all(|f| f.keyframe));
+    // One keyframe every 30 frames: only the first of 12; the others are P pictures.
+    let keys: Vec<usize> = (0..12).filter(|&i| seq.frames[i].keyframe).collect();
+    assert_eq!(keys, [0]);
     assert!((seq.frames[0].duration - 0.04).abs() < 1e-9);
     assert!((seq.frames[11].duration - 0.5).abs() < 1e-9);
 
@@ -276,4 +278,49 @@ fn encode_sequence_refuses_bad_input() {
     transparent.has_alpha = true;
     transparent.data[3] = 0;
     assert!(heifer::encode_sequence(&[transparent], &[0.1], &o).is_err());
+}
+
+#[cfg(feature = "encoder")]
+#[test]
+fn long_encoded_sequences_have_a_keyframe_every_30_frames() {
+    // 64 frames of a scene moving 2 samples right per frame.
+    let (sw, w, h) = (320u32, 96u32, 64u32);
+    let scene: Vec<u16> = (0..sw * h)
+        .map(|i| {
+            let (x, y) = (i % sw, i / sw);
+            (((x * 7 + y * 3) % 97) + ((x / 5 + y / 7) % 2) * 80) as u16
+        })
+        .collect();
+    let frames: Vec<heifer::Image> = (0..64u32)
+        .map(|n| {
+            let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+            for (i, p) in image.data.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                let v = scene[(y * sw + x + 2 * n) as usize];
+                p[..3].copy_from_slice(&[v, v / 2 + 60, 200 - v / 2]);
+            }
+            image
+        })
+        .collect();
+    let durations = vec![1.0 / 30.0; 64];
+    let bytes =
+        heifer::encode_sequence(&frames, &durations, &heifer::EncodeOptions::new()).unwrap();
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    let keys: Vec<usize> = (0..64).filter(|&i| seq.frames[i].keyframe).collect();
+    assert_eq!(keys, [0, 30, 60]);
+    // Decodes on one thread and several (three closed groups), and seeks from a keyframe.
+    let one: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let many: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(4))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    assert_eq!(one.len(), 64);
+    assert!(one == many);
+    assert!(heifer::decode_sequence_frame(&bytes, 45).unwrap() == one[45]);
+    eprintln!("64 frames {w}x{h}: {} bytes", bytes.len());
 }

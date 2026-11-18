@@ -18,8 +18,8 @@
 //! functions without a `_with_format` suffix keep writing 4:2:0.
 
 use heifer_hevc_enc::encoder::{
-    ChromaFormat, CodingOptions, EncodedPicture, EncoderConfig, Planes16, encode_picture16,
-    encode_picture16_with,
+    ChromaFormat, CodingOptions, EncodedPicture, EncoderConfig, Planes16, SequenceEncoder,
+    encode_picture16, encode_picture16_with,
 };
 use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
@@ -271,13 +271,18 @@ pub fn encode_to_size(
 /// Units per second of the durations of an encoded sequence: milliseconds.
 const SEQUENCE_TIMESCALE: u32 = 1000;
 
+/// Frames from one keyframe (IDR picture) to the next in an encoded sequence: about a second
+/// at 30 frames per second, so that seeking decodes few frames.
+const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
+
 /// Encodes an image sequence (a burst or an animation) as a HEIF file: `frames`, all the same
 /// size, each shown for the matching entry of `durations`, in seconds.
 ///
-/// Every frame is coded on its own (intra only), so the frames are encoded in parallel on
-/// [`EncodeOptions::max_threads`] threads, and any frame can be decoded without the others;
-/// files are larger than with motion prediction. The first frame is also stored as the
-/// primary image, for viewers of still images. Frames with transparency are refused: their
+/// Every 30th frame is a keyframe coded on its own; the frames between are predicted from the
+/// one before (motion vectors to a quarter sample, residuals), which makes files far smaller
+/// than coding each frame alone. Groups of pictures are encoded in parallel on
+/// [`EncodeOptions::max_threads`] threads. The first frame is also stored as the primary
+/// image, for viewers of still images. Frames with transparency are refused: their
 /// alpha would need a track of its own.
 ///
 /// ```
@@ -336,38 +341,55 @@ pub fn encode_sequence(
         |i| rgba_at(first, i),
     )?;
 
-    // Every frame as one intra picture, in parallel.
+    // Groups of pictures, encoded in parallel: an IDR picture, then P pictures each
+    // predicted from the one before.
     let config = EncoderConfig {
         qp: options.qp(),
         colour: (1, 13, 6),
         ..EncoderConfig::default()
     };
-    let threads = options.threads().clamp(1, frames.len());
-    let per_thread = frames.len().div_ceil(threads);
-    let pictures: Vec<Result<EncodedPicture, Error>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = frames
+    let coding = CodingOptions {
+        chroma_format: ChromaFormat::Chroma420,
+        lossless: false,
+    };
+    let groups: Vec<&[Image]> = frames.chunks(SEQUENCE_KEYFRAME_INTERVAL).collect();
+    let threads = options.threads().clamp(1, groups.len());
+    let per_thread = groups.len().div_ceil(threads);
+    let coded: Vec<Result<(EncodedPicture, bool), Error>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = groups
             .chunks(per_thread)
             .map(|chunk| {
-                scope.spawn(|| {
-                    chunk
-                        .iter()
-                        .map(|frame| {
-                            let source = Source {
-                                width,
-                                height,
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    for group in chunk {
+                        let mut encoder = SequenceEncoder::new(
+                            width,
+                            height,
+                            coding,
+                            config,
+                            SEQUENCE_KEYFRAME_INTERVAL,
+                        );
+                        for frame in *group {
+                            let at = |x: usize, y: usize| rgba_at(frame, y * width as usize + x);
+                            let (y, cb, cr) = ycbcr_planes(
+                                &at,
+                                width as usize,
+                                height as usize,
                                 bit_depth,
-                                pixel: |i: usize| rgba_at(frame, i),
-                            };
-                            encode_region(
-                                &source,
-                                (0, 0),
-                                (width, height),
-                                false,
-                                &config,
                                 EncodeFormat::Ycbcr420,
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                            );
+                            let planes = Planes16 {
+                                y: &y,
+                                chroma: Some((&cb, &cr)),
+                                bit_depth,
+                            };
+                            out.push(encoder.encode(planes).map_err(Error::from));
+                            if out.last().is_some_and(Result::is_err) {
+                                return out;
+                            }
+                        }
+                    }
+                    out
                 })
             })
             .collect();
@@ -376,7 +398,9 @@ pub fn encode_sequence(
             .flat_map(|h| h.join().expect("encoding thread panicked"))
             .collect()
     });
-    let pictures = pictures.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let coded = coded.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let pictures: Vec<EncodedPicture> = coded.iter().map(|(p, _)| p.clone()).collect();
+    let sync: Vec<bool> = coded.iter().map(|&(_, s)| s).collect();
     let hevc = hevc_config(&pictures[0], bit_depth);
     if pictures
         .iter()
@@ -385,9 +409,9 @@ pub fn encode_sequence(
         return Err(Error::Invalid("frames coded with different parameter sets"));
     }
     let mut track = SequenceTrack::new(width, height, SEQUENCE_TIMESCALE, hevc);
-    for (picture, &duration) in pictures.iter().zip(durations) {
+    for ((picture, &duration), &sync) in pictures.iter().zip(durations).zip(&sync) {
         let ticks = (duration * f64::from(SEQUENCE_TIMESCALE)).round();
-        track.add_sample(&picture.slices, ticks.min(f64::from(u32::MAX)) as u32, true);
+        track.add_sample(&picture.slices, ticks.min(f64::from(u32::MAX)) as u32, sync);
     }
     writer.set_sequence(track);
     Ok(writer.finish())
@@ -973,6 +997,39 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         )?);
     }
 
+    let (y, cb, cr) = ycbcr_planes(&at, w, h, bit_depth, format);
+    let planes = Planes16 {
+        y: &y,
+        chroma: Some((&cb, &cr)),
+        bit_depth,
+    };
+    if matches!(format, EncodeFormat::Ycbcr422 | EncodeFormat::Ycbcr444) {
+        let options = CodingOptions {
+            chroma_format: if format == EncodeFormat::Ycbcr422 {
+                ChromaFormat::Chroma422
+            } else {
+                ChromaFormat::Chroma444
+            },
+            lossless: false,
+        };
+        Ok(encode_picture16_with(
+            size.0, size.1, planes, &options, config,
+        )?)
+    } else {
+        Ok(encode_picture16(size.0, size.1, planes, config)?)
+    }
+}
+
+/// Converts RGBA pixels to YCbCr planes: BT.601, full range, with the chroma subsampled for
+/// `format` (4:4:4, or 4:2:2 and 4:2:0 with a [1 2 1] filter around the even positions).
+/// `at(x, y)` is the pixel at a position of the `w`×`h` area.
+fn ycbcr_planes(
+    at: &impl Fn(usize, usize) -> [u16; 4],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    format: EncodeFormat,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     // BT.601, full range, in 16-bit fixed point.
     let mut y = Vec::with_capacity(w * h);
     let mut cb_full = Vec::with_capacity(w * h);
@@ -1040,26 +1097,7 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         };
         (filtered(&cb_full), filtered(&cr_full))
     };
-    let planes = Planes16 {
-        y: &y,
-        chroma: Some((&cb, &cr)),
-        bit_depth,
-    };
-    if matches!(format, EncodeFormat::Ycbcr422 | EncodeFormat::Ycbcr444) {
-        let options = CodingOptions {
-            chroma_format: if format == EncodeFormat::Ycbcr422 {
-                ChromaFormat::Chroma422
-            } else {
-                ChromaFormat::Chroma444
-            },
-            lossless: false,
-        };
-        Ok(encode_picture16_with(
-            size.0, size.1, planes, &options, config,
-        )?)
-    } else {
-        Ok(encode_picture16(size.0, size.1, planes, config)?)
-    }
+    (y, cb, cr)
 }
 
 fn hevc_config(picture: &EncodedPicture, bit_depth: u8) -> HevcConfig {

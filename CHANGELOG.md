@@ -17,8 +17,14 @@
 - `examples/seqbench.rs` measures sequence decoding.
 - Image sequences can be written: `heifer::encode_sequence` encodes frames, each with its
   duration, as a HEIF file with a sequence track (and the first frame as the primary image),
-  read back by heifer, libheif and ffmpeg. Frames are coded intra only, in parallel; files are
-  larger than with motion prediction, which is planned. `heifer_isobmff::writer::SequenceTrack`
+  read back by heifer, libheif and ffmpeg. Every 30th frame is a keyframe; the frames between
+  are P pictures predicted from the previous one: skipped blocks, merge candidates, motion
+  vectors searched to a quarter sample (AMVP), residuals, or intra blocks, whichever costs
+  least. Groups of pictures are encoded in parallel. A 120-frame animation takes 42 KB instead
+  of 157 KB with keyframes only.
+- `heifer_hevc_enc::encoder::SequenceEncoder` encodes the pictures of a sequence in order (an
+  IDR picture every N pictures, P pictures between), sharing one set of parameter sets; each
+  picture decodes bit-exactly to the encoder's reconstruction, with heifer and ffmpeg. `heifer_isobmff::writer::SequenceTrack`
   and `HeifWriter::set_sequence` write the track (`moov`, `pict` handler, `ccst`, 32-bit
   chunk offsets unless the file passes 4 GiB).
 - CLI: a `.heics` output writes an animated GIF, an APNG or a HEIF sequence as a HEIF image
