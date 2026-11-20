@@ -40,6 +40,11 @@
   blocks, so a good merge candidate with a small correction is used instead of a new motion
   vector. The two 120-frame Nokia samples get 1 to 2% smaller, and every picture still
   decodes bit-exactly to the encoder's reconstruction.
+- Encoder: image sequences also code partitioned prediction blocks (2N×N and N×2N), so a unit
+  whose two halves move differently is predicted by two motion vectors with one set of headers
+  instead of four smaller units. The two 120-frame Nokia samples get 1 to 7% smaller (the
+  candle animation 6.9%, the sea 1.1%), and every picture still decodes bit-exactly to the
+  encoder's reconstruction.
 
 ## 0.5.1 — 2026-11-14
 

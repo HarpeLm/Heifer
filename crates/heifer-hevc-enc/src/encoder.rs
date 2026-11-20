@@ -1,8 +1,8 @@
-//! Encoding of one intra picture.
+//! Encoding of intra and inter pictures.
 //!
 //! The encoder reconstructs the picture with the decoder's own [`Reconstructor`], fed with the
-//! same blocks the decoder will parse: intra prediction and reconstruction are therefore
-//! identical on both sides by construction. Decisions are made by rate-distortion cost
+//! same blocks the decoder will parse: prediction and reconstruction are therefore identical on
+//! both sides by construction. Decisions are made by rate-distortion cost
 //! (`distortion + λ · bits`), with the bits counted by the CABAC encoder itself:
 //!
 //! - coding quadtree: each split is tried against coding the whole block (64 to 8);
@@ -11,6 +11,10 @@
 //! - chroma mode: the two best by SATD coded for real;
 //! - transform tree: split up to twice; 4×4 blocks may skip the transform;
 //! - levels: RDOQ (including coding nothing), sign data hiding; then SAO on the deblocked picture.
+//!
+//! In a P picture, a coding unit is also tried as inter: skipped or merge-predicted with a
+//! residual, with a searched motion vector (AMVP), or as a partition (2N×N and N×2N) that
+//! follows two motions with one set of headers.
 //!
 //! Lossless pictures bypass the transform and quantization: prediction still applies, but the
 //! levels are the raw residual samples, and the in-loop filters are off.
@@ -288,8 +292,8 @@ pub fn encode_picture16_with(
 /// Encodes the pictures of an image sequence in order: an IDR picture every
 /// `keyframe_interval` pictures, and P pictures predicted from the previous picture in
 /// between (skipped blocks, merge candidates with a residual, motion vectors to a quarter
-/// sample, residuals, or intra blocks, whichever costs least). Every picture of the sequence
-/// shares the same parameter sets.
+/// sample, residuals, partitioned prediction blocks 2N×N and N×2N, or intra blocks, whichever
+/// costs least). Every picture of the sequence shares the same parameter sets.
 ///
 /// ```
 /// use heifer_hevc_enc::encoder::{CodingOptions, EncoderConfig, Planes16, SequenceEncoder};
@@ -633,6 +637,25 @@ struct Tb {
 impl Tb {
     fn coded(&self) -> bool {
         !self.levels.is_empty()
+    }
+}
+
+/// How one prediction block of a partitioned coding unit is coded.
+#[derive(Clone, Copy)]
+enum PuCoding {
+    /// Merge mode: the motion of merge candidate `idx`.
+    Merge { idx: usize, motion: Motion },
+    /// AMVP: an explicit vector, coded against the predictor chosen by `flag`.
+    Amvp { mv: Mv, flag: bool, mvd: [i32; 2] },
+}
+
+impl PuCoding {
+    /// The motion this coding predicts the block with.
+    fn motion(self) -> Motion {
+        match self {
+            Self::Merge { motion, .. } => motion,
+            Self::Amvp { mv, .. } => Motion::l0(mv, 0),
+        }
     }
 }
 
@@ -1082,15 +1105,31 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /// The distinct merge candidates of a 2N×2N coding unit, with their `merge_idx`.
-    fn merge_candidates(&self, x0: u32, y0: u32, size: u32) -> Vec<(usize, Motion)> {
-        let (refs, g) = (self.slice_refs(), Self::geom(x0, y0, size));
+    /// Prediction block `part_idx` of a coding unit split by `part_mode`.
+    fn pu_geom(x0: u32, y0: u32, size: u32, part_mode: PartMode, part_idx: u8) -> PuGeom {
+        let (x, y, w, h) = part_mode.blocks(x0, y0, size)[usize::from(part_idx)];
+        PuGeom {
+            x_cb: x0,
+            y_cb: y0,
+            n_cb: size,
+            x,
+            y,
+            w,
+            h,
+            part_idx,
+            part_mode,
+        }
+    }
+
+    /// The distinct merge candidates of a prediction block, with their `merge_idx`.
+    fn merge_candidates_of(&self, g: &PuGeom) -> Vec<(usize, Motion)> {
+        let refs = self.slice_refs();
         let mut out: Vec<(usize, Motion)> = Vec::new();
         for idx in 0..MAX_MERGE_CANDIDATES {
             let m = heifer_hevc_dec::inter::merge(
                 self,
                 &refs,
-                &g,
+                g,
                 idx,
                 MAX_MERGE_CANDIDATES,
                 self.par_mrg_level,
@@ -1101,6 +1140,178 @@ impl<'a> Encoder<'a> {
             }
         }
         out
+    }
+
+    /// Distortion of the prediction currently in the picture, over one prediction block.
+    fn pu_sse(&self, g: &PuGeom) -> f64 {
+        let mut d = self.block_sse_rect(0, g.x, g.y, g.w as usize, g.h as usize) as f64;
+        if self.chroma {
+            let (xc, yc) = self.chroma_pos(g.x, g.y);
+            let (cw, ch) = (g.w as usize / self.csx, g.h as usize / self.csy);
+            let mut dc = 0i64;
+            for c in 1..3 {
+                dc += self.block_sse_rect(c, xc, yc, cw, ch);
+            }
+            d += self.chroma_weight() * dc as f64;
+        }
+        d
+    }
+
+    /// The distinct merge candidates of a 2N×2N coding unit, with their `merge_idx`.
+    fn merge_candidates(&self, x0: u32, y0: u32, size: u32) -> Vec<(usize, Motion)> {
+        self.merge_candidates_of(&Self::geom(x0, y0, size))
+    }
+
+    /// Codes the syntax of one prediction block's merge or motion, and reconstructs it.
+    fn code_pu(&mut self, g: &PuGeom, option: PuCoding) {
+        self.write_pu_syntax(option);
+        let motion = option.motion();
+        self.recon.prediction_unit(&PredictionUnit {
+            x: g.x,
+            y: g.y,
+            w: g.w,
+            h: g.h,
+            motion,
+        });
+        for y in (g.y..g.y + g.h).step_by(4) {
+            for x in (g.x..g.x + g.w).step_by(4) {
+                let i = self.grid(x, y);
+                self.motion[i] = motion;
+            }
+        }
+    }
+
+    /// `prediction_unit()` of one block of a partitioned coding unit: `merge_flag` then either
+    /// `merge_idx` or the motion vector difference and predictor flag (§7.3.8.6).
+    fn write_pu_syntax(&mut self, option: PuCoding) {
+        match option {
+            PuCoding::Merge { idx, .. } => {
+                self.bin(ctx::MERGE_FLAG, true);
+                self.merge_idx(idx);
+            }
+            PuCoding::Amvp { flag, mvd, .. } => {
+                self.bin(ctx::MERGE_FLAG, false);
+                self.mvd_coding(mvd);
+                self.bin(ctx::MVP_LX_FLAG, flag);
+            }
+        }
+    }
+
+    /// The bits of a prediction block's syntax, coded and discarded.
+    fn pu_syntax_bits(&mut self, option: PuCoding) -> f64 {
+        let (point, contexts) = (self.log.checkpoint(), self.ctx);
+        let start = self.log.bit_count();
+        self.write_pu_syntax(option);
+        let bits = self.log.bit_count() - start;
+        self.log.restore(&point);
+        self.ctx = contexts;
+        bits
+    }
+
+    /// Picks how to code one prediction block of a partitioned coding unit: the cheapest of its
+    /// merge candidates and a searched motion vector, by distortion and syntax bits. The block
+    /// is predicted for each candidate, so its neighbours see it afterwards.
+    fn choose_pu(&mut self, g: &PuGeom) -> PuCoding {
+        let mut best: Option<(f64, PuCoding)> = None;
+        let candidates = self.merge_candidates_of(g);
+        let mut consider = |enc: &mut Self, motion: Motion, option: PuCoding| {
+            enc.recon.prediction_unit(&PredictionUnit {
+                x: g.x,
+                y: g.y,
+                w: g.w,
+                h: g.h,
+                motion,
+            });
+            let j = enc.pu_sse(g) + enc.lambda * enc.pu_syntax_bits(option);
+            if best.as_ref().is_none_or(|b| j < b.0) {
+                best = Some((j, option));
+            }
+        };
+        for &(idx, motion) in &candidates {
+            consider(self, motion, PuCoding::Merge { idx, motion });
+        }
+        if self.reference.is_some() {
+            let predictors = heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), g, 0, 0);
+            let mut starts = vec![[0, 0], predictors[0], predictors[1]];
+            starts.extend(candidates.iter().map(|(_, m)| m.mv[0]));
+            let mv = self.search_motion_rect(g.x, g.y, g.w, g.h, &starts, predictors[0]);
+            let mvd_of = |p: Mv| {
+                [
+                    i32::from(mv[0]) - i32::from(p[0]),
+                    i32::from(mv[1]) - i32::from(p[1]),
+                ]
+            };
+            let flag =
+                usize::from(mvd_bits(mvd_of(predictors[1])) < mvd_bits(mvd_of(predictors[0])));
+            let option = PuCoding::Amvp {
+                mv,
+                flag: flag == 1,
+                mvd: mvd_of(predictors[flag]),
+            };
+            consider(self, Motion::l0(mv, 0), option);
+        }
+        best.expect("a merge candidate or a motion vector was tried")
+            .1
+    }
+
+    /// Codes a partitioned inter coding unit (2N×N or N×2N): each prediction block picks its
+    /// merge candidate or motion vector, then the unit's residual is coded once. Unlike a 2N×2N
+    /// merge, `rqt_root_cbf` is not inferred and is written here. Returns the distortion, or
+    /// `None` when a residual was asked for and none of it is worth coding.
+    fn code_partition(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        part_mode: PartMode,
+        residual: bool,
+    ) -> Option<f64> {
+        let size = 1u32 << log2_size;
+        let inc = self.skip_ctx(x0, y0);
+        self.bin(ctx::CU_SKIP_FLAG + inc, false);
+        self.bin(ctx::PRED_MODE_FLAG, false); // inter
+        // part_mode (Table 9-43): 1 is 2N×2N; with AMP disabled, 0 then 1 is 2N×N and 0 then 0
+        // is N×2N (only the smallest coding unit would code a third bin, for N×N, and
+        // partitions are only tried above it).
+        self.bin(ctx::PART_MODE, false);
+        let horizontal = part_mode == PartMode::Part2NxN;
+        self.bin(ctx::PART_MODE + 1, horizontal);
+        self.recon.coding_unit(&CodingUnit {
+            x: x0,
+            y: y0,
+            log2_size,
+            part_nxn: false,
+            transquant_bypass: false,
+            pcm: false,
+            intra: false,
+            qp_y: self.qp,
+        });
+        self.fill_grid(x0, y0, size, Some(depth), Some(1));
+
+        // The prediction blocks, in decoding order: each one's motion is decided with the ones
+        // before it already in the picture (they are its neighbours).
+        let mut sse = 0.0;
+        for part_idx in 0..2u8 {
+            let g = Self::pu_geom(x0, y0, size, part_mode, part_idx);
+            let option = self.choose_pu(&g);
+            self.code_pu(&g, option);
+            sse += self.pu_sse(&g);
+        }
+
+        if !residual {
+            self.bin(ctx::NO_RESIDUAL_DATA_FLAG, false);
+            return Some(sse);
+        }
+        self.inter_block = true;
+        let tree = self.inter_tree(x0, y0, log2_size, true);
+        self.inter_block = false;
+        if !tree_coded(&tree) {
+            return None;
+        }
+        self.bin(ctx::NO_RESIDUAL_DATA_FLAG, true);
+        self.write_inter_tree(&tree, log2_size, 0, (false, false));
+        Some(tree_sse(&tree))
     }
 
     /// Tells the reconstruction about an inter coding unit with `motion`, and records it in the
@@ -1207,7 +1418,7 @@ impl<'a> Encoder<'a> {
         self.merge_idx(merge_idx);
         self.reconstruct_inter(x0, y0, log2_size, depth, motion, false);
         self.inter_block = true;
-        let tree = self.inter_tree(x0, y0, log2_size);
+        let tree = self.inter_tree(x0, y0, log2_size, false);
         self.inter_block = false;
         if !tree_coded(&tree) {
             return None;
@@ -1252,7 +1463,7 @@ impl<'a> Encoder<'a> {
         }
         // The residual of the prediction just written to the picture.
         self.inter_block = true;
-        let tree = self.inter_tree(x0, y0, log2_size);
+        let tree = self.inter_tree(x0, y0, log2_size, false);
         self.inter_block = false;
         if !tree_coded(&tree) {
             return None;
@@ -1263,19 +1474,22 @@ impl<'a> Encoder<'a> {
     }
 
     /// The transform tree of an inter coding unit's residual: one transform block per
-    /// component (`max_transform_hierarchy_depth_inter` is 0), split only above 32×32. Each
-    /// block is reconstructed as it is quantized.
-    fn inter_tree(&mut self, x0: u32, y0: u32, log2_size: u8) -> TNode {
-        if log2_size > LOG2_MAX_TB {
+    /// component (`max_transform_hierarchy_depth_inter` is 0), split above 32×32 and, when
+    /// `split` (a partitioned coding unit, where `interSplitFlag` infers it), once at the root.
+    /// Each block is reconstructed as it is quantized.
+    fn inter_tree(&mut self, x0: u32, y0: u32, log2_size: u8, split: bool) -> TNode {
+        if log2_size > LOG2_MAX_TB || (split && log2_size > 2) {
             let half = 1u32 << (log2_size - 1);
             let blocks = [(0, 0), (half, 0), (0, half), (half, half)]
                 .iter()
-                .map(|&(dx, dy)| self.inter_tree(x0 + dx, y0 + dy, log2_size - 1))
+                .map(|&(dx, dy)| self.inter_tree(x0 + dx, y0 + dy, log2_size - 1, false))
                 .collect();
             return TNode::Split(blocks, None);
         }
         let luma = self.inter_tb(0, x0, y0, log2_size);
-        let chroma = self.chroma.then(|| {
+        // 4×4 luma blocks (4:2:0 / 4:2:2) share their parent's chroma blocks (see
+        // `write_inter_tree`); partition splits stop above them.
+        let chroma = (self.chroma && (log2_size > 2 || self.csx == 1)).then(|| {
             let (xc, yc) = self.chroma_pos(x0, y0);
             let log2_c = log2_size - u8::from(self.csx == 2);
             (1..3)
@@ -1382,11 +1596,25 @@ impl<'a> Encoder<'a> {
         self.log.encode_bypass_bits(value, k);
     }
 
-    /// Integer motion search of a 2N×2N block from the `starts` (quarter-sample vectors): the
+    /// Integer motion search of a 2N×2N block from the `starts` (quarter-sample vectors): see
+    /// [`search_motion_rect`](Self::search_motion_rect).
+    fn search_motion(&self, x0: u32, y0: u32, size: u32, starts: &[Mv], predictor: Mv) -> Mv {
+        self.search_motion_rect(x0, y0, size, size, starts, predictor)
+    }
+
+    /// Integer motion search of a `w`×`h` block from the `starts` (quarter-sample vectors): the
     /// best start or vector of the window around zero motion ([`SEARCH_RANGE`]), then a
     /// diamond search with steps of 8, 4, 2 and 1 samples, then half and quarter samples. The cost is the
     /// luma SAD plus √λ times the vector difference's bits from `predictor`.
-    fn search_motion(&self, x0: u32, y0: u32, size: u32, starts: &[Mv], predictor: Mv) -> Mv {
+    fn search_motion_rect(
+        &self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        starts: &[Mv],
+        predictor: Mv,
+    ) -> Mv {
         let Some(reference) = self.reference else {
             return [0, 0];
         };
@@ -1396,16 +1624,17 @@ impl<'a> Encoder<'a> {
             i64::from(reference.heights[0]),
         );
         let src = &self.src[0];
-        let n = size as usize;
+        let (nw, nh) = (w as usize, h as usize);
         let sad = |mv: Mv| -> u64 {
             let (dx, dy) = (i64::from(mv[0]) >> 2, i64::from(mv[1]) >> 2);
             let (rx, ry) = (i64::from(x0) + dx, i64::from(y0) + dy);
-            let inside = rx >= 0 && ry >= 0 && rx + n as i64 <= stride && ry + n as i64 <= plane_h;
+            let inside =
+                rx >= 0 && ry >= 0 && rx + nw as i64 <= stride && ry + nh as i64 <= plane_h;
             let mut total = 0u64;
-            for row in 0..n {
-                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..n];
+            for row in 0..nh {
+                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..nw];
                 if inside {
-                    let r = &plane[((ry + row as i64) * stride + rx) as usize..][..n];
+                    let r = &plane[((ry + row as i64) * stride + rx) as usize..][..nw];
                     total += s
                         .iter()
                         .zip(r)
@@ -1474,23 +1703,23 @@ impl<'a> Encoder<'a> {
         // Half then quarter samples around the best integer vector, with the luma predicted
         // as the decoder interpolates it (8-tap filter).
         let bit_depth = self.bit_depth;
-        let mut pred = vec![0i32; n * n];
+        let mut pred = vec![0i32; nw * nh];
         let mut fractional = |mv: Mv| -> f64 {
             heifer_hevc_dec::inter::predict_component(
                 reference,
                 0,
                 x0,
                 y0,
-                size,
-                size,
+                w,
+                h,
                 mv,
                 (1, 1),
                 &mut pred,
             );
             let mut total = 0u64;
-            for row in 0..n {
-                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..n];
-                for (&a, &p) in s.iter().zip(&pred[row * n..][..n]) {
+            for row in 0..nh {
+                let s = &src.samples[(y0 as usize + row) * src.width + x0 as usize..][..nw];
+                for (&a, &p) in s.iter().zip(&pred[row * nw..][..nw]) {
                     let v = i32::from(heifer_hevc_dec::inter::weight_uni(p, bit_depth));
                     total += u64::from((a - v).unsigned_abs());
                 }
@@ -2207,6 +2436,22 @@ impl<'a> Encoder<'a> {
                     }
                 }
             }
+            // Partitions 2N×N and N×2N: two prediction blocks with a motion each, at the cost
+            // of one transform tree split (interSplitFlag) and a coded `rqt_root_cbf`. Only
+            // above the smallest coding units, where the extra syntax pays for itself. 4:2:2
+            // chroma trees are not handled, like the residual paths above.
+            if self.reference.is_some() && log2_size > LOG2_MIN_CB && !self.is_422() {
+                for part_mode in [PartMode::Part2NxN, PartMode::PartNx2N] {
+                    let d = self
+                        .code_partition(x0, y0, log2_size, depth, part_mode, false)
+                        .expect("always coded without residual");
+                    keep(self, d, false);
+                    match self.code_partition(x0, y0, log2_size, depth, part_mode, true) {
+                        Some(d) => keep(self, d, false),
+                        None => self.restore(x0, y0, size, &start),
+                    }
+                }
+            }
         }
         let mpm = self.mpm_candidates(x0, y0);
         let modes = match self.mode_cache.take() {
@@ -2917,8 +3162,9 @@ fn scan_type(log2_size: u8, luma: bool, intra_mode: u8) -> ScanType {
 }
 
 impl MotionSource for Encoder<'_> {
-    /// Availability of a neighbouring block (§6.4.2) and its motion. Only 2N×2N prediction
-    /// blocks are coded, so a neighbour is never inside the current coding block.
+    /// Availability of a neighbouring block (§6.4.2) and its motion. A neighbour inside the
+    /// current coding unit (a partitioned one) is available, like the decoder's: the motion of
+    /// the prediction block before it is in the grid.
     fn neighbour(&self, g: &PuGeom, xn: i64, yn: i64) -> Option<Motion> {
         if !self.recon.is_available(g.x, g.y, xn, yn) {
             return None;
@@ -3766,6 +4012,82 @@ mod tests {
         // pictures total about 1070 bytes, more than this bound (0.36 × the IDR picture).
         let inter: usize = sizes[1..].iter().sum();
         assert!(inter * 100 < sizes[0] * 36, "{sizes:?}");
+    }
+
+    #[test]
+    fn partitioned_inter_blocks_two_halves_move_apart() {
+        // Two smooth bands moving in opposite directions, with the boundary inside the coding
+        // units: each unit is then best predicted as two halves with a vector each, stacked
+        // (2N×N) or side by side (N×2N), which a single 2N×2N vector cannot do and which
+        // splitting into smaller units pays more syntax for.
+        let split = 24usize;
+        let margin = 32usize;
+        let scene = |x: usize, y: usize| -> u8 {
+            let fx = (x as f64) * std::f64::consts::TAU / 40.0;
+            let fy = (y as f64) * std::f64::consts::TAU / 64.0;
+            (128.0 + 60.0 * fx.sin() + 30.0 * fy.sin())
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        // `along` is the axis the bands move along, `across` the one the boundary crosses. The
+        // frame is the longer one across, so as many units straddle the boundary either way.
+        for vertical in [false, true] {
+            let (w, h) = if vertical { (64, 128) } else { (128, 64) };
+            let frame = |n: usize| {
+                let shift = 4 * n;
+                let moved = |x: usize, y: usize| -> u8 {
+                    let (across, along) = if vertical { (x, y) } else { (y, x) };
+                    let d = if across < split {
+                        margin + shift
+                    } else {
+                        margin - shift
+                    };
+                    if vertical {
+                        scene(along, across + d)
+                    } else {
+                        scene(along + d, across)
+                    }
+                };
+                let luma: Vec<u8> = (0..h)
+                    .flat_map(|y| (0..w).map(move |x| moved(x, y)).collect::<Vec<_>>())
+                    .collect();
+                let (cw, ch) = (w / 2, h / 2);
+                let chroma = |off: f64| -> Vec<u8> {
+                    (0..ch)
+                        .flat_map(|y| {
+                            (0..cw)
+                                .map(move |x| {
+                                    let (across, along) = if vertical { (x, y) } else { (y, x) };
+                                    let d = if across < split / 2 {
+                                        margin + shift
+                                    } else {
+                                        margin - shift
+                                    };
+                                    let v = if vertical {
+                                        scene(2 * along, 2 * across + d)
+                                    } else {
+                                        scene(2 * along + d, 2 * across)
+                                    };
+                                    (f64::from(v) + off).round().clamp(0.0, 255.0) as u8
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                };
+                (luma, chroma(-4.0), chroma(4.0))
+            };
+            let pictures: Vec<_> = (0..4).map(frame).collect();
+            let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 32);
+            check_sequence(&stream, &recons);
+            // The halves keep moving apart, and the first two follow-ups are where a partition
+            // pays: two prediction blocks in one unit, against a quadtree split into four with
+            // their own headers (they cost about 212 (stacked) and 161 (side by side) bytes
+            // here without partitions, against this bound of the intra picture's half).
+            assert!(
+                sizes[1] + sizes[2] < sizes[0] / 2,
+                "vertical {vertical}: {sizes:?}"
+            );
+        }
     }
 
     #[test]
