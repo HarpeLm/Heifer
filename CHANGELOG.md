@@ -36,6 +36,10 @@
   identical output.
 - Motion compensation copies reference blocks that cross the picture edge row by row instead
   of sample by sample: about 14% faster on a 1080p sequence with motion near the edges.
+- Encoder: image sequences correct a merge prediction with a residual, not only skipped
+  blocks, so a good merge candidate with a small correction is used instead of a new motion
+  vector. The two 120-frame Nokia samples get 1 to 2% smaller, and every picture still
+  decodes bit-exactly to the encoder's reconstruction.
 
 ## 0.5.1 — 2026-11-14
 

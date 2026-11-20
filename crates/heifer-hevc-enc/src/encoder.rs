@@ -287,8 +287,9 @@ pub fn encode_picture16_with(
 
 /// Encodes the pictures of an image sequence in order: an IDR picture every
 /// `keyframe_interval` pictures, and P pictures predicted from the previous picture in
-/// between (skipped blocks, motion vectors to a quarter sample, residuals, or intra blocks,
-/// whichever costs least). Every picture of the sequence shares the same parameter sets.
+/// between (skipped blocks, merge candidates with a residual, motion vectors to a quarter
+/// sample, residuals, or intra blocks, whichever costs least). Every picture of the sequence
+/// shares the same parameter sets.
 ///
 /// ```
 /// use heifer_hevc_enc::encoder::{CodingOptions, EncoderConfig, Planes16, SequenceEncoder};
@@ -1153,6 +1154,20 @@ impl<'a> Encoder<'a> {
         d
     }
 
+    /// `merge_idx` of `prediction_unit()` (§7.3.8.6): truncated unary, the first bin with a
+    /// context, the others bypass.
+    fn merge_idx(&mut self, merge_idx: usize) {
+        self.bin(ctx::MERGE_IDX, merge_idx > 0);
+        if merge_idx > 0 {
+            for _ in 1..merge_idx {
+                self.log.encode_bypass(1);
+            }
+            if merge_idx < MAX_MERGE_CANDIDATES - 1 {
+                self.log.encode_bypass(0);
+            }
+        }
+    }
+
     /// Codes a skipped coding unit: the motion of merge candidate `merge_idx`, no residual.
     /// Returns its distortion.
     fn code_skip(
@@ -1166,17 +1181,39 @@ impl<'a> Encoder<'a> {
     ) -> f64 {
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, true);
-        // merge_idx: truncated unary, the first bin with a context, the others bypass.
-        self.bin(ctx::MERGE_IDX, merge_idx > 0);
-        if merge_idx > 0 {
-            for _ in 1..merge_idx {
-                self.log.encode_bypass(1);
-            }
-            if merge_idx < MAX_MERGE_CANDIDATES - 1 {
-                self.log.encode_bypass(0);
-            }
-        }
+        self.merge_idx(merge_idx);
         self.reconstruct_inter(x0, y0, log2_size, depth, motion, true)
+    }
+
+    /// Codes a merge-predicted coding unit with a residual: the motion of merge candidate
+    /// `merge_idx`, without the skip flag, so that the prediction error is corrected by a
+    /// transform tree. `rqt_root_cbf` is inferred to be 1 for a 2N×2N merge (§7.3.8.7), so no
+    /// flag is coded before the tree. Returns its distortion, or `None` when the prediction
+    /// needs no residual (the skipped coding unit is then the same prediction, cheaper).
+    fn code_merge(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        depth: u8,
+        merge_idx: usize,
+        motion: Motion,
+    ) -> Option<f64> {
+        let inc = self.skip_ctx(x0, y0);
+        self.bin(ctx::CU_SKIP_FLAG + inc, false);
+        self.bin(ctx::PRED_MODE_FLAG, false); // inter
+        self.bin(ctx::PART_MODE, true); // PART_2Nx2N
+        self.bin(ctx::MERGE_FLAG, true);
+        self.merge_idx(merge_idx);
+        self.reconstruct_inter(x0, y0, log2_size, depth, motion, false);
+        self.inter_block = true;
+        let tree = self.inter_tree(x0, y0, log2_size);
+        self.inter_block = false;
+        if !tree_coded(&tree) {
+            return None;
+        }
+        self.write_inter_tree(&tree, log2_size, 0, (false, false));
+        Some(tree_sse(&tree))
     }
 
     /// Codes an inter coding unit with motion vector `mv` (AMVP, one reference picture), with
@@ -2135,6 +2172,17 @@ impl<'a> Encoder<'a> {
             for &(idx, motion) in &candidates {
                 let d = self.code_skip(x0, y0, log2_size, depth, idx, motion);
                 keep(self, d, true);
+            }
+            // Merge with a residual: the same candidates, but correcting the prediction error.
+            // The candidate that predicts best is not always the cheapest once corrected, so
+            // every one is tried. 4:2:2 chroma trees are not handled (see `code_amvp`).
+            if !self.is_422() {
+                for &(idx, motion) in &candidates {
+                    match self.code_merge(x0, y0, log2_size, depth, idx, motion) {
+                        Some(d) => keep(self, d, false),
+                        None => self.restore(x0, y0, size, &start),
+                    }
+                }
             }
             if self.reference.is_some() {
                 let predictors = heifer_hevc_dec::inter::amvp(
@@ -3544,6 +3592,69 @@ mod tests {
     }
 
     #[test]
+    fn p_pictures_422_decode_as_the_encoder_reconstructs_them() {
+        // 4:2:2 P pictures: merge with a residual is left out there (its chroma tree is not
+        // handled, like AMVP with a residual), so this covers the skip and AMVP paths.
+        let (w, h) = (64usize, 48usize);
+        let cw = w.div_ceil(2);
+        let pictures: Vec<[Vec<u16>; 3]> = (0..3)
+            .map(|n| {
+                let [y, cb, cr] = test_picture_444(w, h, 5 + n, 8);
+                let half = |p: &[u16]| -> Vec<u16> {
+                    (0..cw * h)
+                        .map(|i| p[(i / cw) * w + (i % cw) * 2])
+                        .collect()
+                };
+                [y, half(&cb), half(&cr)]
+            })
+            .collect();
+        let options = CodingOptions {
+            chroma_format: ChromaFormat::Chroma422,
+            lossless: false,
+        };
+        let config = EncoderConfig {
+            qp: 30,
+            ..EncoderConfig::default()
+        };
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        let mut reference: Option<Frame> = None;
+        for (poc, [y, cb, cr]) in pictures.iter().enumerate() {
+            let planes = Planes16 {
+                y,
+                chroma: Some((cb, cr)),
+                bit_depth: 8,
+            };
+            let kind = match &reference {
+                None => Kind::SequenceIdr,
+                Some(frame) => Kind::P {
+                    poc: poc as u32,
+                    reference: frame,
+                },
+            };
+            let (picture, recon, _) =
+                encode_kind(w as u32, h as u32, planes, &options, &config, kind).unwrap();
+            if poc == 0 {
+                for nal in &picture.parameter_sets {
+                    stream.extend_from_slice(&[0, 0, 0, 1]);
+                    stream.extend_from_slice(nal);
+                }
+            }
+            for nal in &picture.slices {
+                stream.extend_from_slice(&[0, 0, 0, 1]);
+                stream.extend_from_slice(nal);
+            }
+            recons.push([
+                crop(&recon, 0, w, h),
+                crop(&recon, 1, cw, h),
+                crop(&recon, 2, cw, h),
+            ]);
+            reference = Some(recon);
+        }
+        check_sequence(&stream, &recons);
+    }
+
+    #[test]
     fn skipped_and_intra_blocks_side_by_side() {
         // The left half stays, the right half changes: skipped blocks next to intra blocks,
         // and the deblocking filter between them, must match the decoder.
@@ -3650,6 +3761,11 @@ mod tests {
         check_sequence(&stream, &recons);
         eprintln!("slice sizes: {sizes:?}");
         assert!(sizes[1..].iter().all(|&s| s * 2 < sizes[0]), "{sizes:?}");
+        // The brightness drift is corrected on a merge prediction (a good candidate plus a
+        // residual) rather than by a new motion vector: without merge-with-residual the P
+        // pictures total about 1070 bytes, more than this bound (0.36 × the IDR picture).
+        let inter: usize = sizes[1..].iter().sum();
+        assert!(inter * 100 < sizes[0] * 36, "{sizes:?}");
     }
 
     #[test]

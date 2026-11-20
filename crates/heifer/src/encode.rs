@@ -279,11 +279,11 @@ const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
 /// size, each shown for the matching entry of `durations`, in seconds.
 ///
 /// Every 30th frame is a keyframe coded on its own; the frames between are predicted from the
-/// one before (motion vectors to a quarter sample, residuals), which makes files far smaller
-/// than coding each frame alone. Groups of pictures are encoded in parallel on
-/// [`EncodeOptions::max_threads`] threads. The first frame is also stored as the primary
-/// image, for viewers of still images. Frames with transparency are refused: their
-/// alpha would need a track of its own.
+/// one before (skipped blocks, merge predictions with a residual, motion vectors to a quarter
+/// sample, residuals), which makes files far smaller than coding each frame alone. Groups of
+/// pictures are encoded in parallel on [`EncodeOptions::max_threads`] threads. The first frame
+/// is also stored as the primary image, for viewers of still images. Frames with transparency
+/// are refused: their alpha would need a track of its own.
 ///
 /// ```
 /// let red = heifer::Image::filled(64, 48, 8, [255, 0, 0, 255]);
