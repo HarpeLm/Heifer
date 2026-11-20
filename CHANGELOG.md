@@ -45,6 +45,10 @@
   instead of four smaller units. The two 120-frame Nokia samples get 1 to 7% smaller (the
   candle animation 6.9%, the sea 1.1%), and every picture still decodes bit-exactly to the
   encoder's reconstruction.
+- Encoder: sequences enable asymmetric partitions (AMP): a unit whose quarter moves
+  differently is coded as `2N×nU/D` or `nL/R×2N`, two blocks of different sizes under one set
+  of headers. The candle animation gets 0.9% smaller on top of the symmetric partitions, the
+  sea 0.2%, and every picture still decodes bit-exactly.
 
 ## 0.5.1 — 2026-11-14
 

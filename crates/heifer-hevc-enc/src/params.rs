@@ -219,7 +219,9 @@ impl StreamParams {
         w.ue(0).ue(3); // coding blocks 8×8 to 64×64
         w.ue(0).ue(3); // transform blocks 4×4 to 32×32
         w.ue(0).ue(u32::from(crate::encoder::MAX_TU_DEPTH)); // max_transform_hierarchy_depth_inter / intra
-        w.bit(false).bit(false).bit(!self.lossless).bit(false); // scaling lists, AMP, SAO, PCM
+        // Scaling lists off; asymmetric partitions (AMP) on in sequences, where an inter
+        // coding unit may choose 2N×nU/D or nL/R×2N; SAO on unless lossless; PCM off.
+        w.bit(false).bit(self.inter).bit(!self.lossless).bit(false);
         if self.inter {
             // One short-term RPS: the previous picture (delta POC -1), used for reference.
             w.ue(1).ue(1).ue(0).ue(0).bit(true);

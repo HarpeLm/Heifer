@@ -13,8 +13,8 @@
 //! - levels: RDOQ (including coding nothing), sign data hiding; then SAO on the deblocked picture.
 //!
 //! In a P picture, a coding unit is also tried as inter: skipped or merge-predicted with a
-//! residual, with a searched motion vector (AMVP), or as a partition (2N×N and N×2N) that
-//! follows two motions with one set of headers.
+//! residual, with a searched motion vector (AMVP), or as a partition (2N×N, N×2N or an
+//! asymmetric pair, AMP) that follows two motions with one set of headers.
 //!
 //! Lossless pictures bypass the transform and quantization: prediction still applies, but the
 //! levels are the raw residual samples, and the in-loop filters are off.
@@ -292,8 +292,9 @@ pub fn encode_picture16_with(
 /// Encodes the pictures of an image sequence in order: an IDR picture every
 /// `keyframe_interval` pictures, and P pictures predicted from the previous picture in
 /// between (skipped blocks, merge candidates with a residual, motion vectors to a quarter
-/// sample, residuals, partitioned prediction blocks 2N×N and N×2N, or intra blocks, whichever
-/// costs least). Every picture of the sequence shares the same parameter sets.
+/// sample, residuals, partitioned prediction blocks 2N×N, N×2N or an asymmetric pair (AMP), or
+/// intra blocks, whichever costs least). Every picture of the sequence shares the same
+/// parameter sets.
 ///
 /// ```
 /// use heifer_hevc_enc::encoder::{CodingOptions, EncoderConfig, Planes16, SequenceEncoder};
@@ -1254,10 +1255,31 @@ impl<'a> Encoder<'a> {
             .1
     }
 
-    /// Codes a partitioned inter coding unit (2N×N or N×2N): each prediction block picks its
-    /// merge candidate or motion vector, then the unit's residual is coded once. Unlike a 2N×2N
-    /// merge, `rqt_root_cbf` is not inferred and is written here. Returns the distortion, or
-    /// `None` when a residual was asked for and none of it is worth coding.
+    /// `part_mode` of a partitioned inter coding unit (§7.3.8.5, Table 9-43), with AMP enabled:
+    /// the 2N×2N bin is not coded (a partition is already chosen), then horizontal/vertical,
+    /// symmetric/asymmetric, and for an asymmetric pair a bypass bin picking the near (up or
+    /// left) share or the far one. Only coded above the smallest coding unit, where the third
+    /// and later bins appear, so the minimum-size binarization (N×N) is never reached.
+    fn write_part_mode(&mut self, part_mode: PartMode) {
+        self.bin(ctx::PART_MODE, false);
+        let horizontal = matches!(
+            part_mode,
+            PartMode::Part2NxN | PartMode::Part2NxnU | PartMode::Part2NxnD
+        );
+        self.bin(ctx::PART_MODE + 1, horizontal);
+        let symmetric = matches!(part_mode, PartMode::Part2NxN | PartMode::PartNx2N);
+        self.bin(ctx::PART_MODE + 3, symmetric);
+        if !symmetric {
+            let near = matches!(part_mode, PartMode::Part2NxnU | PartMode::PartnLx2N);
+            self.log.encode_bypass_bits(u32::from(!near), 1);
+        }
+    }
+
+    /// Codes a partitioned inter coding unit (2N×N, N×2N or an asymmetric partition): each
+    /// prediction block picks its merge candidate or motion vector, then the unit's residual is
+    /// coded once. Unlike a 2N×2N merge, `rqt_root_cbf` is not inferred and is written here.
+    /// Returns the distortion, or `None` when a residual was asked for and none of it is worth
+    /// coding.
     fn code_partition(
         &mut self,
         x0: u32,
@@ -1271,12 +1293,7 @@ impl<'a> Encoder<'a> {
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, false);
         self.bin(ctx::PRED_MODE_FLAG, false); // inter
-        // part_mode (Table 9-43): 1 is 2N×2N; with AMP disabled, 0 then 1 is 2N×N and 0 then 0
-        // is N×2N (only the smallest coding unit would code a third bin, for N×N, and
-        // partitions are only tried above it).
-        self.bin(ctx::PART_MODE, false);
-        let horizontal = part_mode == PartMode::Part2NxN;
-        self.bin(ctx::PART_MODE + 1, horizontal);
+        self.write_part_mode(part_mode);
         self.recon.coding_unit(&CodingUnit {
             x: x0,
             y: y0,
@@ -2436,12 +2453,20 @@ impl<'a> Encoder<'a> {
                     }
                 }
             }
-            // Partitions 2N×N and N×2N: two prediction blocks with a motion each, at the cost
-            // of one transform tree split (interSplitFlag) and a coded `rqt_root_cbf`. Only
-            // above the smallest coding units, where the extra syntax pays for itself. 4:2:2
-            // chroma trees are not handled, like the residual paths above.
+            // Partitions 2N×N, N×2N and the asymmetric pairs (AMP): two prediction blocks with
+            // a motion each, at the cost of one transform tree split (interSplitFlag) and a
+            // coded `rqt_root_cbf`. Only above the smallest coding units, where the extra
+            // syntax pays for itself. 4:2:2 chroma trees are not handled, like the residual
+            // paths above.
             if self.reference.is_some() && log2_size > LOG2_MIN_CB && !self.is_422() {
-                for part_mode in [PartMode::Part2NxN, PartMode::PartNx2N] {
+                for part_mode in [
+                    PartMode::Part2NxN,
+                    PartMode::PartNx2N,
+                    PartMode::Part2NxnU,
+                    PartMode::Part2NxnD,
+                    PartMode::PartnLx2N,
+                    PartMode::PartnRx2N,
+                ] {
                     let d = self
                         .code_partition(x0, y0, log2_size, depth, part_mode, false)
                         .expect("always coded without residual");
@@ -4088,6 +4113,68 @@ mod tests {
                 "vertical {vertical}: {sizes:?}"
             );
         }
+    }
+
+    #[test]
+    fn asymmetric_inter_partition_follows_a_quarter() {
+        // A 12-row band moves differently from the rest, over a fine texture so that a wrong
+        // vector costs a real residual. That boundary is a quarter of a 16×16 coding unit, so
+        // inside such a unit an asymmetric partition (AMP) predicts the band with its own
+        // vector and the rest with another, under one set of headers, where a symmetric split
+        // at the middle would not fit and splitting further pays for more headers.
+        let (w, h) = (64usize, 64usize);
+        let band = 12usize;
+        let margin = 32usize;
+        let texture = |x: usize, y: usize| -> u8 {
+            let v = (x as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add((y as u32).wrapping_mul(40_503));
+            let v = v ^ (v >> 13) ^ (v >> 23);
+            (v >> 7) as u8
+        };
+        let frame = |n: usize| {
+            let shift = 8 * n;
+            let moved = |x: usize, y: usize| -> u8 {
+                let d = if y < band {
+                    margin + shift
+                } else {
+                    margin - shift
+                };
+                texture(x + d, y)
+            };
+            let luma: Vec<u8> = (0..h)
+                .flat_map(|y| (0..w).map(move |x| moved(x, y)).collect::<Vec<_>>())
+                .collect();
+            let (cw, ch) = (w / 2, h / 2);
+            let chroma = |off: f64| -> Vec<u8> {
+                (0..ch)
+                    .flat_map(|y| {
+                        (0..cw)
+                            .map(move |x| {
+                                let d = if y < band / 2 {
+                                    margin + shift
+                                } else {
+                                    margin - shift
+                                };
+                                let v = f64::from(texture(2 * x + d, 2 * y)) + off;
+                                v.round().clamp(0.0, 255.0) as u8
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            (luma, chroma(-4.0), chroma(4.0))
+        };
+        let pictures: Vec<_> = (0..4).map(frame).collect();
+        let (stream, recons, sizes) = encode_sequence_stream(w, h, &pictures, 32);
+        check_sequence(&stream, &recons);
+        // The asymmetric partitions carry most of the gain here: the texture makes a wrong
+        // vector expensive, and the 12-row band is a quarter of a 16×16 unit, so the encoder
+        // codes it as 2N×nD with two vectors. The three predicted pictures total about 1469
+        // bytes against this bound (two thirds of the intra picture); with only the symmetric
+        // partitions they total about 2131.
+        let inter: usize = sizes[1..].iter().sum();
+        assert!(inter * 3 < sizes[0] * 2, "{sizes:?}");
     }
 
     #[test]
