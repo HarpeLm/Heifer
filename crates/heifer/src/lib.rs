@@ -39,8 +39,8 @@ pub use depth::{DepthInfo, DepthRepresentation};
 pub use encode::{
     EncodeFormat, EncodeOptions, encode, encode_hdr, encode_hdr_with_metadata, encode_rgb8,
     encode_rgb8_with_format, encode_rgba8, encode_rgba8_with_format, encode_sequence,
-    encode_to_size, encode_with_format, encode_with_metadata, encode_with_metadata_and_format,
-    fit_to_size,
+    encode_sequence_to_size, encode_to_size, encode_with_format, encode_with_metadata,
+    encode_with_metadata_and_format, fit_to_size,
 };
 pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
 pub use heifer_hevc_dec;
@@ -685,36 +685,16 @@ fn decode_hvc1<S: Sample>(
             break;
         }
         let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
-        // The alpha plane must cover the image: anything smaller would be read out of bounds.
-        if alpha.widths[0] < image.width || alpha.heights[0] < image.height {
-            return Err(Error::Unsupported(
-                "alpha plane smaller than the image".into(),
-            ));
-        }
         // The alpha plane is the luma of the auxiliary image, with its own range.
         let range = color_params(file, aux, &alpha)?;
-        let bd = alpha.bit_depth[0];
-        let (offset, span) = if range.full_range {
-            (0.0, f64::from((1u32 << bd) - 1))
-        } else {
-            (f64::from(16u32 << (bd - 8)), f64::from(219u32 << (bd - 8)))
-        };
-        let max = f64::from(image.max_value());
-        for y in 0..image.height as usize {
-            for x in 0..image.width as usize {
-                let a = f64::from(alpha.planes[0][y * alpha.widths[0] as usize + x]);
-                let a = ((a - offset) / span * max).round().clamp(0.0, max);
-                image.data[(y * image.width as usize + x) * 4 + 3] = S::from_u16(a as u16);
-            }
-        }
-        image.has_alpha = true;
+        attach_alpha_frame(&mut image, &alpha, range.full_range)?;
         break;
     }
     Ok(image)
 }
 
-/// Whether an `auxC` type denotes an alpha plane.
-fn is_alpha_urn(urn: &str) -> bool {
+/// Whether an `auxC` / `auxi` type denotes an alpha plane.
+pub(crate) fn is_alpha_urn(urn: &str) -> bool {
     matches!(
         urn,
         "urn:mpeg:hevc:2015:auxid:1" | "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
@@ -734,6 +714,36 @@ fn is_alpha_item(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
     Ok(file
         .item_properties(id)?
         .any(|p| matches!(p, Property::AuxiliaryType(t) if is_alpha_urn(t))))
+}
+
+/// Attaches the luma plane of a decoded auxiliary `alpha` frame to `image`.
+pub(crate) fn attach_alpha_frame<S: Sample>(
+    image: &mut Image<S>,
+    alpha: &Frame,
+    full_range: bool,
+) -> Result<(), Error> {
+    // The alpha plane must cover the image: anything smaller would be read out of bounds.
+    if alpha.widths[0] < image.width || alpha.heights[0] < image.height {
+        return Err(Error::Unsupported(
+            "alpha plane smaller than the image".into(),
+        ));
+    }
+    let bd = alpha.bit_depth[0];
+    let (offset, span) = if full_range {
+        (0.0, f64::from((1u32 << bd) - 1))
+    } else {
+        (f64::from(16u32 << (bd - 8)), f64::from(219u32 << (bd - 8)))
+    };
+    let max = f64::from(image.max_value());
+    for y in 0..image.height as usize {
+        for x in 0..image.width as usize {
+            let a = f64::from(alpha.planes[0][y * alpha.widths[0] as usize + x]);
+            let a = ((a - offset) / span * max).round().clamp(0.0, max);
+            image.data[(y * image.width as usize + x) * 4 + 3] = S::from_u16(a as u16);
+        }
+    }
+    image.has_alpha = true;
+    Ok(())
 }
 
 /// Uses the first channel of a decoded alpha image (e.g. a grid of monochrome tiles) as the
