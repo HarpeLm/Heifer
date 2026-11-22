@@ -59,6 +59,19 @@ fn main_track(bytes: &[u8]) -> Result<Option<Track>, Error> {
     }))
 }
 
+/// The alpha auxiliary track of `main`, if any (`tref` `auxl`, matching sample count).
+fn alpha_track(bytes: &[u8], main: &Track) -> Result<Option<Track>, Error> {
+    Ok(parse_tracks(bytes)?.into_iter().find(|t| {
+        t.id != main.id
+            && t.hevc_config.is_some()
+            && t.samples.len() == main.samples.len()
+            && t.auxiliary_type.as_deref().is_none_or(crate::is_alpha_urn)
+            && t.references
+                .iter()
+                .any(|(kind, ids)| kind.0 == *b"auxl" && ids.contains(&main.id))
+    }))
+}
+
 /// The main image sequence of a HEIF file, or `None` if it has none.
 pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
     let Some(track) = main_track(bytes)? else {
@@ -190,6 +203,8 @@ pub struct SequenceFrames<'a> {
     bytes: std::borrow::Cow<'a, [u8]>,
     track: Track,
     decoder: SequenceDecoder,
+    /// Auxiliary alpha track and its decoder, when the sequence has transparency.
+    alpha: Option<(Track, SequenceDecoder)>,
     /// Next sample to decode, in decoding order.
     next: usize,
     /// Sample indices in display order.
@@ -210,8 +225,8 @@ pub struct SequenceFrames<'a> {
 /// budget, e.g. five groups of 30 frames of 4:2:0 1080p.
 const PARALLEL_BUDGET_BYTES: u64 = 1 << 30;
 
-/// A frame sent back by a group-of-pictures thread: its sample index and the decoded picture.
-type DecodedFrame = (usize, Result<Frame, Error>);
+/// A frame sent back by a group-of-pictures thread: its sample index and decoded plane(s).
+type DecodedFrame = (usize, Result<(Frame, Option<Frame>), Error>);
 
 /// A frame in decoding order, with its sample index, converted to an image.
 type Decoded = (usize, Result<Image, Error>);
@@ -232,44 +247,94 @@ struct GroupJob {
     config: heifer_isobmff::boxes::HevcConfig,
     /// The samples of the group, with the index of the first one.
     samples: Vec<Vec<u8>>,
+    /// Auxiliary alpha track config and samples for the same group, if present.
+    alpha: Option<(heifer_isobmff::boxes::HevcConfig, Vec<Vec<u8>>)>,
     first: usize,
     max_pixels: u64,
+}
+
+fn new_sequence_decoder(
+    config: &heifer_isobmff::boxes::HevcConfig,
+    max_pixels: u64,
+) -> Result<SequenceDecoder, Error> {
+    let mut decoder = SequenceDecoder::new(DecodeOptions::new().with_max_pixels(max_pixels));
+    decoder.add_parameter_sets(&hevc_annex_b(config, &[])?)?;
+    Ok(decoder)
+}
+
+fn decode_sample_frame(
+    config: &heifer_isobmff::boxes::HevcConfig,
+    decoder: &mut SequenceDecoder,
+    data: &[u8],
+    index: usize,
+) -> Result<Frame, Error> {
+    // Parameter sets come from hvcC: the sample holds the picture's NAL units only.
+    let picture_config = heifer_isobmff::boxes::HevcConfig {
+        nal_units: Vec::new(),
+        ..config.clone()
+    };
+    let stream = hevc_annex_b(&picture_config, data)?;
+    decoder.decode(&stream).map_err(|e| decode_error(e, index))
 }
 
 impl GroupJob {
     /// Decodes the group from its sync sample, sending each frame in decoding order. Stops at
     /// the first error, or when the receiver is gone.
     fn run(self, tx: &std::sync::mpsc::Sender<DecodedFrame>) {
-        let mut decoder =
-            SequenceDecoder::new(DecodeOptions::new().with_max_pixels(self.max_pixels));
-        let mut result = hevc_annex_b(&self.config, &[])
-            .map_err(Error::from)
-            .and_then(|sets| decoder.add_parameter_sets(&sets).map_err(Error::from));
-        let picture_config = heifer_isobmff::boxes::HevcConfig {
-            nal_units: Vec::new(),
-            ..self.config.clone()
-        };
+        let mut decoder = new_sequence_decoder(&self.config, self.max_pixels);
+        let mut alpha_decoder = self
+            .alpha
+            .as_ref()
+            .map(|(cfg, _)| new_sequence_decoder(cfg, self.max_pixels));
         for (k, data) in self.samples.iter().enumerate() {
             let index = self.first + k;
-            let frame = result.and_then(|()| {
-                let stream = hevc_annex_b(&picture_config, data)?;
-                decoder.decode(&stream).map_err(|e| decode_error(e, index))
-            });
+            let frame = match &mut decoder {
+                Ok(dec) => decode_sample_frame(&self.config, dec, data, index),
+                Err(e) => Err(decode_setup_error(e)),
+            };
+            let alpha_frame = match (&frame, &self.alpha, &mut alpha_decoder) {
+                (Ok(_), Some((cfg, samples)), Some(Ok(dec))) => {
+                    match decode_sample_frame(cfg, dec, &samples[k], index) {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            let _ = tx.send((index, Err(e)));
+                            return;
+                        }
+                    }
+                }
+                (Ok(_), Some(_), Some(Err(e))) => {
+                    let _ = tx.send((index, Err(decode_setup_error(e))));
+                    return;
+                }
+                _ => None,
+            };
             let failed = frame.is_err();
-            if tx.send((index, frame)).is_err() || failed {
+            if tx.send((index, frame.map(|f| (f, alpha_frame)))).is_err() || failed {
                 return;
             }
-            result = Ok(());
         }
+    }
+}
+
+fn decode_setup_error(e: &Error) -> Error {
+    match e {
+        Error::Invalid(s) => Error::Invalid(s),
+        Error::Unsupported(s) => Error::Unsupported(s.clone()),
+        other => Error::Unsupported(other.to_string()),
     }
 }
 
 impl Parallel {
     /// The decoded frames of the sequence in decoding order, from worker threads, or `None`
     /// when the sequence cannot be split or one thread would do.
-    fn new(track: &Track, bytes: &[u8], options: &Options) -> Option<Self> {
+    fn new(track: &Track, alpha: Option<&Track>, bytes: &[u8], options: &Options) -> Option<Self> {
         let threads = options.threads();
         let groups = closed_gops(track, bytes)?;
+        if let Some(alpha) = alpha
+            && closed_gops(alpha, bytes).as_ref() != Some(&groups)
+        {
+            return None;
+        }
         let longest = groups.iter().map(|g| g.len()).max().unwrap_or(1) as u64;
         // 16-bit samples: a luma plane and two chroma planes, a quarter, half or full size.
         let chroma_quarters = match track.hevc_config.as_ref().map_or(3, |c| c.chroma_format) {
@@ -292,7 +357,13 @@ impl Parallel {
     }
 
     /// Starts groups until `threads` are running.
-    fn fill(&mut self, track: &Track, bytes: &[u8], max_pixels: u64) -> Result<(), Error> {
+    fn fill(
+        &mut self,
+        track: &Track,
+        alpha: Option<&Track>,
+        bytes: &[u8],
+        max_pixels: u64,
+    ) -> Result<(), Error> {
         while self.running.len() < self.running_max {
             let Some(range) = self.todo.pop_front() else {
                 break;
@@ -301,12 +372,27 @@ impl Parallel {
                 .clone()
                 .map(|i| track.sample_data(bytes, i).map(<[u8]>::to_vec))
                 .collect::<Result<Vec<_>, _>>()?;
+            let alpha_job = match alpha {
+                Some(alpha) => {
+                    let config = alpha
+                        .hevc_config
+                        .clone()
+                        .ok_or(Error::Invalid("alpha sequence without HEVC configuration"))?;
+                    let samples = range
+                        .clone()
+                        .map(|i| alpha.sample_data(bytes, i).map(<[u8]>::to_vec))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Some((config, samples))
+                }
+                None => None,
+            };
             let job = GroupJob {
                 config: track
                     .hevc_config
                     .clone()
                     .ok_or(Error::Invalid("sequence without HEVC configuration"))?,
                 samples,
+                alpha: alpha_job,
                 first: range.start,
                 max_pixels,
             };
@@ -318,9 +404,15 @@ impl Parallel {
     }
 
     /// The next decoded frame in decoding order, or `None` after the last one.
-    fn next(&mut self, track: &Track, bytes: &[u8], max_pixels: u64) -> Option<DecodedFrame> {
+    fn next(
+        &mut self,
+        track: &Track,
+        alpha: Option<&Track>,
+        bytes: &[u8],
+        max_pixels: u64,
+    ) -> Option<DecodedFrame> {
         loop {
-            if let Err(e) = self.fill(track, bytes, max_pixels) {
+            if let Err(e) = self.fill(track, alpha, bytes, max_pixels) {
                 return Some((usize::MAX, Err(e)));
             }
             let rx = self.running.front()?;
@@ -345,13 +437,21 @@ fn decode_error(e: heifer_hevc_dec::Error, index: usize) -> Error {
     }
 }
 
-/// The image of a decoded frame, at the track's display size.
-fn frame_image(frame: &Frame, (track_width, track_height): (u32, u32)) -> Image {
+/// The image of a decoded frame, at the track's display size, with optional alpha plane.
+fn frame_image(
+    frame: &Frame,
+    alpha: Option<&Frame>,
+    (track_width, track_height): (u32, u32),
+) -> Result<Image, Error> {
     // The track size is the display size; HEVC may code a slightly larger picture.
     let size = |track: u32, coded: u32| if track == 0 { coded } else { track.min(coded) };
     let width = size(track_width, frame.widths[0]);
     let height = size(track_height, frame.heights[0]);
-    frame_to_rgba_sized(frame, ColorParams::from_frame(frame), width, height)
+    let mut image = frame_to_rgba_sized(frame, ColorParams::from_frame(frame), width, height);
+    if let Some(alpha) = alpha {
+        crate::attach_alpha_frame(&mut image, alpha, ColorParams::from_frame(alpha).full_range)?;
+    }
+    Ok(image)
 }
 
 impl std::fmt::Debug for SequenceFrames<'_> {
@@ -375,14 +475,34 @@ impl<'a> SequenceFrames<'a> {
             .hevc_config
             .as_ref()
             .ok_or_else(|| Error::Unsupported(format!("sequence coding `{}`", track.coding)))?;
-        let mut decoder =
-            SequenceDecoder::new(DecodeOptions::new().with_max_pixels(options.max_pixels()));
-        decoder.add_parameter_sets(&hevc_annex_b(config, &[])?)?;
+        let decoder = new_sequence_decoder(config, options.max_pixels())?;
+        let alpha_track = alpha_track(&bytes, &track)?;
         // Several groups of pictures at once, when decoding the whole sequence.
         let parallel = if start == 0 {
-            Parallel::new(&track, &bytes, options)
+            Parallel::new(&track, alpha_track.as_ref(), &bytes, options)
         } else {
             None
+        };
+        let alpha = match alpha_track {
+            Some(alpha_track) => {
+                let alpha_cfg = alpha_track
+                    .hevc_config
+                    .as_ref()
+                    .ok_or(Error::Invalid("alpha sequence without HEVC configuration"))?;
+                let mut alpha_dec = new_sequence_decoder(alpha_cfg, options.max_pixels())?;
+                if start > 0 && !alpha_track.samples[start].sync {
+                    let alpha_start = alpha_track.samples[..=start]
+                        .iter()
+                        .rposition(|s| s.sync)
+                        .ok_or(Error::Invalid("no keyframe before the alpha frame"))?;
+                    for i in alpha_start..start {
+                        let data = alpha_track.sample_data(&bytes, i)?;
+                        decode_sample_frame(alpha_cfg, &mut alpha_dec, data, i)?;
+                    }
+                }
+                Some((alpha_track, alpha_dec))
+            }
+            None => None,
         };
         Ok(Self {
             parallel,
@@ -391,6 +511,7 @@ impl<'a> SequenceFrames<'a> {
             order: track.display_order(),
             track,
             decoder,
+            alpha,
             next: start,
             shown: 0,
             pending: Vec::new(),
@@ -416,29 +537,44 @@ impl<'a> SequenceFrames<'a> {
             .hevc_config
             .as_ref()
             .ok_or(Error::Invalid("sequence without HEVC configuration"))?;
-        // Parameter sets come from hvcC: the sample holds the picture's NAL units only.
         let data = self.track.sample_data(&self.bytes, index)?;
-        let stream = hevc_annex_b(
-            &heifer_isobmff::boxes::HevcConfig {
-                nal_units: Vec::new(),
-                ..config.clone()
-            },
-            data,
-        )?;
-        let frame = self
-            .decoder
-            .decode(&stream)
-            .map_err(|e| decode_error(e, index))?;
-        Ok(convert.then(|| frame_image(&frame, (self.track.width, self.track.height))))
+        let frame = decode_sample_frame(config, &mut self.decoder, data, index)?;
+        let alpha_frame = match &mut self.alpha {
+            Some((alpha_track, alpha_dec)) => {
+                let alpha_cfg = alpha_track
+                    .hevc_config
+                    .as_ref()
+                    .ok_or(Error::Invalid("alpha sequence without HEVC configuration"))?;
+                let alpha_data = alpha_track.sample_data(&self.bytes, index)?;
+                Some(decode_sample_frame(
+                    alpha_cfg, alpha_dec, alpha_data, index,
+                )?)
+            }
+            None => None,
+        };
+        if convert {
+            Ok(Some(frame_image(
+                &frame,
+                alpha_frame.as_ref(),
+                (self.track.width, self.track.height),
+            )?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// The next frame in decoding order, with its sample index: from the worker threads, or
     /// decoded here.
     fn next_decoded(&mut self) -> Option<Decoded> {
         if let Some(parallel) = &mut self.parallel {
-            let (index, frame) = parallel.next(&self.track, &self.bytes, self.max_pixels)?;
+            let alpha_track = self.alpha.as_ref().map(|(t, _)| t);
+            let (index, result) =
+                parallel.next(&self.track, alpha_track, &self.bytes, self.max_pixels)?;
             let size = (self.track.width, self.track.height);
-            return Some((index, frame.map(|f| frame_image(&f, size))));
+            return Some((
+                index,
+                result.and_then(|(f, a)| frame_image(&f, a.as_ref(), size)),
+            ));
         }
         if self.next >= self.track.samples.len() {
             return None;
@@ -544,9 +680,9 @@ mod tests {
         .unwrap();
         let t = main_track(&bytes).unwrap().unwrap();
         let options = |n| Options::new().with_max_threads(n);
-        assert!(Parallel::new(&t, &bytes, &options(2)).is_some());
+        assert!(Parallel::new(&t, None, &bytes, &options(2)).is_some());
         // One thread, or a single frame decoded from its keyframe: sequential.
-        assert!(Parallel::new(&t, &bytes, &options(1)).is_none());
+        assert!(Parallel::new(&t, None, &bytes, &options(1)).is_none());
         let frames = SequenceFrames::new(bytes.as_slice(), t, 5, &options(4)).unwrap();
         assert!(frames.parallel.is_none());
         for name in [
