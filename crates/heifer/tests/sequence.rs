@@ -274,10 +274,88 @@ fn encode_sequence_refuses_bad_input() {
     assert!(heifer::encode_sequence(&[a.clone(), b], &[0.1, 0.1], &o).is_err());
     assert!(heifer::encode_sequence(std::slice::from_ref(&a), &[0.1, 0.1], &o).is_err());
     assert!(heifer::encode_sequence(std::slice::from_ref(&a), &[f64::NAN], &o).is_err());
-    let mut transparent = a.clone();
-    transparent.has_alpha = true;
-    transparent.data[3] = 0;
-    assert!(heifer::encode_sequence(&[transparent], &[0.1], &o).is_err());
+}
+
+#[cfg(feature = "encoder")]
+#[test]
+fn transparent_sequences_keep_alpha_and_keyframe_interval() {
+    // 10 frames of 65×49 with moving alpha and custom keyframe interval 4 (keyframes at 0, 4, 8).
+    let (w, h) = (65u32, 49u32);
+    let frames: Vec<heifer::Image> = (0..10u16)
+        .map(|n| {
+            let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+            image.has_alpha = true;
+            for (i, p) in image.data.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i as u16 % w as u16, i as u16 / w as u16);
+                let r = (80.0 + 70.0 * (f64::from(x + n * 3) / 11.0).sin()) as u16;
+                let g = (140.0 + 60.0 * (f64::from(y + n * 2) / 9.0).cos()) as u16;
+                let b = (130.0 + 50.0 * (f64::from(x + y + n * 4) / 13.0).sin()) as u16;
+                let a = if x + n * 3 < w as u16 / 2 {
+                    ((y * 255) / (h as u16 - 1)).min(255)
+                } else {
+                    255
+                };
+                p.copy_from_slice(&[r, g, b, a]);
+            }
+            image
+        })
+        .collect();
+    let durations = vec![0.05; 10];
+    let options = heifer::EncodeOptions::new()
+        .with_quality(90)
+        .with_keyframe_interval(4);
+    let bytes = heifer::encode_sequence(&frames, &durations, &options).unwrap();
+
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    let keys: Vec<usize> = (0..10).filter(|&i| seq.frames[i].keyframe).collect();
+    assert_eq!(keys, [0, 4, 8]);
+
+    let still = heifer::decode(&bytes).unwrap();
+    assert!(still.has_alpha);
+
+    let one: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let many: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(4))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    assert_eq!(one.len(), 10);
+    assert!(one == many);
+    assert_eq!(heifer::decode_sequence_frame(&bytes, 6).unwrap(), one[6]);
+
+    for (n, (orig, dec)) in frames.iter().zip(&one).enumerate() {
+        assert!(dec.has_alpha, "frame {n} lost alpha");
+        let psnr = |channel: usize| -> f64 {
+            let mse: f64 = orig
+                .data
+                .iter()
+                .skip(channel)
+                .step_by(4)
+                .zip(dec.data.iter().skip(channel).step_by(4))
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum::<f64>()
+                / (w as f64 * h as f64);
+            10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+        };
+        for c in 0..4 {
+            assert!(psnr(c) > 33.0, "frame {n} ch {c}: {:.1} dB", psnr(c));
+        }
+    }
+
+    // `encode_sequence_to_size` fits a smaller budget than quality 90, and rejects tiny ones.
+    let budget = (bytes.len() * 3 / 4).max(1500);
+    let (fitted, q) =
+        heifer::encode_sequence_to_size(&frames, &durations, budget, &options).unwrap();
+    assert!(
+        fitted.len() <= budget,
+        "{} > {budget} (q={q})",
+        fitted.len()
+    );
+    assert!(heifer::encode_sequence_to_size(&frames, &durations, 100, &options).is_err());
 }
 
 #[cfg(feature = "encoder")]
