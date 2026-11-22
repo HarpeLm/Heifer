@@ -637,6 +637,8 @@ pub enum Property {
     PixelInfo(Vec<u8>),
     /// `uncC`: configuration of an uncompressed frame (ISO/IEC 23001-17).
     UncompressedConfig(UncompressedConfig),
+    /// `cmpd`: component descriptions of an uncompressed frame (ISO/IEC 23001-17).
+    ComponentDescriptions(ComponentDescriptions),
     /// `irot`: anti-clockwise rotation, in multiples of 90°.
     Rotation(u8),
     /// `imir`: mirroring. `true` exchanges top and bottom (coded 0), `false` left and right (coded 1).
@@ -687,6 +689,7 @@ impl Property {
                 Self::PixelInfo(r.bytes(usize::from(n))?.to_vec())
             }
             b"uncC" => Self::UncompressedConfig(UncompressedConfig::parse(content)?),
+            b"cmpd" => Self::ComponentDescriptions(ComponentDescriptions::parse(content)?),
             b"irot" => Self::Rotation(r.u8()? & 0x03),
             b"imir" => Self::Mirror(r.u8()? & 0x01 == 0),
             b"clap" => Self::CleanAperture {
@@ -1041,5 +1044,31 @@ mod tests {
             HevcConfig::parse(&[2; 23]),
             Err(Error::InvalidBox { .. })
         ));
+    }
+
+    #[test]
+    fn cmpd_parses_as_property_variant() {
+        let data = [
+            0, 0, 0, 2, // 2 components
+            0, 4, // red
+            0x80, 0x00, // URI-typed
+            b'u', b'r', b'n', 0,
+        ];
+        let prop = Property::parse(FourCC(*b"cmpd"), &data).unwrap();
+        assert_eq!(
+            prop,
+            Property::ComponentDescriptions(ComponentDescriptions {
+                components: vec![
+                    ComponentDescription {
+                        component_type: 4,
+                        uri: None,
+                    },
+                    ComponentDescription {
+                        component_type: 0x8000,
+                        uri: Some("urn".into()),
+                    },
+                ],
+            })
+        );
     }
 }
