@@ -141,6 +141,7 @@ impl<'a> BitReader<'a> {
 
     /// `more_rbsp_data()` (H.265 §7.2): true if there is data before the RBSP trailing bits
     /// (a final `1` bit followed by zero bits up to the end).
+    #[cfg(test)]
     pub fn more_rbsp_data(&self) -> bool {
         let Some(last) = self.data.iter().rposition(|&b| b != 0) else {
             return false;
@@ -164,6 +165,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Skips bits up to the next byte boundary.
+    #[cfg(test)]
     pub fn align(&mut self) {
         self.pos = self.pos.next_multiple_of(8).min(self.data.len() * 8);
     }
