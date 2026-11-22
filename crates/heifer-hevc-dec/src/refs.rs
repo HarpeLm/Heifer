@@ -88,6 +88,7 @@ impl PocState {
 /// `dpb` must contain every picture the RPS refers to, otherwise the bitstream is invalid.
 /// `num_ref_idx_active` is `num_ref_idx_l0_active_minus1 + 1`; when it exceeds the number of
 /// pictures in the RPS, entries are repeated cyclically.
+#[cfg(test)]
 pub fn build_ref_pic_list0(
     curr_poc: i32,
     rps: &ShortTermRps,
@@ -108,6 +109,7 @@ pub fn build_ref_pic_list0(
 
 /// Builds `RefPicList1` of a B slice (§8.3.4): like [`build_ref_pic_list0`], but the
 /// pictures after the current one (positive delta POC) come first.
+#[cfg(test)]
 pub fn build_ref_pic_list1(
     curr_poc: i32,
     rps: &ShortTermRps,
