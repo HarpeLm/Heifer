@@ -219,21 +219,15 @@ impl<'a> HeifFile<'a> {
         }))
     }
 
-    /// Component descriptions from the `cmpd` property (ISO/IEC 23001-17), parsed on demand.
-    ///
-    /// The `cmpd` box stays a [`Property::Unknown`] in [`item_properties`](Self::item_properties):
-    /// a new [`Property`] variant would break exhaustive matches before 0.6.
+    /// Component descriptions from the `cmpd` property (ISO/IEC 23001-17).
     pub fn component_descriptions(
         &self,
         id: ItemId,
     ) -> Result<Option<ComponentDescriptions>, Error> {
-        self.item_properties(id)?
-            .find_map(|p| match p {
-                Property::Unknown(kind, content) if kind.0 == *b"cmpd" => Some(content),
-                _ => None,
-            })
-            .map(|content| ComponentDescriptions::parse(content))
-            .transpose()
+        Ok(self.item_properties(id)?.find_map(|p| match p {
+            Property::ComponentDescriptions(descriptions) => Some(descriptions.clone()),
+            _ => None,
+        }))
     }
 
     /// Items referenced by `from` with the given reference type (e.g. `dimg` for grid tiles).
