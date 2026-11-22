@@ -55,6 +55,9 @@ pub struct EncodeOptions {
     /// Maximum number of threads used to encode tiles in parallel. `0` uses all available
     /// cores.
     pub max_threads: usize,
+    /// Maximum number of frames from one keyframe (IDR picture) to the next in an encoded
+    /// image sequence. `0` uses the default (`30`); `1` codes every frame as a keyframe.
+    pub keyframe_interval: usize,
 }
 
 impl Default for EncodeOptions {
@@ -71,11 +74,12 @@ impl Default for EncodeOptions {
 /// assert_eq!((options.quality, options.max_threads), (70, 2));
 /// ```
 impl EncodeOptions {
-    /// The default options: quality 80, all cores.
+    /// The default options: quality 80, all cores, keyframe every 30 frames.
     pub const fn new() -> Self {
         Self {
             quality: 80,
             max_threads: 0,
+            keyframe_interval: SEQUENCE_KEYFRAME_INTERVAL,
         }
     }
 
@@ -90,6 +94,14 @@ impl EncodeOptions {
     #[must_use]
     pub const fn with_max_threads(mut self, max_threads: usize) -> Self {
         self.max_threads = max_threads;
+        self
+    }
+
+    /// Sets [`keyframe_interval`](Self::keyframe_interval): `0` uses the default (`30`); `1`
+    /// codes every frame as a keyframe.
+    #[must_use]
+    pub const fn with_keyframe_interval(mut self, keyframe_interval: usize) -> Self {
+        self.keyframe_interval = keyframe_interval;
         self
     }
 }
@@ -107,6 +119,14 @@ impl EncodeOptions {
             available
         } else {
             self.max_threads.min(available)
+        }
+    }
+
+    fn sequence_keyframe_interval(&self) -> usize {
+        if self.keyframe_interval == 0 {
+            SEQUENCE_KEYFRAME_INTERVAL
+        } else {
+            self.keyframe_interval
         }
     }
 }
@@ -276,15 +296,16 @@ const SEQUENCE_TIMESCALE: u32 = 1000;
 const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
 
 /// Encodes an image sequence (a burst or an animation) as a HEIF file: `frames`, all the same
-/// size, each shown for the matching entry of `durations`, in seconds.
+/// size and bit depth, each shown for the matching entry of `durations`, in seconds.
 ///
-/// Every 30th frame is a keyframe coded on its own; the frames between are predicted from the
-/// one before (skipped blocks, merge predictions with a residual, motion vectors to a quarter
-/// sample, prediction blocks 2N×2N, 2N×N, N×2N or an asymmetric pair, residuals), which makes
-/// files far smaller than coding each frame alone. Groups of
-/// pictures are encoded in parallel on [`EncodeOptions::max_threads`] threads. The first frame
-/// is also stored as the primary image, for viewers of still images. Frames with transparency
-/// are refused: their alpha would need a track of its own.
+/// Every `options.keyframe_interval` frames (default `30`) is a keyframe coded on its own; the
+/// frames between are predicted from the one before (skipped blocks, merge predictions with a
+/// residual, motion vectors to a quarter sample, prediction blocks 2N×2N, 2N×N, N×2N or an
+/// asymmetric pair, residuals), which makes files far smaller than coding each frame alone.
+/// Groups of pictures are encoded in parallel on [`EncodeOptions::max_threads`] threads. The
+/// first frame is also stored as the primary image, for viewers of still images. When any
+/// frame has transparency, an auxiliary monochrome alpha track (`auxl`) is stored alongside
+/// the colour track.
 ///
 /// ```
 /// let red = heifer::Image::filled(64, 48, 8, [255, 0, 0, 255]);
@@ -310,9 +331,14 @@ pub fn encode_sequence(
             "frame durations must be finite and not negative",
         ));
     }
-    let (width, height, bit_depth) = (first.width, first.height, first.bit_depth);
+    let (width, height, src_bit_depth) = (first.width, first.height, first.bit_depth);
+    let bit_depth = if src_bit_depth > 8 { 10 } else { 8 };
+    let src_max = u32::from(first.max_value());
+    let target_max = (1u32 << bit_depth) - 1;
+    let scale = |v: u16| ((u32::from(v) * target_max + src_max / 2) / src_max) as u16;
+    let mut has_alpha = false;
     for frame in frames {
-        if (frame.width, frame.height, frame.bit_depth) != (width, height, bit_depth) {
+        if (frame.width, frame.height, frame.bit_depth) != (width, height, src_bit_depth) {
             return Err(Error::Invalid(
                 "the frames of a sequence must have the same size and bit depth",
             ));
@@ -322,11 +348,20 @@ pub fn encode_sequence(
             && frame
                 .data
                 .chunks_exact(4)
-                .any(|p| p[3] != (1 << bit_depth) - 1)
+                .any(|p| u32::from(p[3]) < src_max)
         {
-            return Err(Error::Unsupported("transparency in image sequences".into()));
+            has_alpha = true;
         }
     }
+    let pixel_at = |frame: &Image, i: usize| {
+        let p = rgba_at(frame, i);
+        let a = if frame.has_alpha {
+            scale(p[3])
+        } else {
+            target_max as u16
+        };
+        [scale(p[0]), scale(p[1]), scale(p[2]), a]
+    };
 
     let mut writer = HeifWriter::new();
     // The first frame as a still image, coded like a photo (tiles, thumbnail).
@@ -335,43 +370,57 @@ pub fn encode_sequence(
         width,
         height,
         bit_depth,
-        false,
+        has_alpha,
         None,
         EncodeFormat::Ycbcr420,
         options,
-        |i| rgba_at(first, i),
+        |i| pixel_at(first, i),
     )?;
 
     // Groups of pictures, encoded in parallel: an IDR picture, then P pictures each
     // predicted from the one before.
+    let interval = options.sequence_keyframe_interval();
     let config = EncoderConfig {
         qp: options.qp(),
         colour: (1, 13, 6),
+        ..EncoderConfig::default()
+    };
+    let alpha_config = EncoderConfig {
+        qp: options.qp(),
         ..EncoderConfig::default()
     };
     let coding = CodingOptions {
         chroma_format: ChromaFormat::Chroma420,
         lossless: false,
     };
-    let groups: Vec<&[Image]> = frames.chunks(SEQUENCE_KEYFRAME_INTERVAL).collect();
+    let alpha_coding = CodingOptions {
+        chroma_format: ChromaFormat::Monochrome,
+        lossless: false,
+    };
+    let groups: Vec<&[Image]> = frames.chunks(interval).collect();
     let threads = options.threads().clamp(1, groups.len());
     let per_thread = groups.len().div_ceil(threads);
-    let coded: Vec<Result<(EncodedPicture, bool), Error>> = std::thread::scope(|scope| {
+    type CodedPair = ((EncodedPicture, bool), Option<(EncodedPicture, bool)>);
+    let coded: Vec<Result<CodedPair, Error>> = std::thread::scope(|scope| {
         let handles: Vec<_> = groups
             .chunks(per_thread)
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut out = Vec::new();
                     for group in chunk {
-                        let mut encoder = SequenceEncoder::new(
-                            width,
-                            height,
-                            coding,
-                            config,
-                            SEQUENCE_KEYFRAME_INTERVAL,
-                        );
+                        let mut encoder =
+                            SequenceEncoder::new(width, height, coding, config, interval);
+                        let mut alpha_encoder = has_alpha.then(|| {
+                            SequenceEncoder::new(
+                                width,
+                                height,
+                                alpha_coding,
+                                alpha_config,
+                                interval,
+                            )
+                        });
                         for frame in *group {
-                            let at = |x: usize, y: usize| rgba_at(frame, y * width as usize + x);
+                            let at = |x: usize, y: usize| pixel_at(frame, y * width as usize + x);
                             let (y, cb, cr) = ycbcr_planes(
                                 &at,
                                 width as usize,
@@ -384,10 +433,34 @@ pub fn encode_sequence(
                                 chroma: Some((&cb, &cr)),
                                 bit_depth,
                             };
-                            out.push(encoder.encode(planes).map_err(Error::from));
-                            if out.last().is_some_and(Result::is_err) {
-                                return out;
-                            }
+                            let colour = match encoder.encode(planes) {
+                                Ok(pair) => pair,
+                                Err(e) => {
+                                    out.push(Err(Error::from(e)));
+                                    return out;
+                                }
+                            };
+                            let alpha = match &mut alpha_encoder {
+                                Some(enc) => {
+                                    let alpha_y: Vec<u16> = (0..(width as usize * height as usize))
+                                        .map(|i| pixel_at(frame, i)[3])
+                                        .collect();
+                                    let alpha_planes = Planes16 {
+                                        y: &alpha_y,
+                                        chroma: None,
+                                        bit_depth,
+                                    };
+                                    match enc.encode(alpha_planes) {
+                                        Ok(pair) => Some(pair),
+                                        Err(e) => {
+                                            out.push(Err(Error::from(e)));
+                                            return out;
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
+                            out.push(Ok((colour, alpha)));
                         }
                     }
                     out
@@ -400,22 +473,74 @@ pub fn encode_sequence(
             .collect()
     });
     let coded = coded.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let pictures: Vec<EncodedPicture> = coded.iter().map(|(p, _)| p.clone()).collect();
-    let sync: Vec<bool> = coded.iter().map(|&(_, s)| s).collect();
-    let hevc = hevc_config(&pictures[0], bit_depth);
-    if pictures
-        .iter()
-        .any(|p| p.parameter_sets != pictures[0].parameter_sets)
-    {
-        return Err(Error::Invalid("frames coded with different parameter sets"));
-    }
-    let mut track = SequenceTrack::new(width, height, SEQUENCE_TIMESCALE, hevc);
-    for ((picture, &duration), &sync) in pictures.iter().zip(durations).zip(&sync) {
-        let ticks = (duration * f64::from(SEQUENCE_TIMESCALE)).round();
-        track.add_sample(&picture.slices, ticks.min(f64::from(u32::MAX)) as u32, sync);
+    let colour_coded: Vec<(EncodedPicture, bool)> = coded.iter().map(|(c, _)| c.clone()).collect();
+    let mut track = build_sequence_track(width, height, bit_depth, durations, &colour_coded)?;
+    if has_alpha {
+        let alpha_coded: Vec<(EncodedPicture, bool)> = coded
+            .into_iter()
+            .map(|(_, a)| a.expect("alpha coded for every frame"))
+            .collect();
+        let alpha_track = build_sequence_track(width, height, bit_depth, durations, &alpha_coded)?;
+        track.set_alpha(alpha_track);
     }
     writer.set_sequence(track);
     Ok(writer.finish())
+}
+
+/// Encodes an image sequence at a high quality whose file fits in `max_bytes`; returns the file
+/// and the quality used.
+///
+/// Quality is searched by dichotomy (like [`encode_to_size`]); `options.quality` is ignored,
+/// while [`EncodeOptions::keyframe_interval`] and [`EncodeOptions::max_threads`] apply. Fails
+/// with [`Error::Unsupported`] when even quality 0 is too large.
+pub fn encode_sequence_to_size(
+    frames: &[Image],
+    durations: &[f64],
+    max_bytes: usize,
+    options: &EncodeOptions,
+) -> Result<(Vec<u8>, u8), Error> {
+    let encode = |quality: u8| {
+        encode_sequence(
+            frames,
+            durations,
+            &EncodeOptions {
+                quality,
+                ..*options
+            },
+        )
+    };
+    fit_to_size(max_bytes, encode)?.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "the sequence does not fit in {max_bytes} bytes, even at quality 0"
+        ))
+    })
+}
+
+fn build_sequence_track(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    durations: &[f64],
+    coded: &[(EncodedPicture, bool)],
+) -> Result<SequenceTrack, Error> {
+    let first = &coded[0].0;
+    if coded
+        .iter()
+        .any(|(p, _)| p.parameter_sets != first.parameter_sets)
+    {
+        return Err(Error::Invalid("frames coded with different parameter sets"));
+    }
+    let hevc = hevc_config(first, bit_depth);
+    let mut track = SequenceTrack::new(width, height, SEQUENCE_TIMESCALE, hevc);
+    for ((picture, sync), &duration) in coded.iter().zip(durations) {
+        let ticks = (duration * f64::from(SEQUENCE_TIMESCALE)).round();
+        track.add_sample(
+            &picture.slices,
+            ticks.min(f64::from(u32::MAX)) as u32,
+            *sync,
+        );
+    }
+    Ok(track)
 }
 
 /// Pixel `i` of an RGBA image.
