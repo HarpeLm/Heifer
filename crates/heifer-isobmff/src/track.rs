@@ -46,6 +46,8 @@ pub struct Track {
     pub coding: FourCC,
     /// HEVC configuration of the samples, for `hvc1`/`hev1` sample entries.
     pub hevc_config: Option<HevcConfig>,
+    /// Auxiliary track type (`auxi`), e.g. `urn:mpeg:hevc:2015:auxid:1` (alpha).
+    pub auxiliary_type: Option<String>,
     /// The samples, in decoding order.
     pub samples: Vec<Sample>,
     /// Track references (`tref`): type and referenced track IDs, e.g. `thmb`.
@@ -197,6 +199,7 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
     let entries = r.rest();
     let mut coding = FourCC(*b"    ");
     let mut hevc_config = None;
+    let mut auxiliary_type = None;
     if let Some(entry) = BoxIter::new(entries).next() {
         let entry = entry?;
         coding = entry.header.box_type;
@@ -208,6 +211,10 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
                 .ok_or(invalid(b"stsd", "truncated visual sample entry"))?;
             if let Some(hvcc) = child(children, b"hvcC")? {
                 hevc_config = Some(HevcConfig::parse(hvcc)?);
+            }
+            if let Some(auxi) = child(children, b"auxi")? {
+                let (_, mut r) = full_box(auxi)?;
+                auxiliary_type = Some(r.cstring());
             }
         }
     }
@@ -336,6 +343,7 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
         timescale,
         coding,
         hevc_config,
+        auxiliary_type,
         samples,
         references,
     })
@@ -354,6 +362,7 @@ mod tests {
             timescale: 25,
             coding: FourCC(*b"hvc1"),
             hevc_config: None,
+            auxiliary_type: None,
             samples: offsets
                 .iter()
                 .map(|&composition_offset| Sample {
