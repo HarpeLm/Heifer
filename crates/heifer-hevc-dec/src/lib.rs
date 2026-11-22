@@ -3,10 +3,6 @@
 //! Spec: ITU-T H.265. Still images use intra coding only; [`sequence`] adds inter prediction
 //! (P and B frames) for image sequences.
 
-// Inside the crate, the deprecated modules below are used freely: the deprecation is a notice
-// for other crates.
-#![allow(deprecated)]
-
 // The stable API. Everything else is internal: it stays public because `heifer-hevc-enc`,
 // `heifer` and the fuzz targets use it, but it is hidden from the documentation and may change
 // in any release (see "Stability" in the README).
@@ -19,44 +15,28 @@ pub use nal::{access_units, split_annex_b};
 pub use recon::Frame;
 pub use sequence::SequenceDecoder;
 
-#[doc(hidden)]
-#[deprecated(
-    since = "0.5.1",
-    note = "internal to the decoder; it will become private in 0.6"
-)]
-pub mod bitreader;
+mod bitreader;
 #[doc(hidden)]
 pub mod cabac;
 #[doc(hidden)]
 pub mod contexts;
-#[doc(hidden)]
-#[deprecated(
-    since = "0.5.1",
-    note = "internal to the decoder; it will become private in 0.6"
-)]
-pub mod filters;
+mod filters;
 #[doc(hidden)]
 pub mod inter;
 #[doc(hidden)]
 pub mod nal;
 #[doc(hidden)]
 pub mod params;
+#[cfg(test)]
+mod real_bitstreams_tests;
 #[doc(hidden)]
 pub mod recon;
-#[doc(hidden)]
-#[deprecated(
-    since = "0.5.1",
-    note = "internal to the decoder; it will become private in 0.6"
-)]
-pub mod refs;
+mod refs;
 #[doc(hidden)]
 pub mod scan;
-#[doc(hidden)]
-#[deprecated(
-    since = "0.5.1",
-    note = "internal to the decoder; it will become private in 0.6"
-)]
-pub mod sei;
+mod sei;
+#[cfg(test)]
+mod sequence_refs_tests;
 #[doc(hidden)]
 pub mod slice;
 #[doc(hidden)]
