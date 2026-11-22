@@ -289,12 +289,51 @@ pub fn encode_picture16_with(
     encode_with_reconstruction(width, height, planes, options, config).map(|(picture, ..)| picture)
 }
 
+/// One picture emitted by [`SequenceEncoder::push`] / [`SequenceEncoder::flush`], in decoding
+/// order.
+#[derive(Debug, Clone)]
+pub struct EncodedSequenceFrame {
+    /// Encoded HEVC picture.
+    pub picture: EncodedPicture,
+    /// Whether the picture is an IDR sync sample.
+    pub keyframe: bool,
+    /// 0-based display order index across the stream fed to [`SequenceEncoder`].
+    pub display_index: usize,
+}
+
+/// A frame buffered in [`SequenceEncoder`] waiting for a future anchor P frame.
+struct PendingFrame {
+    display_index: usize,
+    y: Vec<u16>,
+    chroma: Option<(Vec<u16>, Vec<u16>)>,
+    bit_depth: u8,
+}
+
+impl PendingFrame {
+    fn from_planes(display_index: usize, planes: Planes16<'_>) -> Self {
+        Self {
+            display_index,
+            y: planes.y.to_vec(),
+            chroma: planes.chroma.map(|(cb, cr)| (cb.to_vec(), cr.to_vec())),
+            bit_depth: planes.bit_depth,
+        }
+    }
+
+    fn as_planes(&self) -> Planes16<'_> {
+        Planes16 {
+            y: &self.y,
+            chroma: self.chroma.as_ref().map(|(cb, cr)| (&cb[..], &cr[..])),
+            bit_depth: self.bit_depth,
+        }
+    }
+}
+
 /// Encodes the pictures of an image sequence in order: an IDR picture every
-/// `keyframe_interval` pictures, and P pictures predicted from the previous picture in
-/// between (skipped blocks, merge candidates with a residual, motion vectors to a quarter
-/// sample, residuals, partitioned prediction blocks 2N×N, N×2N or an asymmetric pair (AMP), or
-/// intra blocks, whichever costs least). Every picture of the sequence shares the same
-/// parameter sets.
+/// `keyframe_interval` pictures, and P (or P and B) pictures predicted from reference pictures
+/// in between (skipped blocks, merge candidates with a residual, motion vectors to a quarter
+/// sample, bi-prediction, residuals, partitioned prediction blocks 2N×N, N×2N or an asymmetric
+/// pair (AMP), or intra blocks, whichever costs least). Every picture of the sequence shares
+/// the same parameter sets.
 ///
 /// ```
 /// use heifer_hevc_enc::encoder::{CodingOptions, EncoderConfig, Planes16, SequenceEncoder};
@@ -310,19 +349,33 @@ pub fn encode_picture16_with(
 ///     assert_eq!(picture.slices.len(), 1);
 /// }
 /// ```
-#[derive(Debug)]
 pub struct SequenceEncoder {
     width: u32,
     height: u32,
     options: CodingOptions,
     config: EncoderConfig,
     keyframe_interval: usize,
-    /// Pictures encoded so far.
+    b_frames: usize,
+    /// Display-order pictures encoded or queued so far.
     count: usize,
-    /// POC of the next picture.
+    /// POC of the most recently encoded anchor picture (within the current GOP).
     poc: u32,
-    /// The filtered reconstruction of the previous picture.
-    reference: Option<Frame>,
+    /// The filtered reconstruction and POC of the last anchor picture (IDR or P).
+    reference: Option<(u32, Frame)>,
+    /// Frames buffered between the last anchor and the next P anchor when `b_frames > 0`.
+    pending: Vec<PendingFrame>,
+}
+
+impl std::fmt::Debug for SequenceEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequenceEncoder")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("keyframe_interval", &self.keyframe_interval)
+            .field("b_frames", &self.b_frames)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SequenceEncoder {
@@ -341,22 +394,36 @@ impl SequenceEncoder {
             options,
             config,
             keyframe_interval: keyframe_interval.max(1),
+            b_frames: 0,
             count: 0,
             poc: 0,
             reference: None,
+            pending: Vec::new(),
         }
     }
 
-    /// Encodes the next picture. Returns it, and whether it is an IDR picture (a sync sample:
-    /// decodable without the pictures before it).
+    /// Sets the number of consecutive non-reference B pictures coded between P/IDR anchor
+    /// pictures (`0` for low-delay P-only sequences). Use [`push`](Self::push) and
+    /// [`flush`](Self::flush) when `b_frames > 0`.
+    #[must_use]
+    pub fn with_b_frames(mut self, b_frames: usize) -> Self {
+        self.b_frames = b_frames;
+        self
+    }
+
+    /// Encodes the next picture synchronously (for `b_frames == 0`). Returns it, and whether
+    /// it is an IDR picture (a sync sample: decodable without the pictures before it).
     pub fn encode(&mut self, planes: Planes16<'_>) -> Result<(EncodedPicture, bool), Error> {
         let keyframe = self.count % self.keyframe_interval == 0;
+        let poc = if keyframe { 0 } else { self.poc + 1 };
         let kind = match &self.reference {
-            Some(reference) if !keyframe => Kind::P {
-                poc: self.poc,
+            Some((ref_poc, reference)) if !keyframe => Kind::P {
+                poc,
+                ref_poc: *ref_poc as i32,
                 reference,
+                b_frames: false,
             },
-            _ => Kind::SequenceIdr,
+            _ => Kind::SequenceIdr { b_frames: false },
         };
         let (picture, recon, _) = encode_kind(
             self.width,
@@ -366,10 +433,112 @@ impl SequenceEncoder {
             &self.config,
             kind,
         )?;
-        self.poc = if keyframe { 1 } else { self.poc + 1 };
-        self.reference = Some(recon);
+        self.poc = poc;
+        self.reference = Some((poc, recon));
         self.count += 1;
         Ok((picture, keyframe))
+    }
+
+    /// Feeds the next picture in display order and returns zero or more pictures in decoding
+    /// order. Call [`flush`](Self::flush) after the last picture of the sequence.
+    pub fn push(&mut self, planes: Planes16<'_>) -> Result<Vec<EncodedSequenceFrame>, Error> {
+        if self.b_frames == 0 {
+            let display_index = self.count;
+            let (picture, keyframe) = self.encode(planes)?;
+            return Ok(vec![EncodedSequenceFrame {
+                picture,
+                keyframe,
+                display_index,
+            }]);
+        }
+        let keyframe = self.count % self.keyframe_interval == 0;
+        if keyframe {
+            let mut out = self.flush()?;
+            let display_index = self.count;
+            let (picture, recon, _) = encode_kind(
+                self.width,
+                self.height,
+                planes,
+                &self.options,
+                &self.config,
+                Kind::SequenceIdr { b_frames: true },
+            )?;
+            self.poc = 0;
+            self.reference = Some((0, recon));
+            self.count += 1;
+            out.push(EncodedSequenceFrame {
+                picture,
+                keyframe: true,
+                display_index,
+            });
+            return Ok(out);
+        }
+        self.pending
+            .push(PendingFrame::from_planes(self.count, planes));
+        self.count += 1;
+        if self.pending.len() > self.b_frames {
+            self.flush()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Encodes any buffered frames waiting for a future anchor picture, in decoding order.
+    pub fn flush(&mut self) -> Result<Vec<EncodedSequenceFrame>, Error> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (prev_poc, prev_ref) = self
+            .reference
+            .as_ref()
+            .expect("GOP starts with an IDR picture");
+        let prev_poc = *prev_poc;
+        let anchor_offset = self.pending.len() as u32;
+        let p_poc = prev_poc + anchor_offset;
+        let anchor = self.pending.last().expect("non-empty pending");
+        let (p_pic, p_recon, _) = encode_kind(
+            self.width,
+            self.height,
+            anchor.as_planes(),
+            &self.options,
+            &self.config,
+            Kind::P {
+                poc: p_poc,
+                ref_poc: prev_poc as i32,
+                reference: prev_ref,
+                b_frames: true,
+            },
+        )?;
+        let mut out = Vec::with_capacity(self.pending.len());
+        out.push(EncodedSequenceFrame {
+            picture: p_pic,
+            keyframe: false,
+            display_index: anchor.display_index,
+        });
+        for (j, frame) in self.pending[..self.pending.len() - 1].iter().enumerate() {
+            let b_poc = prev_poc + 1 + j as u32;
+            let (b_pic, _, _) = encode_kind(
+                self.width,
+                self.height,
+                frame.as_planes(),
+                &self.options,
+                &self.config,
+                Kind::B {
+                    poc: b_poc,
+                    ref_pocs: [prev_poc as i32, p_poc as i32],
+                    references: [prev_ref, &p_recon],
+                },
+            )?;
+            out.push(EncodedSequenceFrame {
+                picture: b_pic,
+                keyframe: false,
+                display_index: frame.display_index,
+            });
+        }
+        self.poc = p_poc;
+        self.reference = Some((p_poc, p_recon));
+        self.pending.clear();
+        Ok(out)
     }
 }
 
@@ -391,11 +560,21 @@ pub(crate) enum Kind<'r> {
     /// A still image: an IDR picture, in a stream without reference pictures.
     Still,
     /// The first picture of a group of an image sequence: an IDR picture, in a stream whose
-    /// SPS keeps one reference picture.
-    SequenceIdr,
-    /// A P picture of POC `poc`, predicted from `reference`, the filtered reconstruction of
-    /// the previous picture (POC `poc - 1`).
-    P { poc: u32, reference: &'r Frame },
+    /// SPS keeps reference pictures.
+    SequenceIdr { b_frames: bool },
+    /// A P picture of POC `poc`, predicted from `reference` (`ref_poc`).
+    P {
+        poc: u32,
+        ref_poc: i32,
+        reference: &'r Frame,
+        b_frames: bool,
+    },
+    /// A non-reference B picture of POC `poc`, predicted from `[past, future]`.
+    B {
+        poc: u32,
+        ref_pocs: [i32; 2],
+        references: [&'r Frame; 2],
+    },
 }
 
 /// Encodes a picture of the given [`Kind`]. Returns the encoded picture, the reconstruction
@@ -481,6 +660,11 @@ pub(crate) fn encode_kind(
     } else {
         1
     };
+    let b_frames = match kind {
+        Kind::Still => false,
+        Kind::SequenceIdr { b_frames } | Kind::P { b_frames, .. } => b_frames,
+        Kind::B { .. } => true,
+    };
     let params = StreamParams {
         width: width.next_multiple_of(8),
         height: height.next_multiple_of(8),
@@ -493,6 +677,7 @@ pub(crate) fn encode_kind(
         colour: config.colour,
         lossless: options.lossless,
         inter: !matches!(kind, Kind::Still),
+        b_frames,
     };
     let parameter_sets = vec![params.vps(), params.sps(), params.pps()];
 
@@ -502,8 +687,20 @@ pub(crate) fn encode_kind(
         sets.add(&NalUnit::parse(nal)?)?;
     }
     let (header_rbsp, nal_type) = match kind {
-        Kind::P { poc, .. } => (params.p_slice_header(poc), NalType::TrailR),
-        _ => (params.slice_header(), NalType::IdrWRadl),
+        Kind::P { poc, ref_poc, .. } => {
+            let delta = (i64::from(poc) - i64::from(ref_poc)) as u32;
+            (params.p_slice_header(poc, delta), NalType::TrailR)
+        }
+        Kind::B {
+            poc,
+            ref_pocs: [p0, p1],
+            ..
+        } => {
+            let d0 = (i64::from(poc) - i64::from(p0)) as u32;
+            let d1 = (i64::from(p1) - i64::from(poc)) as u32;
+            (params.b_slice_header(poc, d0, d1), NalType::TrailN)
+        }
+        Kind::Still | Kind::SequenceIdr { .. } => (params.slice_header(), NalType::IdrWRadl),
     };
     let header_nal = nal_unit(nal_type, &header_rbsp);
     let header = SliceHeader::parse(
@@ -515,19 +712,43 @@ pub(crate) fn encode_kind(
     let (pps, sps) = sets.get(0)?;
 
     let mut enc = Encoder::new(sps, pps, &params, (w, h), planes, &header);
-    if let Kind::P { poc, reference } = kind {
-        if (reference.widths[0], reference.heights[0]) != (params.width, params.height) {
-            return Err(Error::InvalidInput("reference picture of another size"));
+    match kind {
+        Kind::P {
+            poc,
+            ref_poc,
+            reference,
+            ..
+        } => {
+            if (reference.widths[0], reference.heights[0]) != (params.width, params.height) {
+                return Err(Error::InvalidInput("reference picture of another size"));
+            }
+            enc.recon.set_references(
+                [vec![(reference, ref_poc, false)], Vec::new()],
+                [None, None],
+            );
+            enc.references = [Some(reference), None];
+            enc.poc = poc as i32;
+            enc.ref_pocs = [vec![ref_poc], Vec::new()];
+            enc.ref_long_term = [vec![false], Vec::new()];
         }
-        let previous = i32::try_from(poc).unwrap_or(i32::MAX) - 1;
-        enc.recon.set_references(
-            [vec![(reference, previous, false)], Vec::new()],
-            [None, None],
-        );
-        enc.reference = Some(reference);
-        enc.poc = previous + 1;
-        enc.ref_pocs = vec![previous];
-        enc.ref_long_term = vec![false];
+        Kind::B {
+            poc,
+            ref_pocs: [p0, p1],
+            references: [r0, r1],
+        } => {
+            for r in [r0, r1] {
+                if (r.widths[0], r.heights[0]) != (params.width, params.height) {
+                    return Err(Error::InvalidInput("reference picture of another size"));
+                }
+            }
+            enc.recon
+                .set_references([vec![(r0, p0, false)], vec![(r1, p1, false)]], [None, None]);
+            enc.references = [Some(r0), Some(r1)];
+            enc.poc = poc as i32;
+            enc.ref_pocs = [vec![p0], vec![p1]];
+            enc.ref_long_term = [vec![false], vec![false]];
+        }
+        Kind::Still | Kind::SequenceIdr { .. } => {}
     }
     let (pw, ph) = (params.width, params.height);
     let ctb = 1u32 << LOG2_CTB;
@@ -646,16 +867,19 @@ impl Tb {
 enum PuCoding {
     /// Merge mode: the motion of merge candidate `idx`.
     Merge { idx: usize, motion: Motion },
-    /// AMVP: an explicit vector, coded against the predictor chosen by `flag`.
-    Amvp { mv: Mv, flag: bool, mvd: [i32; 2] },
+    /// AMVP: explicit motion vector(s) (`L0`, `L1`, or `BI`), coded against predictors.
+    Amvp {
+        motion: Motion,
+        flags: [bool; 2],
+        mvds: [[i32; 2]; 2],
+    },
 }
 
 impl PuCoding {
     /// The motion this coding predicts the block with.
     fn motion(self) -> Motion {
         match self {
-            Self::Merge { motion, .. } => motion,
-            Self::Amvp { mv, .. } => Motion::l0(mv, 0),
+            Self::Merge { motion, .. } | Self::Amvp { motion, .. } => motion,
         }
     }
 }
@@ -742,9 +966,11 @@ struct Snapshot {
 
 struct Encoder<'a> {
     recon: Reconstructor<'a>,
-    /// Whether the picture is a P picture: coding units start with `cu_skip_flag` and
-    /// `pred_mode_flag`.
-    p_slice: bool,
+    /// Whether the picture is an inter picture (P or B): coding units start with
+    /// `cu_skip_flag` and `pred_mode_flag`.
+    inter_slice: bool,
+    /// Whether the picture is a B picture (`RefPicList1` active).
+    b_slice: bool,
     /// Bins of the trials, with their estimated rates.
     log: BinLog,
     ctx: Contexts,
@@ -779,12 +1005,12 @@ struct Encoder<'a> {
     /// Whether the transform blocks being coded belong to an inter coding unit: DCT only,
     /// prediction taken from the picture.
     inter_block: bool,
-    /// The reference picture of a P picture (the previous picture's filtered reconstruction),
-    /// the POCs of the current and reference pictures, and `Log2ParMrgLevel`.
-    reference: Option<&'a Frame>,
+    /// The reference pictures of a P or B picture (`L0` and optional `L1`), the POCs of the
+    /// current and reference pictures, and `Log2ParMrgLevel`.
+    references: [Option<&'a Frame>; 2],
     poc: i32,
-    ref_pocs: Vec<i32>,
-    ref_long_term: Vec<bool>,
+    ref_pocs: [Vec<i32>; 2],
+    ref_long_term: [Vec<bool>; 2],
     par_mrg_level: u8,
     grid_w: usize,
     // Scratch buffers.
@@ -872,7 +1098,8 @@ impl<'a> Encoder<'a> {
                 qp,
                 Contexts::init_type(header.slice_type, header.cabac_init_flag),
             ),
-            p_slice: header.slice_type == heifer_hevc_dec::slice::SliceType::P,
+            inter_slice: header.slice_type != heifer_hevc_dec::slice::SliceType::I,
+            b_slice: header.slice_type == heifer_hevc_dec::slice::SliceType::B,
             src: [y, cb, cr],
             chroma: planes.chroma.is_some(),
             csx,
@@ -892,10 +1119,10 @@ impl<'a> Encoder<'a> {
             skipped_cus: 0,
             inter_cus: 0,
             inter_block: false,
-            reference: None,
+            references: [None, None],
             poc: 0,
-            ref_pocs: Vec::new(),
-            ref_long_term: Vec::new(),
+            ref_pocs: [Vec::new(), Vec::new()],
+            ref_long_term: [Vec::new(), Vec::new()],
             par_mrg_level: pps.log2_parallel_merge_level,
             modes: vec![1; grid_w * (ph / 4)],
             grid_w,
@@ -1005,7 +1232,7 @@ impl<'a> Encoder<'a> {
                 modes.push(self.modes[i]);
             }
         }
-        let inter = self.p_slice.then(|| {
+        let inter = self.inter_slice.then(|| {
             let (mut skipped, mut motion) = (Vec::new(), Vec::new());
             for y in (y0..y0 + size).step_by(4) {
                 for x in (x0..x0 + size).step_by(4) {
@@ -1077,15 +1304,15 @@ impl<'a> Encoder<'a> {
             + usize::from(y0 > 0 && self.skipped[self.grid(x0, y0 - 1)])
     }
 
-    /// The reference pictures of the current P picture, for motion vector prediction.
+    /// The reference pictures of the current P or B picture, for motion vector prediction.
     fn slice_refs(&self) -> SliceRefs<'_> {
         SliceRefs {
             poc: self.poc,
-            lists: [&self.ref_pocs, &[]],
-            long_term: [&self.ref_long_term, &[]],
+            lists: [&self.ref_pocs[0], &self.ref_pocs[1]],
+            long_term: [&self.ref_long_term[0], &self.ref_long_term[1]],
             col: None,
             collocated_from_l0: true,
-            no_backward_pred: true,
+            no_backward_pred: !self.b_slice,
             pic_size: (self.width, self.height),
             log2_ctb: LOG2_CTB,
         }
@@ -1125,6 +1352,7 @@ impl<'a> Encoder<'a> {
     /// The distinct merge candidates of a prediction block, with their `merge_idx`.
     fn merge_candidates_of(&self, g: &PuGeom) -> Vec<(usize, Motion)> {
         let refs = self.slice_refs();
+        let num_ref_idx = [1, usize::from(self.b_slice)];
         let mut out: Vec<(usize, Motion)> = Vec::new();
         for idx in 0..MAX_MERGE_CANDIDATES {
             let m = heifer_hevc_dec::inter::merge(
@@ -1134,7 +1362,7 @@ impl<'a> Encoder<'a> {
                 idx,
                 MAX_MERGE_CANDIDATES,
                 self.par_mrg_level,
-                [1, 0],
+                num_ref_idx,
             );
             if !out.iter().any(|(_, o)| *o == m) {
                 out.push((idx, m));
@@ -1163,9 +1391,62 @@ impl<'a> Encoder<'a> {
         self.merge_candidates_of(&Self::geom(x0, y0, size))
     }
 
+    /// Emits `inter_pred_idc` (in B slices) and each active list's `mvd_coding` + `mvp_lX_flag`.
+    fn write_inter_motion(
+        &mut self,
+        g: &PuGeom,
+        depth: u8,
+        motion: Motion,
+        flags: [bool; 2],
+        mvds: [[i32; 2]; 2],
+    ) {
+        if self.b_slice {
+            let uses = [motion.uses(0), motion.uses(1)];
+            let bi = uses[0] && uses[1];
+            if g.w + g.h != 12 {
+                self.bin(ctx::INTER_PRED_IDC + usize::from(depth), bi);
+            }
+            if !bi {
+                self.bin(ctx::INTER_PRED_IDC + 4, uses[1]);
+            }
+        }
+        for list in 0..2 {
+            if motion.uses(list) {
+                self.mvd_coding(mvds[list]);
+                self.bin(ctx::MVP_LX_FLAG, flags[list]);
+            }
+        }
+    }
+
+    /// Searches motion on `list` (0 = L0, 1 = L1) for block `g`, returning `(mv, mvp_flag, mvd)`.
+    fn search_amvp(
+        &self,
+        list: usize,
+        g: &PuGeom,
+        merge_candidates: &[(usize, Motion)],
+    ) -> Option<(Mv, bool, [i32; 2])> {
+        self.references[list]?;
+        let predictors = heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), g, 0, list);
+        let mut starts = vec![[0, 0], predictors[0], predictors[1]];
+        for &(_, m) in merge_candidates {
+            if m.uses(list) {
+                starts.push(m.mv[list]);
+            }
+        }
+        let mv = self.search_motion_rect(list, g.x, g.y, g.w, g.h, &starts, predictors[0]);
+        let mvd_of = |p: Mv| {
+            [
+                i32::from(mv[0]) - i32::from(p[0]),
+                i32::from(mv[1]) - i32::from(p[1]),
+            ]
+        };
+        let flag = usize::from(mvd_bits(mvd_of(predictors[1])) < mvd_bits(mvd_of(predictors[0])));
+        Some((mv, flag == 1, mvd_of(predictors[flag])))
+    }
+
     /// Codes the syntax of one prediction block's merge or motion, and reconstructs it.
     fn code_pu(&mut self, g: &PuGeom, option: PuCoding) {
-        self.write_pu_syntax(option);
+        self.write_pu_syntax(g, option);
         let motion = option.motion();
         self.recon.prediction_unit(&PredictionUnit {
             x: g.x,
@@ -1183,26 +1464,31 @@ impl<'a> Encoder<'a> {
     }
 
     /// `prediction_unit()` of one block of a partitioned coding unit: `merge_flag` then either
-    /// `merge_idx` or the motion vector difference and predictor flag (§7.3.8.6).
-    fn write_pu_syntax(&mut self, option: PuCoding) {
+    /// `merge_idx` or `inter_pred_idc`, motion vector difference(s) and predictor flag(s)
+    /// (§7.3.8.6).
+    fn write_pu_syntax(&mut self, g: &PuGeom, option: PuCoding) {
         match option {
             PuCoding::Merge { idx, .. } => {
                 self.bin(ctx::MERGE_FLAG, true);
                 self.merge_idx(idx);
             }
-            PuCoding::Amvp { flag, mvd, .. } => {
+            PuCoding::Amvp {
+                motion,
+                flags,
+                mvds,
+            } => {
                 self.bin(ctx::MERGE_FLAG, false);
-                self.mvd_coding(mvd);
-                self.bin(ctx::MVP_LX_FLAG, flag);
+                let depth = self.depth[self.grid(g.x_cb, g.y_cb)];
+                self.write_inter_motion(g, depth, motion, flags, mvds);
             }
         }
     }
 
     /// The bits of a prediction block's syntax, coded and discarded.
-    fn pu_syntax_bits(&mut self, option: PuCoding) -> f64 {
+    fn pu_syntax_bits(&mut self, g: &PuGeom, option: PuCoding) -> f64 {
         let (point, contexts) = (self.log.checkpoint(), self.ctx);
         let start = self.log.bit_count();
-        self.write_pu_syntax(option);
+        self.write_pu_syntax(g, option);
         let bits = self.log.bit_count() - start;
         self.log.restore(&point);
         self.ctx = contexts;
@@ -1210,8 +1496,8 @@ impl<'a> Encoder<'a> {
     }
 
     /// Picks how to code one prediction block of a partitioned coding unit: the cheapest of its
-    /// merge candidates and a searched motion vector, by distortion and syntax bits. The block
-    /// is predicted for each candidate, so its neighbours see it afterwards.
+    /// merge candidates and searched motion vector(s) (`L0`, `L1`, `BI`), by distortion and syntax
+    /// bits. The block is predicted for each candidate, so its neighbours see it afterwards.
     fn choose_pu(&mut self, g: &PuGeom) -> PuCoding {
         let mut best: Option<(f64, PuCoding)> = None;
         let candidates = self.merge_candidates_of(g);
@@ -1223,7 +1509,7 @@ impl<'a> Encoder<'a> {
                 h: g.h,
                 motion,
             });
-            let j = enc.pu_sse(g) + enc.lambda * enc.pu_syntax_bits(option);
+            let j = enc.pu_sse(g) + enc.lambda * enc.pu_syntax_bits(g, option);
             if best.as_ref().is_none_or(|b| j < b.0) {
                 best = Some((j, option));
             }
@@ -1231,25 +1517,53 @@ impl<'a> Encoder<'a> {
         for &(idx, motion) in &candidates {
             consider(self, motion, PuCoding::Merge { idx, motion });
         }
-        if self.reference.is_some() {
-            let predictors = heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), g, 0, 0);
-            let mut starts = vec![[0, 0], predictors[0], predictors[1]];
-            starts.extend(candidates.iter().map(|(_, m)| m.mv[0]));
-            let mv = self.search_motion_rect(g.x, g.y, g.w, g.h, &starts, predictors[0]);
-            let mvd_of = |p: Mv| {
-                [
-                    i32::from(mv[0]) - i32::from(p[0]),
-                    i32::from(mv[1]) - i32::from(p[1]),
-                ]
-            };
-            let flag =
-                usize::from(mvd_bits(mvd_of(predictors[1])) < mvd_bits(mvd_of(predictors[0])));
-            let option = PuCoding::Amvp {
-                mv,
-                flag: flag == 1,
-                mvd: mvd_of(predictors[flag]),
-            };
-            consider(self, Motion::l0(mv, 0), option);
+        let l0 = self.search_amvp(0, g, &candidates);
+        if let Some((mv0, flag0, mvd0)) = l0 {
+            let m0 = Motion::l0(mv0, 0);
+            consider(
+                self,
+                m0,
+                PuCoding::Amvp {
+                    motion: m0,
+                    flags: [flag0, false],
+                    mvds: [mvd0, [0, 0]],
+                },
+            );
+        }
+        if self.b_slice {
+            let l1 = self.search_amvp(1, g, &candidates);
+            if let Some((mv1, flag1, mvd1)) = l1 {
+                let m1 = Motion {
+                    mv: [[0, 0], mv1],
+                    ref_idx: [-1, 0],
+                };
+                consider(
+                    self,
+                    m1,
+                    PuCoding::Amvp {
+                        motion: m1,
+                        flags: [false, flag1],
+                        mvds: [[0, 0], mvd1],
+                    },
+                );
+                if let Some((mv0, flag0, mvd0)) = l0
+                    && g.w + g.h != 12
+                {
+                    let bi = Motion {
+                        mv: [mv0, mv1],
+                        ref_idx: [0, 0],
+                    };
+                    consider(
+                        self,
+                        bi,
+                        PuCoding::Amvp {
+                            motion: bi,
+                            flags: [flag0, flag1],
+                            mvds: [mvd0, mvd1],
+                        },
+                    );
+                }
+            }
         }
         best.expect("a merge candidate or a motion vector was tried")
             .1
@@ -1444,36 +1758,29 @@ impl<'a> Encoder<'a> {
         Some(tree_sse(&tree))
     }
 
-    /// Codes an inter coding unit with motion vector `mv` (AMVP, one reference picture), with
-    /// a residual when `residual` and the residual has any level. Returns its distortion, or
-    /// `None` when a residual was asked for and none is worth coding.
+    /// Codes an inter coding unit with `motion` (AMVP `L0`, `L1`, or `BI`, one reference
+    /// picture per active list), with a residual when `residual` and the residual has any level.
+    /// Returns its distortion, or `None` when a residual was asked for and none is worth coding.
+    #[allow(clippy::too_many_arguments)]
     fn code_amvp(
         &mut self,
         x0: u32,
         y0: u32,
         log2_size: u8,
         depth: u8,
-        mv: Mv,
+        motion: Motion,
+        flags: [bool; 2],
+        mvds: [[i32; 2]; 2],
         residual: bool,
     ) -> Option<f64> {
         let size = 1u32 << log2_size;
-        let candidates =
-            heifer_hevc_dec::inter::amvp(self, &self.slice_refs(), &Self::geom(x0, y0, size), 0, 0);
-        let mvd_of = |p: Mv| {
-            [
-                i32::from(mv[0]) - i32::from(p[0]),
-                i32::from(mv[1]) - i32::from(p[1]),
-            ]
-        };
-        let flag = usize::from(mvd_bits(mvd_of(candidates[1])) < mvd_bits(mvd_of(candidates[0])));
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, false);
         self.bin(ctx::PRED_MODE_FLAG, false); // inter
         self.bin(ctx::PART_MODE, true); // PART_2Nx2N
         self.bin(ctx::MERGE_FLAG, false);
-        self.mvd_coding(mvd_of(candidates[flag]));
-        self.bin(ctx::MVP_LX_FLAG, flag == 1);
-        let d = self.reconstruct_inter(x0, y0, log2_size, depth, Motion::l0(mv, 0), false);
+        self.write_inter_motion(&Self::geom(x0, y0, size), depth, motion, flags, mvds);
+        let d = self.reconstruct_inter(x0, y0, log2_size, depth, motion, false);
         if !residual {
             self.bin(ctx::NO_RESIDUAL_DATA_FLAG, false); // rqt_root_cbf: no residual
             return Some(d);
@@ -1613,18 +1920,15 @@ impl<'a> Encoder<'a> {
         self.log.encode_bypass_bits(value, k);
     }
 
-    /// Integer motion search of a 2N×2N block from the `starts` (quarter-sample vectors): see
-    /// [`search_motion_rect`](Self::search_motion_rect).
-    fn search_motion(&self, x0: u32, y0: u32, size: u32, starts: &[Mv], predictor: Mv) -> Mv {
-        self.search_motion_rect(x0, y0, size, size, starts, predictor)
-    }
-
-    /// Integer motion search of a `w`×`h` block from the `starts` (quarter-sample vectors): the
-    /// best start or vector of the window around zero motion ([`SEARCH_RANGE`]), then a
-    /// diamond search with steps of 8, 4, 2 and 1 samples, then half and quarter samples. The cost is the
-    /// luma SAD plus √λ times the vector difference's bits from `predictor`.
+    /// Integer motion search of a `w`×`h` block on reference list `list` (0 = L0, 1 = L1) from
+    /// the `starts` (quarter-sample vectors): the best start or vector of the window around zero
+    /// motion ([`SEARCH_RANGE`]), then a diamond search with steps of 8, 4, 2 and 1 samples, then
+    /// half and quarter samples. The cost is the luma SAD plus √λ times the vector difference's
+    /// bits from `predictor`.
+    #[allow(clippy::too_many_arguments)]
     fn search_motion_rect(
         &self,
+        list: usize,
         x0: u32,
         y0: u32,
         w: u32,
@@ -1632,7 +1936,7 @@ impl<'a> Encoder<'a> {
         starts: &[Mv],
         predictor: Mv,
     ) -> Mv {
-        let Some(reference) = self.reference else {
+        let Some(reference) = self.references[list] else {
             return [0, 0];
         };
         let plane = &reference.planes[0];
@@ -2417,7 +2721,7 @@ impl<'a> Encoder<'a> {
         // In a P picture, the inter codings first: skipped with each merge candidate, then a
         // searched motion vector. The best one is kept to compare with intra.
         let mut skip: Option<(f64, f64, Snapshot, bool)> = None;
-        if self.p_slice && !self.lossless {
+        if self.inter_slice && !self.lossless {
             let mut keep = |enc: &mut Self, d: f64, is_skip: bool| {
                 let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
                 if skip.as_ref().is_none_or(|b| j < b.0) {
@@ -2445,27 +2749,47 @@ impl<'a> Encoder<'a> {
                     }
                 }
             }
-            if self.reference.is_some() {
-                let predictors = heifer_hevc_dec::inter::amvp(
-                    &*self,
-                    &self.slice_refs(),
-                    &Self::geom(x0, y0, size),
-                    0,
-                    0,
-                );
-                let mut starts = vec![[0, 0], predictors[0], predictors[1]];
-                starts.extend(candidates.iter().map(|(_, m)| m.mv[0]));
-                let mv = self.search_motion(x0, y0, size, &starts, predictors[0]);
+            let g = Self::geom(x0, y0, size);
+            let l0 = self.search_amvp(0, &g, &candidates);
+            let l1 = if self.b_slice {
+                self.search_amvp(1, &g, &candidates)
+            } else {
+                None
+            };
+            let mut try_amvp = |motion: Motion, flags: [bool; 2], mvds: [[i32; 2]; 2]| {
                 let d = self
-                    .code_amvp(x0, y0, log2_size, depth, mv, false)
+                    .code_amvp(x0, y0, log2_size, depth, motion, flags, mvds, false)
                     .expect("always coded without residual");
                 keep(self, d, false);
                 // With a residual (4:2:2 chroma trees are not handled).
                 if !self.is_422() {
-                    match self.code_amvp(x0, y0, log2_size, depth, mv, true) {
+                    match self.code_amvp(x0, y0, log2_size, depth, motion, flags, mvds, true) {
                         Some(d) => keep(self, d, false),
                         None => self.restore(x0, y0, size, &start),
                     }
+                }
+            };
+            if let Some((mv0, flag0, mvd0)) = l0 {
+                try_amvp(Motion::l0(mv0, 0), [flag0, false], [mvd0, [0, 0]]);
+            }
+            if let Some((mv1, flag1, mvd1)) = l1 {
+                try_amvp(
+                    Motion {
+                        mv: [[0, 0], mv1],
+                        ref_idx: [-1, 0],
+                    },
+                    [false, flag1],
+                    [[0, 0], mvd1],
+                );
+                if let Some((mv0, flag0, mvd0)) = l0 {
+                    try_amvp(
+                        Motion {
+                            mv: [mv0, mv1],
+                            ref_idx: [0, 0],
+                        },
+                        [flag0, flag1],
+                        [mvd0, mvd1],
+                    );
                 }
             }
             // Partitions 2N×N, N×2N and the asymmetric pairs (AMP): two prediction blocks with
@@ -2473,7 +2797,7 @@ impl<'a> Encoder<'a> {
             // coded `rqt_root_cbf`. Only above the smallest coding units, where the extra
             // syntax pays for itself. 4:2:2 chroma trees are not handled, like the residual
             // paths above.
-            if self.reference.is_some() && log2_size > LOG2_MIN_CB && !self.is_422() {
+            if self.references[0].is_some() && log2_size > LOG2_MIN_CB && !self.is_422() {
                 for part_mode in [
                     PartMode::Part2NxN,
                     PartMode::PartNx2N,
@@ -2674,7 +2998,7 @@ impl<'a> Encoder<'a> {
             // The PPS enables the flag only for lossless streams.
             self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
         }
-        if self.p_slice {
+        if self.inter_slice {
             // Not skipped, and intra.
             let inc = self.skip_ctx(x0, y0);
             self.bin(ctx::CU_SKIP_FLAG + inc, false);
@@ -3790,10 +4114,12 @@ mod tests {
                 bit_depth: 8,
             };
             let kind = match &reference {
-                None => Kind::SequenceIdr,
+                None => Kind::SequenceIdr { b_frames: false },
                 Some(frame) => Kind::P {
                     poc: poc as u32,
+                    ref_poc: poc as i32 - 1,
                     reference: frame,
+                    b_frames: false,
                 },
             };
             let (picture, recon, _) =
@@ -3954,10 +4280,12 @@ mod tests {
                 bit_depth: 8,
             };
             let kind = match &reference {
-                None => Kind::SequenceIdr,
+                None => Kind::SequenceIdr { b_frames: false },
                 Some(frame) => Kind::P {
                     poc: poc as u32,
+                    ref_poc: poc as i32 - 1,
                     reference: frame,
+                    b_frames: false,
                 },
             };
             let (picture, recon, _) =
@@ -4272,5 +4600,157 @@ mod tests {
         check_sequence(&stream, &recons);
         eprintln!("slice sizes: {sizes:?}");
         assert!(sizes[1..].iter().all(|&s| s * 4 < sizes[0]), "{sizes:?}");
+    }
+
+    #[test]
+    fn b_pictures_decode_as_the_encoder_reconstructs_them() {
+        let (w, h) = (64usize, 48usize);
+        let cw = w / 2;
+        let ch = h / 2;
+        let pictures: Vec<_> = (0..7)
+            .map(|n| {
+                let luma: Vec<u16> = (0..h)
+                    .flat_map(|y| {
+                        (0..w).map(move |x| {
+                            let dx = x as f64 - 20.0 - 2.0 * n as f64;
+                            let dy = y as f64 - 16.0 - 1.0 * n as f64;
+                            (128.0 + 90.0 * (-(dx * dx + dy * dy) / 60.0).exp())
+                                .round()
+                                .clamp(0.0, 255.0) as u16
+                        })
+                    })
+                    .collect();
+                let cb = vec![120u16; cw * ch];
+                let cr = vec![136u16; cw * ch];
+                (luma, cb, cr)
+            })
+            .collect();
+        let mut enc = SequenceEncoder::new(
+            w as u32,
+            h as u32,
+            CodingOptions::default(),
+            EncoderConfig {
+                qp: 26,
+                ..EncoderConfig::default()
+            },
+            30,
+        )
+        .with_b_frames(2);
+        let mut encoded = Vec::new();
+        for (luma, cb, cr) in &pictures {
+            let planes = Planes16 {
+                y: luma,
+                chroma: Some((cb, cr)),
+                bit_depth: 8,
+            };
+            encoded.extend(enc.push(planes).unwrap());
+        }
+        encoded.extend(enc.flush().unwrap());
+        assert_eq!(encoded.len(), pictures.len());
+        let display_order: Vec<usize> = encoded.iter().map(|f| f.display_index).collect();
+        assert_eq!(display_order, vec![0, 3, 1, 2, 6, 4, 5]);
+        assert!(encoded[0].keyframe);
+        assert!(encoded[1..].iter().all(|f| !f.keyframe));
+
+        let mut dec =
+            heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+        let mut decoded_frames = Vec::new();
+        let mut nal_types = Vec::new();
+        for frame_out in &encoded {
+            for slice in &frame_out.picture.slices {
+                let nal = heifer_hevc_dec::nal::NalUnit::parse(slice).unwrap();
+                nal_types.push(nal.header.unit_type);
+            }
+            decoded_frames.extend(
+                dec.decode_in_display_order(&frame_out.picture.annex_b())
+                    .unwrap(),
+            );
+        }
+        decoded_frames.extend(dec.flush());
+        assert_eq!(decoded_frames.len(), pictures.len());
+        assert_eq!(
+            nal_types,
+            vec![
+                heifer_hevc_dec::nal::NalUnitType::IrapSlice(19),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(1),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(1),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+            ]
+        );
+        for (i, (frame, (src_y, src_cb, src_cr))) in
+            decoded_frames.iter().zip(&pictures).enumerate()
+        {
+            let dec_y = crop(frame, 0, w, h);
+            let mse = dec_y
+                .iter()
+                .zip(src_y)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum::<f64>()
+                / (w * h) as f64;
+            let psnr = 10.0 * (255.0_f64.powi(2) / mse.max(1e-9)).log10();
+            assert!(psnr > 34.0, "frame {i} luma PSNR too low: {psnr:.2} dB");
+            assert_eq!(crop(frame, 1, cw, ch).len(), src_cb.len());
+            assert_eq!(crop(frame, 2, cw, ch).len(), src_cr.len());
+        }
+    }
+
+    #[test]
+    fn b_pictures_bi_prediction_beats_p_on_cross_fade() {
+        // Middle frame is the average of two distinct textured frames: bi-prediction (L0+L1)
+        // predicts it nearly exactly with zero residual, whereas a single P reference cannot.
+        let (w, h) = (64usize, 64usize);
+        let cw = w / 2;
+        let ch = h / 2;
+        let tex_a: Vec<u16> = (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    if ((x / 8) + (y / 8)) % 2 == 0 {
+                        40
+                    } else {
+                        200
+                    }
+                })
+            })
+            .collect();
+        let tex_b: Vec<u16> = (0..h)
+            .flat_map(|_y| (0..w).map(move |x| if (x / 8) % 2 == 0 { 50 } else { 210 }))
+            .collect();
+        let blend: Vec<u16> = tex_a
+            .iter()
+            .zip(&tex_b)
+            .map(|(&a, &b)| (a + b) / 2)
+            .collect();
+        let uv = vec![128u16; cw * ch];
+        let cfg = EncoderConfig {
+            qp: 28,
+            ..EncoderConfig::default()
+        };
+        let encode_seq = |b_frames: usize| -> Vec<EncodedSequenceFrame> {
+            let mut enc =
+                SequenceEncoder::new(w as u32, h as u32, CodingOptions::default(), cfg, 10)
+                    .with_b_frames(b_frames);
+            let mut out = Vec::new();
+            for y in [&tex_a, &blend, &tex_b] {
+                let planes = Planes16 {
+                    y,
+                    chroma: Some((&uv, &uv)),
+                    bit_depth: 8,
+                };
+                out.extend(enc.push(planes).unwrap());
+            }
+            out.extend(enc.flush().unwrap());
+            out
+        };
+        let p_only = encode_seq(0);
+        let with_b = encode_seq(1);
+        let b_mid_bytes: usize = with_b[2].picture.slices.iter().map(Vec::len).sum();
+        let p_mid_bytes: usize = p_only[1].picture.slices.iter().map(Vec::len).sum();
+        assert!(
+            b_mid_bytes * 2 < p_mid_bytes,
+            "expected B mid frame ({b_mid_bytes} B) < half of P mid frame ({p_mid_bytes} B)"
+        );
     }
 }
