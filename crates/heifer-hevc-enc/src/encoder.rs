@@ -20,7 +20,7 @@
 //! levels are the raw residual samples, and the in-loop filters are off.
 
 use heifer_hevc_dec::contexts::{Contexts, ctx};
-use heifer_hevc_dec::inter::{Motion, MotionSource, Mv, PartMode, PuGeom, SliceRefs};
+use heifer_hevc_dec::inter::{Motion, MotionField, MotionSource, Mv, PartMode, PuGeom, SliceRefs};
 use heifer_hevc_dec::nal::NalUnit;
 use heifer_hevc_dec::params::{ParameterSets, Sps};
 use heifer_hevc_dec::recon::FilterState;
@@ -42,12 +42,21 @@ use crate::transform::{chroma_qp, forward_transform, quantize_levels, satd};
 
 const LOG2_CTB: u8 = 6;
 
-/// Half the side of the window searched exhaustively around zero motion, in quarter samples
-/// (8 samples).
-const SEARCH_RANGE: i16 = 32;
-
-/// `MaxNumMergeCand` of P pictures (`five_minus_max_num_merge_cand` 0).
+/// `MaxNumMergeCand` of P and B pictures (`five_minus_max_num_merge_cand` 0).
 const MAX_MERGE_CANDIDATES: usize = 5;
+
+/// Encoding speed/compression trade-off for intra and sequence encoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SpeedPreset {
+    /// Faster encoding: smaller motion search window, symmetric partitions, fewer mode trials.
+    Fast,
+    /// Balanced speed and compression efficiency (default).
+    #[default]
+    Medium,
+    /// Thorough local search: wider motion search window and full partition trials.
+    Slow,
+}
 
 /// Whether any block of a transform tree has a residual.
 fn tree_coded(tree: &TNode) -> bool {
@@ -171,6 +180,8 @@ pub struct EncoderConfig {
     /// `colour_primaries`, `transfer_characteristics` and `matrix_coeffs` (ITU-T H.273) written
     /// in the VUI.
     pub colour: (u8, u8, u8),
+    /// Speed/compression preset.
+    pub speed: SpeedPreset,
 }
 
 impl Default for EncoderConfig {
@@ -179,6 +190,7 @@ impl Default for EncoderConfig {
             qp: 24,
             full_range: true,
             colour: (1, 13, 6), // BT.709 primaries, sRGB transfer, BT.601 matrix
+            speed: SpeedPreset::Medium,
         }
     }
 }
@@ -360,8 +372,8 @@ pub struct SequenceEncoder {
     count: usize,
     /// POC of the most recently encoded anchor picture (within the current GOP).
     poc: u32,
-    /// The filtered reconstruction and POC of the last anchor picture (IDR or P).
-    reference: Option<(u32, Frame)>,
+    /// The filtered reconstruction, motion field and POC of the last anchor picture (IDR or P).
+    reference: Option<(u32, Frame, MotionField)>,
     /// Frames buffered between the last anchor and the next P anchor when `b_frames > 0`.
     pending: Vec<PendingFrame>,
 }
@@ -402,13 +414,17 @@ impl SequenceEncoder {
         }
     }
 
-    /// Sets the number of consecutive non-reference B pictures coded between P/IDR anchor
-    /// pictures (`0` for low-delay P-only sequences). Use [`push`](Self::push) and
-    /// [`flush`](Self::flush) when `b_frames > 0`.
+    /// Sets the maximum number of consecutive B pictures coded between P/IDR anchor pictures
+    /// (`0` for low-delay P-only sequences). Use [`push`](Self::push) and [`flush`](Self::flush)
+    /// when `b_frames > 0`. Values of `3` or more use hierarchical referenced B pictures.
     #[must_use]
     pub fn with_b_frames(mut self, b_frames: usize) -> Self {
         self.b_frames = b_frames;
         self
+    }
+
+    fn reorder_pics(&self) -> u8 {
+        b_tree_depth(self.b_frames)
     }
 
     /// Encodes the next picture synchronously (for `b_frames == 0`). Returns it, and whether
@@ -417,15 +433,16 @@ impl SequenceEncoder {
         let keyframe = self.count % self.keyframe_interval == 0;
         let poc = if keyframe { 0 } else { self.poc + 1 };
         let kind = match &self.reference {
-            Some((ref_poc, reference)) if !keyframe => Kind::P {
+            Some((ref_poc, reference, ref_motion)) if !keyframe => Kind::P {
                 poc,
                 ref_poc: *ref_poc as i32,
                 reference,
-                b_frames: false,
+                ref_motion: Some(ref_motion),
+                reorder_pics: 0,
             },
-            _ => Kind::SequenceIdr { b_frames: false },
+            _ => Kind::SequenceIdr { reorder_pics: 0 },
         };
-        let (picture, recon, _) = encode_kind(
+        let (picture, recon, motion, _) = encode_kind(
             self.width,
             self.height,
             planes,
@@ -434,7 +451,7 @@ impl SequenceEncoder {
             kind,
         )?;
         self.poc = poc;
-        self.reference = Some((poc, recon));
+        self.reference = Some((poc, recon, motion));
         self.count += 1;
         Ok((picture, keyframe))
     }
@@ -452,19 +469,20 @@ impl SequenceEncoder {
             }]);
         }
         let keyframe = self.count % self.keyframe_interval == 0;
+        let reorder_pics = self.reorder_pics();
         if keyframe {
             let mut out = self.flush()?;
             let display_index = self.count;
-            let (picture, recon, _) = encode_kind(
+            let (picture, recon, motion, _) = encode_kind(
                 self.width,
                 self.height,
                 planes,
                 &self.options,
                 &self.config,
-                Kind::SequenceIdr { b_frames: true },
+                Kind::SequenceIdr { reorder_pics },
             )?;
             self.poc = 0;
-            self.reference = Some((0, recon));
+            self.reference = Some((0, recon, motion));
             self.count += 1;
             out.push(EncodedSequenceFrame {
                 picture,
@@ -488,15 +506,16 @@ impl SequenceEncoder {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
-        let (prev_poc, prev_ref) = self
+        let (prev_poc, prev_ref, prev_motion) = self
             .reference
             .as_ref()
             .expect("GOP starts with an IDR picture");
         let prev_poc = *prev_poc;
+        let reorder_pics = self.reorder_pics();
         let anchor_offset = self.pending.len() as u32;
         let p_poc = prev_poc + anchor_offset;
         let anchor = self.pending.last().expect("non-empty pending");
-        let (p_pic, p_recon, _) = encode_kind(
+        let (p_pic, p_recon, p_motion, _) = encode_kind(
             self.width,
             self.height,
             anchor.as_planes(),
@@ -506,7 +525,8 @@ impl SequenceEncoder {
                 poc: p_poc,
                 ref_poc: prev_poc as i32,
                 reference: prev_ref,
-                b_frames: true,
+                ref_motion: Some(prev_motion),
+                reorder_pics,
             },
         )?;
         let mut out = Vec::with_capacity(self.pending.len());
@@ -515,9 +535,98 @@ impl SequenceEncoder {
             keyframe: false,
             display_index: anchor.display_index,
         });
-        for (j, frame) in self.pending[..self.pending.len() - 1].iter().enumerate() {
-            let b_poc = prev_poc + 1 + j as u32;
-            let (b_pic, _, _) = encode_kind(
+        let b_slice_count = self.pending.len() - 1;
+        if b_slice_count > 0 {
+            self.encode_b_span(
+                prev_poc,
+                (prev_ref, prev_motion),
+                p_poc,
+                (&p_recon, &p_motion),
+                &self.pending[..b_slice_count],
+                &[],
+                reorder_pics,
+                &mut out,
+            )?;
+        }
+        self.poc = p_poc;
+        self.reference = Some((p_poc, p_recon, p_motion));
+        self.pending.clear();
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_b_span(
+        &self,
+        left_poc: u32,
+        left: (&Frame, &MotionField),
+        right_poc: u32,
+        right: (&Frame, &MotionField),
+        inner: &[PendingFrame],
+        kept_pos: &[u32],
+        reorder_pics: u8,
+        out: &mut Vec<EncodedSequenceFrame>,
+    ) -> Result<(), Error> {
+        let base_poc = left_poc + 1;
+        let pos_for = |curr: u32| -> Vec<(u32, bool)> {
+            let mut pos = Vec::with_capacity(1 + kept_pos.len());
+            pos.push((right_poc - curr, true));
+            for &kp in kept_pos {
+                pos.push((kp - curr, false));
+            }
+            pos
+        };
+        if inner.len() >= 3 {
+            let mid = inner.len() / 2;
+            let mid_poc = base_poc + mid as u32;
+            let (b_pic, b_recon, b_motion, _) = encode_kind(
+                self.width,
+                self.height,
+                inner[mid].as_planes(),
+                &self.options,
+                &self.config,
+                Kind::B {
+                    poc: mid_poc,
+                    ref_pocs: [left_poc as i32, right_poc as i32],
+                    references: [left.0, right.0],
+                    ref_motions: [Some(left.1), Some(right.1)],
+                    pos_refs: pos_for(mid_poc),
+                    reference_pic: true,
+                    reorder_pics,
+                },
+            )?;
+            out.push(EncodedSequenceFrame {
+                picture: b_pic,
+                keyframe: false,
+                display_index: inner[mid].display_index,
+            });
+            let mut left_kept = Vec::with_capacity(1 + kept_pos.len());
+            left_kept.push(right_poc);
+            left_kept.extend_from_slice(kept_pos);
+            self.encode_b_span(
+                left_poc,
+                left,
+                mid_poc,
+                (&b_recon, &b_motion),
+                &inner[..mid],
+                &left_kept,
+                reorder_pics,
+                out,
+            )?;
+            self.encode_b_span(
+                mid_poc,
+                (&b_recon, &b_motion),
+                right_poc,
+                right,
+                &inner[mid + 1..],
+                kept_pos,
+                reorder_pics,
+                out,
+            )?;
+            return Ok(());
+        }
+        for (j, frame) in inner.iter().enumerate() {
+            let b_poc = base_poc + j as u32;
+            let (b_pic, _, _, _) = encode_kind(
                 self.width,
                 self.height,
                 frame.as_planes(),
@@ -525,8 +634,12 @@ impl SequenceEncoder {
                 &self.config,
                 Kind::B {
                     poc: b_poc,
-                    ref_pocs: [prev_poc as i32, p_poc as i32],
-                    references: [prev_ref, &p_recon],
+                    ref_pocs: [left_poc as i32, right_poc as i32],
+                    references: [left.0, right.0],
+                    ref_motions: [Some(left.1), Some(right.1)],
+                    pos_refs: pos_for(b_poc),
+                    reference_pic: false,
+                    reorder_pics,
                 },
             )?;
             out.push(EncodedSequenceFrame {
@@ -535,10 +648,19 @@ impl SequenceEncoder {
                 display_index: frame.display_index,
             });
         }
-        self.poc = p_poc;
-        self.reference = Some((p_poc, p_recon));
-        self.pending.clear();
-        Ok(out)
+        Ok(())
+    }
+}
+
+/// Depth of the dyadic B-frame hierarchy (`0` = none, `1` = 1–2 B-frames, `2` = 3–5, ...).
+fn b_tree_depth(len: usize) -> u8 {
+    if len == 0 {
+        0
+    } else if len < 3 {
+        1
+    } else {
+        let mid = len / 2;
+        1 + b_tree_depth(mid).max(b_tree_depth(len - 1 - mid))
     }
 }
 
@@ -551,35 +673,61 @@ fn encode_with_reconstruction(
     options: &CodingOptions,
     config: &EncoderConfig,
 ) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
-    encode_kind(width, height, planes, options, config, Kind::Still)
+    let (pic, recon, _, kinds) = encode_kind(width, height, planes, options, config, Kind::Still)?;
+    Ok((pic, recon, kinds))
 }
 
 /// What to encode: a still image, or a picture of an image sequence.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) enum Kind<'r> {
     /// A still image: an IDR picture, in a stream without reference pictures.
     Still,
     /// The first picture of a group of an image sequence: an IDR picture, in a stream whose
     /// SPS keeps reference pictures.
-    SequenceIdr { b_frames: bool },
+    SequenceIdr { reorder_pics: u8 },
     /// A P picture of POC `poc`, predicted from `reference` (`ref_poc`).
     P {
         poc: u32,
         ref_poc: i32,
         reference: &'r Frame,
-        b_frames: bool,
+        ref_motion: Option<&'r MotionField>,
+        reorder_pics: u8,
     },
-    /// A non-reference B picture of POC `poc`, predicted from `[past, future]`.
+    /// A B picture of POC `poc`, predicted from `[past, future]`, coded as `TrailR` when
+    /// `reference_pic` (hierarchical midpoint) or `TrailN` otherwise.
     B {
         poc: u32,
         ref_pocs: [i32; 2],
         references: [&'r Frame; 2],
+        ref_motions: [Option<&'r MotionField>; 2],
+        pos_refs: Vec<(u32, bool)>,
+        reference_pic: bool,
+        reorder_pics: u8,
     },
+}
+
+fn slice_qp_for(base_qp: u8, kind: &Kind<'_>, lossless: bool) -> u8 {
+    if lossless {
+        return base_qp;
+    }
+    match kind {
+        Kind::Still | Kind::SequenceIdr { .. } => base_qp,
+        Kind::P { .. } => base_qp.saturating_add(1).min(51),
+        Kind::B {
+            reference_pic: true,
+            ..
+        } => base_qp.saturating_add(2).min(51),
+        Kind::B {
+            reference_pic: false,
+            ..
+        } => base_qp.saturating_add(3).min(51),
+    }
 }
 
 /// Encodes a picture of the given [`Kind`]. Returns the encoded picture, the reconstruction
 /// (before the in-loop filters for a still image; filtered, as decoders keep it for reference,
-/// for a picture of a sequence) and how many coding units of each [`CuKind`] were chosen.
+/// for a picture of a sequence), its motion field and how many coding units of each [`CuKind`]
+/// were chosen.
 pub(crate) fn encode_kind(
     width: u32,
     height: u32,
@@ -587,7 +735,7 @@ pub(crate) fn encode_kind(
     options: &CodingOptions,
     config: &EncoderConfig,
     kind: Kind<'_>,
-) -> Result<(EncodedPicture, Frame, [usize; 4]), Error> {
+) -> Result<(EncodedPicture, Frame, MotionField, [usize; 4]), Error> {
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
         return Err(Error::InvalidInput(
             "picture size must be 1 to 16384 pixels",
@@ -660,11 +808,14 @@ pub(crate) fn encode_kind(
     } else {
         1
     };
-    let b_frames = match kind {
-        Kind::Still => false,
-        Kind::SequenceIdr { b_frames } | Kind::P { b_frames, .. } => b_frames,
-        Kind::B { .. } => true,
+    let reorder_pics = match kind {
+        Kind::Still => 0,
+        Kind::SequenceIdr { reorder_pics }
+        | Kind::P { reorder_pics, .. }
+        | Kind::B { reorder_pics, .. } => reorder_pics,
     };
+    let slice_qp = slice_qp_for(config.qp, &kind, options.lossless);
+    let qp_delta = i32::from(slice_qp) - i32::from(config.qp);
     let params = StreamParams {
         width: width.next_multiple_of(8),
         height: height.next_multiple_of(8),
@@ -677,7 +828,7 @@ pub(crate) fn encode_kind(
         colour: config.colour,
         lossless: options.lossless,
         inter: !matches!(kind, Kind::Still),
-        b_frames,
+        reorder_pics,
     };
     let parameter_sets = vec![params.vps(), params.sps(), params.pps()];
 
@@ -686,19 +837,44 @@ pub(crate) fn encode_kind(
     for nal in &parameter_sets {
         sets.add(&NalUnit::parse(nal)?)?;
     }
-    let (header_rbsp, nal_type) = match kind {
-        Kind::P { poc, ref_poc, .. } => {
-            let delta = (i64::from(poc) - i64::from(ref_poc)) as u32;
-            (params.p_slice_header(poc, delta), NalType::TrailR)
+    let (header_rbsp, nal_type) = match &kind {
+        Kind::P {
+            poc,
+            ref_poc,
+            ref_motion,
+            ..
+        } => {
+            let delta = (i64::from(*poc) - i64::from(*ref_poc)) as u32;
+            (
+                params.p_slice_header(*poc, delta, ref_motion.is_some(), qp_delta),
+                NalType::TrailR,
+            )
         }
         Kind::B {
             poc,
-            ref_pocs: [p0, p1],
+            ref_pocs: [p0, _],
+            ref_motions,
+            pos_refs,
+            reference_pic,
             ..
         } => {
-            let d0 = (i64::from(poc) - i64::from(p0)) as u32;
-            let d1 = (i64::from(p1) - i64::from(poc)) as u32;
-            (params.b_slice_header(poc, d0, d1), NalType::TrailN)
+            let d0 = (i64::from(*poc) - i64::from(*p0)) as u32;
+            let nal = if *reference_pic {
+                NalType::TrailR
+            } else {
+                NalType::TrailN
+            };
+            (
+                params.b_slice_header(
+                    *poc,
+                    &[(d0, true)],
+                    pos_refs,
+                    ref_motions[1].is_some(),
+                    false,
+                    qp_delta,
+                ),
+                nal,
+            )
         }
         Kind::Still | Kind::SequenceIdr { .. } => (params.slice_header(), NalType::IdrWRadl),
     };
@@ -711,12 +887,13 @@ pub(crate) fn encode_kind(
     )?;
     let (pps, sps) = sets.get(0)?;
 
-    let mut enc = Encoder::new(sps, pps, &params, (w, h), planes, &header);
+    let mut enc = Encoder::new(sps, pps, &params, (w, h), planes, &header, config.speed);
     match kind {
         Kind::P {
             poc,
             ref_poc,
             reference,
+            ref_motion,
             ..
         } => {
             if (reference.widths[0], reference.heights[0]) != (params.width, params.height) {
@@ -727,6 +904,7 @@ pub(crate) fn encode_kind(
                 [None, None],
             );
             enc.references = [Some(reference), None];
+            enc.ref_motions = [ref_motion, None];
             enc.poc = poc as i32;
             enc.ref_pocs = [vec![ref_poc], Vec::new()];
             enc.ref_long_term = [vec![false], Vec::new()];
@@ -735,6 +913,8 @@ pub(crate) fn encode_kind(
             poc,
             ref_pocs: [p0, p1],
             references: [r0, r1],
+            ref_motions,
+            ..
         } => {
             for r in [r0, r1] {
                 if (r.widths[0], r.heights[0]) != (params.width, params.height) {
@@ -744,6 +924,7 @@ pub(crate) fn encode_kind(
             enc.recon
                 .set_references([vec![(r0, p0, false)], vec![(r1, p1, false)]], [None, None]);
             enc.references = [Some(r0), Some(r1)];
+            enc.ref_motions = ref_motions;
             enc.poc = poc as i32;
             enc.ref_pocs = [vec![p0], vec![p1]];
             enc.ref_long_term = [vec![false], vec![false]];
@@ -771,7 +952,7 @@ pub(crate) fn encode_kind(
     let bit_depth = planes.bit_depth;
     let chroma = format != ChromaFormat::Monochrome;
     let write = |sao: &[(CtbSao, SaoParams)]| -> Vec<u8> {
-        let mut ctx = Contexts::new_with_type(params.qp, enc_init_type);
+        let mut ctx = Contexts::new_with_type(enc.qp, enc_init_type);
         let mut coder = ArithmeticEncoder::new();
         for (i, bins) in blocks.iter().enumerate() {
             if !sao.is_empty() {
@@ -826,9 +1007,11 @@ pub(crate) fn encode_kind(
         width: params.output_width,
         height: params.output_height,
     };
+    let poc = enc.poc;
     let kinds = enc.kinds;
     let skip_filters = matches!(kind, Kind::Still);
-    Ok((picture, enc.recon.finish(skip_filters), kinds))
+    let (recon, motion) = enc.recon.finish_with_motion(skip_filters, poc);
+    Ok((picture, recon, motion, kinds))
 }
 
 /// The ways a coding unit can be coded.
@@ -1008,6 +1191,10 @@ struct Encoder<'a> {
     /// The reference pictures of a P or B picture (`L0` and optional `L1`), the POCs of the
     /// current and reference pictures, and `Log2ParMrgLevel`.
     references: [Option<&'a Frame>; 2],
+    ref_motions: [Option<&'a MotionField>; 2],
+    temporal_mvp: bool,
+    collocated_from_l0: bool,
+    speed: SpeedPreset,
     poc: i32,
     ref_pocs: [Vec<i32>; 2],
     ref_long_term: [Vec<bool>; 2],
@@ -1048,6 +1235,7 @@ impl<'a> Encoder<'a> {
         (w, h): (usize, usize),
         planes: Planes16<'_>,
         header: &SliceHeader,
+        speed: SpeedPreset,
     ) -> Self {
         let (pw, ph) = (params.width as usize, params.height as usize);
         let csx = if matches!(params.chroma_format, 1 | 2) {
@@ -1078,7 +1266,7 @@ impl<'a> Encoder<'a> {
         };
         let mut recon = Reconstructor::new(sps, pps);
         recon.start_slice(header);
-        let qp = params.qp;
+        let qp = params.qp + i32::from(header.slice_qp_delta);
         let bd_offset = 6 * i32::from(planes.bit_depth - 8);
         // λ of the HM reference encoder for intra pictures, for distortions measured on
         // `bit_depth`-bit samples (4× larger per extra bit, squared).
@@ -1120,6 +1308,10 @@ impl<'a> Encoder<'a> {
             inter_cus: 0,
             inter_block: false,
             references: [None, None],
+            ref_motions: [None, None],
+            temporal_mvp: header.slice_temporal_mvp_enabled_flag,
+            collocated_from_l0: header.collocated_from_l0_flag,
+            speed,
             poc: 0,
             ref_pocs: [Vec::new(), Vec::new()],
             ref_long_term: [Vec::new(), Vec::new()],
@@ -1306,13 +1498,18 @@ impl<'a> Encoder<'a> {
 
     /// The reference pictures of the current P or B picture, for motion vector prediction.
     fn slice_refs(&self) -> SliceRefs<'_> {
+        let col = if self.temporal_mvp {
+            self.ref_motions[usize::from(!self.collocated_from_l0)]
+        } else {
+            None
+        };
         SliceRefs {
             poc: self.poc,
             lists: [&self.ref_pocs[0], &self.ref_pocs[1]],
             long_term: [&self.ref_long_term[0], &self.ref_long_term[1]],
-            col: None,
-            collocated_from_l0: true,
-            no_backward_pred: !self.b_slice,
+            col,
+            collocated_from_l0: self.collocated_from_l0,
+            no_backward_pred: self.ref_pocs.iter().flatten().all(|&p| p <= self.poc),
             pic_size: (self.width, self.height),
             log2_ctb: LOG2_CTB,
         }
@@ -1604,6 +1801,9 @@ impl<'a> Encoder<'a> {
         residual: bool,
     ) -> Option<f64> {
         let size = 1u32 << log2_size;
+        if self.lossless {
+            self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, false);
         self.bin(ctx::PRED_MODE_FLAG, false); // inter
@@ -1613,7 +1813,7 @@ impl<'a> Encoder<'a> {
             y: y0,
             log2_size,
             part_nxn: false,
-            transquant_bypass: false,
+            transquant_bypass: self.lossless,
             pcm: false,
             intra: false,
             qp_y: self.qp,
@@ -1662,7 +1862,7 @@ impl<'a> Encoder<'a> {
             y: y0,
             log2_size,
             part_nxn: false,
-            transquant_bypass: false,
+            transquant_bypass: self.lossless,
             pcm: false,
             intra: false,
             qp_y: self.qp,
@@ -1721,6 +1921,9 @@ impl<'a> Encoder<'a> {
         merge_idx: usize,
         motion: Motion,
     ) -> f64 {
+        if self.lossless {
+            self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, true);
         self.merge_idx(merge_idx);
@@ -1741,6 +1944,9 @@ impl<'a> Encoder<'a> {
         merge_idx: usize,
         motion: Motion,
     ) -> Option<f64> {
+        if self.lossless {
+            self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, false);
         self.bin(ctx::PRED_MODE_FLAG, false); // inter
@@ -1774,6 +1980,9 @@ impl<'a> Encoder<'a> {
         residual: bool,
     ) -> Option<f64> {
         let size = 1u32 << log2_size;
+        if self.lossless {
+            self.bin(ctx::CU_TRANSQUANT_BYPASS_FLAG, true);
+        }
         let inc = self.skip_ctx(x0, y0);
         self.bin(ctx::CU_SKIP_FLAG + inc, false);
         self.bin(ctx::PRED_MODE_FLAG, false); // inter
@@ -1841,7 +2050,15 @@ impl<'a> Encoder<'a> {
         self.pred = pred;
         self.diff_from_prediction(c, x, y, n);
         // Mode 1 (DC) gives the diagonal scan of inter blocks.
-        let levels = self.quantize(c, log2_size, 1, false);
+        let levels = if self.lossless {
+            if self.diff[..n * n].iter().any(|&v| v != 0) {
+                self.diff[..n * n].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.quantize(c, log2_size, 1, false)
+        };
         let sse = self.reconstruct(c, x, y, log2_size, 1, &levels, false);
         let w = if c == 0 { 1.0 } else { self.chroma_weight() };
         Tb {
@@ -2001,8 +2218,13 @@ impl<'a> Encoder<'a> {
         }
         // Every integer vector of a small window around zero motion: a diamond search alone
         // gets lost in textures, whose cost has no slope to follow.
-        for dy in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
-            for dx in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
+        let search_range: i16 = match self.speed {
+            SpeedPreset::Fast => 16,
+            SpeedPreset::Medium => 32,
+            SpeedPreset::Slow => 48,
+        };
+        for dy in (-search_range..=search_range).step_by(4) {
+            for dx in (-search_range..=search_range).step_by(4) {
                 if dx == 0 && dy == 0 {
                     continue;
                 }
@@ -2011,7 +2233,11 @@ impl<'a> Encoder<'a> {
                 }
             }
         }
-        for step in [32i16, 16, 8, 4] {
+        let steps: &[i16] = match self.speed {
+            SpeedPreset::Slow => &[64, 32, 16, 8, 4],
+            SpeedPreset::Fast | SpeedPreset::Medium => &[32, 16, 8, 4],
+        };
+        for &step in steps {
             loop {
                 let mut moved = false;
                 for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
@@ -2721,8 +2947,12 @@ impl<'a> Encoder<'a> {
         // In a P picture, the inter codings first: skipped with each merge candidate, then a
         // searched motion vector. The best one is kept to compare with intra.
         let mut skip: Option<(f64, f64, Snapshot, bool)> = None;
-        if self.inter_slice && !self.lossless {
+        if self.inter_slice {
             let mut keep = |enc: &mut Self, d: f64, is_skip: bool| {
+                if enc.lossless && d > 0.0 {
+                    enc.restore(x0, y0, size, &start);
+                    return;
+                }
                 let j = d + enc.lambda * (enc.log.bit_count() - start_bits);
                 if skip.as_ref().is_none_or(|b| j < b.0) {
                     let after = enc.log.checkpoint_since(&start.log);
@@ -2740,9 +2970,15 @@ impl<'a> Encoder<'a> {
             }
             // Merge with a residual: the same candidates, but correcting the prediction error.
             // The candidate that predicts best is not always the cheapest once corrected, so
-            // every one is tried. 4:2:2 chroma trees are not handled (see `code_amvp`).
+            // every one is tried (top 2 in Fast). 4:2:2 chroma trees are not handled (see
+            // `code_amvp`).
             if !self.is_422() {
-                for &(idx, motion) in &candidates {
+                let merge_limit = if self.speed == SpeedPreset::Fast {
+                    2
+                } else {
+                    candidates.len()
+                };
+                for &(idx, motion) in candidates.iter().take(merge_limit) {
                     match self.code_merge(x0, y0, log2_size, depth, idx, motion) {
                         Some(d) => keep(self, d, false),
                         None => self.restore(x0, y0, size, &start),
@@ -2798,14 +3034,19 @@ impl<'a> Encoder<'a> {
             // syntax pays for itself. 4:2:2 chroma trees are not handled, like the residual
             // paths above.
             if self.references[0].is_some() && log2_size > LOG2_MIN_CB && !self.is_422() {
-                for part_mode in [
-                    PartMode::Part2NxN,
-                    PartMode::PartNx2N,
-                    PartMode::Part2NxnU,
-                    PartMode::Part2NxnD,
-                    PartMode::PartnLx2N,
-                    PartMode::PartnRx2N,
-                ] {
+                let parts: &[PartMode] = if self.speed == SpeedPreset::Fast {
+                    &[PartMode::Part2NxN, PartMode::PartNx2N]
+                } else {
+                    &[
+                        PartMode::Part2NxN,
+                        PartMode::PartNx2N,
+                        PartMode::Part2NxnU,
+                        PartMode::Part2NxnD,
+                        PartMode::PartnLx2N,
+                        PartMode::PartnRx2N,
+                    ]
+                };
+                for &part_mode in parts {
                     let d = self
                         .code_partition(x0, y0, log2_size, depth, part_mode, false)
                         .expect("always coded without residual");
@@ -2818,9 +3059,14 @@ impl<'a> Encoder<'a> {
             }
         }
         let mpm = self.mpm_candidates(x0, y0);
+        let mode_count = if self.speed == SpeedPreset::Fast {
+            3
+        } else {
+            5
+        };
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
-            _ => self.choose_modes(x0, y0, log2_size.min(LOG2_MAX_TB), mpm, 5),
+            _ => self.choose_modes(x0, y0, log2_size.min(LOG2_MAX_TB), mpm, mode_count),
         };
         self.chroma_choice = None;
 
@@ -4105,7 +4351,7 @@ mod tests {
         let mut stream = Vec::new();
         let mut recons = Vec::new();
         let mut sizes = Vec::new();
-        let mut reference: Option<Frame> = None;
+        let mut reference: Option<(Frame, MotionField)> = None;
         for (poc, (y, cb, cr)) in pictures.iter().enumerate() {
             let (y, cb, cr) = (wide(y), wide(cb), wide(cr));
             let planes = Planes16 {
@@ -4114,15 +4360,16 @@ mod tests {
                 bit_depth: 8,
             };
             let kind = match &reference {
-                None => Kind::SequenceIdr { b_frames: false },
-                Some(frame) => Kind::P {
+                None => Kind::SequenceIdr { reorder_pics: 0 },
+                Some((frame, motion)) => Kind::P {
                     poc: poc as u32,
                     ref_poc: poc as i32 - 1,
                     reference: frame,
-                    b_frames: false,
+                    ref_motion: Some(motion),
+                    reorder_pics: 0,
                 },
             };
-            let (picture, recon, _) =
+            let (picture, recon, motion, _) =
                 encode_kind(w as u32, h as u32, planes, &options, &config, kind).unwrap();
             if poc == 0 {
                 for nal in &picture.parameter_sets {
@@ -4141,7 +4388,7 @@ mod tests {
                 crop(&recon, 1, cw, ch),
                 crop(&recon, 2, cw, ch),
             ]);
-            reference = Some(recon);
+            reference = Some((recon, motion));
         }
         (stream, recons, sizes)
     }
@@ -4272,7 +4519,7 @@ mod tests {
         };
         let mut stream = Vec::new();
         let mut recons = Vec::new();
-        let mut reference: Option<Frame> = None;
+        let mut reference: Option<(Frame, MotionField)> = None;
         for (poc, [y, cb, cr]) in pictures.iter().enumerate() {
             let planes = Planes16 {
                 y,
@@ -4280,15 +4527,16 @@ mod tests {
                 bit_depth: 8,
             };
             let kind = match &reference {
-                None => Kind::SequenceIdr { b_frames: false },
-                Some(frame) => Kind::P {
+                None => Kind::SequenceIdr { reorder_pics: 0 },
+                Some((frame, motion)) => Kind::P {
                     poc: poc as u32,
                     ref_poc: poc as i32 - 1,
                     reference: frame,
-                    b_frames: false,
+                    ref_motion: Some(motion),
+                    reorder_pics: 0,
                 },
             };
-            let (picture, recon, _) =
+            let (picture, recon, motion, _) =
                 encode_kind(w as u32, h as u32, planes, &options, &config, kind).unwrap();
             if poc == 0 {
                 for nal in &picture.parameter_sets {
@@ -4305,7 +4553,7 @@ mod tests {
                 crop(&recon, 1, cw, h),
                 crop(&recon, 2, cw, h),
             ]);
-            reference = Some(recon);
+            reference = Some((recon, motion));
         }
         check_sequence(&stream, &recons);
     }
@@ -4752,5 +5000,197 @@ mod tests {
             b_mid_bytes * 2 < p_mid_bytes,
             "expected B mid frame ({b_mid_bytes} B) < half of P mid frame ({p_mid_bytes} B)"
         );
+    }
+
+    #[test]
+    fn tmvp_qp_offsets_and_hierarchical_b_frames_decode() {
+        // 5 frames with `b_frames = 3` form a dyadic mini-GOP: I0, P4 (+1 QP, TrailR),
+        // B2 (+2 QP, TrailR ref), B1 (+3 QP, TrailN), B3 (+3 QP, TrailN), with TMVP enabled.
+        let (w, h) = (64usize, 48usize);
+        let cw = w / 2;
+        let ch = h / 2;
+        let pictures: Vec<_> = (0..5)
+            .map(|n| {
+                let luma: Vec<u16> = (0..h)
+                    .flat_map(|y| {
+                        (0..w).map(move |x| {
+                            let dx = x as f64 - 16.0 - 2.0 * n as f64;
+                            let dy = y as f64 - 14.0 - 1.0 * n as f64;
+                            (128.0 + 95.0 * (-(dx * dx + dy * dy) / 50.0).exp())
+                                .round()
+                                .clamp(0.0, 255.0) as u16
+                        })
+                    })
+                    .collect();
+                let cb = vec![120u16; cw * ch];
+                let cr = vec![136u16; cw * ch];
+                (luma, cb, cr)
+            })
+            .collect();
+        let mut enc = SequenceEncoder::new(
+            w as u32,
+            h as u32,
+            CodingOptions::default(),
+            EncoderConfig {
+                qp: 24,
+                ..EncoderConfig::default()
+            },
+            30,
+        )
+        .with_b_frames(3);
+        let mut encoded = Vec::new();
+        for (luma, cb, cr) in &pictures {
+            encoded.extend(
+                enc.push(Planes16 {
+                    y: luma,
+                    chroma: Some((cb, cr)),
+                    bit_depth: 8,
+                })
+                .unwrap(),
+            );
+        }
+        encoded.extend(enc.flush().unwrap());
+        let display_order: Vec<usize> = encoded.iter().map(|f| f.display_index).collect();
+        assert_eq!(display_order, vec![0, 4, 2, 1, 3]);
+
+        let mut sets = heifer_hevc_dec::params::ParameterSets::default();
+        for nal in &encoded[0].picture.parameter_sets {
+            sets.add(&heifer_hevc_dec::nal::NalUnit::parse(nal).unwrap())
+                .unwrap();
+        }
+        let mut nal_types = Vec::new();
+        let mut qp_deltas = Vec::new();
+        let mut tmvp_flags = Vec::new();
+        for f in &encoded {
+            let nal = heifer_hevc_dec::nal::NalUnit::parse(&f.picture.slices[0]).unwrap();
+            let hdr =
+                heifer_hevc_dec::slice::SliceHeader::parse(&nal.rbsp, &nal.header, &sets, None)
+                    .unwrap();
+            nal_types.push(nal.header.unit_type);
+            qp_deltas.push(hdr.slice_qp_delta);
+            tmvp_flags.push(hdr.slice_temporal_mvp_enabled_flag);
+        }
+        assert_eq!(
+            nal_types,
+            vec![
+                heifer_hevc_dec::nal::NalUnitType::IrapSlice(19),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(1),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(1),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+                heifer_hevc_dec::nal::NalUnitType::OtherSlice(0),
+            ]
+        );
+        assert_eq!(qp_deltas, vec![0, 1, 2, 3, 3]);
+        assert_eq!(tmvp_flags, vec![false, true, true, true, true]);
+
+        let mut dec =
+            heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+        let mut decoded = Vec::new();
+        for f in &encoded {
+            decoded.extend(dec.decode_in_display_order(&f.picture.annex_b()).unwrap());
+        }
+        decoded.extend(dec.flush());
+        assert_eq!(decoded.len(), pictures.len());
+    }
+
+    #[test]
+    fn lossless_inter_sequence_is_exact_and_uses_skip() {
+        let (w, h) = (32usize, 32usize);
+        let [g, b, r] = test_picture_444(w, h, 7, 10);
+        // Repeat the identical frame 4 times: P and B frames reproduce it 100% losslessly via skip.
+        let mut enc = SequenceEncoder::new(
+            w as u32,
+            h as u32,
+            CodingOptions {
+                chroma_format: ChromaFormat::Chroma444,
+                lossless: true,
+            },
+            EncoderConfig::default(),
+            30,
+        )
+        .with_b_frames(2);
+        let mut encoded = Vec::new();
+        for _ in 0..4 {
+            encoded.extend(
+                enc.push(Planes16 {
+                    y: &g,
+                    chroma: Some((&b, &r)),
+                    bit_depth: 10,
+                })
+                .unwrap(),
+            );
+        }
+        encoded.extend(enc.flush().unwrap());
+        assert_eq!(encoded.len(), 4);
+        // P and B frames on identical 10-bit 4:4:4 frames skip completely and stay tiny.
+        let idr_bytes = encoded[0].picture.slices[0].len();
+        for f in &encoded[1..] {
+            assert!(
+                f.picture.slices[0].len() * 10 < idr_bytes,
+                "expected tiny inter lossless slice ({} vs IDR {idr_bytes})",
+                f.picture.slices[0].len()
+            );
+        }
+        let mut dec =
+            heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+        let mut decoded = Vec::new();
+        for f in &encoded {
+            decoded.extend(dec.decode_in_display_order(&f.picture.annex_b()).unwrap());
+        }
+        decoded.extend(dec.flush());
+        assert_eq!(decoded.len(), 4);
+        for frame in &decoded {
+            assert_eq!(crop(frame, 0, w, h), g);
+            assert_eq!(crop(frame, 1, w, h), b);
+            assert_eq!(crop(frame, 2, w, h), r);
+        }
+    }
+
+    #[test]
+    fn speed_presets_produce_decodable_b_frame_sequences() {
+        let (w, h) = (64usize, 48usize);
+        let pictures: Vec<_> = (0..4)
+            .map(|n| {
+                let luma: Vec<u16> = (0..w * h)
+                    .map(|i| (((i % w) + (i / w) + n * 4) * 3 % 255) as u16)
+                    .collect();
+                let uv = vec![128u16; (w / 2) * (h / 2)];
+                (luma, uv)
+            })
+            .collect();
+        for speed in [SpeedPreset::Fast, SpeedPreset::Medium, SpeedPreset::Slow] {
+            let mut enc = SequenceEncoder::new(
+                w as u32,
+                h as u32,
+                CodingOptions::default(),
+                EncoderConfig {
+                    qp: 28,
+                    speed,
+                    ..EncoderConfig::default()
+                },
+                30,
+            )
+            .with_b_frames(2);
+            let mut encoded = Vec::new();
+            for (y, uv) in &pictures {
+                encoded.extend(
+                    enc.push(Planes16 {
+                        y,
+                        chroma: Some((uv, uv)),
+                        bit_depth: 8,
+                    })
+                    .unwrap(),
+                );
+            }
+            encoded.extend(enc.flush().unwrap());
+            let mut dec =
+                heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+            let mut decoded = Vec::new();
+            for f in &encoded {
+                decoded.extend(dec.decode_in_display_order(&f.picture.annex_b()).unwrap());
+            }
+            decoded.extend(dec.flush());
+            assert_eq!(decoded.len(), pictures.len());
+        }
     }
 }
