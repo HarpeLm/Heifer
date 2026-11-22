@@ -18,8 +18,8 @@
 //! functions without a `_with_format` suffix keep writing 4:2:0.
 
 use heifer_hevc_enc::encoder::{
-    ChromaFormat, CodingOptions, EncodedPicture, EncoderConfig, Planes16, SequenceEncoder,
-    encode_picture16, encode_picture16_with,
+    ChromaFormat, CodingOptions, EncodedPicture, EncodedSequenceFrame, EncoderConfig, Planes16,
+    SequenceEncoder, encode_picture16, encode_picture16_with,
 };
 use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
@@ -58,6 +58,10 @@ pub struct EncodeOptions {
     /// Maximum number of frames from one keyframe (IDR picture) to the next in an encoded
     /// image sequence. `0` uses the default (`30`); `1` codes every frame as a keyframe.
     pub keyframe_interval: usize,
+    /// Maximum number of consecutive B-frames between reference pictures (IDR or P) in an
+    /// encoded image sequence. `0` disables B-frames and writes IDR + P-frames only.
+    /// Default: `2`.
+    pub b_frames: usize,
 }
 
 impl Default for EncodeOptions {
@@ -74,12 +78,14 @@ impl Default for EncodeOptions {
 /// assert_eq!((options.quality, options.max_threads), (70, 2));
 /// ```
 impl EncodeOptions {
-    /// The default options: quality 80, all cores, keyframe every 30 frames.
+    /// The default options: quality 80, all cores, keyframe every 30 frames, 2 consecutive
+    /// B-frames.
     pub const fn new() -> Self {
         Self {
             quality: 80,
             max_threads: 0,
             keyframe_interval: SEQUENCE_KEYFRAME_INTERVAL,
+            b_frames: 2,
         }
     }
 
@@ -102,6 +108,14 @@ impl EncodeOptions {
     #[must_use]
     pub const fn with_keyframe_interval(mut self, keyframe_interval: usize) -> Self {
         self.keyframe_interval = keyframe_interval;
+        self
+    }
+
+    /// Sets [`b_frames`](Self::b_frames): `0` disables B-frames; larger values allow longer
+    /// B-frame runs between P/IDR references.
+    #[must_use]
+    pub const fn with_b_frames(mut self, b_frames: usize) -> Self {
+        self.b_frames = b_frames;
         self
     }
 }
@@ -299,11 +313,12 @@ const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
 /// size and bit depth, each shown for the matching entry of `durations`, in seconds.
 ///
 /// Every `options.keyframe_interval` frames (default `30`) is a keyframe coded on its own; the
-/// frames between are predicted from the one before (skipped blocks, merge predictions with a
-/// residual, motion vectors to a quarter sample, prediction blocks 2N×2N, 2N×N, N×2N or an
-/// asymmetric pair, residuals), which makes files far smaller than coding each frame alone.
-/// Groups of pictures are encoded in parallel on [`EncodeOptions::max_threads`] threads. The
-/// first frame is also stored as the primary image, for viewers of still images. When any
+/// frames between are predicted from nearby references (P-frames and, when
+/// [`EncodeOptions::b_frames`] > 0, bi-directionally predicted B-frames with L0/L1 motion,
+/// skipped blocks, merge predictions with a residual, motion vectors to a quarter sample, and
+/// asymmetric/symmetric partitions), which makes files far smaller than coding each frame
+/// alone. Groups of pictures are encoded in parallel on [`EncodeOptions::max_threads`] threads.
+/// The first frame is also stored as the primary image, for viewers of still images. When any
 /// frame has transparency, an auxiliary monochrome alpha track (`auxl`) is stored alongside
 /// the colour track.
 ///
@@ -377,9 +392,9 @@ pub fn encode_sequence(
         |i| pixel_at(first, i),
     )?;
 
-    // Groups of pictures, encoded in parallel: an IDR picture, then P pictures each
-    // predicted from the one before.
+    // Groups of pictures, encoded in parallel: an IDR picture, then reordered P and B pictures.
     let interval = options.sequence_keyframe_interval();
+    let b_frames = options.b_frames;
     let config = EncoderConfig {
         qp: options.qp(),
         colour: (1, 13, 6),
@@ -397,19 +412,24 @@ pub fn encode_sequence(
         chroma_format: ChromaFormat::Monochrome,
         lossless: false,
     };
-    let groups: Vec<&[Image]> = frames.chunks(interval).collect();
+    let groups: Vec<(usize, &[Image])> = frames
+        .chunks(interval)
+        .enumerate()
+        .map(|(g, chunk)| (g * interval, chunk))
+        .collect();
     let threads = options.threads().clamp(1, groups.len());
     let per_thread = groups.len().div_ceil(threads);
-    type CodedPair = ((EncodedPicture, bool), Option<(EncodedPicture, bool)>);
+    type CodedPair = (EncodedSequenceFrame, Option<EncodedSequenceFrame>);
     let coded: Vec<Result<CodedPair, Error>> = std::thread::scope(|scope| {
         let handles: Vec<_> = groups
             .chunks(per_thread)
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut out = Vec::new();
-                    for group in chunk {
+                    for &(group_start, group) in chunk {
                         let mut encoder =
-                            SequenceEncoder::new(width, height, coding, config, interval);
+                            SequenceEncoder::new(width, height, coding, config, interval)
+                                .with_b_frames(b_frames);
                         let mut alpha_encoder = has_alpha.then(|| {
                             SequenceEncoder::new(
                                 width,
@@ -418,8 +438,30 @@ pub fn encode_sequence(
                                 alpha_config,
                                 interval,
                             )
+                            .with_b_frames(b_frames)
                         });
-                        for frame in *group {
+                        let mut push_batch =
+                            |colour_batch: Vec<EncodedSequenceFrame>,
+                             alpha_batch: Option<Vec<EncodedSequenceFrame>>| {
+                                match alpha_batch {
+                                    Some(alphas) => {
+                                        debug_assert_eq!(colour_batch.len(), alphas.len());
+                                        for (mut c, mut a) in colour_batch.into_iter().zip(alphas) {
+                                            debug_assert_eq!(c.display_index, a.display_index);
+                                            c.display_index += group_start;
+                                            a.display_index += group_start;
+                                            out.push(Ok((c, Some(a))));
+                                        }
+                                    }
+                                    None => {
+                                        for mut c in colour_batch {
+                                            c.display_index += group_start;
+                                            out.push(Ok((c, None)));
+                                        }
+                                    }
+                                }
+                            };
+                        for frame in group {
                             let at = |x: usize, y: usize| pixel_at(frame, y * width as usize + x);
                             let (y, cb, cr) = ycbcr_planes(
                                 &at,
@@ -433,14 +475,14 @@ pub fn encode_sequence(
                                 chroma: Some((&cb, &cr)),
                                 bit_depth,
                             };
-                            let colour = match encoder.encode(planes) {
-                                Ok(pair) => pair,
+                            let colour_batch = match encoder.push(planes) {
+                                Ok(batch) => batch,
                                 Err(e) => {
                                     out.push(Err(Error::from(e)));
                                     return out;
                                 }
                             };
-                            let alpha = match &mut alpha_encoder {
+                            let alpha_batch = match &mut alpha_encoder {
                                 Some(enc) => {
                                     let alpha_y: Vec<u16> = (0..(width as usize * height as usize))
                                         .map(|i| pixel_at(frame, i)[3])
@@ -450,8 +492,8 @@ pub fn encode_sequence(
                                         chroma: None,
                                         bit_depth,
                                     };
-                                    match enc.encode(alpha_planes) {
-                                        Ok(pair) => Some(pair),
+                                    match enc.push(alpha_planes) {
+                                        Ok(batch) => Some(batch),
                                         Err(e) => {
                                             out.push(Err(Error::from(e)));
                                             return out;
@@ -460,8 +502,26 @@ pub fn encode_sequence(
                                 }
                                 None => None,
                             };
-                            out.push(Ok((colour, alpha)));
+                            push_batch(colour_batch, alpha_batch);
                         }
+                        let colour_rest = match encoder.flush() {
+                            Ok(batch) => batch,
+                            Err(e) => {
+                                out.push(Err(Error::from(e)));
+                                return out;
+                            }
+                        };
+                        let alpha_rest = match &mut alpha_encoder {
+                            Some(enc) => match enc.flush() {
+                                Ok(batch) => Some(batch),
+                                Err(e) => {
+                                    out.push(Err(Error::from(e)));
+                                    return out;
+                                }
+                            },
+                            None => None,
+                        };
+                        push_batch(colour_rest, alpha_rest);
                     }
                     out
                 })
@@ -473,10 +533,10 @@ pub fn encode_sequence(
             .collect()
     });
     let coded = coded.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let colour_coded: Vec<(EncodedPicture, bool)> = coded.iter().map(|(c, _)| c.clone()).collect();
+    let colour_coded: Vec<EncodedSequenceFrame> = coded.iter().map(|(c, _)| c.clone()).collect();
     let mut track = build_sequence_track(width, height, bit_depth, durations, &colour_coded)?;
     if has_alpha {
-        let alpha_coded: Vec<(EncodedPicture, bool)> = coded
+        let alpha_coded: Vec<EncodedSequenceFrame> = coded
             .into_iter()
             .map(|(_, a)| a.expect("alpha coded for every frame"))
             .collect();
@@ -491,8 +551,9 @@ pub fn encode_sequence(
 /// and the quality used.
 ///
 /// Quality is searched by dichotomy (like [`encode_to_size`]); `options.quality` is ignored,
-/// while [`EncodeOptions::keyframe_interval`] and [`EncodeOptions::max_threads`] apply. Fails
-/// with [`Error::Unsupported`] when even quality 0 is too large.
+/// while [`EncodeOptions::keyframe_interval`], [`EncodeOptions::b_frames`] and
+/// [`EncodeOptions::max_threads`] apply. Fails with [`Error::Unsupported`] when even quality 0
+/// is too large.
 pub fn encode_sequence_to_size(
     frames: &[Image],
     durations: &[f64],
@@ -521,24 +582,35 @@ fn build_sequence_track(
     height: u32,
     bit_depth: u8,
     durations: &[f64],
-    coded: &[(EncodedPicture, bool)],
+    coded: &[EncodedSequenceFrame],
 ) -> Result<SequenceTrack, Error> {
-    let first = &coded[0].0;
+    let first = &coded[0].picture;
     if coded
         .iter()
-        .any(|(p, _)| p.parameter_sets != first.parameter_sets)
+        .any(|f| f.picture.parameter_sets != first.parameter_sets)
     {
         return Err(Error::Invalid("frames coded with different parameter sets"));
     }
     let hevc = hevc_config(first, bit_depth);
     let mut track = SequenceTrack::new(width, height, SEQUENCE_TIMESCALE, hevc);
-    for ((picture, sync), &duration) in coded.iter().zip(durations) {
-        let ticks = (duration * f64::from(SEQUENCE_TIMESCALE)).round();
-        track.add_sample(
-            &picture.slices,
-            ticks.min(f64::from(u32::MAX)) as u32,
-            *sync,
-        );
+    let mut display_ticks = Vec::with_capacity(durations.len());
+    let mut display_starts = Vec::with_capacity(durations.len());
+    let mut display_time = 0i64;
+    for &duration in durations {
+        let ticks = (duration * f64::from(SEQUENCE_TIMESCALE))
+            .round()
+            .min(f64::from(u32::MAX)) as u32;
+        display_starts.push(display_time);
+        display_ticks.push(ticks);
+        display_time += i64::from(ticks);
+    }
+    let mut decode_time = 0i64;
+    for frame in coded {
+        let dur = display_ticks[frame.display_index];
+        let offset = (display_starts[frame.display_index] - decode_time)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        track.add_sample_with_offset(&frame.picture.slices, dur, frame.keyframe, offset);
+        decode_time += i64::from(dur);
     }
     Ok(track)
 }
