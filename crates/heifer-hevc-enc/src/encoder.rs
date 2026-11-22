@@ -1642,7 +1642,18 @@ impl<'a> Encoder<'a> {
         );
         let src = &self.src[0];
         let (nw, nh) = (w as usize, h as usize);
-        let sad = |mv: Mv| -> u64 {
+        let limit = 4 * 256;
+        // Early-exit integer SAD once the partial sum + MVD penalty already exceeds `best_cost`.
+        let eval = |mv: Mv, best_cost: f64| -> Option<f64> {
+            let mvd = [
+                i32::from(mv[0]) - i32::from(predictor[0]),
+                i32::from(mv[1]) - i32::from(predictor[1]),
+            ];
+            let mvd_cost = self.sqrt_lambda * mvd_bits(mvd);
+            if mvd_cost >= best_cost {
+                return None;
+            }
+            let sad_limit = best_cost - mvd_cost;
             let (dx, dy) = (i64::from(mv[0]) >> 2, i64::from(mv[1]) >> 2);
             let (rx, ry) = (i64::from(x0) + dx, i64::from(y0) + dy);
             let inside =
@@ -1665,27 +1676,22 @@ impl<'a> Encoder<'a> {
                             u64::from((a - i32::from(plane[(yy + xx) as usize])).unsigned_abs());
                     }
                 }
+                if (total as f64) >= sad_limit {
+                    return None;
+                }
             }
-            total
-        };
-        let limit = 4 * 256;
-        let cost = |mv: Mv| -> f64 {
-            let mvd = [
-                i32::from(mv[0]) - i32::from(predictor[0]),
-                i32::from(mv[1]) - i32::from(predictor[1]),
-            ];
-            sad(mv) as f64 + self.sqrt_lambda * mvd_bits(mvd)
+            let c = total as f64 + mvd_cost;
+            (c < best_cost).then_some(c)
         };
         let integer = |mv: Mv| [mv[0] & !3, mv[1] & !3];
         let mut best = [0, 0];
-        let mut best_cost = cost(best);
+        let mut best_cost = eval(best, f64::INFINITY).expect("finite initial cost");
         for &s in starts {
             let s = integer(s);
-            if s[0].unsigned_abs() > limit || s[1].unsigned_abs() > limit {
+            if s == [0, 0] || s[0].unsigned_abs() > limit || s[1].unsigned_abs() > limit {
                 continue;
             }
-            let c = cost(s);
-            if c < best_cost {
+            if let Some(c) = eval(s, best_cost) {
                 (best, best_cost) = (s, c);
             }
         }
@@ -1693,8 +1699,10 @@ impl<'a> Encoder<'a> {
         // gets lost in textures, whose cost has no slope to follow.
         for dy in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
             for dx in (-SEARCH_RANGE..=SEARCH_RANGE).step_by(4) {
-                let c = cost([dx, dy]);
-                if c < best_cost {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if let Some(c) = eval([dx, dy], best_cost) {
                     (best, best_cost) = ([dx, dy], c);
                 }
             }
@@ -1707,8 +1715,7 @@ impl<'a> Encoder<'a> {
                     if mv[0].unsigned_abs() > limit || mv[1].unsigned_abs() > limit {
                         continue;
                     }
-                    let c = cost(mv);
-                    if c < best_cost {
+                    if let Some(c) = eval(mv, best_cost) {
                         (best, best_cost, moved) = (mv, c, true);
                     }
                 }
@@ -1721,7 +1728,16 @@ impl<'a> Encoder<'a> {
         // as the decoder interpolates it (8-tap filter).
         let bit_depth = self.bit_depth;
         let mut pred = vec![0i32; nw * nh];
-        let mut fractional = |mv: Mv| -> f64 {
+        let mut fractional = |mv: Mv, best_cost: f64| -> Option<f64> {
+            let mvd = [
+                i32::from(mv[0]) - i32::from(predictor[0]),
+                i32::from(mv[1]) - i32::from(predictor[1]),
+            ];
+            let mvd_cost = self.sqrt_lambda * mvd_bits(mvd);
+            if mvd_cost >= best_cost {
+                return None;
+            }
+            let sad_limit = best_cost - mvd_cost;
             heifer_hevc_dec::inter::predict_component(
                 reference,
                 0,
@@ -1740,14 +1756,14 @@ impl<'a> Encoder<'a> {
                     let v = i32::from(heifer_hevc_dec::inter::weight_uni(p, bit_depth));
                     total += u64::from((a - v).unsigned_abs());
                 }
+                if (total as f64) >= sad_limit {
+                    return None;
+                }
             }
-            let mvd = [
-                i32::from(mv[0]) - i32::from(predictor[0]),
-                i32::from(mv[1]) - i32::from(predictor[1]),
-            ];
-            total as f64 + self.sqrt_lambda * mvd_bits(mvd)
+            let c = total as f64 + mvd_cost;
+            (c < best_cost).then_some(c)
         };
-        let mut best_cost = fractional(best);
+        let mut best_cost = fractional(best, f64::INFINITY).expect("finite initial cost");
         for step in [2i16, 1] {
             let centre = best;
             for dy in [-step, 0, step] {
@@ -1759,8 +1775,7 @@ impl<'a> Encoder<'a> {
                     if mv[0].unsigned_abs() > limit || mv[1].unsigned_abs() > limit {
                         continue;
                     }
-                    let c = fractional(mv);
-                    if c < best_cost {
+                    if let Some(c) = fractional(mv, best_cost) {
                         (best, best_cost) = (mv, c);
                     }
                 }
@@ -3859,6 +3874,48 @@ mod tests {
                     "picture {n}, plane {c}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn p_pictures_monochrome_decode_as_the_encoder_reconstructs_them() {
+        let (w, h) = (64usize, 48usize);
+        let pictures: Vec<Vec<u16>> = (0..4)
+            .map(|n| {
+                (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        (((x + 3 * n) * 5 + y * 7) % 220) as u16
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut enc = SequenceEncoder::new(
+            w as u32,
+            h as u32,
+            CodingOptions {
+                chroma_format: ChromaFormat::Monochrome,
+                lossless: false,
+            },
+            EncoderConfig {
+                qp: 28,
+                ..EncoderConfig::default()
+            },
+            30,
+        );
+        let mut decoder =
+            heifer_hevc_dec::SequenceDecoder::new(DecodeOptions::new().with_verify_hash(true));
+        for (n, y) in pictures.iter().enumerate() {
+            let planes = Planes16 {
+                y,
+                chroma: None,
+                bit_depth: 8,
+            };
+            let (picture, keyframe) = enc.encode(planes).unwrap();
+            assert_eq!(keyframe, n == 0);
+            let frame = decoder.decode(&picture.annex_b()).unwrap();
+            assert_eq!(frame.chroma_format, 0);
+            assert_eq!(crop(&frame, 0, w, h).len(), w * h);
         }
     }
 
