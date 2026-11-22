@@ -110,11 +110,11 @@ pub(crate) struct StreamParams {
     /// Whether coding units bypass the transform and quantization (`cu_transquant_bypass_flag`).
     pub lossless: bool,
     /// Whether the stream holds P or B pictures (image sequences): the SPS then keeps at least
-    /// one reference picture.
+    /// one reference picture and enables temporal motion vector prediction.
     pub inter: bool,
-    /// Whether the stream may contain reordered B pictures (requires 3-picture DPB and
-    /// `max_num_reorder_pics = 1`).
-    pub b_frames: bool,
+    /// Maximum number of reordered pictures waiting for display (`0` for IDR/P-only, `1` for
+    /// 1–2 consecutive B-frames, higher for hierarchical B-frame pyramids).
+    pub reorder_pics: u8,
 }
 
 impl StreamParams {
@@ -169,12 +169,12 @@ impl StreamParams {
     }
 
     fn sub_layer_ordering(&self, w: &mut BitWriter) {
-        let buffering_minus1 = if self.b_frames {
-            2
+        let reorder = u32::from(self.reorder_pics);
+        let buffering_minus1 = if reorder > 0 {
+            1 + reorder
         } else {
             u32::from(self.inter)
         };
-        let reorder = u32::from(self.b_frames);
         w.bit(true).ue(buffering_minus1).ue(reorder).ue(0);
     }
 
@@ -243,7 +243,7 @@ impl StreamParams {
         } else {
             w.ue(0); // no RPS
         }
-        w.bit(false).bit(false); // no long-term pictures, no TMVP
+        w.bit(false).bit(self.inter); // no long-term pictures; TMVP enabled in sequences
         w.bit(true); // strong_intra_smoothing_enabled_flag
         w.bit(true); // vui_parameters_present_flag
         {
@@ -288,40 +288,82 @@ impl StreamParams {
 
     /// The slice segment header of a P picture whose POC LSBs are `poc_lsb`, predicted from
     /// the previous reference picture `delta_poc` display frames earlier.
-    pub(crate) fn p_slice_header(&self, poc_lsb: u32, delta_poc: u32) -> Vec<u8> {
-        self.inter_slice_header(1, poc_lsb, delta_poc, None)
+    pub(crate) fn p_slice_header(
+        &self,
+        poc_lsb: u32,
+        delta_poc: u32,
+        temporal_mvp: bool,
+        qp_delta: i32,
+    ) -> Vec<u8> {
+        self.inter_slice_header(
+            1,
+            poc_lsb,
+            &[(delta_poc, true)],
+            &[],
+            temporal_mvp,
+            true,
+            qp_delta,
+        )
     }
 
-    /// The slice segment header of a B picture whose POC LSBs are `poc_lsb`, predicted from
-    /// `l0_delta` earlier (past) and `l1_delta` later (future) in display order.
-    pub(crate) fn b_slice_header(&self, poc_lsb: u32, l0_delta: u32, l1_delta: u32) -> Vec<u8> {
-        self.inter_slice_header(0, poc_lsb, l0_delta, Some(l1_delta))
+    /// The slice segment header of a B picture whose POC LSBs are `poc_lsb`, with short-term
+    /// negative/positive RPS entries `(delta_magnitude, used_by_curr_pic)` in ascending
+    /// magnitude order.
+    pub(crate) fn b_slice_header(
+        &self,
+        poc_lsb: u32,
+        neg_refs: &[(u32, bool)],
+        pos_refs: &[(u32, bool)],
+        temporal_mvp: bool,
+        collocated_from_l0: bool,
+        qp_delta: i32,
+    ) -> Vec<u8> {
+        self.inter_slice_header(
+            0,
+            poc_lsb,
+            neg_refs,
+            pos_refs,
+            temporal_mvp,
+            collocated_from_l0,
+            qp_delta,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inter_slice_header(
         &self,
         slice_type: u32,
         poc_lsb: u32,
-        l0_delta: u32,
-        l1_delta: Option<u32>,
+        neg_refs: &[(u32, bool)],
+        pos_refs: &[(u32, bool)],
+        temporal_mvp: bool,
+        collocated_from_l0: bool,
+        qp_delta: i32,
     ) -> Vec<u8> {
         let mut w = BitWriter::default();
         w.bit(true); // first_slice_segment_in_pic_flag
         w.ue(0); // slice_pic_parameter_set_id
         w.ue(slice_type); // 0 = B, 1 = P
         w.bits(poc_lsb & 0xFF, 8); // slice_pic_order_cnt_lsb (log2_max_pic_order_cnt_lsb 8)
-        if l1_delta.is_none() && l0_delta == 1 {
+        if neg_refs == [(1, true)] && pos_refs.is_empty() {
             w.bit(true); // short_term_ref_pic_set_sps_flag: the SPS's only RPS (-1)
         } else {
             w.bit(false); // short_term_ref_pic_set_sps_flag
             w.bit(false); // inter_ref_pic_set_prediction_flag
-            w.ue(1); // num_negative_pics
-            w.ue(u32::from(l1_delta.is_some())); // num_positive_pics
-            w.ue(l0_delta - 1).bit(true); // delta_poc_s0_minus1, used_by_curr_pic_s0_flag
-            if let Some(d1) = l1_delta {
-                w.ue(d1 - 1).bit(true); // delta_poc_s1_minus1, used_by_curr_pic_s1_flag
+            w.ue(neg_refs.len() as u32);
+            w.ue(pos_refs.len() as u32);
+            let mut prev = 0u32;
+            for &(delta, used) in neg_refs {
+                w.ue(delta - prev - 1).bit(used);
+                prev = delta;
+            }
+            let mut prev = 0u32;
+            for &(delta, used) in pos_refs {
+                w.ue(delta - prev - 1).bit(used);
+                prev = delta;
             }
         }
+        w.bit(temporal_mvp); // slice_temporal_mvp_enabled_flag (SPS enables TMVP for inter)
         if !self.lossless {
             w.bit(true); // slice_sao_luma_flag
             if self.chroma_format != 0 {
@@ -329,11 +371,14 @@ impl StreamParams {
             }
         }
         w.bit(false); // num_ref_idx_active_override_flag: one reference per list (PPS default)
-        if l1_delta.is_some() {
+        if slice_type == 0 {
             w.bit(false); // mvd_l1_zero_flag
+            if temporal_mvp {
+                w.bit(collocated_from_l0);
+            }
         }
         w.ue(0); // five_minus_max_num_merge_cand: 5 merge candidates
-        w.se(0); // slice_qp_delta
+        w.se(qp_delta); // slice_qp_delta
         w.finish()
     }
 
