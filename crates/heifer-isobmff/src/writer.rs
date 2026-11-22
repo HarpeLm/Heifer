@@ -78,8 +78,9 @@ pub struct SequenceTrack {
     height: u32,
     timescale: u32,
     config: HevcConfig,
-    /// Each sample's data (length-prefixed NAL units), duration and sync flag.
-    samples: Vec<(Vec<u8>, u32, bool)>,
+    /// Each sample's data (length-prefixed NAL units), duration, sync flag, and composition
+    /// offset (`ctts`: display time minus decode time).
+    samples: Vec<(Vec<u8>, u32, bool, i32)>,
     /// Optional auxiliary alpha sequence track (`tref` `auxl`, `auxi` = [`ALPHA_URN`]).
     alpha: Option<Box<SequenceTrack>>,
 }
@@ -107,12 +108,25 @@ impl SequenceTrack {
     /// Adds a picture: its slice segment NAL units (without start codes or length prefixes),
     /// how long it is shown, and whether it is a sync sample (decodable on its own).
     pub fn add_sample(&mut self, slices: &[Vec<u8>], duration: u32, sync: bool) {
+        self.add_sample_with_offset(slices, duration, sync, 0);
+    }
+
+    /// Like [`add_sample`](Self::add_sample), with a composition offset (`ctts`, display time
+    /// minus decode time in [`timescale`](Self::new) units) for reordered frames (B frames).
+    pub fn add_sample_with_offset(
+        &mut self,
+        slices: &[Vec<u8>],
+        duration: u32,
+        sync: bool,
+        composition_offset: i32,
+    ) {
         let mut data = Vec::new();
         for nal in slices {
             data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
             data.extend_from_slice(nal);
         }
-        self.samples.push((data, duration, sync));
+        self.samples
+            .push((data, duration, sync, composition_offset));
     }
 
     /// Number of pictures added.
@@ -291,6 +305,24 @@ impl SequenceTrack {
                     b.extend_from_slice(&d.to_be_bytes());
                 }
             }));
+            // Composition offsets (`ctts`), when any sample is reordered (e.g. B frames).
+            if self.samples.iter().any(|s| s.3 != 0) {
+                let mut ctts_runs: Vec<(u32, i32)> = Vec::new();
+                for s in &self.samples {
+                    match ctts_runs.last_mut() {
+                        Some((n, off)) if *off == s.3 => *n += 1,
+                        _ => ctts_runs.push((1, s.3)),
+                    }
+                }
+                let version = u8::from(self.samples.iter().any(|s| s.3 < 0));
+                stbl.extend(full_box(b"ctts", version, 0, |b| {
+                    b.extend_from_slice(&(ctts_runs.len() as u32).to_be_bytes());
+                    for &(n, off) in &ctts_runs {
+                        b.extend_from_slice(&n.to_be_bytes());
+                        b.extend_from_slice(&off.to_be_bytes());
+                    }
+                }));
+            }
             // Without `stss`, every sample is a sync sample.
             if self.samples.iter().any(|s| !s.2) {
                 stbl.extend(full_box(b"stss", 0, 0, |b| {
@@ -1271,5 +1303,25 @@ mod tests {
             aux.sample_data(&bytes, 1).unwrap(),
             [0, 0, 0, 4, 0x02, 1, 0x22, 0x33]
         );
+    }
+
+    #[test]
+    fn sequence_track_writes_ctts_for_reordered_frames() {
+        let cfg = config(1);
+        let mut track = SequenceTrack::new(64, 48, 1000, cfg.clone());
+        // Display order 0, 1, 2, 3 stored as I0, P3, B1, B2 with durations 40ms each.
+        track.add_sample_with_offset(&[vec![0x26, 1, 0x00]], 40, true, 0);
+        track.add_sample_with_offset(&[vec![0x02, 1, 0x03]], 40, false, 80);
+        track.add_sample_with_offset(&[vec![0x00, 1, 0x01]], 40, false, -40);
+        track.add_sample_with_offset(&[vec![0x00, 1, 0x02]], 40, false, -40);
+
+        let mut w = HeifWriter::new();
+        w.add_image(&ImageSpec::new(64, 48, cfg, &[vec![0x26, 1, 0x00]]));
+        w.set_sequence(track);
+        let bytes = w.finish();
+
+        let tracks = crate::track::parse_tracks(&bytes).unwrap();
+        assert_eq!(tracks[0].display_order(), [0, 2, 3, 1]);
+        assert_eq!(tracks[0].composition_times(), [0, 120, 40, 80]);
     }
 }
