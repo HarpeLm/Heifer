@@ -80,6 +80,8 @@ pub struct SequenceTrack {
     config: HevcConfig,
     /// Each sample's data (length-prefixed NAL units), duration and sync flag.
     samples: Vec<(Vec<u8>, u32, bool)>,
+    /// Optional auxiliary alpha sequence track (`tref` `auxl`, `auxi` = [`ALPHA_URN`]).
+    alpha: Option<Box<SequenceTrack>>,
 }
 
 impl SequenceTrack {
@@ -93,7 +95,13 @@ impl SequenceTrack {
             timescale,
             config,
             samples: Vec::new(),
+            alpha: None,
         }
+    }
+
+    /// Attaches an auxiliary alpha sequence track (`auxl`, [`ALPHA_URN`]) to this track.
+    pub fn set_alpha(&mut self, alpha: SequenceTrack) {
+        self.alpha = Some(Box::new(alpha));
     }
 
     /// Adds a picture: its slice segment NAL units (without start codes or length prefixes),
@@ -117,8 +125,12 @@ impl SequenceTrack {
         self.samples.is_empty()
     }
 
-    fn data_size(&self) -> u64 {
+    fn own_data_size(&self) -> u64 {
         self.samples.iter().map(|s| s.0.len() as u64).sum()
+    }
+
+    fn data_size(&self) -> u64 {
+        self.own_data_size() + self.alpha.as_ref().map_or(0, |a| a.data_size())
     }
 
     /// The `moov` box, with the samples stored as one chunk at `chunk_offset`, a 64-bit
@@ -133,6 +145,7 @@ impl SequenceTrack {
                 b.extend_from_slice(&v.to_be_bytes());
             }
         };
+        let next_track_id = if self.alpha.is_some() { 3u32 } else { 2u32 };
         make_box(b"moov", |moov| {
             moov.extend(full_box(b"mvhd", 0, 0, |b| {
                 b.extend_from_slice(&[0; 8]); // creation and modification times
@@ -143,52 +156,88 @@ impl SequenceTrack {
                 b.extend_from_slice(&[0; 10]); // reserved
                 matrix(b);
                 b.extend_from_slice(&[0; 24]); // pre_defined
-                b.extend_from_slice(&2u32.to_be_bytes()); // next_track_ID
+                b.extend_from_slice(&next_track_id.to_be_bytes()); // next_track_ID
             }));
-            moov.extend(make_box(b"trak", |trak| {
-                // Enabled, in the movie and in the preview.
-                trak.extend(full_box(b"tkhd", 0, 7, |b| {
-                    b.extend_from_slice(&[0; 8]); // creation and modification times
-                    b.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-                    b.extend_from_slice(&[0; 4]); // reserved
-                    b.extend_from_slice(&duration32.to_be_bytes());
-                    b.extend_from_slice(&[0; 8]); // reserved
-                    b.extend_from_slice(&[0; 8]); // layer, alternate_group, volume, reserved
-                    matrix(b);
-                    b.extend_from_slice(&(self.width << 16).to_be_bytes());
-                    b.extend_from_slice(&(self.height << 16).to_be_bytes());
+            moov.extend(self.trak_box(1, None, chunk_offset, large));
+            if let Some(alpha) = &self.alpha {
+                moov.extend(alpha.trak_box(
+                    2,
+                    Some((1, ALPHA_URN)),
+                    chunk_offset + self.own_data_size(),
+                    large,
+                ));
+            }
+        })
+    }
+
+    fn trak_box(
+        &self,
+        track_id: u32,
+        aux_for: Option<(u32, &str)>,
+        chunk_offset: u64,
+        large: bool,
+    ) -> Vec<u8> {
+        let duration: u64 = self.samples.iter().map(|s| u64::from(s.1)).sum();
+        let duration32 = u32::try_from(duration).unwrap_or(u32::MAX);
+        const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
+        let matrix = |b: &mut Vec<u8>| {
+            for v in MATRIX {
+                b.extend_from_slice(&v.to_be_bytes());
+            }
+        };
+        let tkhd_flags = if aux_for.is_some() { 0 } else { 7 };
+        let handler = if aux_for.is_some() { b"auxv" } else { b"pict" };
+        let aux_urn = aux_for.map(|(_, urn)| urn);
+        make_box(b"trak", |trak| {
+            // Main track: enabled, in the movie and in the preview; auxiliary track: hidden.
+            trak.extend(full_box(b"tkhd", 0, tkhd_flags, |b| {
+                b.extend_from_slice(&[0; 8]); // creation and modification times
+                b.extend_from_slice(&track_id.to_be_bytes()); // track_ID
+                b.extend_from_slice(&[0; 4]); // reserved
+                b.extend_from_slice(&duration32.to_be_bytes());
+                b.extend_from_slice(&[0; 8]); // reserved
+                b.extend_from_slice(&[0; 8]); // layer, alternate_group, volume, reserved
+                matrix(b);
+                b.extend_from_slice(&(self.width << 16).to_be_bytes());
+                b.extend_from_slice(&(self.height << 16).to_be_bytes());
+            }));
+            if let Some((main_id, _)) = aux_for {
+                trak.extend(make_box(b"tref", |tref| {
+                    tref.extend(make_box(b"auxl", |a| {
+                        a.extend_from_slice(&main_id.to_be_bytes());
+                    }));
                 }));
-                trak.extend(make_box(b"mdia", |mdia| {
-                    mdia.extend(full_box(b"mdhd", 0, 0, |b| {
-                        b.extend_from_slice(&[0; 8]); // creation and modification times
-                        b.extend_from_slice(&self.timescale.to_be_bytes());
-                        b.extend_from_slice(&duration32.to_be_bytes());
-                        b.extend_from_slice(&0x55C4u16.to_be_bytes()); // language `und`
-                        b.extend_from_slice(&[0; 2]); // pre_defined
-                    }));
-                    mdia.extend(full_box(b"hdlr", 0, 0, |b| {
-                        b.extend_from_slice(&[0; 4]); // pre_defined
-                        b.extend_from_slice(b"pict");
-                        b.extend_from_slice(&[0; 12]); // reserved
-                        b.push(0); // empty name
-                    }));
-                    mdia.extend(make_box(b"minf", |minf| {
-                        minf.extend(full_box(b"vmhd", 0, 1, |b| b.extend_from_slice(&[0; 8])));
-                        minf.extend(make_box(b"dinf", |dinf| {
-                            dinf.extend(full_box(b"dref", 0, 0, |b| {
-                                b.extend_from_slice(&1u32.to_be_bytes());
-                                // The data is in this file.
-                                b.extend(full_box(b"url ", 0, 1, |_| {}));
-                            }));
+            }
+            trak.extend(make_box(b"mdia", |mdia| {
+                mdia.extend(full_box(b"mdhd", 0, 0, |b| {
+                    b.extend_from_slice(&[0; 8]); // creation and modification times
+                    b.extend_from_slice(&self.timescale.to_be_bytes());
+                    b.extend_from_slice(&duration32.to_be_bytes());
+                    b.extend_from_slice(&0x55C4u16.to_be_bytes()); // language `und`
+                    b.extend_from_slice(&[0; 2]); // pre_defined
+                }));
+                mdia.extend(full_box(b"hdlr", 0, 0, |b| {
+                    b.extend_from_slice(&[0; 4]); // pre_defined
+                    b.extend_from_slice(handler);
+                    b.extend_from_slice(&[0; 12]); // reserved
+                    b.push(0); // empty name
+                }));
+                mdia.extend(make_box(b"minf", |minf| {
+                    minf.extend(full_box(b"vmhd", 0, 1, |b| b.extend_from_slice(&[0; 8])));
+                    minf.extend(make_box(b"dinf", |dinf| {
+                        dinf.extend(full_box(b"dref", 0, 0, |b| {
+                            b.extend_from_slice(&1u32.to_be_bytes());
+                            // The data is in this file.
+                            b.extend(full_box(b"url ", 0, 1, |_| {}));
                         }));
-                        minf.extend(self.stbl_box(chunk_offset, large));
                     }));
+                    minf.extend(self.stbl_box(chunk_offset, large, aux_urn));
                 }));
             }));
         })
     }
 
-    fn stbl_box(&self, chunk_offset: u64, large: bool) -> Vec<u8> {
+    fn stbl_box(&self, chunk_offset: u64, large: bool, aux_urn: Option<&str>) -> Vec<u8> {
         make_box(b"stbl", |stbl| {
             stbl.extend(full_box(b"stsd", 0, 0, |b| {
                 b.extend_from_slice(&1u32.to_be_bytes());
@@ -219,6 +268,12 @@ impl SequenceTrack {
                         }
                         c.extend_from_slice(&v.to_be_bytes());
                     }));
+                    if let Some(urn) = aux_urn {
+                        e.extend(full_box(b"auxi", 0, 0, |a| {
+                            a.extend_from_slice(urn.as_bytes());
+                            a.push(0);
+                        }));
+                    }
                 }));
             }));
             // Durations, as runs of equal values.
@@ -696,6 +751,11 @@ impl HeifWriter {
             for sample in &track.samples {
                 out.extend_from_slice(&sample.0);
             }
+            if let Some(alpha) = &track.alpha {
+                for sample in &alpha.samples {
+                    out.extend_from_slice(&sample.0);
+                }
+            }
         }
         out
     }
@@ -1172,5 +1232,44 @@ mod tests {
         // 32-bit chunk offsets, which every reader supports.
         let has = |kind: &[u8]| bytes.windows(4).any(|w| w == kind);
         assert!(has(b"stco") && !has(b"co64") && has(b"ccst"));
+    }
+
+    #[test]
+    fn sequence_alpha_tracks_read_back() {
+        let color_cfg = config(1);
+        let alpha_cfg = config(0);
+        let mut track = SequenceTrack::new(64, 48, 1000, color_cfg.clone());
+        track.add_sample(&[vec![0x26, 1, 0xAA]], 40, true);
+        track.add_sample(&[vec![0x02, 1, 0xBB]], 40, false);
+
+        let mut alpha = SequenceTrack::new(64, 48, 1000, alpha_cfg.clone());
+        alpha.add_sample(&[vec![0x26, 1, 0x11]], 40, true);
+        alpha.add_sample(&[vec![0x02, 1, 0x22, 0x33]], 40, false);
+        track.set_alpha(alpha);
+
+        let mut w = HeifWriter::new();
+        w.add_image(&ImageSpec::new(64, 48, color_cfg, &[vec![0x26, 1, 0x99]]));
+        w.set_sequence(track);
+        let bytes = w.finish();
+
+        let tracks = crate::track::parse_tracks(&bytes).unwrap();
+        assert_eq!(tracks.len(), 2);
+        let (main, aux) = (&tracks[0], &tracks[1]);
+        assert_eq!((main.id, &main.handler.0), (1, b"pict"));
+        assert_eq!(main.auxiliary_type, None);
+        assert_eq!((aux.id, &aux.handler.0), (2, b"auxv"));
+        assert_eq!(aux.auxiliary_type.as_deref(), Some(ALPHA_URN));
+        assert_eq!(
+            aux.references,
+            vec![(crate::FourCC(*b"auxl"), vec![main.id])]
+        );
+        assert_eq!(
+            main.sample_data(&bytes, 1).unwrap(),
+            [0, 0, 0, 3, 0x02, 1, 0xBB]
+        );
+        assert_eq!(
+            aux.sample_data(&bytes, 1).unwrap(),
+            [0, 0, 0, 4, 0x02, 1, 0x22, 0x33]
+        );
     }
 }
