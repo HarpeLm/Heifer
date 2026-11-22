@@ -19,7 +19,7 @@
 
 use heifer_hevc_enc::encoder::{
     ChromaFormat, CodingOptions, EncodedPicture, EncodedSequenceFrame, EncoderConfig, Planes16,
-    SequenceEncoder, encode_picture16, encode_picture16_with,
+    SequenceEncoder, SpeedPreset, encode_picture16, encode_picture16_with,
 };
 use heifer_isobmff::ItemId;
 use heifer_isobmff::boxes::{ColorInfo, HevcConfig};
@@ -47,6 +47,29 @@ pub enum EncodeFormat {
     Lossless,
 }
 
+/// Encoding speed/compression trade-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EncodeSpeed {
+    /// Faster encoding: smaller motion search window and fewer mode/partition trials.
+    Fast,
+    /// Balanced speed and compression efficiency (default).
+    #[default]
+    Medium,
+    /// Thorough search: wider motion search window and full partition trials.
+    Slow,
+}
+
+impl EncodeSpeed {
+    const fn preset(self) -> SpeedPreset {
+        match self {
+            Self::Fast => SpeedPreset::Fast,
+            Self::Medium => SpeedPreset::Medium,
+            Self::Slow => SpeedPreset::Slow,
+        }
+    }
+}
+
 /// Encoding options.
 #[derive(Debug, Clone, Copy)]
 pub struct EncodeOptions {
@@ -62,6 +85,8 @@ pub struct EncodeOptions {
     /// encoded image sequence. `0` disables B-frames and writes IDR + P-frames only.
     /// Default: `2`.
     pub b_frames: usize,
+    /// Speed/compression preset for intra and sequence encoding. Default: [`EncodeSpeed::Medium`].
+    pub speed: EncodeSpeed,
 }
 
 impl Default for EncodeOptions {
@@ -79,13 +104,14 @@ impl Default for EncodeOptions {
 /// ```
 impl EncodeOptions {
     /// The default options: quality 80, all cores, keyframe every 30 frames, 2 consecutive
-    /// B-frames.
+    /// B-frames, medium speed.
     pub const fn new() -> Self {
         Self {
             quality: 80,
             max_threads: 0,
             keyframe_interval: SEQUENCE_KEYFRAME_INTERVAL,
             b_frames: 2,
+            speed: EncodeSpeed::Medium,
         }
     }
 
@@ -111,11 +137,18 @@ impl EncodeOptions {
         self
     }
 
-    /// Sets [`b_frames`](Self::b_frames): `0` disables B-frames; larger values allow longer
+    /// Sets [`b_frames`](Self::b_frames): `0` disables B-frames; larger values allow hierarchical
     /// B-frame runs between P/IDR references.
     #[must_use]
     pub const fn with_b_frames(mut self, b_frames: usize) -> Self {
         self.b_frames = b_frames;
+        self
+    }
+
+    /// Sets [`speed`](Self::speed).
+    #[must_use]
+    pub const fn with_speed(mut self, speed: EncodeSpeed) -> Self {
+        self.speed = speed;
         self
     }
 }
@@ -309,8 +342,9 @@ const SEQUENCE_TIMESCALE: u32 = 1000;
 /// at 30 frames per second, so that seeking decodes few frames.
 const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
 
-/// Encodes an image sequence (a burst or an animation) as a HEIF file: `frames`, all the same
-/// size and bit depth, each shown for the matching entry of `durations`, in seconds.
+/// Encodes an image sequence (a burst or an animation) as a HEIF file in YCbCr 4:2:0:
+/// `frames`, all the same size and bit depth, each shown for the matching entry of `durations`,
+/// in seconds. See [`encode_sequence_with_format`] to choose 4:2:2, 4:4:4 or lossless GBR.
 ///
 /// Every `options.keyframe_interval` frames (default `30`) is a keyframe coded on its own; the
 /// frames between are predicted from nearby references (P-frames and, when
@@ -333,6 +367,16 @@ const SEQUENCE_KEYFRAME_INTERVAL: usize = 30;
 pub fn encode_sequence(
     frames: &[Image],
     durations: &[f64],
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, Error> {
+    encode_sequence_with_format(frames, durations, EncodeFormat::Ycbcr420, options)
+}
+
+/// Like [`encode_sequence`], with the chroma format and coding mode of `format`.
+pub fn encode_sequence_with_format(
+    frames: &[Image],
+    durations: &[f64],
+    format: EncodeFormat,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     let first = frames
@@ -387,7 +431,7 @@ pub fn encode_sequence(
         bit_depth,
         has_alpha,
         None,
-        EncodeFormat::Ycbcr420,
+        format,
         options,
         |i| pixel_at(first, i),
     )?;
@@ -395,22 +439,31 @@ pub fn encode_sequence(
     // Groups of pictures, encoded in parallel: an IDR picture, then reordered P and B pictures.
     let interval = options.sequence_keyframe_interval();
     let b_frames = options.b_frames;
+    let lossless = format == EncodeFormat::Lossless;
+    let chroma_format = match format {
+        EncodeFormat::Ycbcr420 => ChromaFormat::Chroma420,
+        EncodeFormat::Ycbcr422 => ChromaFormat::Chroma422,
+        EncodeFormat::Ycbcr444 | EncodeFormat::Lossless => ChromaFormat::Chroma444,
+    };
+    let speed = options.speed.preset();
     let config = EncoderConfig {
         qp: options.qp(),
-        colour: (1, 13, 6),
+        colour: if lossless { (1, 13, 0) } else { (1, 13, 6) },
+        speed,
         ..EncoderConfig::default()
     };
     let alpha_config = EncoderConfig {
         qp: options.qp(),
+        speed,
         ..EncoderConfig::default()
     };
     let coding = CodingOptions {
-        chroma_format: ChromaFormat::Chroma420,
-        lossless: false,
+        chroma_format,
+        lossless,
     };
     let alpha_coding = CodingOptions {
         chroma_format: ChromaFormat::Monochrome,
-        lossless: false,
+        lossless,
     };
     let groups: Vec<(usize, &[Image])> = frames
         .chunks(interval)
@@ -463,16 +516,20 @@ pub fn encode_sequence(
                             };
                         for frame in group {
                             let at = |x: usize, y: usize| pixel_at(frame, y * width as usize + x);
-                            let (y, cb, cr) = ycbcr_planes(
-                                &at,
-                                width as usize,
-                                height as usize,
-                                bit_depth,
-                                EncodeFormat::Ycbcr420,
-                            );
+                            let (c0, c1, c2) = if lossless {
+                                gbr_planes(&at, width as usize, height as usize)
+                            } else {
+                                ycbcr_planes(
+                                    &at,
+                                    width as usize,
+                                    height as usize,
+                                    bit_depth,
+                                    format,
+                                )
+                            };
                             let planes = Planes16 {
-                                y: &y,
-                                chroma: Some((&cb, &cr)),
+                                y: &c0,
+                                chroma: Some((&c1, &c2)),
                                 bit_depth,
                             };
                             let colour_batch = match encoder.push(planes) {
@@ -551,25 +608,51 @@ pub fn encode_sequence(
 /// and the quality used.
 ///
 /// Quality is searched by dichotomy (like [`encode_to_size`]); `options.quality` is ignored,
-/// while [`EncodeOptions::keyframe_interval`], [`EncodeOptions::b_frames`] and
-/// [`EncodeOptions::max_threads`] apply. Fails with [`Error::Unsupported`] when even quality 0
-/// is too large.
+/// while [`EncodeOptions::keyframe_interval`], [`EncodeOptions::b_frames`],
+/// [`EncodeOptions::speed`] and [`EncodeOptions::max_threads`] apply. Fails with
+/// [`Error::Unsupported`] when even quality 0 is too large.
 pub fn encode_sequence_to_size(
     frames: &[Image],
     durations: &[f64],
     max_bytes: usize,
     options: &EncodeOptions,
 ) -> Result<(Vec<u8>, u8), Error> {
+    encode_sequence_to_size_with_format(
+        frames,
+        durations,
+        EncodeFormat::Ycbcr420,
+        max_bytes,
+        options,
+    )
+}
+
+/// Like [`encode_sequence_to_size`], with the chroma format and coding mode of `format`.
+pub fn encode_sequence_to_size_with_format(
+    frames: &[Image],
+    durations: &[f64],
+    format: EncodeFormat,
+    max_bytes: usize,
+    options: &EncodeOptions,
+) -> Result<(Vec<u8>, u8), Error> {
     let encode = |quality: u8| {
-        encode_sequence(
+        encode_sequence_with_format(
             frames,
             durations,
+            format,
             &EncodeOptions {
                 quality,
                 ..*options
             },
         )
     };
+    if format == EncodeFormat::Lossless {
+        let heic = encode(100)?;
+        return if heic.len() <= max_bytes {
+            Ok((heic, 100))
+        } else {
+            Err(too_large(heic.len(), max_bytes))
+        };
+    }
     fit_to_size(max_bytes, encode)?.ok_or_else(|| {
         Error::Unsupported(format!(
             "the sequence does not fit in {max_bytes} bytes, even at quality 0"
@@ -1015,6 +1098,7 @@ fn encode_image<F: Fn(usize) -> [u16; 4] + Sync>(
             EncodeFormat::Lossless => (1, 13, 0),
             _ => (1, 13, 6),
         },
+        speed: options.speed.preset(),
         ..EncoderConfig::default()
     };
     // Alpha edges are visible: code the alpha plane a little better.
@@ -1166,21 +1250,7 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
         )?);
     }
     if lossless {
-        // GBR: component 0 is G, then B and R, with the identity matrix in the VUI. Bypassing
-        // the transform and quantization makes the round trip exact.
-        let (mut g, mut b, mut r) = (
-            Vec::with_capacity(w * h),
-            Vec::with_capacity(w * h),
-            Vec::with_capacity(w * h),
-        );
-        for row in 0..h {
-            for col in 0..w {
-                let [red, green, blue, _] = at(col, row);
-                g.push(green);
-                b.push(blue);
-                r.push(red);
-            }
-        }
+        let (g, b, r) = gbr_planes(&at, w, h);
         let planes = Planes16 {
             y: &g,
             chroma: Some((&b, &r)),
@@ -1216,6 +1286,29 @@ fn encode_region<F: Fn(usize) -> [u16; 4]>(
     } else {
         Ok(encode_picture16(size.0, size.1, planes, config)?)
     }
+}
+
+/// Converts RGBA pixels into GBR planes (G = Y, B = Cb, R = Cr) with identity colour matrix for
+/// lossless coding.
+fn gbr_planes(
+    at: &impl Fn(usize, usize) -> [u16; 4],
+    w: usize,
+    h: usize,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let (mut g, mut b, mut r) = (
+        Vec::with_capacity(w * h),
+        Vec::with_capacity(w * h),
+        Vec::with_capacity(w * h),
+    );
+    for row in 0..h {
+        for col in 0..w {
+            let [red, green, blue, _] = at(col, row);
+            g.push(green);
+            b.push(blue);
+            r.push(red);
+        }
+    }
+    (g, b, r)
 }
 
 /// Converts RGBA pixels to YCbCr planes: BT.601, full range, with the chroma subsampled for
