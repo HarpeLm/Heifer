@@ -278,6 +278,81 @@ fn main() {
                 rs[rs.len() / 2],
             );
         }
-        _ => panic!("decode|encode|profile|ab"),
+        "sequence" => {
+            // Benchmarks sequence encoding & decoding on panning textured motion across presets
+            // and B-frame configurations: `heifer-benchmarks sequence [frames] [w] [h] [out_dir]`.
+            let n: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(45);
+            let w: u32 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(192);
+            let h: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(128);
+            let out_dir = a.get(5).map(std::path::PathBuf::from);
+            if let Some(dir) = &out_dir {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            let frames: Vec<heifer::Image> = (0..n)
+                .map(|t| {
+                    let mut img = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+                    for (i, p) in img.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let (x, y) = (i as u32 % w, i as u32 / w);
+                        let sx = x as f64 + 1.5 * t as f64;
+                        let sy = y as f64 + 0.5 * t as f64;
+                        let blob = 70.0
+                            * (-((f64::from(x) - f64::from(w) * 0.35 - 1.5 * t as f64).powi(2)
+                                + (f64::from(y) - f64::from(h) * 0.40 - 0.5 * t as f64).powi(2))
+                                / 280.0)
+                                .exp();
+                        let bg = 120.0
+                            + 55.0 * (sx * 0.13).sin()
+                            + 45.0 * (sy * 0.17).cos()
+                            + 20.0 * ((sx + sy) * 0.29).sin();
+                        let luma = (bg + blob).round().clamp(0.0, 255.0) as u16;
+                        p[..3].copy_from_slice(&[luma, (255 - luma / 2), (luma / 2 + 50).min(255)]);
+                    }
+                    img
+                })
+                .collect();
+            let durations = vec![1.0 / 30.0; n];
+            let cases = [
+                ("p-only", 0usize, heifer::EncodeSpeed::Medium),
+                ("b2-fast", 2, heifer::EncodeSpeed::Fast),
+                ("b2-medium", 2, heifer::EncodeSpeed::Medium),
+                ("b2-slow", 2, heifer::EncodeSpeed::Slow),
+                ("b3-hier", 3, heifer::EncodeSpeed::Medium),
+            ];
+            for (name, b_frames, speed) in cases {
+                let opts = heifer::EncodeOptions::new()
+                    .with_quality(78)
+                    .with_b_frames(b_frames)
+                    .with_speed(speed);
+                let t_enc = Instant::now();
+                let bytes = heifer::encode_sequence(&frames, &durations, &opts).unwrap();
+                let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+                if let Some(dir) = &out_dir {
+                    std::fs::write(dir.join(format!("{name}.heics")), &bytes).unwrap();
+                }
+                let t_dec = Instant::now();
+                let dec: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(dec.len(), n);
+                let mse: f64 = frames
+                    .iter()
+                    .zip(&dec)
+                    .flat_map(|(o, d)| o.data.iter().zip(&d.data))
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+                    / (n as f64 * f64::from(w * h) * 4.0);
+                let psnr = 10.0 * (255.0_f64.powi(2) / mse.max(1e-9)).log10();
+                println!(
+                    "{name}\t{}x{}_x{n}\t{} B\tenc {enc_ms:.0} ms ({:.1} fps)\tdec {dec_ms:.1} ms\t{psnr:.2} dB",
+                    w,
+                    h,
+                    bytes.len(),
+                    n as f64 / (enc_ms / 1000.0)
+                );
+            }
+        }
+        _ => panic!("decode|encode|profile|ab|sequence"),
     }
 }
