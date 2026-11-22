@@ -38,7 +38,7 @@ Options:
                          of the main image: out.png gives out-001.png, out-002.png, ...;
                          out.gif or out.apng gives one animated file
                          A .heics output writes an animated GIF, APNG or HEIF sequence as a
-                         HEIF image sequence (transparency is flattened onto white)
+                         HEIF image sequence
   -t, --to <format>      output format when converting several files
   -o, --out-dir <dir>    output folder (default: next to each input)
   -f, --force            overwrite existing files
@@ -278,10 +278,10 @@ fn animation_frames(input: &Path) -> Result<Vec<image::Frame>, String> {
 }
 
 /// A `.heics` output: the frames of an animated input, each with its duration, as a HEIF image
-/// sequence. Transparent pixels are flattened onto white.
+/// sequence.
 fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
-    if args.format.is_some() || args.max_size.is_some() || args.wants_aux() {
-        return Err("a .heics output takes only -q among the HEIC options".into());
+    if args.format.is_some() || args.wants_aux() {
+        return Err("a .heics output takes only -q or -s among the HEIC options".into());
     }
     if output.exists() && !args.force {
         return Err(format!(
@@ -291,7 +291,6 @@ fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String
     }
     let start = Instant::now();
     let frames = animation_frames(input)?;
-    let mut flattened = false;
     let mut images = Vec::with_capacity(frames.len());
     let mut durations = Vec::with_capacity(frames.len());
     for frame in &frames {
@@ -299,25 +298,30 @@ fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String
         durations.push(f64::from(numer) / f64::from(denom.max(1)) / 1000.0);
         let buffer = frame.buffer();
         let (w, h) = buffer.dimensions();
-        let mut image = heifer::Image::filled(w, h, 8, [255, 255, 255, 255]);
+        let has_alpha = buffer.pixels().any(|p| p.0[3] < 255);
+        let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+        image.has_alpha = has_alpha;
         for (o, p) in image.data.chunks_exact_mut(4).zip(buffer.pixels()) {
-            let [r, g, b, a] = p.0.map(u32::from);
-            if a < 255 {
-                flattened = true;
-            }
-            // Over white: c * a + 255 * (255 - a), rounded, divided by 255.
-            let over = |c: u32| ((c * a + 255 * (255 - a) + 127) / 255) as u16;
-            o[..3].copy_from_slice(&[over(r), over(g), over(b)]);
+            o.copy_from_slice(&p.0.map(u16::from));
         }
         images.push(image);
     }
     let options = heifer::EncodeOptions::new().with_quality(args.quality.unwrap_or(80));
-    let bytes =
-        heifer::encode_sequence(&images, &durations, &options).map_err(|e| e.to_string())?;
+    let (bytes, chosen_quality) = if let Some(max_bytes) = args.max_size {
+        let (b, q) = heifer::encode_sequence_to_size(&images, &durations, max_bytes, &options)
+            .map_err(|e| e.to_string())?;
+        (b, Some(q))
+    } else {
+        (
+            heifer::encode_sequence(&images, &durations, &options).map_err(|e| e.to_string())?,
+            None,
+        )
+    };
     std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
     let total: f64 = durations.iter().sum();
+    let quality_note = chosen_quality.map_or_else(String::new, |q| format!(", q={q}"));
     println!(
-        "{} → {} ({} frames {}×{}, {total:.2} s, {}, {:.2?})",
+        "{} → {} ({} frames {}×{}, {total:.2} s, {}{quality_note}, {:.2?})",
         input.display(),
         output.display(),
         images.len(),
@@ -326,9 +330,6 @@ fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String
         human(bytes.len() as u64),
         start.elapsed()
     );
-    if flattened {
-        println!("  transparent pixels were flattened onto white");
-    }
     Ok(())
 }
 
@@ -1474,6 +1475,63 @@ mod tests {
             let err = write_sequence(&still, &dir.join("b.heics"), &args).unwrap_err();
             assert!(err.contains("not an animation"), "{err}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transparent_animations_keep_alpha_and_max_size() {
+        use image::{Delay, Frame, RgbaImage};
+        let dir = temp_dir("heics-alpha");
+        let apng = dir.join("alpha.apng");
+        let (w, h) = (96u32, 64u32);
+        let mut frames = Vec::new();
+        for n in 0..4u8 {
+            let img = RgbaImage::from_fn(w, h, |x, y| {
+                let a = if x < w / 2 { 80 + n * 40 } else { 255 };
+                let r = (128.0 + 90.0 * (f64::from(x + u32::from(n) * 4) / 7.0).sin()) as u8;
+                let g = (128.0 + 90.0 * (f64::from(y + u32::from(n) * 3) / 5.0).cos()) as u8;
+                image::Rgba([r, g, ((x * 3 + y * 5) % 250) as u8, a])
+            });
+            frames.push(Frame::from_parts(
+                img,
+                0,
+                0,
+                Delay::from_numer_denom_ms(50, 1),
+            ));
+        }
+        {
+            let f = std::fs::File::create(&apng).unwrap();
+            let mut w_png = png::Encoder::new(f, w, h);
+            w_png.set_color(png::ColorType::Rgba);
+            w_png.set_depth(png::BitDepth::Eight);
+            w_png.set_animated(4, 0).unwrap();
+            w_png.set_frame_delay(50, 1000).unwrap();
+            let mut writer = w_png.write_header().unwrap();
+            for frame in &frames {
+                writer.write_image_data(frame.buffer().as_raw()).unwrap();
+            }
+        }
+        let out = dir.join("out.heics");
+        let args = parse("in out.heics -q 95").unwrap().unwrap();
+        write_sequence(&apng, &out, &args).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let decoded: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert!(decoded.iter().all(|img| img.has_alpha));
+        assert!(decoded[0].data[3] < 130);
+        assert_eq!(decoded[0].data[(w as usize / 2 * 4) + 3], 255);
+
+        let small = dir.join("small.heics");
+        let budget = bytes.len() * 3 / 4;
+        let args = Args {
+            max_size: Some(budget),
+            ..parse("in small.heics").unwrap().unwrap()
+        };
+        write_sequence(&apng, &small, &args).unwrap();
+        assert!(std::fs::read(&small).unwrap().len() <= budget);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
