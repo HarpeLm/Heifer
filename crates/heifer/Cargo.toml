@@ -70,6 +70,10 @@ required-features = ["encoder", "image"]
 name = "to_heic"
 required-features = ["encoder"]
 
+[[example]]
+name = "seqsize"
+required-features = ["encoder"]
+
 [lints]
 workspace = true
 
