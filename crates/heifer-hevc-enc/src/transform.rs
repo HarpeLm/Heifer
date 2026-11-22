@@ -24,6 +24,7 @@ const DCT16: [[i32; 16]; 16] = dct_matrix();
 
 /// Forward 2-D DCT of an `n`×`n` residual (`n` = 4..=32), row-major. The output has the scale
 /// that the decoder's inverse transform expects, as in the HM reference encoder.
+#[cfg(test)]
 pub fn forward_dct(residual: &[i32], log2_size: u8, out: &mut [i32]) {
     forward_transform(residual, log2_size, false, 8, out);
 }
@@ -45,11 +46,6 @@ pub fn forward_transform(
         4 => forward(residual, &DCT16, bd, out),
         _ => forward(residual, &DCT32, bd, out),
     }
-}
-
-/// Forward 4×4 DST-VII, used instead of the DCT for 4×4 intra luma blocks.
-pub fn forward_dst4(residual: &[i32], out: &mut [i32]) {
-    forward(residual, &DST4, 8, out);
 }
 
 /// Separable forward transform with `basis[frequency][position]`: columns first, then rows.
@@ -89,14 +85,9 @@ const QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 
 /// Quantizes transform coefficients in place for quantization parameter `qp` (0..=51), with a
 /// dead zone of 1/3 as usual for intra blocks. Returns whether any level is non-zero.
+#[cfg(test)]
 pub fn quantize(coeffs: &mut [i32], log2_size: u8, qp: i32) -> bool {
     quantize_levels(coeffs, log2_size, qp, 8, None)
-}
-
-/// Like [`quantize`], also giving the unrounded level of each coefficient (signed, in units of
-/// the quantization step) in `exact`, for rate-distortion refinements of the levels.
-pub fn quantize_exact(coeffs: &mut [i32], log2_size: u8, qp: i32, exact: &mut [f32]) -> bool {
-    quantize_levels(coeffs, log2_size, qp, 8, Some(exact))
 }
 
 /// Quantization of the coefficients of `bit_depth`-bit samples with `qp` = `Qp′`, the QP plus
