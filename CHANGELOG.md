@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+**Breaking**
+
+- `heifer::EncodeOptions` adds `speed: EncodeSpeed` (use `EncodeOptions::new()` and
+  `with_speed`, or `..Default::default()`).
+
+**New**
+
+- `encode_sequence_with_format` and `encode_sequence_to_size_with_format` support `Ycbcr422`,
+  `Ycbcr444` and `Lossless` (GBR + lossless inter `cu_transquant_bypass_flag`) image
+  sequences.
+- `EncodeSpeed` (`Fast`, `Medium`, `Slow`) / `heifer_hevc_enc::encoder::SpeedPreset` controls
+  motion search and partition/mode trials across still and sequence encoding.
+- Sequence encoding enables temporal motion vector prediction (`sps_temporal_mvp_enabled_flag` /
+  `slice_temporal_mvp_enabled_flag`), hierarchical referenced B-frames (`TrailR`) when
+  `b_frames >= 3`, and per-slice QP offsets (`+1` for P, `+2` for referenced B, `+3` for
+  non-referenced `TrailN` B-frames).
+- `benchmarks` gains a `sequence` subcommand to measure sequence encode/decode speed, size and
+  PSNR across presets and B-frame configurations.
+
 ## 0.6.0 — 2026-11-22
 
 Image sequences encode B-frames (`ctts`, GOP reordering, bi-prediction) and transparent alpha
