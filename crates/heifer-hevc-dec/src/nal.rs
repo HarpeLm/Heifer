@@ -88,7 +88,7 @@ impl NalHeader {
 pub struct NalUnit<'a> {
     /// Parsed header.
     pub header: NalHeader,
-    /// Payload after the 2-byte header, ready for [`crate::bitreader::BitReader`].
+    /// Payload after the 2-byte header (RBSP, emulation prevention bytes removed).
     pub rbsp: Cow<'a, [u8]>,
 }
 
