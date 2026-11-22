@@ -8,11 +8,15 @@
   private (deprecated since 0.5.1).
 - `heifer_isobmff::boxes::Property::ComponentDescriptions` parses `cmpd` directly in
   `HeifFile::properties` instead of leaving it as `Property::Unknown`.
-- `heifer::EncodeOptions` adds `keyframe_interval` (use `EncodeOptions::new()` and
-  `with_keyframe_interval`, or `..Default::default()`).
+- `heifer::EncodeOptions` adds `keyframe_interval` and `b_frames` (use `EncodeOptions::new()`
+  and `with_keyframe_interval` / `with_b_frames`, or `..Default::default()`).
 
 **New**
 
+- Image sequences encode B-frames (`SliceType::B` with L0/L1/bi-prediction motion search,
+  merge/skip and residuals) by default (`EncodeOptions::b_frames = 2`), with GOP reordering via
+  `heifer_hevc_enc::encoder::SequenceEncoder::{with_b_frames, push, flush}` and `ctts`
+  composition time offsets in `heifer_isobmff::writer::SequenceTrack::add_sample_with_offset`.
 - `encode_sequence` supports transparent frames (writing an auxiliary monochrome alpha track
   referenced by `auxl` with `auxi`), custom keyframe intervals via
   `EncodeOptions::with_keyframe_interval`, and size targets via `encode_sequence_to_size`.
