@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+**Breaking**
+
+- `heifer_hevc_dec::{bitreader, filters, refs, sei}` and `heifer_hevc_enc::transform` are now
+  private (deprecated since 0.5.1).
+- `heifer_isobmff::boxes::Property::ComponentDescriptions` parses `cmpd` directly in
+  `HeifFile::properties` instead of leaving it as `Property::Unknown`.
+- `heifer::EncodeOptions` adds `keyframe_interval` (use `EncodeOptions::new()` and
+  `with_keyframe_interval`, or `..Default::default()`).
+
+**New**
+
+- `encode_sequence` supports transparent frames (writing an auxiliary monochrome alpha track
+  referenced by `auxl` with `auxi`), custom keyframe intervals via
+  `EncodeOptions::with_keyframe_interval`, and size targets via `encode_sequence_to_size`.
+- `decode_sequence` and `decode_sequence_frame` decode auxiliary alpha sequence tracks (`auxl`)
+  and attach the alpha plane to each decoded frame.
+- `heifer_isobmff::writer::SequenceTrack::set_alpha` writes an auxiliary `auxv`/`auxl` alpha
+  track alongside the main sequence track, and `heifer_isobmff::track::Track::auxiliary_type`
+  parses `auxi`.
+- CLI: `.heics` output preserves transparency instead of flattening onto white and accepts
+  `-s` / `--max-size`.
+
+**Changed**
+
+- Encoder: `search_motion_rect` exits early when the partial SAD plus MVD penalty already
+  exceeds the best motion vector cost, speeding up sequence encoding with bit-identical output.
+
 ## 0.5.3 — 2026-11-22
 
 Image sequence encoding (`encode_sequence`, P pictures with motion search, merge residuals and
