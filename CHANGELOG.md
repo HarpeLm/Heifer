@@ -1,11 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 — 2026-11-22
 
-**Changed**
-
-- `heifer_hevc_dec::inter` is no longer deprecated: the encoder now uses its `Motion` type. It
-  stays internal and hidden from the documentation.
+Image sequence encoding (`encode_sequence`, P pictures with motion search, merge residuals and
+partitions, `.heics` CLI output) and parallel sequence decoding. No breaking change.
 
 **New**
 
@@ -32,6 +30,8 @@
 
 **Changed**
 
+- `heifer_hevc_dec::inter` is no longer deprecated: the encoder now uses its `Motion` type. It
+  stays internal and hidden from the documentation.
 - The SAO filter skips its per-sample checks inside CTBs: 6 to 10% faster on sequences,
   identical output.
 - Motion compensation copies reference blocks that cross the picture edge row by row instead
