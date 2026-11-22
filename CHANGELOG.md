@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-11-22
+
+Image sequences encode B-frames (`ctts`, GOP reordering, bi-prediction) and transparent alpha
+tracks (`auxi`/`auxl`), gain configurable keyframe intervals and byte-size budgets, and clean
+up deprecated internal APIs.
 
 **Breaking**
 
