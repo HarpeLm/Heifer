@@ -472,3 +472,108 @@ fn b_frames_preserve_variable_durations_and_reorder() {
         assert!(psnr > 34.0, "frame {idx} PSNR too low: {psnr:.1} dB");
     }
 }
+
+#[cfg(feature = "encoder")]
+#[test]
+fn ten_bit_b_frame_alpha_sequences_preserve_precision() {
+    // 5 frames of 10-bit RGBA with moving smooth gradient + transparency, using hierarchical
+    // B-frames (`b_frames = 3`) and an auxiliary alpha track.
+    let (w, h) = (64u32, 48u32);
+    let frames: Vec<heifer::Image> = (0..5u16)
+        .map(|n| {
+            let mut image = heifer::Image::filled(w, h, 10, [0, 0, 0, 1023]);
+            image.has_alpha = true;
+            for (i, p) in image.data.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (
+                    f64::from(i as u16 % w as u16),
+                    f64::from(i as u16 / w as u16),
+                );
+                let t = f64::from(n);
+                let r = (512.0 + 420.0 * ((x + t * 3.0) / 11.0).sin()).round() as u16;
+                let g = (512.0 + 420.0 * ((y + t * 2.0) / 9.0).cos()).round() as u16;
+                let b = (512.0 + 380.0 * ((x + y + t * 4.0) / 13.0).sin()).round() as u16;
+                let a = if (x as u16) < w as u16 / 2 {
+                    (((y as u16) * 1023) / (h as u16 - 1)).min(1023)
+                } else {
+                    1023
+                };
+                p.copy_from_slice(&[r, g, b, a]);
+            }
+            image
+        })
+        .collect();
+    let durations = vec![0.04; 5];
+    let options = heifer::EncodeOptions::new()
+        .with_quality(90)
+        .with_b_frames(3);
+    let bytes = heifer::encode_sequence(&frames, &durations, &options).unwrap();
+
+    let one: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let many: Vec<heifer::Image> =
+        heifer::decode_sequence_with_options(&bytes, &heifer::Options::new().with_max_threads(4))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    assert_eq!(one.len(), 5);
+    assert!(one == many);
+    for (idx, (orig, dec)) in frames.iter().zip(&one).enumerate() {
+        assert_eq!(dec.bit_depth, 10);
+        assert!(dec.has_alpha);
+        assert_eq!(heifer::decode_sequence_frame(&bytes, idx).unwrap(), *dec);
+        let mse: f64 = orig
+            .data
+            .iter()
+            .zip(&dec.data)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>()
+            / orig.data.len() as f64;
+        let psnr = 10.0 * (1023.0_f64.powi(2) / mse.max(1e-9)).log10();
+        assert!(psnr > 38.0, "10-bit frame {idx} PSNR too low: {psnr:.1} dB");
+    }
+}
+
+#[cfg(feature = "encoder")]
+#[test]
+fn sequence_formats_and_speed_presets_round_trip() {
+    let (w, h) = (48u32, 32u32);
+    let frames: Vec<heifer::Image> = (0..4u16)
+        .map(|n| {
+            let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+            image.has_alpha = true;
+            for (i, p) in image.data.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i as u16 % w as u16, i as u16 / w as u16);
+                p[0] = (x * 5 + n * 7) % 256;
+                p[1] = (y * 7 + n * 5) % 256;
+                p[2] = ((x ^ y) * 9 + n * 11) % 256;
+                p[3] = if x < 16 { 180 } else { 255 };
+            }
+            image
+        })
+        .collect();
+    let durations = [0.05; 4];
+    for (format, speed) in [
+        (heifer::EncodeFormat::Ycbcr422, heifer::EncodeSpeed::Fast),
+        (heifer::EncodeFormat::Ycbcr444, heifer::EncodeSpeed::Medium),
+        (heifer::EncodeFormat::Lossless, heifer::EncodeSpeed::Fast),
+    ] {
+        let opts = heifer::EncodeOptions::new()
+            .with_quality(88)
+            .with_speed(speed);
+        let bytes =
+            heifer::encode_sequence_with_format(&frames, &durations, format, &opts).unwrap();
+        let decoded: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(decoded.len(), 4);
+        if format == heifer::EncodeFormat::Lossless {
+            for (idx, (orig, dec)) in frames.iter().zip(&decoded).enumerate() {
+                assert_eq!(dec.data, orig.data, "lossless frame {idx} differed");
+            }
+        }
+    }
+}
