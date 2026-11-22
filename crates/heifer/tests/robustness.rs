@@ -162,13 +162,29 @@ fn option_constructors_match_the_defaults() {
         heifer::EncodeOptions::default(),
     );
     assert_eq!(
-        (o.quality, o.max_threads, o.keyframe_interval, o.b_frames),
-        (d.quality, d.max_threads, d.keyframe_interval, d.b_frames)
+        (
+            o.quality,
+            o.max_threads,
+            o.keyframe_interval,
+            o.b_frames,
+            o.speed
+        ),
+        (
+            d.quality,
+            d.max_threads,
+            d.keyframe_interval,
+            d.b_frames,
+            d.speed
+        )
     );
     let o = heifer::EncodeOptions::new()
         .with_keyframe_interval(12)
-        .with_b_frames(0);
-    assert_eq!((o.keyframe_interval, o.b_frames), (12, 0));
+        .with_b_frames(0)
+        .with_speed(heifer::EncodeSpeed::Fast);
+    assert_eq!(
+        (o.keyframe_interval, o.b_frames, o.speed),
+        (12, 0, heifer::EncodeSpeed::Fast)
+    );
     let (o, d) = (
         heifer::heifer_hevc_dec::decoder::DecodeOptions::new(),
         heifer::heifer_hevc_dec::decoder::DecodeOptions::default(),
