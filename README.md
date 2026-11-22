@@ -434,7 +434,6 @@ that may grow are `#[non_exhaustive]`.
 items re-exported at its root: `Frame`, `DecodeOptions`, `SequenceDecoder`, `access_units`, ...).
 The other modules of the two codec crates are hidden from the documentation: they are public only
 because heifer's own crates and fuzz targets share them, and they may change in any release.
-Modules marked `#[deprecated]` will become private in 0.6.
 
 Prefer the construction methods of the option structs to struct literals:
 `Options::new().with_max_threads(1)` keeps compiling when options are added, `Options { .. }`
