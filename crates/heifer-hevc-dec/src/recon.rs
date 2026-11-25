@@ -199,7 +199,6 @@ const fn odd_rows<const N: usize, const H: usize>() -> [[i32; H]; H] {
     m
 }
 
-const ODD4: [[i32; 2]; 2] = odd_rows::<4, 2>();
 const ODD8: [[i32; 4]; 4] = odd_rows::<8, 4>();
 const ODD16: [[i32; 8]; 8] = odd_rows::<16, 8>();
 const ODD32: [[i32; 16]; 16] = odd_rows::<32, 16>();
@@ -240,35 +239,57 @@ fn butterfly<const N: usize, const H: usize>(
 /// The even coefficients of `src` (`src[2i]`), and how many of them may be non-zero.
 #[inline]
 fn evens<const N: usize, const H: usize>(src: &[i32; N], terms: usize) -> ([i32; H], usize) {
+    let t = terms.min(N).div_ceil(2);
     let mut e = [0i32; H];
-    for (i, e) in e.iter_mut().enumerate() {
-        *e = src[2 * i];
+    for i in 0..t {
+        e[i] = src[2 * i];
     }
-    (e, terms.min(N).div_ceil(2))
+    (e, t)
 }
 
-fn idct2(src: &[i32; 2], terms: usize) -> [i32; 2] {
-    // DCT_2 = [[64, 64], [64, -64]].
-    let e = if terms > 0 { 64 * src[0] } else { 0 };
-    let o = if terms > 1 { 64 * src[1] } else { 0 };
-    [e + o, e - o]
-}
-
+#[inline]
 fn idct4(src: &[i32; 4], terms: usize) -> [i32; 4] {
-    let (e, t) = evens::<4, 2>(src, terms);
-    butterfly(&ODD4, idct2(&e, t), src, terms)
+    let s0 = if terms > 0 { src[0] } else { 0 };
+    let s1 = if terms > 1 { src[1] } else { 0 };
+    let s2 = if terms > 2 { src[2] } else { 0 };
+    let s3 = if terms > 3 { src[3] } else { 0 };
+    let (e0, e1) = (64 * (s0 + s2), 64 * (s0 - s2));
+    let (o0, o1) = (83 * s1 + 36 * s3, 36 * s1 - 83 * s3);
+    [e0 + o0, e1 + o1, e1 - o1, e0 - o0]
 }
 
+/// 4×4 inverse DST-VII by partial factorization (7 multiplications instead of 16).
+#[inline]
+fn idst4(src: &[i32; 4], terms: usize) -> [i32; 4] {
+    let a = if terms > 0 { src[0] } else { 0 };
+    let b = if terms > 1 { src[1] } else { 0 };
+    let c = if terms > 2 { src[2] } else { 0 };
+    let d = if terms > 3 { src[3] } else { 0 };
+    let c0 = a + c;
+    let c1 = c + d;
+    let c2 = a - d;
+    let c3 = 74 * b;
+    [
+        29 * c0 + 55 * c1 + c3,
+        55 * c2 - 29 * c1 + c3,
+        74 * (a - c + d),
+        55 * c0 + 29 * c2 - c3,
+    ]
+}
+
+#[inline]
 fn idct8(src: &[i32; 8], terms: usize) -> [i32; 8] {
     let (e, t) = evens::<8, 4>(src, terms);
     butterfly(&ODD8, idct4(&e, t), src, terms)
 }
 
+#[inline]
 fn idct16(src: &[i32; 16], terms: usize) -> [i32; 16] {
     let (e, t) = evens::<16, 8>(src, terms);
     butterfly(&ODD16, idct8(&e, t), src, terms)
 }
 
+#[inline]
 fn idct32(src: &[i32; 32], terms: usize) -> [i32; 32] {
     let (e, t) = evens::<32, 16>(src, terms);
     butterfly(&ODD32, idct16(&e, t), src, terms)
@@ -289,26 +310,31 @@ fn idct_1d<const N: usize>(src: &[i32; N], terms: usize) -> [i32; N] {
 }
 
 /// One 1-D stage of the inverse transform: the partial butterfly for the DCT (`FLAT_ROW`), the
-/// matrix product for the DST.
+/// fast DST-VII for 4×4 (`N = 4`) or matrix product for general sizes.
 #[inline]
 fn inverse_1d<const N: usize, const FLAT_ROW: bool>(
-    m: &[[i32; N]; N],
+    _m: &[[i32; N]; N],
     src: &[i32; N],
     terms: usize,
 ) -> [i32; N] {
     if FLAT_ROW {
         idct_1d::<N>(src, terms)
+    } else if N == 4 {
+        let mut out = [0i32; N];
+        out.copy_from_slice(&idst4(src[..].try_into().expect("N = 4"), terms));
+        out
     } else {
-        mul_1d::<N>(m, src, terms)
+        mul_1d::<N>(_m, src, terms)
     }
 }
 
 /// 2-D inverse transform (§8.6.4.2) of an `N`×`N` block of scaled coefficients `d` whose
-/// non-zero values all lie in the top-left `rows`×`cols` corner: a column pass with clipping
-/// to 16 bits, then a row pass shifted by `bd_shift`.
+/// non-zero values all lie in the top-left `rows`×`cols` corner: a column pass into `g` with
+/// clipping to 16 bits, then a row pass shifted by `bd_shift`.
 ///
 /// Both passes sum only over that rectangle, whose outside is never read: the parser already
-/// gives the tight bounds, so this is exact and cheaper than scanning.
+/// gives the tight bounds and `inverse_1d` ignores entries at or past `terms`, so `g` does not
+/// need to be pre-zeroed.
 ///
 /// With `FLAT_ROW` (the DCT, whose first basis row `m[0][i]` is constant) the one-row and
 /// one-column shapes are handled directly; the DST's first row is not flat, so it only uses
@@ -316,23 +342,25 @@ fn inverse_1d<const N: usize, const FLAT_ROW: bool>(
 fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
     m: &[[i32; N]; N],
     d: &[i32],
+    g: &mut [i32],
     rows: usize,
     cols: usize,
     bd_shift: i32,
     out: &mut [i32],
 ) {
     let b = &d[..N * N];
+    let g = &mut g[..N * N];
     let (rows, cols) = (rows.min(N), cols.min(N));
     let rnd = 1 << (bd_shift - 1);
     if FLAT_ROW && rows == 1 {
         // Only the first coefficient row is non-zero, so the column pass gives every row the
         // same values `m[0][0] * d[x]`; the row pass then produces one residual row, repeated
         // down the block.
-        let mut g = [0i32; N];
-        for (g, &c) in g.iter_mut().zip(b).take(cols) {
-            *g = ((m[0][0] * c + 64) >> 7).clamp(-32768, 32767);
+        let mut row_in = [0i32; N];
+        for (dst, &c) in row_in.iter_mut().zip(b).take(cols) {
+            *dst = ((m[0][0] * c + 64) >> 7).clamp(-32768, 32767);
         }
-        let mut row = inverse_1d::<N, FLAT_ROW>(m, &g, cols);
+        let mut row = inverse_1d::<N, FLAT_ROW>(m, &row_in, cols);
         for v in row.iter_mut() {
             *v = (*v + rnd) >> bd_shift;
         }
@@ -343,7 +371,6 @@ fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
     }
     // Column pass on the first `cols` columns (later columns have an all-zero source, so they
     // stay zero and the row pass never sums over them).
-    let mut g = [[0i32; N]; N];
     let mut col = [0i32; N];
     for x in 0..cols {
         for j in 0..rows {
@@ -351,20 +378,19 @@ fn inverse_2d<const N: usize, const FLAT_ROW: bool>(
         }
         let e = inverse_1d::<N, FLAT_ROW>(m, &col, rows);
         for y in 0..N {
-            g[y][x] = ((e[y] + 64) >> 7).clamp(-32768, 32767);
+            g[y * N + x] = ((e[y] + 64) >> 7).clamp(-32768, 32767);
         }
     }
     // Row pass: one row of `g` at a time.
-    for y in 0..N {
+    for (grow, o) in g.chunks_exact(N).zip(out.chunks_exact_mut(N)) {
         if FLAT_ROW && cols == 1 {
             // One column of `g` means every sample of the row is `m[0][i] * g[y][0]`.
-            out[y * N..y * N + N].fill((m[0][0] * g[y][0] + rnd) >> bd_shift);
+            o.fill((m[0][0] * grow[0] + rnd) >> bd_shift);
             continue;
         }
-        let r = inverse_1d::<N, FLAT_ROW>(m, &g[y], cols);
-        let o = &mut out[y * N..y * N + N];
-        for i in 0..N {
-            o[i] = (r[i] + rnd) >> bd_shift;
+        let r = inverse_1d::<N, FLAT_ROW>(m, grow.try_into().expect("N elements"), cols);
+        for (dst, &val) in o.iter_mut().zip(&r) {
+            *dst = (val + rnd) >> bd_shift;
         }
     }
 }
@@ -423,7 +449,7 @@ pub struct Reconstructor<'a> {
     /// Luma residual of the current transform unit, for cross-component prediction (4:4:4).
     luma_residual: Vec<i32>,
     /// Scratch buffers reused across transform blocks (prediction, residual, dequantized
-    /// coefficients), 32×32 each.
+    /// coefficients, and 2-D inverse transform intermediate column pass), 32×32 each.
     scratch: Vec<i32>,
     /// Information for the in-loop filters.
     filter_info: FilterInfo,
@@ -465,7 +491,7 @@ impl<'a> Reconstructor<'a> {
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
             luma_residual: vec![0; 32 * 32],
-            scratch: vec![0; 3 * 32 * 32],
+            scratch: vec![0; 4 * 32 * 32],
             refs: [Vec::new(), Vec::new()],
             weights: [None, None],
             inter_scratch: Vec::new(),
@@ -633,12 +659,17 @@ impl<'a> Reconstructor<'a> {
         }
     }
 
+    #[inline]
     fn mark_decoded(&mut self, x: u32, y: u32, w: u32, h: u32) {
         let h4 = self.decoded.len() / self.w4;
+        let x4 = x as usize >> 2;
+        let x4_end = ((x + w) as usize).div_ceil(4).min(self.w4);
+        if x4 >= x4_end {
+            return;
+        }
         for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(h4) {
-            for xx in (x as usize >> 2)..((x + w) as usize).div_ceil(4).min(self.w4) {
-                self.decoded[yy * self.w4 + xx] = self.slice_addr;
-            }
+            let row = yy * self.w4;
+            self.decoded[row + x4..row + x4_end].fill(self.slice_addr);
         }
     }
 
@@ -650,6 +681,7 @@ impl<'a> Reconstructor<'a> {
         self.available(x, y, xn, yn)
     }
 
+    #[inline]
     fn available(&self, x: u32, y: u32, xn: i64, yn: i64) -> bool {
         let (pw, ph) = (
             self.sps.pic_width_in_luma_samples,
@@ -723,7 +755,7 @@ impl<'a> Reconstructor<'a> {
         let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
         let plane = &self.frame.planes[c];
         let stride = self.frame.widths[c] as usize;
-        let (xl, yl) = (x0 * sw, y0 * sh);
+        let ph_c = self.frame.heights[c] as usize;
 
         // Reference samples: index 0 = p[-1][2n-1] (bottom of the left column) ... index 2n =
         // p[-1][-1] ... index 4n = p[2n-1][-1] (right end of the top row), as in the
@@ -736,47 +768,99 @@ impl<'a> Reconstructor<'a> {
         // Availability is decided per 4×4 luma block, i.e. per run of `unit_x` (`unit_y`)
         // samples of this component along the top row (left column).
         let (unit_x, unit_y) = ((4 / sw).max(1) as usize, (4 / sh).max(1) as usize);
-        let (sw64, sh64) = (i64::from(sw), i64::from(sh));
         let (x0u, y0u) = (x0 as usize, y0 as usize);
-        let available = |xc: i64, yc: i64| self.available(xl, yl, xc * sw64, yc * sh64);
-        // Left column, rows y0..y0+2n, stored from index 2n-1 downwards.
-        let mut k = 0;
-        while k < 2 * n {
-            let y = y0u + k;
-            let len = (unit_y - y % unit_y).min(2 * n - k);
-            if available(i64::from(x0) - 1, y as i64) {
-                for j in 0..len {
-                    refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
-                    avail[2 * n - 1 - k - j] = true;
+        if self.single_tile && x0u > 0 && y0u > 0 && x0u + 2 * n <= stride && y0u + 2 * n <= ph_c {
+            let mut all_avail = true;
+            let x4_left = ((x0u - 1) * sw as usize) >> 2;
+            let y4_above = ((y0u - 1) * sh as usize) >> 2;
+            let mut k = 0;
+            while k < 2 * n {
+                let y = y0u + k;
+                let len = (unit_y - y % unit_y).min(2 * n - k);
+                if self.decoded[((y * sh as usize) >> 2) * self.w4 + x4_left] == self.slice_addr {
+                    for j in 0..len {
+                        refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
+                        avail[2 * n - 1 - k - j] = true;
+                    }
+                    any = true;
+                } else {
+                    all_avail = false;
                 }
+                k += len;
+            }
+            if self.decoded[y4_above * self.w4 + x4_left] == self.slice_addr {
+                refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
+                avail[2 * n] = true;
+                any = true;
+            } else {
+                all_avail = false;
+            }
+            let mut k = 0;
+            while k < 2 * n {
+                let x = x0u + k;
+                let len = (unit_x - x % unit_x).min(2 * n - k);
+                if self.decoded[y4_above * self.w4 + ((x * sw as usize) >> 2)] == self.slice_addr {
+                    let row = (y0u - 1) * stride + x;
+                    for ((r, a), &v) in refs[2 * n + 1 + k..2 * n + 1 + k + len]
+                        .iter_mut()
+                        .zip(&mut avail[2 * n + 1 + k..])
+                        .zip(&plane[row..row + len])
+                    {
+                        *r = i32::from(v);
+                        *a = true;
+                    }
+                    any = true;
+                } else {
+                    all_avail = false;
+                }
+                k += len;
+            }
+            if all_avail {
+                return all_refs;
+            }
+        } else {
+            let (xl, yl) = (x0 * sw, y0 * sh);
+            let (sw64, sh64) = (i64::from(sw), i64::from(sh));
+            let available = |xc: i64, yc: i64| self.available(xl, yl, xc * sw64, yc * sh64);
+            // Left column, rows y0..y0+2n, stored from index 2n-1 downwards.
+            let mut k = 0;
+            while k < 2 * n {
+                let y = y0u + k;
+                let len = (unit_y - y % unit_y).min(2 * n - k);
+                if available(i64::from(x0) - 1, y as i64) {
+                    for j in 0..len {
+                        refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
+                        avail[2 * n - 1 - k - j] = true;
+                    }
+                    any = true;
+                }
+                k += len;
+            }
+            // Corner.
+            if available(i64::from(x0) - 1, i64::from(y0) - 1) {
+                refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
+                avail[2 * n] = true;
                 any = true;
             }
-            k += len;
-        }
-        // Corner.
-        if available(i64::from(x0) - 1, i64::from(y0) - 1) {
-            refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
-            avail[2 * n] = true;
-            any = true;
-        }
-        // Top row, columns x0..x0+2n, contiguous in the plane.
-        let mut k = 0;
-        while k < 2 * n {
-            let x = x0u + k;
-            let len = (unit_x - x % unit_x).min(2 * n - k);
-            if available(x as i64, i64::from(y0) - 1) {
-                let row = (y0u - 1) * stride + x;
-                for ((r, a), &v) in refs[2 * n + 1 + k..2 * n + 1 + k + len]
-                    .iter_mut()
-                    .zip(&mut avail[2 * n + 1 + k..])
-                    .zip(&plane[row..row + len])
-                {
-                    *r = i32::from(v);
-                    *a = true;
+            // Top row, columns x0..x0+2n, contiguous in the plane.
+            let mut k = 0;
+            while k < 2 * n {
+                let x = x0u + k;
+                let len = (unit_x - x % unit_x).min(2 * n - k);
+                if available(x as i64, i64::from(y0) - 1) {
+                    let row = (y0u - 1) * stride + x;
+                    for ((r, a), &v) in refs[2 * n + 1 + k..2 * n + 1 + k + len]
+                        .iter_mut()
+                        .zip(&mut avail[2 * n + 1 + k..])
+                        .zip(&plane[row..row + len])
+                    {
+                        *r = i32::from(v);
+                        *a = true;
+                    }
+                    any = true;
                 }
-                any = true;
+                k += len;
             }
-            k += len;
         }
         if !any {
             refs.fill(1 << (bit_depth - 1));
@@ -810,8 +894,8 @@ impl<'a> Reconstructor<'a> {
             && !(self.sps.range_extension.implicit_rdpcm_enabled_flag && transquant_bypass);
         let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
         let total = 4 * n + 1;
-        let mut copy = *all_refs;
-        let refs = &mut copy[..total];
+        let mut smoothed = [0i32; 4 * 32 + 1];
+        let mut refs: &[i32] = &all_refs[..total];
         // p[-1][y] = left(y), p[x][-1] = top(x), with -1 meaning the corner.
         let left = |r: &[i32], y: i32| r[(2 * n as i32 - 1 - y) as usize];
         let top = |r: &[i32], x: i32| r[(2 * n as i32 + 1 + x) as usize];
@@ -838,10 +922,11 @@ impl<'a> Reconstructor<'a> {
                         < (1 << (bit_depth - 5))
                     && (corner + left(refs, n2 - 1) - 2 * left(refs, n as i32 - 1)).abs()
                         < (1 << (bit_depth - 5));
-                let mut f = [0i32; 4 * 32 + 1];
-                let f = &mut f[..total];
-                f.copy_from_slice(refs);
+                let f = &mut smoothed[..total];
+                f[0] = refs[0];
+                f[total - 1] = refs[total - 1];
                 if bi_int {
+                    f[2 * n] = corner;
                     let (l63, t63) = (left(refs, 63), top(refs, 63));
                     for y in 0..63 {
                         f[(63 - y) as usize] = ((63 - y) * corner + (y + 1) * l63 + 32) >> 6;
@@ -854,7 +939,7 @@ impl<'a> Reconstructor<'a> {
                         f[i] = (refs[i - 1] + 2 * refs[i] + refs[i + 1] + 2) >> 2;
                     }
                 }
-                refs.copy_from_slice(f);
+                refs = &smoothed[..total];
             }
         }
 
@@ -865,18 +950,15 @@ impl<'a> Reconstructor<'a> {
             0 => {
                 // Planar.
                 let (tr, bl) = (top(refs, n_i), left(refs, n_i));
-                let tops: [i32; 32] = core::array::from_fn(|x| top(refs, (x as i32).min(n_i - 1)));
+                let tops = &refs[2 * n + 1..3 * n + 1];
                 for (y, row) in pred.chunks_exact_mut(n).enumerate() {
                     let y = y as i32;
                     let l = left(refs, y);
-                    for (x, (o, &t)) in row.iter_mut().zip(&tops).enumerate() {
-                        let x = x as i32;
-                        *o = ((n_i - 1 - x) * l
-                            + (x + 1) * tr
-                            + (n_i - 1 - y) * t
-                            + (y + 1) * bl
-                            + n_i)
-                            >> (log2n + 1);
+                    let row_base = (n_i - 1) * l + tr + (y + 1) * bl + n_i;
+                    let dl = tr - l;
+                    let ym = n_i - 1 - y;
+                    for (x, (o, &t)) in row.iter_mut().zip(tops).enumerate() {
+                        *o = (row_base + (x as i32) * dl + ym * t) >> (log2n + 1);
                     }
                 }
             }
@@ -895,48 +977,80 @@ impl<'a> Reconstructor<'a> {
                     }
                 }
             }
+            26 => {
+                let top_row = &refs[2 * n + 1..3 * n + 1];
+                for line in pred.chunks_exact_mut(n) {
+                    line.copy_from_slice(top_row);
+                }
+                if boundary_filters {
+                    let corner = refs[2 * n];
+                    let top0 = top_row[0];
+                    for y in 0..n {
+                        pred[y * n] = (top0 + ((refs[2 * n - 1 - y] - corner) >> 1)).clamp(0, max);
+                    }
+                }
+            }
+            10 => {
+                for (y, line) in pred.chunks_exact_mut(n).enumerate() {
+                    line.fill(refs[2 * n - 1 - y]);
+                }
+                if boundary_filters {
+                    let corner = refs[2 * n];
+                    let left0 = refs[2 * n - 1];
+                    let top_row = &refs[2 * n + 1..3 * n + 1];
+                    for (o, &t) in pred[..n].iter_mut().zip(top_row) {
+                        *o = (left0 + ((t - corner) >> 1)).clamp(0, max);
+                    }
+                }
+            }
             _ => {
                 let angle = INTRA_PRED_ANGLE[usize::from(mode) - 2];
                 let vertical = mode >= 18;
-                // ref[] with offset n so that negative indices are representable.
+                // ref[] with offset n so that negative indices are representable, or slice
+                // `refs[2*n..=4*n]` directly for vertical modes with non-negative angle.
                 let mut r = [0i32; 3 * 32 + 1];
-                let main = |i: i32| {
-                    if vertical {
-                        top(refs, i - 1)
-                    } else {
-                        left(refs, i - 1)
-                    }
-                };
-                let side = |i: i32| {
-                    if vertical {
-                        left(refs, i - 1)
-                    } else {
-                        top(refs, i - 1)
-                    }
-                };
-                for x in 0..=n_i {
-                    r[(x + n_i) as usize] = main(x);
-                }
-                if angle < 0 {
-                    let inv = INV_ANGLE[usize::from(mode) - 11];
-                    let last = (n_i * angle) >> 5;
-                    if last < -1 {
-                        for x in last..=-1 {
-                            r[(x + n_i) as usize] = side((x * inv + 128) >> 8);
-                        }
-                    }
+                let (ref_base, ref_slice): (usize, &[i32]) = if vertical && angle >= 0 {
+                    (2 * n, refs)
                 } else {
-                    for x in n_i + 1..=2 * n_i {
+                    let main = |i: i32| {
+                        if vertical {
+                            top(refs, i - 1)
+                        } else {
+                            left(refs, i - 1)
+                        }
+                    };
+                    let side = |i: i32| {
+                        if vertical {
+                            left(refs, i - 1)
+                        } else {
+                            top(refs, i - 1)
+                        }
+                    };
+                    for x in 0..=n_i {
                         r[(x + n_i) as usize] = main(x);
                     }
-                }
+                    if angle < 0 {
+                        let inv = INV_ANGLE[usize::from(mode) - 11];
+                        let last = (n_i * angle) >> 5;
+                        if last < -1 {
+                            for x in last..=-1 {
+                                r[(x + n_i) as usize] = side((x * inv + 128) >> 8);
+                            }
+                        }
+                    } else {
+                        for x in n_i + 1..=2 * n_i {
+                            r[(x + n_i) as usize] = main(x);
+                        }
+                    }
+                    (n, &r)
+                };
                 // j runs along the prediction direction: rows for vertical modes. Rows are
                 // computed contiguously (vectorizable), then transposed for horizontal modes.
                 for (j, line) in pred.chunks_exact_mut(n).enumerate() {
                     let j = j as i32;
                     let idx = ((j + 1) * angle) >> 5;
                     let fact = ((j + 1) * angle) & 31;
-                    let src = &r[(idx + 1 + n_i) as usize..];
+                    let src = &ref_slice[(idx + 1 + ref_base as i32) as usize..];
                     if fact == 0 {
                         line.copy_from_slice(&src[..n]);
                     } else {
@@ -949,20 +1063,6 @@ impl<'a> Reconstructor<'a> {
                     for y in 0..n {
                         for x in y + 1..n {
                             pred.swap(y * n + x, x * n + y);
-                        }
-                    }
-                }
-                if boundary_filters {
-                    let corner = refs[2 * n];
-                    if mode == 26 {
-                        for y in 0..n_i {
-                            pred[(y * n_i) as usize] =
-                                (top(refs, 0) + ((left(refs, y) - corner) >> 1)).clamp(0, max);
-                        }
-                    } else if mode == 10 {
-                        for x in 0..n_i {
-                            pred[x as usize] =
-                                (left(refs, 0) + ((top(refs, x) - corner) >> 1)).clamp(0, max);
                         }
                     }
                 }
@@ -1029,8 +1129,15 @@ impl<'a> Reconstructor<'a> {
     }
 
     /// Computes the residual of a block from its coefficients (§8.6.2 to §8.6.4).
-    /// `d` is a scratch buffer of at least `n * n` values.
-    fn residual(&self, tb: &TransformBlock<'_>, coeffs: &[i32], out: &mut [i32], d: &mut [i32]) {
+    /// `d` and `g_buf` are scratch buffers of at least `n * n` values.
+    fn residual(
+        &self,
+        tb: &TransformBlock<'_>,
+        coeffs: &[i32],
+        out: &mut [i32],
+        d: &mut [i32],
+        g_buf: &mut [i32],
+    ) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
         if tb.transquant_bypass {
@@ -1100,28 +1207,47 @@ impl<'a> Reconstructor<'a> {
         let d = &mut d[..n * n];
         let rnd = 1i64 << (bd_shift - 1);
         let flat_factor = 16 * scale;
-        for (y, (src, dst)) in coeffs
-            .chunks_exact(n)
-            .zip(d.chunks_exact_mut(n))
-            .take(rows)
-            .enumerate()
-        {
-            dst[cols..width].fill(0);
-            for (x, (&level, o)) in src[..cols].iter().zip(&mut dst[..cols]).enumerate() {
-                let factor = if flat {
-                    flat_factor
-                } else {
-                    i64::from(Self::scaling_factor(
-                        list.unwrap(),
+        if flat {
+            if flat_factor <= 65000 {
+                let ff = flat_factor as i32;
+                let rnd32 = rnd as i32;
+                for (src, dst) in coeffs.chunks_exact(n).zip(d.chunks_exact_mut(n)).take(rows) {
+                    dst[cols..width].fill(0);
+                    for (&level, o) in src[..cols].iter().zip(&mut dst[..cols]) {
+                        *o = ((level * ff + rnd32) >> bd_shift).clamp(-32768, 32767);
+                    }
+                }
+            } else {
+                for (src, dst) in coeffs.chunks_exact(n).zip(d.chunks_exact_mut(n)).take(rows) {
+                    dst[cols..width].fill(0);
+                    for (&level, o) in src[..cols].iter().zip(&mut dst[..cols]) {
+                        *o = ((i64::from(level) * flat_factor + rnd) >> bd_shift)
+                            .clamp(-32768, 32767) as i32;
+                    }
+                }
+            }
+        } else {
+            let scaling_list = list.unwrap();
+            for (y, (src, dst)) in coeffs
+                .chunks_exact(n)
+                .zip(d.chunks_exact_mut(n))
+                .take(rows)
+                .enumerate()
+            {
+                dst[cols..width].fill(0);
+                for (x, (&level, o)) in src[..cols].iter().zip(&mut dst[..cols]).enumerate() {
+                    let factor = i64::from(Self::scaling_factor(
+                        scaling_list,
                         tb.log2_size,
                         matrix_id,
                         x,
                         y,
-                    )) * scale
-                };
-                // A zero level scales to `rnd >> bd_shift`, which is zero for every `bd_shift`
-                // in range, so no special case is needed here.
-                *o = ((i64::from(level) * factor + rnd) >> bd_shift).clamp(-32768, 32767) as i32;
+                    )) * scale;
+                    // A zero level scales to `rnd >> bd_shift`, which is zero for every `bd_shift`
+                    // in range, so no special case is needed here.
+                    *o =
+                        ((i64::from(level) * factor + rnd) >> bd_shift).clamp(-32768, 32767) as i32;
+                }
             }
         }
 
@@ -1146,11 +1272,11 @@ impl<'a> Reconstructor<'a> {
         }
         let out = &mut out[..n * n];
         match n {
-            4 if dst => inverse_2d::<4, false>(&DST4, d, rows, cols, bd_shift2, out),
-            4 => inverse_2d::<4, true>(&DCT4, d, rows, cols, bd_shift2, out),
-            8 => inverse_2d::<8, true>(&DCT8, d, rows, cols, bd_shift2, out),
-            16 => inverse_2d::<16, true>(&DCT16, d, rows, cols, bd_shift2, out),
-            _ => inverse_2d::<32, true>(&DCT32, d, rows, cols, bd_shift2, out),
+            4 if dst => inverse_2d::<4, false>(&DST4, d, g_buf, rows, cols, bd_shift2, out),
+            4 => inverse_2d::<4, true>(&DCT4, d, g_buf, rows, cols, bd_shift2, out),
+            8 => inverse_2d::<8, true>(&DCT8, d, g_buf, rows, cols, bd_shift2, out),
+            16 => inverse_2d::<16, true>(&DCT16, d, g_buf, rows, cols, bd_shift2, out),
+            _ => inverse_2d::<32, true>(&DCT32, d, g_buf, rows, cols, bd_shift2, out),
         }
     }
 
@@ -1166,10 +1292,46 @@ impl<'a> Reconstructor<'a> {
     fn transform_block_impl(&mut self, tb: &TransformBlock<'_>, prediction: Option<&[i32]>) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
+        let ccp = self
+            .pps
+            .range_extension
+            .cross_component_prediction_enabled_flag;
+        if tb.coeffs.is_none() && (c == 0 || tb.res_scale_val == 0) {
+            if c == 0 && ccp {
+                self.luma_residual[..n * n].fill(0);
+            }
+            if !(tb.inter && prediction.is_none()) {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                let pred = &mut scratch[..n * n];
+                match prediction {
+                    Some(p) => pred.copy_from_slice(&p[..n * n]),
+                    None => {
+                        self.predict(c, tb.x, tb.y, n, tb.intra_mode, tb.transquant_bypass, pred)
+                    }
+                }
+                let max = (1i32 << self.frame.bit_depth[usize::from(c > 0)]) - 1;
+                let stride = self.frame.widths[c] as usize;
+                let plane = &mut self.frame.planes[c];
+                for (y, p) in pred.chunks_exact(n).enumerate() {
+                    let row = (tb.y as usize + y) * stride + tb.x as usize;
+                    for (o, &p) in plane[row..row + n].iter_mut().zip(p) {
+                        *o = p.clamp(0, max) as u16;
+                    }
+                }
+                self.scratch = scratch;
+            }
+            if c == 0 {
+                if !(tb.inter && self.pps.constrained_intra_pred_flag) {
+                    self.mark_decoded(tb.x, tb.y, n as u32, n as u32);
+                }
+                self.mark_edges(tb.x, tb.y, n as u32, n as u32);
+            }
+            return;
+        }
         let mut scratch = std::mem::take(&mut self.scratch);
         let (pred, rest) = scratch.split_at_mut(32 * 32);
         let (residual, rest) = rest.split_at_mut(32 * 32);
-        let d = &mut rest[..32 * 32];
+        let (d, g_buf) = rest.split_at_mut(32 * 32);
         let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
         match prediction {
             Some(p) => pred.copy_from_slice(&p[..n * n]),
@@ -1187,16 +1349,11 @@ impl<'a> Reconstructor<'a> {
         }
 
         if let Some(coeffs) = tb.coeffs {
-            self.residual(tb, coeffs, residual, d);
+            self.residual(tb, coeffs, residual, d, g_buf);
         } else {
             residual.fill(0);
         }
-        if c == 0
-            && self
-                .pps
-                .range_extension
-                .cross_component_prediction_enabled_flag
-        {
+        if c == 0 && ccp {
             self.luma_residual[..n * n].copy_from_slice(residual);
         }
         if c > 0 && tb.res_scale_val != 0 {
@@ -1231,9 +1388,12 @@ impl<'a> Reconstructor<'a> {
             self.mark_edges(tb.x, tb.y, n as u32, n as u32);
             if tb.coeffs.is_some() {
                 let info = &mut self.filter_info;
-                for yy in (tb.y as usize >> 2)..((tb.y as usize + n).div_ceil(4)).min(info.h4) {
-                    for xx in (tb.x as usize >> 2)..((tb.x as usize + n).div_ceil(4)).min(info.w4) {
-                        info.coded[yy * info.w4 + xx] = true;
+                let x4 = tb.x as usize >> 2;
+                let x4_end = (tb.x as usize + n).div_ceil(4).min(info.w4);
+                if x4 < x4_end {
+                    for yy in (tb.y as usize >> 2)..((tb.y as usize + n).div_ceil(4)).min(info.h4) {
+                        let row = yy * info.w4;
+                        info.coded[row + x4..row + x4_end].fill(true);
                     }
                 }
             }
@@ -1422,13 +1582,33 @@ impl Sink for Reconstructor<'_> {
             || (cu.pcm && self.sps.pcm.is_some_and(|p| p.loop_filter_disabled_flag));
         let slice = (self.filter_info.slices.len().max(1) - 1) as u16;
         let info = &mut self.filter_info;
-        for yy in (cu.y as usize >> 2)..((cu.y + size) as usize).div_ceil(4).min(info.h4) {
-            for xx in (cu.x as usize >> 2)..((cu.x + size) as usize).div_ceil(4).min(info.w4) {
-                let i = yy * info.w4 + xx;
-                info.qp_y[i] = cu.qp_y as i8;
-                info.intra[i] = intra;
-                info.no_filter[i] = no_filter;
-                info.slice[i] = slice;
+        let x4 = cu.x as usize >> 2;
+        let x4_end = ((cu.x + size) as usize).div_ceil(4).min(info.w4);
+        if x4 >= x4_end {
+            return;
+        }
+        let y4_end = ((cu.y + size) as usize).div_ceil(4).min(info.h4);
+        let qp = cu.qp_y as i8;
+        for yy in (cu.y as usize >> 2)..y4_end {
+            let range = yy * info.w4 + x4..yy * info.w4 + x4_end;
+            info.qp_y[range].fill(qp);
+        }
+        if !intra {
+            for yy in (cu.y as usize >> 2)..y4_end {
+                let range = yy * info.w4 + x4..yy * info.w4 + x4_end;
+                info.intra[range].fill(false);
+            }
+        }
+        if no_filter {
+            for yy in (cu.y as usize >> 2)..y4_end {
+                let range = yy * info.w4 + x4..yy * info.w4 + x4_end;
+                info.no_filter[range].fill(true);
+            }
+        }
+        if slice != 0 {
+            for yy in (cu.y as usize >> 2)..y4_end {
+                let range = yy * info.w4 + x4..yy * info.w4 + x4_end;
+                info.slice[range].fill(slice);
             }
         }
     }
@@ -1491,6 +1671,31 @@ mod tests {
         check::<8>(&DCT8);
         check::<16>(&DCT16);
         check::<32>(&DCT32);
+    }
+
+    #[test]
+    fn fast_dst4_and_unzeroed_scratch_match_matrix_product() {
+        let mut seed = 0x517c_c1b7_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..2000 {
+            let src: [i32; 4] = core::array::from_fn(|_| i32::from(next() as i16));
+            for terms in 0..=4 {
+                assert_eq!(idst4(&src, terms), mul_1d::<4>(&DST4, &src, terms));
+            }
+        }
+        let d: Vec<i32> = (0..64).map(|_| i32::from(next() as i16)).collect();
+        let mut zero_g = vec![0i32; 64];
+        let mut dirty_g = vec![0x1234_5678_i32; 64];
+        let mut out_clean = vec![0i32; 64];
+        let mut out_dirty = vec![0i32; 64];
+        inverse_2d::<8, true>(&DCT8, &d, &mut zero_g, 3, 5, 12, &mut out_clean);
+        inverse_2d::<8, true>(&DCT8, &d, &mut dirty_g, 3, 5, 12, &mut out_dirty);
+        assert_eq!(out_clean, out_dirty);
     }
 
     use crate::scan::{ScanType, scan_order};
