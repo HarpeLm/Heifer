@@ -32,29 +32,6 @@ impl ChromaTerms {
             }
         }
     }
-
-    /// Sets this row to `terms` at twice the width, stopping at column `last` of `terms`.
-    fn widen(&mut self, terms: &Self, last: usize) {
-        for (out, t) in [
-            (&mut self.r, &terms.r),
-            (&mut self.g, &terms.g),
-            (&mut self.b, &terms.b),
-        ] {
-            widen_row(&t[..=last], out);
-        }
-    }
-}
-
-fn widen_row(terms: &[i32], out: &mut [i32]) {
-    let pairs = out.chunks_exact_mut(2).zip(terms).zip(&terms[1..]);
-    for ((pair, &a), &b) in pairs {
-        pair[0] = a;
-        pair[1] = (a + b + 1) >> 1;
-    }
-    let done = (terms.len() - 1).min(out.len() / 2) * 2;
-    for (x, o) in out.iter_mut().enumerate().skip(done) {
-        *o = terms[(x / 2).min(terms.len() - 1)];
-    }
 }
 
 /// How to interpret YCbCr samples.
@@ -134,6 +111,9 @@ pub fn frame_to_rgba_into<S: Sample>(
 ) {
     let (w, h) = (frame.widths[0] as usize, frame.heights[0] as usize);
     let (width, height) = (width.min(w), height.min(h));
+    if width == 0 || height == 0 {
+        return;
+    }
     let bd_y = frame.bit_depth[0];
     let bd_c = frame.bit_depth[1];
     let out_depth = S::depth(bd_y.max(bd_c));
@@ -174,17 +154,6 @@ pub fn frame_to_rgba_into<S: Sample>(
     };
     let c_mid = f64::from(1u32 << (bd_c - 1));
     let cwu = cw as usize;
-    let xcs: Vec<usize> = (0..width as u32)
-        .map(|x| (x / sx).min(cw - 1) as usize)
-        .collect();
-    let chroma_rows = |y: usize| {
-        let yc = (y as u32 / sy).min(chh - 1) as usize;
-        (
-            yc,
-            &frame.planes[1][yc * cwu..(yc + 1) * cwu],
-            &frame.planes[2][yc * cwu..(yc + 1) * cwu],
-        )
-    };
 
     if params.matrix != 0 {
         // Fixed point with FRAC fractional bits. Every step is a plain loop over a row, with the
@@ -219,10 +188,11 @@ pub fn frame_to_rgba_into<S: Sample>(
         };
         let last_row = (height.saturating_sub(1) / sy as usize).min(chh as usize - 1);
         let last_column = (width.saturating_sub(1) / sx as usize).min(cwu - 1);
-        // Terms of the chroma rows above and below the current luma row, of the luma row at
-        // chroma width, and of its pixels.
+        let pair_count = last_column.min(width / 2);
+        let done = pair_count * 2;
+        // Terms of the chroma rows above and below the current luma row.
         let (mut above, mut below) = (ChromaTerms::new(cwu), ChromaTerms::new(cwu));
-        let (mut blended, mut line) = (ChromaTerms::new(cwu), ChromaTerms::new(width));
+        let mut blended = ChromaTerms::new(cwu);
         let mut loaded = (usize::MAX, usize::MAX);
         for (y, out_row) in rows {
             // Vertically: chroma rows sit on even luma rows (4:2:0); odd rows are in between.
@@ -250,31 +220,70 @@ pub fn frame_to_rgba_into<S: Sample>(
                 blended.average(&above, &below);
                 &blended
             };
-            // Horizontally: chroma samples on even columns, odd columns in between.
-            let pixels = if sx == 2 {
-                line.widen(terms, last_column);
-                &line
+            let luma = luma_row(y);
+            if sx == 2 {
+                // Fuse horizontal chroma widening directly into pixel conversion (2 pixels per chroma step).
+                let pairs = out_row[..done * 4]
+                    .chunks_exact_mut(8)
+                    .zip(luma[..done].chunks_exact(2))
+                    .zip(terms.r[..=last_column].windows(2))
+                    .zip(terms.g[..=last_column].windows(2))
+                    .zip(terms.b[..=last_column].windows(2));
+                for ((((px, lv), tr), tg), tb) in pairs {
+                    let yf0 = y_mul * (i32::from(lv[0]) - y_base);
+                    let yf1 = y_mul * (i32::from(lv[1]) - y_base);
+                    px[0] = to_out(yf0 + tr[0]);
+                    px[1] = to_out(yf0 - tg[0]);
+                    px[2] = to_out(yf0 + tb[0]);
+                    px[3] = alpha;
+                    px[4] = to_out(yf1 + ((tr[0] + tr[1] + 1) >> 1));
+                    px[5] = to_out(yf1 - ((tg[0] + tg[1] + 1) >> 1));
+                    px[6] = to_out(yf1 + ((tb[0] + tb[1] + 1) >> 1));
+                    px[7] = alpha;
+                }
+                for (dx, (px, &yv)) in out_row[done * 4..width * 4]
+                    .chunks_exact_mut(4)
+                    .zip(&luma[done..])
+                    .enumerate()
+                {
+                    let xc = ((done + dx) / 2).min(last_column);
+                    let yf = y_mul * (i32::from(yv) - y_base);
+                    px[0] = to_out(yf + terms.r[xc]);
+                    px[1] = to_out(yf - terms.g[xc]);
+                    px[2] = to_out(yf + terms.b[xc]);
+                    px[3] = alpha;
+                }
             } else {
-                terms
-            };
-            let columns = out_row[..width * 4]
-                .chunks_exact_mut(4)
-                .zip(luma_row(y))
-                .zip(&pixels.r)
-                .zip(&pixels.g)
-                .zip(&pixels.b);
-            for ((((px, &yv), &r), &g), &b) in columns {
-                let yf = y_mul * (i32::from(yv) - y_base);
-                px[0] = to_out(yf + r);
-                px[1] = to_out(yf - g);
-                px[2] = to_out(yf + b);
-                px[3] = alpha;
+                let columns = out_row[..width * 4]
+                    .chunks_exact_mut(4)
+                    .zip(luma)
+                    .zip(&terms.r)
+                    .zip(&terms.g)
+                    .zip(&terms.b);
+                for ((((px, &yv), &r), &g), &b) in columns {
+                    let yf = y_mul * (i32::from(yv) - y_base);
+                    px[0] = to_out(yf + r);
+                    px[1] = to_out(yf - g);
+                    px[2] = to_out(yf + b);
+                    px[3] = alpha;
+                }
             }
         }
         return;
     }
 
     // Identity matrix: planes are G, B, R.
+    let xcs: Vec<usize> = (0..width as u32)
+        .map(|x| (x / sx).min(cw - 1) as usize)
+        .collect();
+    let chroma_rows = |y: usize| {
+        let yc = (y as u32 / sy).min(chh - 1) as usize;
+        (
+            yc,
+            &frame.planes[1][yc * cwu..(yc + 1) * cwu],
+            &frame.planes[2][yc * cwu..(yc + 1) * cwu],
+        )
+    };
     let s = max_out / f64::from((1u32 << bd_y) - 1);
     let to_out = |v: f64| S::from_u16((v * s).round().clamp(0.0, max_out) as u16);
     for (y, out_row) in rows {
