@@ -86,8 +86,12 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 
 ### 1. Single-thread hot loops
 
-Multi-threaded decoding is already faster than libheif, but one thread is slower than ffmpeg on
-large grids. Optimise the per-tile and colour-conversion loops without adding `unsafe`.
+Multi-threaded decoding is already faster than libheif. A 100% safe-Rust pass across CABAC,
+residual parsing, transforms/intra prediction, deblocking/SAO, inter interpolation and
+YCbCr→RGBA conversion cut single-thread decode time by 13–21% (12 MP iPhone `134.7 → 114.9 ms`,
+beating single-thread `heic-rs` at `117.0` vs `129.2 ms` median; 5 MP Xiaomi `91.6 → 74.9 ms`;
+48 MP `792 → 685 ms`; 114 conformance streams / 7115 pictures bit-exact). One thread on large
+grids still trails ffmpeg and remains a target for further gains without `unsafe`.
 
 ### 2. More encoding knobs
 
