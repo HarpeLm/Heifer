@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use heifer::image_crate::HeifEncoder;
-use heifer::{EncodeFormat, EncodeOptions};
+use heifer::{EncodeFormat, EncodeOptions, EncodeSpeed};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
@@ -19,31 +19,36 @@ heifer: convert HEIC/HEIF photos, in pure Rust
 
 Usage:
   heifer <input> <output> [-q <quality>]        convert one file
+  heifer <frames>... <out.heics> [--fps <n>]     encode images as a HEIF sequence
   heifer <inputs>... --to <format> [-o <dir>] [-q <quality>]
                                                  convert many files
   heifer info <files>...                         show size and metadata
 
-The formats come from the file extensions: heic (or heif), png, jpg, webp, tiff, bmp, gif.
+The formats come from the file extensions: heic (or heif, heics), png, jpg, webp, tiff, bmp, gif.
 EXIF and ICC profiles are kept, and photos are written upright.
 
 Options:
-  -q, --quality <0-100>  quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
-      --format <mode>    HEIC coding: 420 (default), 422, 444 or lossless
-      --lossless         same as --format lossless
-  -s, --max-size <size>  HEIC no larger than this (e.g. 500K, 2M): the quality is chosen
-      --aux              also write every auxiliary image as PNG
-      --depth            also write the depth map as PNG
-      --gain-map         also write the HDR gain map as PNG
-      --frames           write every frame of an image sequence (burst, animation) instead
-                         of the main image: out.png gives out-001.png, out-002.png, ...;
-                         out.gif or out.apng gives one animated file
-                         A .heics output writes an animated GIF, APNG or HEIF sequence as a
-                         HEIF image sequence
-  -t, --to <format>      output format when converting several files
-  -o, --out-dir <dir>    output folder (default: next to each input)
-  -f, --force            overwrite existing files
-  -h, --help             show this help
-  -V, --version          show the version
+  -q, --quality <0-100>       quality of HEIC and JPEG output (default: 80 for HEIC, 90 for JPEG)
+      --format <mode>         HEIC/HEICS coding: 420 (default), 422, 444 or lossless
+      --lossless              same as --format lossless
+      --speed <preset>        HEIC/HEICS speed preset: fast, medium (default) or slow
+      --keyframe-interval <n> max frames between keyframes in .heics sequences (default: 30)
+      --b-frames <n>          max consecutive B-frames in .heics sequences (default: 2)
+      --fps <n>               frame rate for .heics sequences from still images (default: 25)
+  -s, --max-size <size>       HEIC/HEICS no larger than this (e.g. 500K, 2M): chooses quality
+      --aux                   also write every auxiliary image as PNG
+      --depth                 also write the depth map as PNG
+      --gain-map              also write the HDR gain map as PNG
+      --frames                write every frame of an image sequence (burst, animation) instead
+                              of the main image: out.png gives out-001.png, out-002.png, ...;
+                              out.gif or out.apng gives one animated file
+                              A .heics output writes an animated GIF, APNG, HEIF sequence or
+                              multiple input images as a HEIF image sequence
+  -t, --to <format>           output format when converting several files
+  -o, --out-dir <dir>         output folder (default: next to each input)
+  -f, --force                 overwrite existing files
+  -h, --help                  show this help
+  -V, --version               show the version
 
 Auxiliary images are written next to the output, for example photo.depth.png.
 
@@ -54,7 +59,8 @@ Examples:
   heifer *.HEIC --to jpg -o converted --gain-map
   heifer burst.heics frames.png --frames
   heifer burst.heics burst.gif --frames
-  heifer animation.gif animation.heics -q 70
+  heifer frame_*.png burst.heics --fps 30 --speed fast
+  heifer animation.gif animation.heics -q 70 --b-frames 3
   heifer screenshot.png screenshot.heic -q 70
   heifer screenshot.png screenshot.heic --lossless
   heifer info IMG_1234.heic";
@@ -71,6 +77,10 @@ struct Args {
     /// `--max-size`: largest HEIC file, in bytes.
     max_size: Option<usize>,
     format: Option<EncodeFormat>,
+    speed: Option<EncodeSpeed>,
+    keyframe_interval: Option<usize>,
+    b_frames: Option<usize>,
+    fps: Option<f64>,
     aux: bool,
     depth: bool,
     gain_map: bool,
@@ -117,6 +127,17 @@ fn parse_format(name: &str) -> Result<EncodeFormat, String> {
     }
 }
 
+fn parse_speed(name: &str) -> Result<EncodeSpeed, String> {
+    match name.to_lowercase().as_str() {
+        "fast" => Ok(EncodeSpeed::Fast),
+        "medium" | "default" => Ok(EncodeSpeed::Medium),
+        "slow" => Ok(EncodeSpeed::Slow),
+        _ => Err(format!(
+            "unknown speed preset `{name}`: use fast, medium or slow"
+        )),
+    }
+}
+
 /// Records the coding mode, rejecting a `--format` and a `--lossless` that disagree.
 fn set_format(args: &mut Args, format: EncodeFormat) -> Result<(), String> {
     match args.format {
@@ -158,6 +179,35 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
                 set_format(&mut args, format)?;
             }
             "--lossless" => set_format(&mut args, EncodeFormat::Lossless)?,
+            "--speed" => args.speed = Some(parse_speed(&value(&arg)?)?),
+            "--keyframe-interval" => {
+                let raw_val = value(&arg)?;
+                args.keyframe_interval = Some(
+                    raw_val
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .ok_or(format!(
+                            "keyframe interval must be at least 1, not `{raw_val}`"
+                        ))?,
+                );
+            }
+            "--b-frames" => {
+                let raw_val = value(&arg)?;
+                args.b_frames = Some(raw_val.parse::<usize>().map_err(|_| {
+                    format!("b-frames must be a non-negative integer, not `{raw_val}`")
+                })?);
+            }
+            "--fps" => {
+                let raw_val = value(&arg)?;
+                args.fps = Some(
+                    raw_val
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|&f| f.is_finite() && f > 0.0)
+                        .ok_or(format!("fps must be a positive number, not `{raw_val}`"))?,
+                );
+            }
             "--aux" => args.aux = true,
             "--depth" => args.depth = true,
             "--gain-map" => args.gain_map = true,
@@ -171,7 +221,11 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Option<Args>, Str
     if positional.first().is_some_and(|p| p.as_os_str() == "info") {
         positional.remove(0);
         args.info = true;
-    } else if args.to.is_none() && args.out_dir.is_none() && positional.len() == 2 {
+    } else if args.to.is_none()
+        && args.out_dir.is_none()
+        && (positional.len() == 2
+            || (positional.len() > 2 && positional.last().is_some_and(|p| is_heics(p))))
+    {
         args.output = positional.pop();
     } else if args.to.is_none() && !positional.is_empty() {
         return Err("give an output file, or `--to <format>` for several files".into());
@@ -196,6 +250,19 @@ fn main() -> ExitCode {
         }
     };
     heifer::image_crate::register_image_decoder_hooks();
+
+    if !args.info
+        && !args.frames
+        && args.inputs.len() > 1
+        && let Some(out) = args.output.as_deref().filter(|o| is_heics(o))
+    {
+        let refs: Vec<&Path> = args.inputs.iter().map(PathBuf::as_path).collect();
+        if let Err(e) = write_sequence_paths(&refs, out, &args) {
+            eprintln!("{}: {e}", out.display());
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let mut failed = 0;
     for input in &args.inputs {
@@ -277,11 +344,72 @@ fn animation_frames(input: &Path) -> Result<Vec<image::Frame>, String> {
     frames.map_err(|e| e.to_string())
 }
 
+/// Builds [`EncodeOptions`] from command-line flags.
+fn encode_options(args: &Args, quality: u8) -> EncodeOptions {
+    let mut options = EncodeOptions::new().with_quality(quality);
+    if let Some(speed) = args.speed {
+        options = options.with_speed(speed);
+    }
+    if let Some(interval) = args.keyframe_interval {
+        options = options.with_keyframe_interval(interval);
+    }
+    if let Some(b_frames) = args.b_frames {
+        options = options.with_b_frames(b_frames);
+    }
+    options
+}
+
+/// Converts a decoded `DynamicImage` into a 8-bit or 10-bit `heifer::Image`.
+fn dynamic_to_heifer_image(image: &DynamicImage) -> heifer::Image {
+    use image::ColorType;
+    let is_16 = matches!(
+        image.color(),
+        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16
+    );
+    if is_16 {
+        let buf = image.to_rgba16();
+        let (w, h) = buf.dimensions();
+        let has_alpha = buf.pixels().any(|p| p.0[3] < u16::MAX);
+        let mut out = heifer::Image::filled(w, h, 10, [0, 0, 0, 1023]);
+        out.has_alpha = has_alpha;
+        for (o, p) in out.data.chunks_exact_mut(4).zip(buf.pixels()) {
+            o.copy_from_slice(&p.0.map(|v| (u32::from(v) * 1023 / 65535) as u16));
+        }
+        out
+    } else {
+        let buf = image.to_rgba8();
+        let (w, h) = buf.dimensions();
+        let has_alpha = buf.pixels().any(|p| p.0[3] < 255);
+        let mut out = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+        out.has_alpha = has_alpha;
+        for (o, p) in out.data.chunks_exact_mut(4).zip(buf.pixels()) {
+            o.copy_from_slice(&p.0.map(u16::from));
+        }
+        out
+    }
+}
+
 /// A `.heics` output: the frames of an animated input, each with its duration, as a HEIF image
 /// sequence.
 fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
-    if args.format.is_some() || args.wants_aux() {
-        return Err("a .heics output takes only -q or -s among the HEIC options".into());
+    write_sequence_paths(&[input], output, args)
+}
+
+/// Encodes one animated input or a sequence of still image files into a `.heics` file.
+fn write_sequence_paths(inputs: &[&Path], output: &Path, args: &Args) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("no input frames given for .heics sequence".into());
+    }
+    if args.wants_aux() {
+        return Err("auxiliary options (--aux, --depth, --gain-map) do not apply to .heics".into());
+    }
+    if args.max_size.is_some() {
+        if args.quality.is_some() {
+            return Err("--max-size chooses the quality: do not give -q as well".into());
+        }
+        if args.format == Some(EncodeFormat::Lossless) {
+            return Err("--max-size does not apply to lossless coding".into());
+        }
     }
     if output.exists() && !args.force {
         return Err(format!(
@@ -290,39 +418,62 @@ fn write_sequence(input: &Path, output: &Path, args: &Args) -> Result<(), String
         ));
     }
     let start = Instant::now();
-    let frames = animation_frames(input)?;
-    let mut images = Vec::with_capacity(frames.len());
-    let mut durations = Vec::with_capacity(frames.len());
-    for frame in &frames {
-        let (numer, denom) = frame.delay().numer_denom_ms();
-        durations.push(f64::from(numer) / f64::from(denom.max(1)) / 1000.0);
-        let buffer = frame.buffer();
-        let (w, h) = buffer.dimensions();
-        let has_alpha = buffer.pixels().any(|p| p.0[3] < 255);
-        let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
-        image.has_alpha = has_alpha;
-        for (o, p) in image.data.chunks_exact_mut(4).zip(buffer.pixels()) {
-            o.copy_from_slice(&p.0.map(u16::from));
+    let (images, durations): (Vec<heifer::Image>, Vec<f64>) = if inputs.len() == 1 {
+        let frames = animation_frames(inputs[0])?;
+        let mut images = Vec::with_capacity(frames.len());
+        let mut durations = Vec::with_capacity(frames.len());
+        let override_dur = args.fps.map(|fps| 1.0 / fps);
+        for frame in &frames {
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let dur =
+                override_dur.unwrap_or_else(|| f64::from(numer) / f64::from(denom.max(1)) / 1000.0);
+            durations.push(dur);
+            let buffer = frame.buffer();
+            let (w, h) = buffer.dimensions();
+            let has_alpha = buffer.pixels().any(|p| p.0[3] < 255);
+            let mut image = heifer::Image::filled(w, h, 8, [0, 0, 0, 255]);
+            image.has_alpha = has_alpha;
+            for (o, p) in image.data.chunks_exact_mut(4).zip(buffer.pixels()) {
+                o.copy_from_slice(&p.0.map(u16::from));
+            }
+            images.push(image);
         }
-        images.push(image);
-    }
-    let options = heifer::EncodeOptions::new().with_quality(args.quality.unwrap_or(80));
+        (images, durations)
+    } else {
+        let dur = 1.0 / args.fps.unwrap_or(25.0);
+        let mut images = Vec::with_capacity(inputs.len());
+        for &path in inputs {
+            let (dyn_img, _, _) = read(path)?;
+            images.push(dynamic_to_heifer_image(&dyn_img));
+        }
+        let durations = vec![dur; images.len()];
+        (images, durations)
+    };
+    let format = args.format.unwrap_or_default();
+    let options = encode_options(args, args.quality.unwrap_or(80));
     let (bytes, chosen_quality) = if let Some(max_bytes) = args.max_size {
-        let (b, q) = heifer::encode_sequence_to_size(&images, &durations, max_bytes, &options)
-            .map_err(|e| e.to_string())?;
+        let (b, q) = heifer::encode_sequence_to_size_with_format(
+            &images, &durations, format, max_bytes, &options,
+        )
+        .map_err(|e| e.to_string())?;
         (b, Some(q))
     } else {
         (
-            heifer::encode_sequence(&images, &durations, &options).map_err(|e| e.to_string())?,
+            heifer::encode_sequence_with_format(&images, &durations, format, &options)
+                .map_err(|e| e.to_string())?,
             None,
         )
     };
     std::fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
     let total: f64 = durations.iter().sum();
     let quality_note = chosen_quality.map_or_else(String::new, |q| format!(", q={q}"));
+    let label = if inputs.len() == 1 {
+        inputs[0].display().to_string()
+    } else {
+        format!("{} files", inputs.len())
+    };
     println!(
-        "{} → {} ({} frames {}×{}, {total:.2} s, {}{quality_note}, {:.2?})",
-        input.display(),
+        "{label} → {} ({} frames {}×{}, {total:.2} s, {}{quality_note}, {:.2?})",
         output.display(),
         images.len(),
         images.first().map_or(0, |i| i.width),
@@ -360,14 +511,24 @@ fn read(input: &Path) -> Result<Decoded, String> {
     Ok((image, icc, exif))
 }
 
-/// Rejects a HEIC coding mode when the output is not a HEIC file.
+/// Rejects HEIC/HEICS options when the output format does not support them.
 fn check_heic_only(args: &Args, output: &Path) -> Result<(), String> {
+    if !is_heics(output)
+        && (args.keyframe_interval.is_some() || args.b_frames.is_some() || args.fps.is_some())
+    {
+        return Err(
+            "--keyframe-interval, --b-frames and --fps only apply to .heics sequence output".into(),
+        );
+    }
     if !is_heif(output) && args.format.is_some() {
-        return Err("the HEIC coding mode only applies to HEIC output".into());
+        return Err("the HEIC coding mode only applies to HEIC/HEICS output".into());
+    }
+    if !is_heif(output) && args.speed.is_some() {
+        return Err("--speed only applies to HEIC/HEICS output".into());
     }
     if args.max_size.is_some() {
         if !is_heif(output) {
-            return Err("--max-size only applies to HEIC output".into());
+            return Err("--max-size only applies to HEIC/HEICS output".into());
         }
         if args.quality.is_some() {
             return Err("--max-size chooses the quality: do not give -q as well".into());
@@ -424,7 +585,7 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
             let max = args.max_size.expect("checked");
             let encode = |quality: u8| -> Result<Vec<u8>, String> {
                 let mut bytes = Vec::new();
-                let options = EncodeOptions::new().with_quality(quality);
+                let options = encode_options(args, quality);
                 let heif = args.format.unwrap_or_default();
                 write(
                     HeifEncoder::with_format(&mut bytes, options, heif),
@@ -446,7 +607,7 @@ fn convert(input: &Path, output: &Path, args: &Args) -> Result<(), String> {
             }
         }
         None => {
-            let options = EncodeOptions::new().with_quality(args.quality.unwrap_or(80));
+            let options = encode_options(args, args.quality.unwrap_or(80));
             write(
                 HeifEncoder::with_format(&mut writer, options, args.format.unwrap_or_default()),
                 &image,
@@ -1532,6 +1693,103 @@ mod tests {
         };
         write_sequence(&apng, &small, &args).unwrap();
         assert!(std::fs::read(&small).unwrap().len() <= budget);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sequence_cli_options_parse_and_validate() {
+        let a = parse("f1.png f2.png f3.png out.heics --speed fast --keyframe-interval 12 --b-frames 3 --fps 30 --format 444")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.inputs,
+            [
+                PathBuf::from("f1.png"),
+                PathBuf::from("f2.png"),
+                PathBuf::from("f3.png")
+            ]
+        );
+        assert_eq!(a.output, Some(PathBuf::from("out.heics")));
+        assert_eq!(a.speed, Some(EncodeSpeed::Fast));
+        assert_eq!(a.keyframe_interval, Some(12));
+        assert_eq!(a.b_frames, Some(3));
+        assert_eq!(a.fps, Some(30.0));
+        assert_eq!(a.format, Some(EncodeFormat::Ycbcr444));
+
+        assert!(parse("a.png b.png out.heics --speed turbo").is_err());
+        assert!(parse("a.png b.png out.heics --keyframe-interval 0").is_err());
+        assert!(parse("a.png b.png out.heics --b-frames -1").is_err());
+        assert!(parse("a.png b.png out.heics --fps 0").is_err());
+        assert!(parse("a.png b.png out.heic").is_err());
+        assert!(check_heic_only(&a, Path::new("out.heic")).is_err());
+        let speed_only = parse("a.png b.jpg --speed slow").unwrap().unwrap();
+        assert!(check_heic_only(&speed_only, Path::new("b.jpg")).is_err());
+    }
+
+    #[test]
+    fn still_images_combine_into_heics_with_formats_and_options() {
+        use image::{ImageBuffer, Rgb, RgbImage};
+        let dir = temp_dir("heics-multi");
+        let (w, h) = (48u32, 32u32);
+        let mut paths = Vec::new();
+        let mut expected_rgb = Vec::new();
+        for n in 0..4u8 {
+            let p = dir.join(format!("frame-{n}.png"));
+            let img: RgbImage = ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([
+                    ((x * 5 + u32::from(n) * 9) % 256) as u8,
+                    ((y * 7 + u32::from(n) * 6) % 256) as u8,
+                    (((x ^ y) * 11) % 256) as u8,
+                ])
+            });
+            img.save(&p).unwrap();
+            expected_rgb.push(img.into_raw());
+            paths.push(p);
+        }
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+
+        // Lossless 4:4:4 GBR with hierarchical options and custom FPS / keyframe interval.
+        let out_lossless = dir.join("lossless.heics");
+        let args = parse(
+            "a b out.heics --lossless --speed fast --keyframe-interval 2 --b-frames 0 --fps 20",
+        )
+        .unwrap()
+        .unwrap();
+        write_sequence_paths(&refs, &out_lossless, &args).unwrap();
+        let bytes = std::fs::read(&out_lossless).unwrap();
+        let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+        assert_eq!(seq.frames.len(), 4);
+        assert!(seq.frames.iter().all(|f| (f.duration - 0.05).abs() < 1e-3));
+        assert_eq!(
+            (0..4)
+                .filter(|&i| seq.frames[i].keyframe)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        let decoded: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (idx, (exp, dec)) in expected_rgb.iter().zip(&decoded).enumerate() {
+            let rgb: Vec<u8> = dec
+                .to_rgba8()
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            assert_eq!(&rgb, exp, "lossless multi-input frame {idx} differed");
+        }
+
+        // Lossy 4:2:2 with B-frames works too.
+        let out_422 = dir.join("y422.heics");
+        let args_422 = parse("a b out.heics --format 422 --b-frames 3 --speed medium -q 85")
+            .unwrap()
+            .unwrap();
+        write_sequence_paths(&refs, &out_422, &args_422).unwrap();
+        let seq_422 = heifer::read_sequence(&std::fs::read(&out_422).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq_422.frames.len(), 4);
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
