@@ -20,6 +20,9 @@
   non-referenced `TrailN` B-frames).
 - `benchmarks` gains a `sequence` subcommand to measure sequence encode/decode speed, size and
   PSNR across presets and B-frame configurations.
+- CLI: `--speed <fast|medium|slow>`, `--keyframe-interval <n>`, `--b-frames <n>`, `--fps <n>`,
+  `--format 422|444|lossless` on `.heics`, and combining multiple input image files into a single
+  `.heics` sequence (`heifer frames/*.png out.heics`).
 
 ## 0.6.0 — 2026-11-22
 
