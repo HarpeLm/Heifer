@@ -18,12 +18,17 @@ heifer portrait.heic portrait.png --aux       # every auxiliary image as PNG
 heifer burst.heics frames.png --frames        # frames-001.png, frames-002.png, ...
 heifer burst.heics burst.gif --frames         # one animated GIF (or .apng)
 heifer animation.gif animation.heics -q 70     # a GIF, APNG or HEIF sequence as .heics
+heifer frame_*.png burst.heics --fps 24 --b-frames 3 --speed fast   # PNG/JPG frames -> .heics
 heifer info IMG_1234.heic                     # size, tiles, camera, auxiliary images, metadata
 ```
 
-- `--format 420|444|lossless` picks the HEIC coding: 4:2:0 by default, 4:4:4 for graphics and
-  text, or lossless (4:4:4 GBR, no quantization, so 8-bit input decodes unchanged). `--lossless`
-  is a shortcut, and `-q` has no effect on lossless output.
+- `--format 420|422|444|lossless` picks the HEIC or `.heics` coding: 4:2:0 by default, 4:2:2
+  (half width) or 4:4:4 for graphics and text, or lossless (4:4:4 GBR, no quantization, so 8-bit
+  input decodes unchanged). `--lossless` is a shortcut, and `-q` has no effect on lossless
+  output.
+- `--speed fast|medium|slow` selects the speed/compression preset for HEIC and `.heics` output.
+- `--keyframe-interval <n>`, `--b-frames <n>` and `--fps <n>` control `.heics` sequence GOP
+  structure and timing (with `--b-frames >= 3` enabling hierarchical B-frames).
 
 - `--aux` writes every auxiliary image next to the output as PNG: `photo.depth.png`,
   `photo.gain-map.png`, `photo.alpha.png`, and `photo.aux-<id>.png` for other refinements.
