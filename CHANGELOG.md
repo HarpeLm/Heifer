@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-11-25
+
+Video sequence encoder upgrades (TMVP, per-slice QP offsets, hierarchical B-frames,
+4:2:2/4:4:4/lossless & 10-bit formats, `EncodeSpeed`/`SpeedPreset`), `ctts` v0 + `edts`/`elst`
+timing alignment, full `.heics` CLI support, sequence benchmarks, and sequence fuzzing.
 
 **Breaking**
 
