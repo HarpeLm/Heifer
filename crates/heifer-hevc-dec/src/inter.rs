@@ -173,11 +173,14 @@ impl MotionField {
     /// Sets the motion of a luma area.
     pub fn fill(&mut self, x: u32, y: u32, w: u32, h: u32, m: ColMotion) {
         let h4 = self.blocks.len() / self.w4;
+        let x4 = x as usize >> 2;
+        let x4_end = ((x + w) as usize).div_ceil(4).min(self.w4);
+        if x4 >= x4_end {
+            return;
+        }
         for yy in (y as usize >> 2)..((y + h) as usize).div_ceil(4).min(h4) {
             let row = yy * self.w4;
-            for xx in (x as usize >> 2)..((x + w) as usize).div_ceil(4).min(self.w4) {
-                self.blocks[row + xx] = m;
-            }
+            self.blocks[row + x4..row + x4_end].fill(m);
         }
     }
 
@@ -360,7 +363,12 @@ pub fn merge(
     };
     let (a1, b1, b0, a0, b2) = (a1_flag, b1_flag, b0_flag, a0_flag, b2_flag);
 
-    let mut list: Vec<Motion> = [a1, b1, b0, a0, b2].into_iter().flatten().collect();
+    let mut list = [Motion::NONE; 16];
+    let mut list_len = 0usize;
+    for m in [a1, b1, b0, a0, b2].into_iter().flatten() {
+        list[list_len] = m;
+        list_len += 1;
+    }
     let is_b = num_ref_idx[1] > 0;
     // 8×4 and 4×8 blocks are not bi-predicted: their candidate keeps only RefPicList0
     // (8-161), using the size of the block itself, not of the shared 8×8 list.
@@ -374,7 +382,7 @@ pub fn merge(
             m
         }
     };
-    if list.len() > merge_idx {
+    if list_len > merge_idx {
         return restrict(list[merge_idx]);
     }
     // Temporal candidate, reference index 0 of each list (§8.5.3.2.2 step 4).
@@ -386,30 +394,35 @@ pub fn merge(
         }
     }
     if col.is_inter() {
-        list.push(col);
+        list[list_len] = col;
+        list_len += 1;
     }
     // Combined bi-predictive candidates (§8.5.3.2.4): L0 motion of one candidate with the L1
     // motion of another, in the order of Table 8-7.
-    let num_orig = list.len();
+    let num_orig = list_len;
     if is_b && num_orig > 1 && num_orig < max_num_merge_cand {
         const L0: [usize; 12] = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3];
         const L1: [usize; 12] = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2];
-        for comb in 0..num_orig * (num_orig - 1) {
+        for comb in 0..(num_orig * (num_orig - 1)).min(L0.len()) {
             let (c0, c1) = (list[L0[comb]], list[L1[comb]]);
             if c0.uses(0)
                 && c1.uses(1)
                 && (refs.poc_of(0, c0.ref_idx[0]) != refs.poc_of(1, c1.ref_idx[1])
                     || c0.mv[0] != c1.mv[1])
             {
-                list.push(Motion {
+                list[list_len] = Motion {
                     mv: [c0.mv[0], c1.mv[1]],
                     ref_idx: [c0.ref_idx[0], c1.ref_idx[1]],
-                });
-                if list.len() == max_num_merge_cand {
+                };
+                list_len += 1;
+                if list_len == max_num_merge_cand || list_len == list.len() {
                     break;
                 }
             }
         }
+    }
+    if merge_idx < list_len {
+        return restrict(list[merge_idx]);
     }
     // Zero candidates (§8.5.3.2.5), on both lists in B slices.
     let num_zero_ref = if is_b {
@@ -417,16 +430,12 @@ pub fn merge(
     } else {
         num_ref_idx[0]
     };
-    let mut zero_idx = 0;
-    while list.len() < max_num_merge_cand.max(merge_idx + 1) {
-        let r = if zero_idx < num_zero_ref { zero_idx } else { 0 } as i8;
-        list.push(Motion {
-            mv: [[0; 2]; 2],
-            ref_idx: [r, if is_b { r } else { -1 }],
-        });
-        zero_idx += 1;
-    }
-    restrict(list[merge_idx])
+    let zero_idx = merge_idx - list_len;
+    let r = if zero_idx < num_zero_ref { zero_idx } else { 0 } as i8;
+    restrict(Motion {
+        mv: [[0; 2]; 2],
+        ref_idx: [r, if is_b { r } else { -1 }],
+    })
 }
 
 /// Luma motion vector prediction (§8.5.3.2.6): the two candidates of `mvpListLX` for a
@@ -489,20 +498,24 @@ pub fn amvp(
         mv_b = b.iter().flatten().find_map(scaled);
     }
 
-    let mut candidates: Vec<Mv> = Vec::with_capacity(3);
-    candidates.extend(mv_a);
+    let mut candidates = [[0i16; 2]; 2];
+    let mut count = 0usize;
+    if let Some(a) = mv_a {
+        candidates[0] = a;
+        count = 1;
+    }
     if let Some(b) = mv_b
         && mv_a != Some(b)
     {
-        candidates.push(b);
+        candidates[count] = b;
+        count += 1;
     }
-    if candidates.len() < 2
+    if count < 2
         && let Some(col) = temporal(refs, g, ref_idx, list)
     {
-        candidates.push(col);
+        candidates[count] = col;
     }
-    candidates.resize(2, [0; 2]);
-    [candidates[0], candidates[1]]
+    candidates
 }
 
 /// Luma interpolation filter coefficients `fL` (Table 8-11), by fractional position.
@@ -524,6 +537,136 @@ const CHROMA_FILTER: [[i32; 4]; 8] = [
     [-2, 16, 54, -4],
     [-2, 10, 58, -2],
 ];
+
+/// Core interpolation over a buffer already valid for all `sw × sh` source positions.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn interpolate_block<const TAPS: usize>(
+    src: &[u16],
+    src_stride: usize,
+    sw: usize,
+    sh: usize,
+    b: usize,
+    fx: usize,
+    fy: usize,
+    w: usize,
+    h: usize,
+    shift1: i32,
+    shift3: i32,
+    filters: &[[i32; TAPS]],
+    out: &mut [i32],
+) {
+    let row = |r: usize| &src[r * src_stride..r * src_stride + sw];
+    let (cx, cy) = (&filters[fx], &filters[fy]);
+    let horizontal = |row: &[u16], out: &mut [i32]| {
+        for (o, taps) in out.iter_mut().zip(row.windows(TAPS)) {
+            let mut s = 0i32;
+            for i in 0..TAPS {
+                s += cx[i] * i32::from(taps[i]);
+            }
+            *o = s >> shift1;
+        }
+    };
+    match (fx, fy) {
+        (0, 0) => {
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                for (o, &v) in out.iter_mut().zip(&row(yy + b)[b..b + w]) {
+                    *o = i32::from(v) << shift3;
+                }
+            }
+        }
+        (_, 0) => {
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                horizontal(row(yy + b), out);
+            }
+        }
+        (0, _) => {
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                out.fill(0);
+                for (t, &c) in cy.iter().enumerate() {
+                    if c == 0 {
+                        continue;
+                    }
+                    for (o, &v) in out.iter_mut().zip(&row(yy + t)[b..b + w]) {
+                        *o += c * i32::from(v);
+                    }
+                }
+                for o in out.iter_mut() {
+                    *o >>= shift1;
+                }
+            }
+        }
+        _ => {
+            // Horizontal pass over the rows the vertical filter needs, then vertical pass.
+            let mut tmp = [0i32; 64 * (64 + 7)];
+            let tmp = &mut tmp[..sh * w];
+            for (r, t) in tmp.chunks_exact_mut(w).enumerate() {
+                horizontal(row(r), t);
+            }
+            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
+                out.fill(0);
+                for (t, &c) in cy.iter().enumerate() {
+                    if c == 0 {
+                        continue;
+                    }
+                    for (o, &v) in out.iter_mut().zip(&tmp[(yy + t) * w..(yy + t + 1) * w]) {
+                        *o += c * v;
+                    }
+                }
+                for o in out.iter_mut() {
+                    *o >>= 6;
+                }
+            }
+        }
+    }
+}
+
+/// Boundary fallback for [`interpolate`]: copies and clamps edge samples into a stack buffer
+/// (falling back to heap only if larger than a 64×64 CTU).
+#[allow(clippy::too_many_arguments)]
+#[cold]
+fn interpolate_clamped<const TAPS: usize>(
+    plane: &[u16],
+    stride: usize,
+    plane_h: usize,
+    x0: i64,
+    y0: i64,
+    sw: usize,
+    sh: usize,
+    b: usize,
+    fx: usize,
+    fy: usize,
+    w: usize,
+    h: usize,
+    shift1: i32,
+    shift3: i32,
+    filters: &[[i32; TAPS]],
+    out: &mut [i32],
+) {
+    let (max_x, max_y) = (stride as i64 - 1, plane_h as i64 - 1);
+    let inside_x = x0 >= 0 && x0 as usize + sw <= stride;
+    let mut stack_buf = [0u16; (64 + 7) * (64 + 7)];
+    let mut heap_buf;
+    let buf: &mut [u16] = if sw * sh <= stack_buf.len() {
+        &mut stack_buf[..sw * sh]
+    } else {
+        heap_buf = vec![0u16; sw * sh];
+        &mut heap_buf
+    };
+    for (r, dst) in buf.chunks_exact_mut(sw).enumerate() {
+        let line = &plane[(y0 + r as i64).clamp(0, max_y) as usize * stride..][..stride];
+        if inside_x {
+            dst.copy_from_slice(&line[x0 as usize..x0 as usize + sw]);
+        } else {
+            for (c, o) in dst.iter_mut().enumerate() {
+                *o = line[(x0 + c as i64).clamp(0, max_x) as usize];
+            }
+        }
+    }
+    interpolate_block::<TAPS>(
+        buf, sw, sw, sh, b, fx, fy, w, h, shift1, shift3, filters, out,
+    );
+}
 
 /// Fractional sample interpolation of one block (§8.5.3.3.3) at 14-bit intermediate
 /// precision, into `out` (`w * h` values, row-major).
@@ -554,82 +697,42 @@ fn interpolate<const TAPS: usize>(
     // coordinates clamped to the plane, as the spec does.
     let (sw, sh) = (w + TAPS - 1, h + TAPS - 1);
     let (x0, y0) = (xi - before, yi - before);
-    let padded: Vec<u16>;
-    let (src, src_stride) =
-        if x0 >= 0 && y0 >= 0 && x0 as usize + sw <= stride && y0 as usize + sh <= plane_h {
-            (&plane[y0 as usize * stride + x0 as usize..], stride)
-        } else {
-            let (max_x, max_y) = (stride as i64 - 1, plane_h as i64 - 1);
-            // Row by row: a plain copy when the row lies inside horizontally, clamped
-            // samples otherwise (only the columns past an edge need it, but this case is rare).
-            let inside_x = x0 >= 0 && x0 as usize + sw <= stride;
-            let mut copy = Vec::with_capacity(sw * sh);
-            for r in 0..sh as i64 {
-                let line = &plane[(y0 + r).clamp(0, max_y) as usize * stride..][..stride];
-                if inside_x {
-                    copy.extend_from_slice(&line[x0 as usize..x0 as usize + sw]);
-                } else {
-                    copy.extend((0..sw as i64).map(|c| line[(x0 + c).clamp(0, max_x) as usize]));
-                }
-            }
-            padded = copy;
-            (&padded[..], sw)
-        };
-    let b = before as usize;
-    let row = |r: usize| &src[r * src_stride..r * src_stride + sw];
-    let (cx, cy) = (&filters[fx], &filters[fy]);
-    let horizontal = |row: &[u16], out: &mut [i32]| {
-        for (xx, o) in out.iter_mut().enumerate() {
-            let taps = &row[xx..xx + TAPS];
-            let s: i32 = cx.iter().zip(taps).map(|(&c, &v)| c * i32::from(v)).sum();
-            *o = s >> shift1;
-        }
-    };
-    match (fx, fy) {
-        (0, 0) => {
-            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
-                for (o, &v) in out.iter_mut().zip(&row(yy + b)[b..b + w]) {
-                    *o = i32::from(v) << shift3;
-                }
-            }
-        }
-        (_, 0) => {
-            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
-                horizontal(row(yy + b), out);
-            }
-        }
-        (0, _) => {
-            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
-                out.fill(0);
-                for (t, &c) in cy.iter().enumerate() {
-                    for (o, &v) in out.iter_mut().zip(&row(yy + t)[b..b + w]) {
-                        *o += c * i32::from(v);
-                    }
-                }
-                for o in out.iter_mut() {
-                    *o >>= shift1;
-                }
-            }
-        }
-        _ => {
-            // Horizontal pass over the rows the vertical filter needs, then vertical pass.
-            let mut tmp = [0i32; 64 * (64 + 7)];
-            let tmp = &mut tmp[..sh * w];
-            for (r, t) in tmp.chunks_exact_mut(w).enumerate() {
-                horizontal(row(r), t);
-            }
-            for (yy, out) in out.chunks_exact_mut(w).take(h).enumerate() {
-                out.fill(0);
-                for (t, &c) in cy.iter().enumerate() {
-                    for (o, &v) in out.iter_mut().zip(&tmp[(yy + t) * w..(yy + t + 1) * w]) {
-                        *o += c * v;
-                    }
-                }
-                for o in out.iter_mut() {
-                    *o >>= 6;
-                }
-            }
-        }
+    if x0 >= 0 && y0 >= 0 && x0 as usize + sw <= stride && y0 as usize + sh <= plane_h {
+        let src = &plane[y0 as usize * stride + x0 as usize..];
+        interpolate_block::<TAPS>(
+            src,
+            stride,
+            sw,
+            sh,
+            before as usize,
+            fx,
+            fy,
+            w,
+            h,
+            shift1,
+            shift3,
+            filters,
+            out,
+        );
+    } else {
+        interpolate_clamped::<TAPS>(
+            plane,
+            stride,
+            plane_h,
+            x0,
+            y0,
+            sw,
+            sh,
+            before as usize,
+            fx,
+            fy,
+            w,
+            h,
+            shift1,
+            shift3,
+            filters,
+            out,
+        );
     }
 }
 
