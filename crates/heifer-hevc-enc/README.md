@@ -1,7 +1,8 @@
 # heifer-hevc-enc
 
-Pure-Rust HEVC (H.265) intra encoder for still images: Main and Main 10 profiles, 8 to 10 bits,
-4:2:0 or monochrome,
+Pure-Rust HEVC (H.265) encoder for still images and image sequences: Main, Main 10 and Range
+Extensions profiles, 8 to 10 bits, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 / lossless GBR, P and
+hierarchical B-frames (`SequenceEncoder`, TMVP, per-slice QP offsets), `SpeedPreset` presets,
 blocks of 4×4 to 64×64, prediction modes and transform splits chosen by rate-distortion cost, RDOQ,
 sign data hiding, transform skip, SAO. At equal quality, its files are about 5% smaller than
 x265's `medium` preset and 3% smaller than `slow`. No C, no `unsafe`, runs in
