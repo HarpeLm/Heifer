@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 — 2026-11-25
+
+Single-thread HEVC decoding and YCbCr-to-RGBA speedups (13–21% faster in 100% safe Rust,
+now faster than `heic-rs` on 1 thread), refreshed public benchmarks, and crates.io Trusted
+Publishing in the release workflow.
 
 **Performance & CI**
 
@@ -15,9 +19,11 @@
     clamping buffer in inter interpolation (`inter.rs`).
   - `heifer`: removed unused `xcs` allocation on YCbCr paths and fused horizontal chroma widening
     directly into the 4:2:0/4:2:2 pixel output loop (`color.rs`).
-  - Measured 1-thread speedups (`heifer8`): 12 MP iPhone `134.7 → 114.9 ms` (`117.0 ms` vs
-    `129.2 ms` median against single-thread `heic-rs`), 5 MP Xiaomi `91.6 → 74.9 ms`, 48 MP
-    `792 → 685 ms`.
+  - Measured 1-thread speedups (`heifer8`): 12 MP iPhone `114.6 ms` vs `129.2 ms` median for
+    `heic-rs` (13-file suite `646 ms` vs `729 ms`), 5 MP Xiaomi `74.7 ms`, 48 MP `700 ms`, 200 MP
+    `1.21 s` on 1 thread (`0.43 s` multi-thread).
+- Refreshed public benchmarks in `README.md`, `docs/BENCHMARKS.md`, `docs/benchmark.json`, and
+  `docs/images/bench-*.svg`.
 - Added crates.io Trusted Publishing (OIDC via `rust-lang/crates-io-auth-action@v1`) in
   `.github/workflows/release.yml` so tagged releases `vX.Y.Z` publish all workspace crates
   automatically alongside the GitHub release.
