@@ -23,6 +23,10 @@
 - CLI: `--speed <fast|medium|slow>`, `--keyframe-interval <n>`, `--b-frames <n>`, `--fps <n>`,
   `--format 422|444|lossless` on `.heics`, and combining multiple input image files into a single
   `.heics` sequence (`heifer frames/*.png out.heics`).
+- `heifer_isobmff::writer::SequenceTrack` normalizes negative `ctts` offsets to non-negative `ctts`
+  v0 values paired with an `edts`/`elst` edit list so `PTS >= DTS` for every sample.
+- Fuzz targets (`container`, `hevc`, `decode`, `parallel`, `encode`) cover sequence parsing,
+  `ctts`/B-frame reordering, TMVP, parallel sequence decoding and sequence round trips.
 
 ## 0.6.0 — 2026-11-22
 
