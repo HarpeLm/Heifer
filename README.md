@@ -18,7 +18,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.53 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.43 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -350,27 +350,28 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 17 ms (ffmpeg 57), iPhone 12 MP 25 ms (ffmpeg 96), 48 MP 141 ms (ffmpeg 583), Galaxy 200 MP 0.53 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 15 ms (ffmpeg 11), iPhone 12 MP 21 ms (ffmpeg 21), 48 MP 116 ms (ffmpeg 95), Galaxy 200 MP 0.43 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 17 ms | 100 ms | 57 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 25 ms | 140 ms | 96 ms |
-| 8000×6000, 48 MP | 141 ms | 0.82 s | 583 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.53 s | 1.99 s | fails |
+| Xiaomi, 5 MP | 15 ms | 75 ms | 11 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 21 ms | 116 ms | 21 ms |
+| 8000×6000, 48 MP | 116 ms | 0.70 s | 95 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.43 s | 1.21 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 140 ms on 1 thread to 26 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 117 ms on 1 thread to 20 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 140 ms with 1 thread down to 26 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 117 ms with 1 thread down to 20 ms with 10" width="100%">
 </picture>
 
-On multi-core machines heifer decodes these photos faster than ffmpeg. Single-threaded decoding is still
-slower than ffmpeg. The hot loops are written so that the compiler vectorizes them (NEON, SSE/AVX),
-without any `unsafe` code.
+On multi-core machines heifer matches FFmpeg 9 on the 12 MP iPhone photo (and includes the
+YCbCr-to-RGBA conversion that `ffmpeg -f null -` skips), stays 3–5× faster than `libheif`, and
+decodes the 200 MP Galaxy photo where FFmpeg fails. The hot loops are written so that the compiler
+vectorizes them (NEON, SSE/AVX), without any `unsafe` code.
 
 **[Benchmarks against every other HEIC decoder and encoder](docs/BENCHMARKS.md)** (heic-rs,
 heic, heic-decoder, zune-heic, still265, ffmpeg, libheif with libde265 and x265, Apple),
@@ -379,17 +380,19 @@ reproducible with `python3 benchmarks/run.py`.
 ### Other pure-Rust decoders
 
 Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine, decoding to
-8-bit RGBA, on the files of this repository (October 2026, `heic` 0.1.6 and `heic-rs` 0.1.1):
+8-bit RGBA, on the files of this repository (November 2026, `heic` 0.1.6 and `heic-rs` 0.1.4):
 
 | | heifer | [`heic-rs`](https://crates.io/crates/heic-rs) | [`heic`](https://crates.io/crates/heic) |
 |---|---|---|---|
 | License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | AGPL-3.0 or commercial |
-| Test files decoded (of 53) | 50 | 49 (no `iovl` overlays) | 50 (refuses 200 MP by default) |
-| Colours vs Apple's decoder (median of 13 Apple and other files) | **50 dB** | 27 dB (full-range video decoded as limited range) | 40 dB |
+| Test files decoded (of 55) | **52** (all valid files) | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
+| Colours vs Apple's decoder (median of 13 Apple and other files) | **50.2 dB** | 43.9 dB (26.4 dB worst: limited-range mismatch) | 47.0 dB |
 | Apple HDR gain maps applied | ✓ | – | extraction only |
-| Speed, 12 MP iPhone photo, 1 thread | 165 ms | **128 ms** | 227 ms |
+| Speed, 12 MP iPhone photo, 1 thread | **115 ms** (`decode_rgba8`; 119 ms 16-bit) | 129 ms | 225 ms |
 
-`heic-rs` is currently about 1.3× faster than heifer; heifer is more accurate and complete.
+heifer is now the fastest pure-Rust software decoder (≈1.13× faster than `heic-rs` on 1 thread,
+both on the 12 MP iPhone photo and across the 13-file benchmark suite), while remaining more
+accurate and complete.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 
@@ -463,7 +466,7 @@ may not.
 - [x] **0.5**: image sequences with P and B frames in display order, as `image` animations and GIF/APNG in the CLI
 - [x] **0.6**: B-frame `.heics` encoding (`ctts`, GOP reordering), `auxl` alpha tracks, sequence size targets and keyframe intervals
 - [x] **0.7**: hierarchical B-frames, TMVP, per-slice QP offsets, `EncodeSpeed` presets, 4:2:2 / 4:4:4 / lossless & 10-bit `.heics`, `ctts` v0 + `edts`/`elst`, full `.heics` CLI support
-- [ ] **Next**: single-thread decoding speed (still slower than ffmpeg)
+- [ ] **Next**: further single-thread decoding optimizations
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
@@ -516,8 +519,8 @@ cargo build --release -p heifer-hevc-dec --example decode
 **Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
 
 ```sh
-git tag -a v0.7.0 -m "0.7.0 — what changed"
-git push origin v0.7.0
+git tag -a v0.7.1 -m "0.7.1 — what changed"
+git push origin v0.7.1
 ```
 
 The `Release` workflow creates the GitHub release, with the annotation as title and the matching
