@@ -9,11 +9,15 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.3.29, IPTC metadata, decoding from a reader, faster CABAC.
+- Latest release: 0.7.0 — image sequences (P, B and hierarchical B-frames, TMVP, `ctts` v0 +
+  `edts`/`elst`, alpha auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit), `EncodeSpeed` presets,
+  full `.heics` CLI support, IPTC metadata, decoding from a reader, faster CABAC.
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
-  images (`unci`).
-- Encoding: 4:2:0, 4:4:4, lossless, alpha, grids and `tmap` gain maps.
-- Conformance: 66 official HEVC bitstreams, no unsupported stream.
+  images (`unci`), image sequences (114 conformance bitstreams match their MD5).
+- Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
+  sequences (`encode_sequence`, `encode_sequence_with_format`, `encode_sequence_to_size_with_format`).
+- Conformance: 66 official still HEVC bitstreams + 114 sequence bitstreams (7115 pictures), no
+  unsupported stream.
 
 ## Done
 
@@ -64,6 +68,20 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 - `read_regions` / `item_regions` with every geometry and the `udes` descriptions, and
   `HeifWriter::add_region_item` to write them.
 
+### Image sequences and encoding presets (`0.5`–`0.7.0`)
+
+- Decoding: P and B frames (DPB, merge/AMVP, TMVP, bi-prediction, weighted prediction, long-term
+  references, explicit RDPCM), display order (`ctts`), auxiliary alpha sequence tracks (`auxl`);
+  114 conformance streams (7115 pictures) match their MD5.
+- Encoding: `.heics` sequences (`encode_sequence`, `encode_sequence_with_format`,
+  `encode_sequence_to_size_with_format`), hierarchical B-frames, TMVP, per-slice QP offsets,
+  `ctts` v0 + `edts`/`elst` edit lists (`PTS >= DTS`), alpha auxiliary tracks (`auxi`/`auxl`),
+  4:2:2 / 4:4:4 / lossless & 10-bit formats, `EncodeSpeed` (`Fast`/`Medium`/`Slow`), and full
+  CLI support (`--speed`, `--keyframe-interval`, `--b-frames`, `--fps`, `frames/*.png out.heics`).
+- Size targets (`encode_to_size`, `--max-size`) and 4:2:2 encoding for stills and sequences.
+- Fuzz targets covering container and HEVC sequence decoding, B-frame reordering, TMVP and
+  sequence round trips.
+
 ## Next
 
 ### 1. Single-thread hot loops
@@ -75,6 +93,7 @@ large grids. Optimise the per-tile and colour-conversion loops without adding `u
 
 - ~~Size targets~~: done (`encode_to_size`, `--max-size`).
 - ~~4:2:2 encoding~~: done.
+- ~~Speed presets~~: done (`EncodeSpeed`, `--speed`).
 - Advanced HEVC parameters for users who need them.
 
 ### 3. Fixtures and fuzzing
@@ -91,9 +110,5 @@ pure-Rust, lightweight and HEVC-only promise.
 - AVIF / AV1: a separate crate could reuse the container, not the core codec.
 - VVC / H.266, AVC / H.264: no mature pure-Rust implementation.
 - JPEG and JPEG 2000 inside HEIF.
-- Image sequences: P and B frames are done (DPB, merge/AMVP, TMVP, bi-prediction, weighted
-  prediction, verified against ffmpeg and the conformance MD5s). Frames come out in display
-  order (`ctts`); long-term references and explicit RDPCM are supported. 114
-  conformance streams match their MD5.
 
 The target is a credible HEIC/HEVC alternative to libheif, not a libheif clone.
