@@ -81,8 +81,9 @@ impl FilterInfo {
 /// pictures they point to.
 pub use crate::inter::ColMotion as EdgeMotion;
 
-/// Boundary strength of the edge between units `ip` and `iq` (§8.7.2.4); `transform_edge`
+/// Boundary strength of the edge between units `p` and `iq` (§8.7.2.4); `transform_edge`
 /// tells whether the edge is a transform block edge.
+#[inline]
 fn boundary_strength(info: &FilterInfo, ip: usize, iq: usize, transform_edge: bool) -> i32 {
     if info.intra[ip] || info.intra[iq] {
         return 2;
@@ -96,6 +97,7 @@ fn boundary_strength(info: &FilterInfo, ip: usize, iq: usize, transform_edge: bo
 /// Boundary strength between two inter blocks from their motion (§8.7.2.4): 1 when they use
 /// different reference pictures, a different number of vectors, or vectors at least one
 /// integer sample apart; 0 otherwise.
+#[inline]
 fn motion_strength(p: EdgeMotion, q: EdgeMotion) -> i32 {
     let far = |a: [i16; 2], b: [i16; 2]| {
         (i32::from(a[0]) - i32::from(b[0])).abs() >= 4
@@ -181,6 +183,9 @@ pub(crate) fn chroma_qp(qpi: i32, chroma_array_type: u8) -> i32 {
 
 /// Applies the deblocking filter to `frame` in place (§8.7.2).
 pub fn deblock(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &CtbLayout) {
+    if info.slices.len() == 1 && info.slices[0].deblocking_disabled {
+        return;
+    }
     deblock_luma::<true>(frame, info, sps, pps, layout);
     deblock_luma::<false>(frame, info, sps, pps, layout);
     if sps.chroma_array_type() != 0 {
@@ -192,6 +197,7 @@ pub fn deblock(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layou
 /// Whether the edge between unit `p` (left/above) and unit `q` (the current block) at luma
 /// position (`xq`, `yq`) is filtered (§8.7.2.3, filterEdgeFlag).
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn edge_filtered(
     info: &FilterInfo,
     sps: &Sps,
@@ -224,8 +230,8 @@ fn edge_filtered(
 /// Applies the luma deblocking filter (§8.7.2.4) across vertical (`VERTICAL`) or horizontal
 /// edges.
 ///
-/// `VERTICAL` is a compile-time constant so the sample addressing below collapses to a base
-/// offset and two strides, with no per-sample branch.
+/// `VERTICAL` is a compile-time constant so both the sample addressing and the outer/inner
+/// cache-friendly row-major traversal collapse with no per-sample branch.
 fn deblock_luma<const VERTICAL: bool>(
     frame: &mut Frame,
     info: &FilterInfo,
@@ -243,16 +249,20 @@ fn deblock_luma<const VERTICAL: bool>(
     let plane = &mut frame.planes[0];
     let edge_bit = if VERTICAL { 1 } else { 2 };
     let any_edge = edge_bit | (edge_bit << 2);
+    let all_edges_filtered = info.slices.len() == 1
+        && pps
+            .tiles
+            .as_ref()
+            .is_none_or(|t| t.loop_filter_across_tiles_enabled_flag);
 
-    // Each segment: 4 lines across an edge on the 8×8 grid.
-    let (outer, inner) = if VERTICAL { (h, w) } else { (w, h) };
-    for a in (0..outer).step_by(4) {
-        for b in (8..inner).step_by(8) {
-            let (xq, yq) = if VERTICAL { (b, a) } else { (a, b) };
-            let (xp, yp) = if VERTICAL { (b - 1, a) } else { (a, b - 1) };
+    // Each segment: 4 lines across an edge on the 8×8 grid, traversed in row-major order.
+    let (y_start, y_step, x_start, x_step) = if VERTICAL { (0, 4, 8, 8) } else { (8, 8, 0, 4) };
+    for yq in (y_start..h).step_by(y_step) {
+        for xq in (x_start..w).step_by(x_step) {
+            let (xp, yp) = if VERTICAL { (xq - 1, yq) } else { (xq, yq - 1) };
             let iq = info.at(xq, yq);
             if info.edges[iq] & any_edge == 0
-                || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
+                || (!all_edges_filtered && !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp))
             {
                 continue;
             }
@@ -268,6 +278,9 @@ fn deblock_luma<const VERTICAL: bool>(
             let tc = tc_prime(
                 (qpl + 2 * (bs - 1) + (i32::from(slice.tc_offset_div2) << 1)).clamp(0, 53),
             ) << (bit_depth - 8);
+            if beta == 0 || tc == 0 {
+                continue;
+            }
             let (no_p, no_q) = (info.no_filter[ip], info.no_filter[iq]);
 
             // Sample p3..q3 of line `k` runs across the edge: `base` is p3 of line 0, and the
@@ -277,72 +290,105 @@ fn deblock_luma<const VERTICAL: bool>(
             } else {
                 ((yq as usize - 4) * stride + xq as usize, stride, 1usize)
             };
-            let at = |k: usize, i: isize| base + k * step_k + (i + 4) as usize * step_i;
-            let s = |plane: &[u16], k: usize, i: isize| i32::from(plane[at(k, i)]);
-
-            let dp = |plane: &[u16], k: usize| {
-                (s(plane, k, -3) - 2 * s(plane, k, -2) + s(plane, k, -1)).abs()
+            let load = |plane: &[u16], k: usize| -> [i32; 8] {
+                let b = base + k * step_k;
+                if VERTICAL {
+                    let row = &plane[b..b + 8];
+                    [
+                        i32::from(row[0]),
+                        i32::from(row[1]),
+                        i32::from(row[2]),
+                        i32::from(row[3]),
+                        i32::from(row[4]),
+                        i32::from(row[5]),
+                        i32::from(row[6]),
+                        i32::from(row[7]),
+                    ]
+                } else {
+                    core::array::from_fn(|j| i32::from(plane[b + j * step_i]))
+                }
             };
-            let dq = |plane: &[u16], k: usize| {
-                (s(plane, k, 2) - 2 * s(plane, k, 1) + s(plane, k, 0)).abs()
-            };
-            let (dp0, dp3, dq0, dq3) = (dp(plane, 0), dp(plane, 3), dq(plane, 0), dq(plane, 3));
+            let l0 = load(plane, 0);
+            let l3 = load(plane, 3);
+            let dp0 = (l0[1] - 2 * l0[2] + l0[3]).abs();
+            let dq0 = (l0[6] - 2 * l0[5] + l0[4]).abs();
+            let dp3 = (l3[1] - 2 * l3[2] + l3[3]).abs();
+            let dq3 = (l3[6] - 2 * l3[5] + l3[4]).abs();
             let (dpq0, dpq3) = (dp0 + dq0, dp3 + dq3);
-            let d = dpq0 + dpq3;
-            if d >= beta {
+            if dpq0 + dpq3 >= beta {
                 continue;
             }
-            let strong = |plane: &[u16], k: usize, dpq: i32| {
+            let strong = |line: &[i32; 8], dpq: i32| {
                 2 * dpq < (beta >> 2)
-                    && (s(plane, k, -4) - s(plane, k, -1)).abs()
-                        + (s(plane, k, 0) - s(plane, k, 3)).abs()
-                        < (beta >> 3)
-                    && (s(plane, k, -1) - s(plane, k, 0)).abs() < ((5 * tc + 1) >> 1)
+                    && (line[0] - line[3]).abs() + (line[4] - line[7]).abs() < (beta >> 3)
+                    && (line[3] - line[4]).abs() < ((5 * tc + 1) >> 1)
             };
-            let de_strong = strong(plane, 0, dpq0) && strong(plane, 3, dpq3);
+            let de_strong = strong(&l0, dpq0) && strong(&l3, dpq3);
             let dep = dp0 + dp3 < ((beta + (beta >> 1)) >> 3);
             let deq = dq0 + dq3 < ((beta + (beta >> 1)) >> 3);
 
             for k in 0..4 {
-                let [p3, p2, p1, p0, q0, q1, q2, q3] =
-                    core::array::from_fn(|j| s(plane, k, j as isize - 4));
-                let mut out = [(p0, -1), (q0, 0), (p1, -2), (q1, 1), (p2, -3), (q2, 2)];
-                let mut n = 0;
+                let [p3, p2, p1, p0, q0, q1, q2, q3] = match k {
+                    0 => l0,
+                    3 => l3,
+                    _ => load(plane, k),
+                };
+                let b = base + k * step_k;
                 if de_strong {
-                    let c = |v: i32, f: i32| f.clamp(v - 2 * tc, v + 2 * tc);
-                    out = [
-                        (c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3), -1),
-                        (c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3), 0),
-                        (c(p1, (p2 + p1 + p0 + q0 + 2) >> 2), -2),
-                        (c(q1, (p0 + q0 + q1 + q2 + 2) >> 2), 1),
-                        (c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3), -3),
-                        (c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3), 2),
-                    ];
-                    n = 6;
+                    let c = |v: i32, f: i32| f.clamp(v - 2 * tc, v + 2 * tc) as u16;
+                    let np0 = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                    let np1 = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
+                    let np2 = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+                    let nq0 = c(q0, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                    let nq1 = c(q1, (p0 + q0 + q1 + q2 + 2) >> 2);
+                    let nq2 = c(q2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+                    if VERTICAL {
+                        let row = &mut plane[b..b + 8];
+                        if !no_p {
+                            row[1] = np2;
+                            row[2] = np1;
+                            row[3] = np0;
+                        }
+                        if !no_q {
+                            row[4] = nq0;
+                            row[5] = nq1;
+                            row[6] = nq2;
+                        }
+                    } else {
+                        if !no_p {
+                            plane[b + step_i] = np2;
+                            plane[b + 2 * step_i] = np1;
+                            plane[b + 3 * step_i] = np0;
+                        }
+                        if !no_q {
+                            plane[b + 4 * step_i] = nq0;
+                            plane[b + 5 * step_i] = nq1;
+                            plane[b + 6 * step_i] = nq2;
+                        }
+                    }
                 } else {
                     let mut delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
                     if delta.abs() < tc * 10 {
                         delta = delta.clamp(-tc, tc);
-                        out[0].0 = (p0 + delta).clamp(0, max);
-                        out[1].0 = (q0 - delta).clamp(0, max);
-                        if dep {
-                            let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1)
-                                .clamp(-(tc >> 1), tc >> 1);
-                            out[2].0 = (p1 + dp).clamp(0, max);
+                        if !no_p {
+                            let np0 = (p0 + delta).clamp(0, max) as u16;
+                            plane[b + 3 * step_i] = np0;
+                            if dep {
+                                let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1)
+                                    .clamp(-(tc >> 1), tc >> 1);
+                                plane[b + 2 * step_i] = (p1 + dp).clamp(0, max) as u16;
+                            }
                         }
-                        if deq {
-                            let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1)
-                                .clamp(-(tc >> 1), tc >> 1);
-                            out[3].0 = (q1 + dq).clamp(0, max);
+                        if !no_q {
+                            let nq0 = (q0 - delta).clamp(0, max) as u16;
+                            plane[b + 4 * step_i] = nq0;
+                            if deq {
+                                let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1)
+                                    .clamp(-(tc >> 1), tc >> 1);
+                                plane[b + 5 * step_i] = (q1 + dq).clamp(0, max) as u16;
+                            }
                         }
-                        n = 4;
                     }
-                }
-                for &(v, i) in &out[..n] {
-                    if (i < 0 && no_p) || (i >= 0 && no_q) {
-                        continue;
-                    }
-                    plane[at(k, i)] = v as u16;
                 }
             }
         }
@@ -363,24 +409,30 @@ fn deblock_chroma<const VERTICAL: bool>(
     let bit_depth = i32::from(sps.bit_depth_chroma);
     let max = (1 << bit_depth) - 1;
     let edge_bit = if VERTICAL { 1 } else { 2 };
+    let any_edge = edge_bit | (edge_bit << 2);
     let chroma_type = sps.chroma_array_type();
+    let all_edges_filtered = info.slices.len() == 1
+        && pps
+            .tiles
+            .as_ref()
+            .is_none_or(|t| t.loop_filter_across_tiles_enabled_flag);
 
+    let (yc_start, yc_step, xc_start, xc_step) = if VERTICAL { (0, 1, 8, 8) } else { (8, 8, 0, 1) };
     for (c, plane) in frame.planes.iter_mut().enumerate().skip(1) {
         let pic_offset = i32::from(if c == 1 {
             pps.pps_cb_qp_offset
         } else {
             pps.pps_cr_qp_offset
         });
-        // Chroma edges lie on an 8×8 grid of chroma samples.
-        let (outer, inner) = if VERTICAL { (ch, cw) } else { (cw, ch) };
-        for a in 0..outer {
-            for b in (8..inner).step_by(8) {
-                let (xc, yc) = if VERTICAL { (b, a) } else { (a, b) };
+        // Chroma edges lie on an 8×8 grid of chroma samples, traversed row-major.
+        for yc in (yc_start..ch).step_by(yc_step) {
+            for xc in (xc_start..cw).step_by(xc_step) {
                 let (xq, yq) = (xc * sw, yc * sh);
                 let (xp, yp) = if VERTICAL { (xq - 1, yq) } else { (xq, yq - 1) };
                 let iq = info.at(xq, yq);
-                if info.edges[iq] & (edge_bit | (edge_bit << 2)) == 0
-                    || !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp)
+                if info.edges[iq] & any_edge == 0
+                    || (!all_edges_filtered
+                        && !edge_filtered(info, sps, pps, layout, xq, yq, xp, yp))
                 {
                     continue;
                 }
@@ -404,15 +456,28 @@ fn deblock_chroma<const VERTICAL: bool>(
                 } else {
                     ((yc as usize - 2) * stride + xc as usize, stride)
                 };
-                let at = |i: isize| base + (i + 2) as usize * step;
-                let [p1, p0, q0, q1] =
-                    core::array::from_fn(|j| i32::from(plane[at(j as isize - 2)]));
+                let (p1, p0, q0, q1) = if VERTICAL {
+                    let s = &plane[base..base + 4];
+                    (
+                        i32::from(s[0]),
+                        i32::from(s[1]),
+                        i32::from(s[2]),
+                        i32::from(s[3]),
+                    )
+                } else {
+                    (
+                        i32::from(plane[base]),
+                        i32::from(plane[base + step]),
+                        i32::from(plane[base + 2 * step]),
+                        i32::from(plane[base + 3 * step]),
+                    )
+                };
                 let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
                 if !info.no_filter[ip] {
-                    plane[at(-1)] = (p0 + delta).clamp(0, max) as u16;
+                    plane[base + step] = (p0 + delta).clamp(0, max) as u16;
                 }
                 if !info.no_filter[iq] {
-                    plane[at(0)] = (q0 - delta).clamp(0, max) as u16;
+                    plane[base + 2 * step] = (q0 - delta).clamp(0, max) as u16;
                 }
             }
         }
@@ -429,7 +494,16 @@ pub fn sao(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &
     let ctb = sps.ctb_size();
     let num_ctb = (layout.width * layout.height) as usize;
     for c in 0..num_comps {
-        let has_edge = info.sao[..num_ctb].iter().any(|p| p.type_idx[c] == 2);
+        let mut any_sao = false;
+        let mut has_edge = false;
+        for p in &info.sao[..num_ctb] {
+            let t = p.type_idx[c];
+            any_sao |= t != 0;
+            has_edge |= t == 2;
+        }
+        if !any_sao {
+            continue;
+        }
         let (pw, ph) = (frame.widths[c], frame.heights[c]);
         if has_edge {
             let src = frame.planes[c].clone();
@@ -499,19 +573,51 @@ fn sao_plane(
         let y0 = (rs / layout.width) * ctb / sh;
         let (x1, y1) = ((x0 + ctb / sw).min(pw), (y0 + ctb / sh).min(ph));
         let offsets = params.offsets[c];
+        let clean = (y0 * sh..y1 * sh).step_by(4).all(|yl| {
+            (x0 * sw..x1 * sw)
+                .step_by(4)
+                .all(|xl| !info.no_filter[info.at(xl, yl)])
+        });
         if type_idx == 1 {
             let shift = bit_depth - 5;
             let band = params.band_position[c];
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    if info.no_filter[info.at(x * sw, y * sh)] {
-                        continue;
+            if clean {
+                let (xs, xe) = (x0 as usize, x1 as usize);
+                for y in y0..y1 {
+                    let row = y as usize * stride;
+                    if let Some(src) = src {
+                        for (d, &sv) in dst[row + xs..row + xe]
+                            .iter_mut()
+                            .zip(&src[row + xs..row + xe])
+                        {
+                            let v = i32::from(sv);
+                            let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
+                            if k < 4 {
+                                *d = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                            }
+                        }
+                    } else {
+                        for d in &mut dst[row + xs..row + xe] {
+                            let v = i32::from(*d);
+                            let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
+                            if k < 4 {
+                                *d = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                            }
+                        }
                     }
-                    let i = y as usize * stride + x as usize;
-                    let v = i32::from(src.map_or(dst[i], |s| s[i]));
-                    let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
-                    if k < 4 {
-                        dst[i] = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                }
+            } else {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        if info.no_filter[info.at(x * sw, y * sh)] {
+                            continue;
+                        }
+                        let i = y as usize * stride + x as usize;
+                        let v = i32::from(src.map_or(dst[i], |s| s[i]));
+                        let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
+                        if k < 4 {
+                            dst[i] = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                        }
                     }
                 }
             }
@@ -523,35 +629,27 @@ fn sao_plane(
                 2 => (1, 1),
                 _ => (-1, 1),
             };
-            // Inside a CTB, the neighbours of a sample that is not on the CTB's border are in
-            // the picture, in the same slice and the same tile: when no block of the CTB is
-            // excluded from filtering, those samples need none of the checks below.
-            let clean = (y0 * sh..y1 * sh).step_by(4).all(|yl| {
-                (x0 * sw..x1 * sw)
-                    .step_by(4)
-                    .all(|xl| !info.no_filter[info.at(xl, yl)])
-            });
             // Distance, in the plane, from a sample to its neighbour b (and from a to the sample).
             let step = dy as isize * stride as isize + dx as isize;
+            let eo = [offsets[0], offsets[1], 0, offsets[2], offsets[3]];
             for y in y0..y1 {
                 if clean && y > y0 && y + 1 < y1 && x1 > x0 + 2 {
                     let row = y as usize * stride;
-                    for x in (x0 + 1) as usize..(x1 - 1) as usize {
-                        let i = row + x;
-                        let v = i32::from(src[i]);
-                        let a = i32::from(src[(i as isize - step) as usize]);
-                        let b = i32::from(src[(i as isize + step) as usize]);
-                        let edge = 2 + (v - a).signum() + (v - b).signum();
-                        // edgeIdx 0, 1, 2 are remapped to 1, 2, 0 (§8.7.3.2).
-                        let edge_idx = match edge {
-                            0 => 1,
-                            1 => 2,
-                            2 => 0,
-                            e => e,
-                        };
-                        if edge_idx != 0 {
-                            dst[i] = (v + i32::from(offsets[edge_idx as usize - 1])).clamp(0, max)
-                                as u16;
+                    let (xs, xe) = ((x0 + 1) as usize, (x1 - 1) as usize);
+                    let len = xe - xs;
+                    let a_start = ((row + xs) as isize - step) as usize;
+                    let b_start = ((row + xs) as isize + step) as usize;
+                    for (((d, &v), &a), &b) in dst[row + xs..row + xe]
+                        .iter_mut()
+                        .zip(&src[row + xs..row + xe])
+                        .zip(&src[a_start..a_start + len])
+                        .zip(&src[b_start..b_start + len])
+                    {
+                        let (v, a, b) = (i32::from(v), i32::from(a), i32::from(b));
+                        let edge = (2 + (v - a).signum() + (v - b).signum()) as usize;
+                        let off = eo[edge];
+                        if off != 0 {
+                            *d = (v + i32::from(off)).clamp(0, max) as u16;
                         }
                     }
                 }
@@ -595,17 +693,10 @@ fn sao_plane(
                     let v = i32::from(src[i]);
                     let a = i32::from(src[ay as usize * stride + ax as usize]);
                     let b = i32::from(src[by as usize * stride + bx as usize]);
-                    let edge = 2 + (v - a).signum() + (v - b).signum();
-                    // edgeIdx 0, 1, 2 are remapped to 1, 2, 0 (§8.7.3.2).
-                    let edge_idx = match edge {
-                        0 => 1,
-                        1 => 2,
-                        2 => 0,
-                        e => e,
-                    };
-                    if edge_idx != 0 {
-                        dst[i] =
-                            (v + i32::from(offsets[edge_idx as usize - 1])).clamp(0, max) as u16;
+                    let edge = (2 + (v - a).signum() + (v - b).signum()) as usize;
+                    let off = eo[edge];
+                    if off != 0 {
+                        dst[i] = (v + i32::from(off)).clamp(0, max) as u16;
                     }
                 }
             }
