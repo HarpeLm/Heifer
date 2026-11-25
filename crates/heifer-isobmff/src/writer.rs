@@ -113,6 +113,8 @@ impl SequenceTrack {
 
     /// Like [`add_sample`](Self::add_sample), with a composition offset (`ctts`, display time
     /// minus decode time in [`timescale`](Self::new) units) for reordered frames (B frames).
+    /// When any offset is negative, all `ctts` entries are shifted to non-negative `ctts` v0
+    /// values and paired with an `edts`/`elst` edit list so `PTS >= DTS` for every sample.
     pub fn add_sample_with_offset(
         &mut self,
         slices: &[Vec<u8>],
@@ -172,13 +174,14 @@ impl SequenceTrack {
                 b.extend_from_slice(&[0; 24]); // pre_defined
                 b.extend_from_slice(&next_track_id.to_be_bytes()); // next_track_ID
             }));
-            moov.extend(self.trak_box(1, None, chunk_offset, large));
+            moov.extend(self.trak_box(1, None, chunk_offset, large, self.timescale));
             if let Some(alpha) = &self.alpha {
                 moov.extend(alpha.trak_box(
                     2,
                     Some((1, ALPHA_URN)),
                     chunk_offset + self.own_data_size(),
                     large,
+                    self.timescale,
                 ));
             }
         })
@@ -190,9 +193,23 @@ impl SequenceTrack {
         aux_for: Option<(u32, &str)>,
         chunk_offset: u64,
         large: bool,
+        movie_timescale: u32,
     ) -> Vec<u8> {
         let duration: u64 = self.samples.iter().map(|s| u64::from(s.1)).sum();
         let duration32 = u32::try_from(duration).unwrap_or(u32::MAX);
+        let min_off = self.samples.iter().map(|s| s.3).min().unwrap_or(0);
+        let shift = if min_off < 0 { -i64::from(min_off) } else { 0 };
+        let mut dts = 0i64;
+        let first_pts = self
+            .samples
+            .iter()
+            .map(|s| {
+                let pts = dts + i64::from(s.3) + shift;
+                dts += i64::from(s.1);
+                pts
+            })
+            .min()
+            .unwrap_or(0);
         const MATRIX: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000];
         let matrix = |b: &mut Vec<u8>| {
             for v in MATRIX {
@@ -222,6 +239,28 @@ impl SequenceTrack {
                     }));
                 }));
             }
+            if first_pts > 0 {
+                let seg_duration = if self.timescale == movie_timescale || self.timescale == 0 {
+                    duration
+                } else {
+                    duration.saturating_mul(u64::from(movie_timescale)) / u64::from(self.timescale)
+                };
+                let v1 = seg_duration > u64::from(u32::MAX) || first_pts > i64::from(i32::MAX);
+                trak.extend(make_box(b"edts", |edts| {
+                    edts.extend(full_box(b"elst", u8::from(v1), 0, |b| {
+                        b.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+                        if v1 {
+                            b.extend_from_slice(&seg_duration.to_be_bytes());
+                            b.extend_from_slice(&first_pts.to_be_bytes());
+                        } else {
+                            b.extend_from_slice(&(seg_duration as u32).to_be_bytes());
+                            b.extend_from_slice(&(first_pts as i32).to_be_bytes());
+                        }
+                        b.extend_from_slice(&1i16.to_be_bytes()); // media_rate_integer
+                        b.extend_from_slice(&0i16.to_be_bytes()); // media_rate_fraction
+                    }));
+                }));
+            }
             trak.extend(make_box(b"mdia", |mdia| {
                 mdia.extend(full_box(b"mdhd", 0, 0, |b| {
                     b.extend_from_slice(&[0; 8]); // creation and modification times
@@ -245,13 +284,19 @@ impl SequenceTrack {
                             b.extend(full_box(b"url ", 0, 1, |_| {}));
                         }));
                     }));
-                    minf.extend(self.stbl_box(chunk_offset, large, aux_urn));
+                    minf.extend(self.stbl_box(chunk_offset, large, aux_urn, shift));
                 }));
             }));
         })
     }
 
-    fn stbl_box(&self, chunk_offset: u64, large: bool, aux_urn: Option<&str>) -> Vec<u8> {
+    fn stbl_box(
+        &self,
+        chunk_offset: u64,
+        large: bool,
+        aux_urn: Option<&str>,
+        ctts_shift: i64,
+    ) -> Vec<u8> {
         make_box(b"stbl", |stbl| {
             stbl.extend(full_box(b"stsd", 0, 0, |b| {
                 b.extend_from_slice(&1u32.to_be_bytes());
@@ -306,16 +351,18 @@ impl SequenceTrack {
                 }
             }));
             // Composition offsets (`ctts`), when any sample is reordered (e.g. B frames).
+            // All entries are shifted into non-negative `ctts` v0 offsets (`PTS >= DTS`).
             if self.samples.iter().any(|s| s.3 != 0) {
-                let mut ctts_runs: Vec<(u32, i32)> = Vec::new();
+                let mut ctts_runs: Vec<(u32, u32)> = Vec::new();
                 for s in &self.samples {
+                    let shifted =
+                        u32::try_from((i64::from(s.3) + ctts_shift).max(0)).unwrap_or(u32::MAX);
                     match ctts_runs.last_mut() {
-                        Some((n, off)) if *off == s.3 => *n += 1,
-                        _ => ctts_runs.push((1, s.3)),
+                        Some((n, off)) if *off == shifted => *n += 1,
+                        _ => ctts_runs.push((1, shifted)),
                     }
                 }
-                let version = u8::from(self.samples.iter().any(|s| s.3 < 0));
-                stbl.extend(full_box(b"ctts", version, 0, |b| {
+                stbl.extend(full_box(b"ctts", 0, 0, |b| {
                     b.extend_from_slice(&(ctts_runs.len() as u32).to_be_bytes());
                     for &(n, off) in &ctts_runs {
                         b.extend_from_slice(&n.to_be_bytes());
@@ -1263,7 +1310,7 @@ mod tests {
         );
         // 32-bit chunk offsets, which every reader supports.
         let has = |kind: &[u8]| bytes.windows(4).any(|w| w == kind);
-        assert!(has(b"stco") && !has(b"co64") && has(b"ccst"));
+        assert!(has(b"stco") && !has(b"co64") && has(b"ccst") && !has(b"edts") && !has(b"ctts"));
     }
 
     #[test]
@@ -1322,6 +1369,13 @@ mod tests {
 
         let tracks = crate::track::parse_tracks(&bytes).unwrap();
         assert_eq!(tracks[0].display_order(), [0, 2, 3, 1]);
-        assert_eq!(tracks[0].composition_times(), [0, 120, 40, 80]);
+        assert!(tracks[0].samples.iter().all(|s| s.composition_offset >= 0));
+        assert_eq!(tracks[0].composition_times(), [40, 160, 80, 120]);
+        assert!(bytes.windows(4).any(|w| w == b"edts"));
+        let elst = bytes.windows(4).position(|w| w == b"elst").unwrap();
+        let entry_count = u32::from_be_bytes(bytes[elst + 8..elst + 12].try_into().unwrap());
+        let seg_duration = u32::from_be_bytes(bytes[elst + 12..elst + 16].try_into().unwrap());
+        let media_time = i32::from_be_bytes(bytes[elst + 16..elst + 20].try_into().unwrap());
+        assert_eq!((entry_count, seg_duration, media_time), (1, 160, 40));
     }
 }
