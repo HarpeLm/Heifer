@@ -63,7 +63,7 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 - **Safe**: `#![forbid(unsafe_code)]`, size limits against malicious files, fuzzed continuously on CI.
 - **Complete**: alpha, overlays, crop/rotation/mirror, 8–12 bit, EXIF/XMP/ICC metadata, colour
   management to sRGB (`decode_srgb`, from the ICC profile, `nclx`, or the HEVC VUI).
-- **Encoder**: writes HEIC files from RGB(A) pixels, with alpha, in parallel tiles like iPhone photos, in 4:2:0, 4:4:4 or lossless; checked with Apple's ImageIO and ffmpeg.
+- **Encoder**: writes HEIC photos and `.heics` sequences (P, B and hierarchical B-frames, TMVP, `auxl` alpha tracks) from RGB(A) pixels, in parallel tiles like iPhone photos, in 4:2:0, 4:2:2, 4:4:4 or lossless, 8 or 10 bits, with `EncodeSpeed` presets; checked with Apple's ImageIO and ffmpeg.
 - **Portable**: optional [`image`](https://crates.io/crates/image) integration, and it compiles to WebAssembly (≈ 250 KB).
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Quick start
@@ -72,20 +72,22 @@ APIs and fills in the diffs: **[docs/MIGRATION.md](docs/MIGRATION.md)**.
 
 ```sh
 cargo install heifer-cli
-heifer IMG_1234.heic photo.jpg          # or: heifer *.HEIC --to jpg -o converted
-heifer photo.png photo.heic -q 80       # to HEIC, 4:2:0
-heifer art.png art.heic --format 444    # full-resolution chroma (or 422: half width)
-heifer photo.png photo.heic -s 500K     # the best quality that fits in 500 KB
-heifer shot.png shot.heic --lossless    # no quantization (8-bit input)
-heifer IMG_1234.heic photo.png --depth  # extract the Portrait depth map too
-heifer info IMG_1234.heic               # size, tiles, camera, auxiliary images, metadata
+heifer IMG_1234.heic photo.jpg                      # or: heifer *.HEIC --to jpg -o converted
+heifer photo.png photo.heic -q 80                   # to HEIC, 4:2:0
+heifer art.png art.heic --format 444                # full-resolution chroma (or 422: half width)
+heifer photo.png photo.heic -s 500K                 # the best quality that fits in 500 KB
+heifer shot.png shot.heic --lossless                # no quantization (8-bit input)
+heifer frames/*.png burst.heics --fps 24 --b-frames 3   # image sequence with B-frames
+heifer animation.gif animation.heics --speed fast   # GIF/APNG/HEIF sequence to .heics
+heifer IMG_1234.heic photo.png --depth              # extract the Portrait depth map too
+heifer info IMG_1234.heic                           # size, tiles, camera, auxiliary images, metadata
 ```
 
 **Library**:
 
 ```toml
 [dependencies]
-heifer = "0.5"
+heifer = "0.7"
 ```
 
 Decoding only? Turn off the default `encoder` feature: heifer then depends on its container and
@@ -93,7 +95,7 @@ decoder crates and `thiserror`, nothing else.
 
 ```toml
 [dependencies]
-heifer = { version = "0.5", default-features = false }
+heifer = { version = "0.7", default-features = false }
 ```
 
 Or try the examples on your own photos:
@@ -173,12 +175,16 @@ let exact = heifer::encode_rgba8_with_format(
 `EncodeFormat` also selects the format when re-encoding an `Image`:
 `encode_with_format`, `encode_with_metadata_and_format`, `encode_rgb8_with_format` and
 `encode_rgba8_with_format`. They are additive: `encode`, `encode_rgb8` and `encode_rgba8` keep
-their signatures and write 4:2:0.
+their signatures and write 4:2:0. Image sequences (`.heics`) use `encode_sequence`,
+`encode_sequence_with_format`, `encode_sequence_to_size` and
+`encode_sequence_to_size_with_format`, with `EncodeSpeed` (`Fast`, `Medium`, `Slow`), configurable
+`keyframe_interval` / `b_frames` (including hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`),
+and automatic alpha auxiliary tracks (`auxl`/`auxi`) for transparent frames.
 
-`Ycbcr444` codes chroma at full resolution in a Range Extensions (profile 4) stream. `Lossless`
-codes GBR 4:4:4 with `matrix_coeffs = 0` and no transform or quantization, so decoding returns
-the input samples exactly, alpha included; the files are considerably larger. 4:4:4 streams are
-decoded by Apple's ImageIO and by ffmpeg.
+`Ycbcr444` codes chroma at full resolution in a Range Extensions (profile 4) stream (`Ycbcr422`
+halves chroma width only). `Lossless` codes GBR 4:4:4 with `matrix_coeffs = 0` and no transform or
+quantization, so decoding returns the input samples exactly, alpha included; the files are
+considerably larger. 4:2:2 and 4:4:4 streams are decoded by Apple's ImageIO and by ffmpeg.
 
 When the metadata carries an ICC profile, it is attached to every image item (tiles, grid and
 thumbnail) and no `nclx` colour box is written, as in iPhone photos: the profile is the file's
@@ -266,7 +272,7 @@ ISO 21496-1 `log2` gain range, so any headroom above 1 works.
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.5", features = ["image"] }
+heifer = { version = "0.7", features = ["image"] }
 ```
 
 ```rust
@@ -291,12 +297,12 @@ and the ICC profile and EXIF set by `image`. (`image::save` only knows the forma
 
 | | Supported | Not yet |
 |---|---|---|
-| **Container** | grids, overlays (`iovl`), alpha planes, auxiliary images (depth maps, gain maps, listed and decoded by ID or URN), uncompressed images (`unci`, ISO/IEC 23001-17) as primary and auxiliary images, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods | — |
+| **Container** | grids, overlays (`iovl`), alpha planes, auxiliary images (depth maps, gain maps, listed and decoded by ID or URN), uncompressed images (`unci`, ISO/IEC 23001-17) as primary and auxiliary images, `clap`/`irot`/`imir`, thumbnails, multiple images, all `iloc` construction methods, sequence tracks (`ctts` v0 + `edts`/`elst`, `auxl` alpha tracks) | — |
 | **HEVC** | Main, Main 10, Main Still Picture, P and B frames (image sequences), intra Range Extensions: 8–12 bit and 16-bit, 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4, tiles, WPP, PCM, scaling lists, deblocking, SAO | extended precision processing |
 | **Colour** | YCbCr → RGB, BT.601 / 709 / 2020, full and limited range, primaries and transfer (`colr` nclx, else HEVC VUI); chroma upsampled like Apple's decoder (≈ 50 dB from Apple's output on Apple photos); matrix/TRC and LUT-based (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) RGB ICC profiles (`Display P3`, `Adobe RGB`, camera LUT profiles, …) converted to sRGB by `decode_srgb` (matched to littleCMS) | ICC profiles whose input space is not RGB; `B2A` output tables / soft proofing |
 | **HDR** | Apple gain maps and ISO 21496-1 `tmap` gain maps; PQ (transfer 16) and HLG (18) linearised by `decode_hdr` on the BT.2408 203 cd/m² scale, from `nclx` or the HEVC VUI; display-headroom limiting for gain maps | tone mapping PQ/HLG to a display |
 | **Metadata** | EXIF (with a small reader for camera, date, orientation, GPS), XMP, ICC, IPTC-IIM (from an `iptc` item or EXIF; caption, keywords, by-line, copyright, place, date), region annotations (`rgan`: points, rectangles, ellipses, polygons, masks, with `udes` names and tags; read and written) | writing IPTC |
-| **Encoding** | HEIC from 8- to 16-bit RGB(A): HEVC Main and Main 10 intra, 4:2:0, 4:2:2, 4:4:4 and lossless (Range Extensions profile 4), alpha, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups) | — |
+| **Encoding** | HEIC and `.heics` image sequences from 8- to 16-bit RGB(A): HEVC Main and Main 10, 4:2:0, 4:2:2, 4:4:4 and lossless (Range Extensions profile 4), P and hierarchical B-frames, TMVP, `EncodeSpeed` presets, alpha planes and `auxl` alpha tracks, 512×512 grid tiles, 320-pixel thumbnails, any size, EXIF/XMP/ICC; ISO 21496-1 HDR gain maps (`tmap`); HEIF writing (items, grids, alpha, thumbnails, metadata, `clap`, entity groups, sequence tracks) | — |
 
 ## <img src="docs/icons/shield.svg" width="24" height="24" align="top"> Conformance
 
@@ -455,6 +461,8 @@ may not.
 - [x] **IPTC** (#4) and decoding from a reader (#5)
 - [x] **0.4**: 4:2:2 encoding, size targets, region annotations, decode-only builds
 - [x] **0.5**: image sequences with P and B frames in display order, as `image` animations and GIF/APNG in the CLI
+- [x] **0.6**: B-frame `.heics` encoding (`ctts`, GOP reordering), `auxl` alpha tracks, sequence size targets and keyframe intervals
+- [x] **0.7**: hierarchical B-frames, TMVP, per-slice QP offsets, `EncodeSpeed` presets, 4:2:2 / 4:4:4 / lossless & 10-bit `.heics`, `ctts` v0 + `edts`/`elst`, full `.heics` CLI support
 - [ ] **Next**: single-thread decoding speed (still slower than ffmpeg)
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
@@ -508,13 +516,14 @@ cargo build --release -p heifer-hevc-dec --example decode
 **Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
 
 ```sh
-git tag -a v0.3.15 -m "0.3.15 — what changed"
-git push origin v0.3.15
+git tag -a v0.7.0 -m "0.7.0 — what changed"
+git push origin v0.7.0
 ```
 
 The `Release` workflow creates the GitHub release, with the annotation as title and the matching
-CHANGELOG section as notes. `cargo publish` is still run by hand, in dependency order:
-`heifer-isobmff`, `heifer-hevc-dec`, `heifer-hevc-enc`, `heifer`, `heifer-cli`.
+CHANGELOG section as notes, and publishes the workspace crates to crates.io via Trusted Publishing
+(or manually in dependency order with `cargo publish --workspace` /
+`heifer-isobmff`, `heifer-hevc-dec`, `heifer-hevc-enc`, `heifer`, `heifer-cli`).
 
 </details>
 
