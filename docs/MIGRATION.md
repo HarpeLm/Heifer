@@ -44,7 +44,7 @@ libheif-sys = "1"          # only if referenced directly
 
 # after
 [dependencies]
-heifer = "0.5"
+heifer = "0.7"
 ```
 
 `heifer` needs Rust **1.85** (edition 2024) and has no non-Rust dependencies. To confirm
@@ -380,11 +380,14 @@ match heifer::decode(&bytes) {
 - **`u16` samples by default.** `decode` keeps the coded precision in `u16`; use
   `decode_rgba8` for 8-bit output. `bit_depth` tells you what is meaningful.
 - **No stride.** Rows are packed contiguously; `width * 4` samples per row.
-- **Sequences: the main track only.** `heifer::read_sequence` replaces `has_sequence`
-  (`Some` when there is one) and gives the size, the track ID and each frame's duration in
-  seconds (no `sequence_timescale` to divide by). `decode_sequence` iterates over the frames
-  in display order, and `decode_sequence_frame` decodes one. Thumbnail and auxiliary tracks
-  are not exposed, so there is no `track_ids` list.
+- **Sequences: main track plus alpha auxiliary tracks.** `heifer::read_sequence` replaces
+  `has_sequence` (`Some` when there is one) and gives the size, the track ID and each frame's
+  duration in seconds (no `sequence_timescale` to divide by). `decode_sequence` iterates over the
+  frames in display order (attaching any `auxl` alpha sequence track), and
+  `decode_sequence_frame` decodes one. Sequences are encoded with `encode_sequence`,
+  `encode_sequence_with_format`, `encode_sequence_to_size` and
+  `encode_sequence_to_size_with_format`. Thumbnail tracks are not exposed, so there is no
+  `track_ids` list.
 
 ## What you give up
 
@@ -400,7 +403,7 @@ match heifer::decode(&bytes) {
 | AVIF (AV1), VVC, AVC, JPEG-in-HEIF, JPEG 2000 / HTJ2K | ✓ | — | out of scope; different codecs |
 | Uncompressed (ISO/IEC 23001-17) | ✓ | ✓ (`unci` as primary and auxiliary images) | ready for the supported layouts |
 | 15/16-bit extended precision tools | ✓ | partial | 16-bit coding passes conformance; the extended-precision tool is not implemented |
-| Image sequences (tracks, bursts, animations, MP4 with HEVC) | ✓ | ✓ (`read_sequence`, `decode_sequence`) | ready: P and B frames, long-term references, display order; main track only |
+| Image sequences (tracks, bursts, animations, MP4 with HEVC) | ✓ | ✓ (`read_sequence`, `decode_sequence`, `encode_sequence*`) | ready: P and B frames, TMVP, `auxl` alpha tracks, long-term references, display order |
 | Depth maps, non-alpha auxiliary images | ✓ | ✓ (`auxiliary_images`, `decode_auxiliary`) | ready |
 | Region annotations / masks | ✓ | ✓ (`read_regions`, `add_region_item`) | ready |
 | Streaming / network `Reader` | ✓ | ✓ (`decode_reader`, `Read + Seek`) | ready: only the needed items are read |
@@ -408,7 +411,7 @@ match heifer::decode(&bytes) {
 | LUT-based ICC for an RGB input (`A2B0`/`A2B1`, `lut8`/`lut16`/`lutAtoB`) | ✓ | ✓ | ready |
 | ICC output tables (`B2A`) / soft proofing | ✓ | — | not needed to decode |
 | PQ / HLG transfer functions | ✓ (HDR) | ✓ (`decode_hdr`, no tone mapping) | ready |
-| IPTC | ✓ | — | not implemented |
+| IPTC | ✓ | ✓ (`read_iptc`, `item_iptc`) | ready (reading; writing not implemented) |
 
 If something in this table blocks you, that is worth an issue — it tells us what to build
 next.
