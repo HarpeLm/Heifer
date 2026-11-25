@@ -15,6 +15,10 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(tracks) = heifer_isobmff::track::parse_tracks(data) {
         for track in &tracks {
+            let _ = track.auxiliary_type.as_deref();
+            let _ = track.duration_seconds();
+            let _ = track.composition_times();
+            let _ = track.display_order();
             for i in 0..track.samples.len().min(64) {
                 if let (Some(config), Ok(sample)) = (&track.hevc_config, track.sample_data(data, i))
                 {
