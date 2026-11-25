@@ -31,10 +31,69 @@ const SIG_PATTERN: [[u8; 16]; 4] = [
 /// Every position shares one context under `transform_skip_context_enabled_flag`.
 const SIG_FLAT: [u8; 16] = [0; 16];
 
+/// Raster position `(y << 2) | x` of each 4×4 scan position for Diagonal (0), Horizontal (1),
+/// and Vertical (2) scan orders (§6.5.3–§6.5.5).
+const fn sub_raster_4(scan: usize) -> [u8; 16] {
+    match scan {
+        0 => {
+            let mut out = [0u8; 16];
+            let mut i = 0;
+            let (mut x, mut y): (i16, i16) = (0, 0);
+            while i < 16 {
+                while y >= 0 {
+                    if x < 4 && y < 4 {
+                        out[i] = ((y as u8) << 2) | (x as u8);
+                        i += 1;
+                    }
+                    y -= 1;
+                    x += 1;
+                }
+                y = x;
+                x = 0;
+            }
+            out
+        }
+        1 => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        _ => [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15],
+    }
+}
+
+/// Precomputed `sig_coeff_flag` context offsets (before adding `add`), indexed by
+/// `[scan as usize][pattern_id][scan_pos]`, where `pattern_id` is:
+/// - `0..4`: `SIG_PATTERN[prev_csbf]`
+/// - `4`: `SIG_MAP_4X4`
+/// - `5`: `SIG_FLAT`
+const SIG_CTX_BY_SCAN: [[[u8; 16]; 6]; 3] = {
+    let tables = [
+        SIG_PATTERN[0],
+        SIG_PATTERN[1],
+        SIG_PATTERN[2],
+        SIG_PATTERN[3],
+        SIG_MAP_4X4,
+        SIG_FLAT,
+    ];
+    let mut out = [[[0u8; 16]; 6]; 3];
+    let mut s = 0;
+    while s < 3 {
+        let sr = sub_raster_4(s);
+        let mut p = 0;
+        while p < 6 {
+            let mut n = 0;
+            while n < 16 {
+                out[s][p][n] = tables[p][(sr[n] & 15) as usize];
+                n += 1;
+            }
+            p += 1;
+        }
+        s += 1;
+    }
+    out
+};
+
 /// `sig_coeff_flag` context derivation of one sub-block (clause 9.3.4.2.5).
 ///
 /// Everything fixed across the coefficients of the sub-block is settled once here, leaving one
-/// table lookup per coefficient.
+/// direct scan-position lookup per coefficient.
 struct SigCtx {
     table: &'static [u8; 16],
     add: usize,
@@ -43,6 +102,7 @@ struct SigCtx {
 }
 
 impl SigCtx {
+    #[inline]
     fn new(
         log2_size: u8,
         luma: bool,
@@ -52,17 +112,18 @@ impl SigCtx {
         scan: ScanType,
         ts_ctx: bool,
     ) -> Self {
+        let s = scan as usize;
         let chroma = if luma { 0 } else { 27 };
         if ts_ctx {
             return Self {
-                table: &SIG_FLAT,
+                table: &SIG_CTX_BY_SCAN[s][5],
                 add: if luma { 42 } else { 43 },
                 dc: None,
             };
         }
         if log2_size == 2 {
             return Self {
-                table: &SIG_MAP_4X4,
+                table: &SIG_CTX_BY_SCAN[s][4],
                 add: chroma,
                 dc: None,
             };
@@ -78,19 +139,24 @@ impl SigCtx {
             chroma + if log2_size == 3 { 9 } else { 12 }
         };
         Self {
-            table: &SIG_PATTERN[usize::from(prev_csbf & 3)],
+            table: &SIG_CTX_BY_SCAN[s][usize::from(prev_csbf & 3)],
             add,
             dc: if xs + ys == 0 { Some(chroma) } else { None },
         }
     }
 
-    /// `ctxInc` of scan position `n`, whose raster index in the sub-block is `raster`.
+    /// `ctxInc` of non-DC scan position `n` (`n > 0`).
     #[inline(always)]
-    fn at(&self, n: usize, raster: usize) -> usize {
-        match self.dc {
-            Some(dc) if n == 0 => dc,
-            _ => usize::from(self.table[raster & 15]) + self.add,
-        }
+    fn at_nz(&self, n: usize) -> usize {
+        (usize::from(self.table[n & 15]) + self.add).min(43)
+    }
+
+    /// `ctxInc` of scan position `0` (the sub-block DC position).
+    #[inline(always)]
+    fn at_dc(&self) -> usize {
+        self.dc
+            .unwrap_or_else(|| usize::from(self.table[0]) + self.add)
+            .min(43)
     }
 }
 
@@ -204,6 +270,8 @@ pub struct Picture<'a> {
     pub pps: &'a Pps,
     /// CTB scan conversions and tiles.
     pub layout: CtbLayout,
+    /// Whether the picture is a single tile: neighbours never cross a tile boundary.
+    single_tile: bool,
     /// SAO parameters per CTB (raster order).
     pub sao: Vec<SaoParams>,
     /// Number of CTBs decoded so far.
@@ -231,12 +299,14 @@ impl<'a> Picture<'a> {
     /// Creates the state for a new picture.
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
         let layout = CtbLayout::new(sps, pps);
+        let single_tile = layout.col_bd.len() == 2 && layout.row_bd.len() == 2;
         let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
         let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
         let n = w4 * h4;
         Self {
             sao: vec![SaoParams::default(); (layout.width * layout.height) as usize],
             layout,
+            single_tile,
             sps,
             pps,
             decoded_ctbs: 0,
@@ -260,10 +330,12 @@ impl<'a> Picture<'a> {
         self.decoded_ctbs == self.layout.width * self.layout.height
     }
 
+    #[inline(always)]
     fn idx(&self, x: u32, y: u32) -> usize {
         (y as usize >> 2) * self.w4 + (x as usize >> 2)
     }
 
+    #[inline]
     fn ctb_rs(&self, x: u32, y: u32) -> u32 {
         let l = self.sps.log2_ctb_size;
         (y >> l) * self.layout.width + (x >> l)
@@ -271,6 +343,7 @@ impl<'a> Picture<'a> {
 
     /// Availability of a neighbouring luma position (§6.4.1): inside the picture, already
     /// decoded, in the same slice and the same tile.
+    #[inline]
     fn available(&self, x: u32, y: u32, xn: i64, yn: i64) -> bool {
         if xn < 0
             || yn < 0
@@ -281,10 +354,12 @@ impl<'a> Picture<'a> {
         }
         let (xn, yn) = (xn as u32, yn as u32);
         self.slice_addr[self.idx(xn, yn)] == self.slice_addr_rs
-            && self.layout.tile_of_rs(self.ctb_rs(xn, yn))
-                == self.layout.tile_of_rs(self.ctb_rs(x, y))
+            && (self.single_tile
+                || self.layout.tile_of_rs(self.ctb_rs(xn, yn))
+                    == self.layout.tile_of_rs(self.ctb_rs(x, y)))
     }
 
+    #[inline]
     fn fill<T: Copy>(
         grid_sel: fn(&mut Self) -> &mut Vec<T>,
         pic: &mut Self,
@@ -300,12 +375,14 @@ impl<'a> Picture<'a> {
             (size as usize).div_ceil(4),
         );
         let h4 = pic.slice_addr.len() / w4;
+        let x4_end = (x4 + n4).min(w4);
+        if x4 >= x4_end {
+            return;
+        }
         let grid = grid_sel(pic);
         for yy in y4..(y4 + n4).min(h4) {
             let row = yy * w4;
-            for xx in x4..(x4 + n4).min(w4) {
-                grid[row + xx] = v;
-            }
+            grid[row + x4..row + x4_end].fill(v);
         }
     }
 }
@@ -795,9 +872,6 @@ impl Parser<'_, '_> {
         let slice_addr = self.pic.slice_addr_rs;
         Picture::fill(|p| &mut p.slice_addr, self.pic, x0, y0, size, slice_addr);
         Picture::fill(|p| &mut p.ct_depth, self.pic, x0, y0, size, depth);
-        Picture::fill(|p| &mut p.intra_mode, self.pic, x0, y0, size, 1);
-        Picture::fill(|p| &mut p.pcm, self.pic, x0, y0, size, false);
-        Picture::fill(|p| &mut p.motion, self.pic, x0, y0, size, Motion::NONE);
 
         self.predict_qp(x0, y0);
         self.cu_transquant_bypass =
@@ -819,7 +893,9 @@ impl Parser<'_, '_> {
             }
             self.flag(ctx::CU_SKIP_FLAG + inc)
         };
-        Picture::fill(|p| &mut p.skip, self.pic, x0, y0, size, skip);
+        if skip {
+            Picture::fill(|p| &mut p.skip, self.pic, x0, y0, size, true);
+        }
 
         let intra = !skip && (!inter_slice || self.flag(ctx::PRED_MODE_FLAG));
         let mut part_nxn = false;
@@ -1028,9 +1104,11 @@ impl Parser<'_, '_> {
         };
         let (w4, x4, y4) = (self.pic.w4, g.x as usize >> 2, g.y as usize >> 2);
         let h4 = self.pic.motion.len() / w4;
-        for yy in y4..(y4 + (g.h as usize).div_ceil(4)).min(h4) {
-            for xx in x4..(x4 + (g.w as usize).div_ceil(4)).min(w4) {
-                self.pic.motion[yy * w4 + xx] = motion;
+        let x4_end = (x4 + (g.w as usize).div_ceil(4)).min(w4);
+        if x4 < x4_end {
+            for yy in y4..(y4 + (g.h as usize).div_ceil(4)).min(h4) {
+                let row = yy * w4;
+                self.pic.motion[row + x4..row + x4_end].fill(motion);
             }
         }
         sink.prediction_unit(&PredictionUnit {
@@ -1698,22 +1776,20 @@ impl Parser<'_, '_> {
                 } else {
                     15
                 };
-                for n in (0..=start).rev() {
-                    let n = n as usize;
-                    let significant = if n > 0 || !infer_sb_dc {
-                        let raster = usize::from(sr[n]);
-                        let inc = sig_ctx.at(n, raster);
-                        let s = self.flag(ctx::SIG_COEFF_FLAG + inc);
-                        if s {
+                if start >= 0 {
+                    let models = &mut self.ctx.models;
+                    let engine = &mut self.engine;
+                    let sig_models = &mut models[ctx::SIG_COEFF_FLAG..ctx::SIG_COEFF_FLAG + 44];
+                    for n in (1..=start as usize).rev() {
+                        if engine.decode(&mut sig_models[sig_ctx.at_nz(n)]) == 1 {
                             infer_sb_dc = false;
+                            sig[n_sig] = n as u8;
+                            n_sig += 1;
                         }
-                        s
-                    } else {
-                        // DC of a coded sub-block with no other significant coefficient.
-                        true
-                    };
-                    if significant {
-                        sig[n_sig] = n as u8;
+                    }
+                    // Scan position 0 (DC): inferred significant when no non-DC coefficient was coded.
+                    if infer_sb_dc || engine.decode(&mut sig_models[sig_ctx.at_dc()]) == 1 {
+                        sig[n_sig] = 0;
                         n_sig += 1;
                     }
                 }
@@ -1728,20 +1804,23 @@ impl Parser<'_, '_> {
                 ctx_set += 1;
             }
             greater1_ctx_state = 1;
-            let mut greater1 = [false; 16];
+            let mut greater1_mask = 0u8;
             let mut first_g1: Option<usize> = None;
             let mut greater1_count = 0u32;
-            for (k, g1) in greater1.iter_mut().enumerate().take(n_sig.min(8)) {
-                let inc = ctx_set * 4
-                    + usize::from(greater1_ctx_state.min(3))
-                    + if luma { 0 } else { 16 };
-                *g1 = self.flag(ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + inc);
-                if *g1 {
-                    greater1_ctx_state = 0;
-                    greater1_count += 1;
-                    first_g1.get_or_insert(k);
-                } else if greater1_ctx_state > 0 && greater1_ctx_state < 3 {
-                    greater1_ctx_state += 1;
+            let g1_base =
+                ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_set * 4 + if luma { 0 } else { 16 };
+            {
+                let g1_models = &mut self.ctx.models[g1_base..g1_base + 4];
+                let engine = &mut self.engine;
+                for k in 0..n_sig.min(8) {
+                    if engine.decode(&mut g1_models[usize::from(greater1_ctx_state.min(3))]) == 1 {
+                        greater1_mask |= 1u8 << k;
+                        greater1_ctx_state = 0;
+                        greater1_count += 1;
+                        first_g1.get_or_insert(k);
+                    } else if greater1_ctx_state > 0 && greater1_ctx_state < 3 {
+                        greater1_ctx_state += 1;
+                    }
                 }
             }
             let mut greater2 = false;
@@ -1769,66 +1848,89 @@ impl Parser<'_, '_> {
             // one (the lowest position) absent from the end.
             let coded_signs = n_sig - usize::from(sign_hidden);
             let signs = self.engine.decode_bypass_bits(coded_signs as u32);
+            let sb_base = (ys << 2) * size + (xs << 2);
+            let (mut max_rx, mut max_ry) = (0usize, 0usize);
 
-            // coeff_abs_level_remaining and final levels.
-            let mut rice: u32 = if persistent_rice {
-                u32::from(self.ctx.stat_coeff[sb_type] / 4)
-            } else {
-                0
-            };
-            let mut first_remaining = true;
-            let mut sum_abs: i64 = 0;
-            for k in 0..n_sig {
-                let base = 1 + i32::from(greater1[k]) + i32::from(first_g1 == Some(k) && greater2);
-                let threshold = if k < 8 {
-                    if first_g1 == Some(k) { 3 } else { 2 }
+            if greater1_count == 0 && n_sig <= 8 {
+                // Fast path: every significant coefficient has magnitude 1 and no escape levels.
+                let neg_mask = if sign_hidden {
+                    (signs << 1) | ((n_sig as u32) & 1)
                 } else {
-                    1
+                    signs
                 };
-                let mut abs = base;
-                if base == threshold {
-                    let rem = self.coeff_abs_level_remaining(rice)?;
-                    if persistent_rice && first_remaining {
-                        let stat = &mut self.ctx.stat_coeff[sb_type];
-                        if rem >= (3 << (*stat / 4)) {
-                            *stat += 1;
-                        } else if 2 * rem < (1 << (*stat / 4)) && *stat > 0 {
-                            *stat -= 1;
+                for (k, &pos) in sig[..n_sig].iter().enumerate() {
+                    let raster = usize::from(sr[usize::from(pos)]);
+                    let rx = raster & 3;
+                    let ry = raster >> 2;
+                    let neg = ((neg_mask >> (n_sig - 1 - k)) & 1) as i32;
+                    self.coeffs[sb_base + ry * size + rx] = 1 - 2 * neg;
+                    max_rx = max_rx.max(rx);
+                    max_ry = max_ry.max(ry);
+                }
+            } else {
+                // coeff_abs_level_remaining and final levels.
+                let mut rice: u32 = if persistent_rice {
+                    u32::from(self.ctx.stat_coeff[sb_type] / 4)
+                } else {
+                    0
+                };
+                let mut first_remaining = true;
+                let mut sum_abs: i64 = 0;
+                for k in 0..n_sig {
+                    let g1 = i32::from(k < 8 && (greater1_mask >> k) & 1 != 0);
+                    let base = 1 + g1 + i32::from(first_g1 == Some(k) && greater2);
+                    let threshold = if k < 8 {
+                        if first_g1 == Some(k) { 3 } else { 2 }
+                    } else {
+                        1
+                    };
+                    let mut abs = base;
+                    if base == threshold {
+                        let rem = self.coeff_abs_level_remaining(rice)?;
+                        if persistent_rice && first_remaining {
+                            let stat = &mut self.ctx.stat_coeff[sb_type];
+                            if rem >= (3 << (*stat / 4)) {
+                                *stat += 1;
+                            } else if 2 * rem < (1 << (*stat / 4)) && *stat > 0 {
+                                *stat -= 1;
+                            }
+                        }
+                        first_remaining = false;
+                        abs = base
+                            .checked_add(rem as i32)
+                            .ok_or(Error::Invalid("coefficient overflow"))?;
+                        if abs > 3 * (1 << rice) {
+                            // Capped at 4 unless persistent Rice adaptation is enabled (§9.3.3.11).
+                            rice = if persistent_rice {
+                                rice + 1
+                            } else {
+                                (rice + 1).min(4)
+                            };
                         }
                     }
-                    first_remaining = false;
-                    abs = base
-                        .checked_add(rem as i32)
-                        .ok_or(Error::Invalid("coefficient overflow"))?;
-                    if abs > 3 * (1 << rice) {
-                        // Capped at 4 unless persistent Rice adaptation is enabled (§9.3.3.11).
-                        rice = if persistent_rice {
-                            rice + 1
-                        } else {
-                            (rice + 1).min(4)
-                        };
-                    }
-                }
-                let raster = usize::from(sr[usize::from(sig[k])]);
-                let xc = (xs << 2) | (raster & 3);
-                let yc = (ys << 2) | (raster >> 2);
-                let mut level = abs;
-                if k < coded_signs && (signs >> (coded_signs - 1 - k)) & 1 != 0 {
-                    level = -level;
-                }
-                if sign_hidden {
-                    sum_abs += i64::from(abs);
-                    if k == n_sig - 1 && sum_abs % 2 == 1 {
+                    let raster = usize::from(sr[usize::from(sig[k])]);
+                    let rx = raster & 3;
+                    let ry = raster >> 2;
+                    let mut level = abs;
+                    if k < coded_signs && (signs >> (coded_signs - 1 - k)) & 1 != 0 {
                         level = -level;
                     }
+                    if sign_hidden {
+                        sum_abs += i64::from(abs);
+                        if k == n_sig - 1 && sum_abs % 2 == 1 {
+                            level = -level;
+                        }
+                    }
+                    // TransCoeffLevel is limited to CoeffMinY..=CoeffMaxY (7.4.9.11). A crafted stream
+                    // can code larger levels; without a transform (transquant bypass) they would
+                    // reach the residual unchanged and overflow when added to the prediction.
+                    self.coeffs[sb_base + ry * size + rx] = level.clamp(-32768, 32767);
+                    max_rx = max_rx.max(rx);
+                    max_ry = max_ry.max(ry);
                 }
-                // TransCoeffLevel is limited to CoeffMinY..=CoeffMaxY (7.4.9.11). A crafted stream
-                // can code larger levels; without a transform (transquant bypass) they would
-                // reach the residual unchanged and overflow when added to the prediction.
-                self.coeffs[yc * size + xc] = level.clamp(-32768, 32767);
-                self.coeff_bounds.1 = self.coeff_bounds.1.max(xc + 1);
-                self.coeff_bounds.2 = self.coeff_bounds.2.max(yc + 1);
             }
+            self.coeff_bounds.1 = self.coeff_bounds.1.max((xs << 2) + max_rx + 1);
+            self.coeff_bounds.2 = self.coeff_bounds.2.max((ys << 2) + max_ry + 1);
         }
         Ok(transform_skip)
     }
@@ -1924,7 +2026,8 @@ struct TreeCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::chroma_qp_offset;
+    use super::{SIG_CTX_BY_SCAN, SIG_FLAT, SIG_MAP_4X4, SIG_PATTERN, chroma_qp_offset};
+    use crate::scan::{ScanType, sub_raster};
 
     #[test]
     fn empty_chroma_qp_offset_list_is_ignored() {
@@ -1932,5 +2035,22 @@ mod tests {
         assert_eq!(chroma_qp_offset(&[(1, -2)], true, 0), (1, -2));
         assert_eq!(chroma_qp_offset(&[(1, -2)], false, 0), (0, 0));
         assert_eq!(chroma_qp_offset(&[(1, -2)], true, 5), (0, 0));
+    }
+
+    #[test]
+    fn sig_ctx_table_matches_sub_raster() {
+        for scan in [ScanType::Diagonal, ScanType::Horizontal, ScanType::Vertical] {
+            let sr = sub_raster(scan);
+            let s = scan as usize;
+            for (p, pat) in SIG_PATTERN.iter().enumerate() {
+                for n in 0..16 {
+                    assert_eq!(SIG_CTX_BY_SCAN[s][p][n], pat[usize::from(sr[n])]);
+                }
+            }
+            for n in 0..16 {
+                assert_eq!(SIG_CTX_BY_SCAN[s][4][n], SIG_MAP_4X4[usize::from(sr[n])]);
+                assert_eq!(SIG_CTX_BY_SCAN[s][5][n], SIG_FLAT[usize::from(sr[n])]);
+            }
+        }
     }
 }
