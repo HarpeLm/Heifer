@@ -432,6 +432,10 @@ fn b_frames_preserve_variable_durations_and_reorder() {
 
     let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
     assert_eq!(seq.frames.len(), 8);
+    assert!(bytes.windows(4).any(|w| w == b"edts"));
+    assert!(bytes.windows(4).any(|w| w == b"elst"));
+    let tracks = heifer::heifer_isobmff::track::parse_tracks(&bytes).unwrap();
+    assert!(tracks[0].samples.iter().all(|s| s.composition_offset >= 0));
     assert!(seq.frames[0].keyframe);
     assert!(seq.frames[1..].iter().all(|f| !f.keyframe));
     for (i, (&got, &expected)) in seq
