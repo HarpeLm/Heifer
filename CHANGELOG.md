@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+**Performance & CI**
+
+- **Single-thread decoding & colour conversion** (`#![forbid(unsafe_code)]`, bit-exact across all
+  114 conformance sequences / 7115 pictures):
+  - `heifer-hevc-dec`: 32-bit `u64` CABAC refill (`cabac.rs`), precomputed `sig_coeff_flag` scan
+    context lookup, split non-DC loop, zero-escape fast path & skipped pre-initialized CU grid
+    fills (`syntax.rs`), 7-multiply inverse 4×4 DST-VII, unrolled `idct4`, reused 2-D transform
+    scratch buffer, `i32` flat dequantization path, zero-residual bypass, `single_tile` intra
+    reference fast path and direct vertical/horizontal angular modes (`recon.rs`), row-major
+    deblocking & clean SAO offset LUTs (`filters.rs`), and allocation-free `merge`/`amvp` + stack
+    clamping buffer in inter interpolation (`inter.rs`).
+  - `heifer`: removed unused `xcs` allocation on YCbCr paths and fused horizontal chroma widening
+    directly into the 4:2:0/4:2:2 pixel output loop (`color.rs`).
+  - Measured 1-thread speedups (`heifer8`): 12 MP iPhone `134.7 → 114.9 ms` (`117.0 ms` vs
+    `129.2 ms` median against single-thread `heic-rs`), 5 MP Xiaomi `91.6 → 74.9 ms`, 48 MP
+    `792 → 685 ms`.
+- Added crates.io Trusted Publishing (OIDC via `rust-lang/crates-io-auth-action@v1`) in
+  `.github/workflows/release.yml` so tagged releases `vX.Y.Z` publish all workspace crates
+  automatically alongside the GitHub release.
+
 ## 0.7.0 — 2026-11-25
 
 Video sequence encoder upgrades (TMVP, per-slice QP offsets, hierarchical B-frames,
