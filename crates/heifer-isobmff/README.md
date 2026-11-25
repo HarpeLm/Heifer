@@ -13,6 +13,8 @@ let tiles = file.referenced_items(file.primary_id, b"dimg");
 let hevc = file.hevc_bitstream(tiles[0])?; // Annex B, decodable by heifer-hevc-dec or ffmpeg
 ```
 
-Writing goes through `writer::HeifWriter`: HEVC image items, grids, alpha planes, EXIF, `clap`.
+Writing goes through `writer::HeifWriter` and `writer::SequenceTrack`: HEVC image items, grids,
+alpha planes, EXIF, `clap`, `rgan`, and HEVC sequences with `ctts` v0 + `edts`/`elst` timing and
+`auxl` alpha tracks.
 
 Licensed under MIT or Apache-2.0, at your option.
