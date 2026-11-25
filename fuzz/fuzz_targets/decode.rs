@@ -3,7 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let options = heifer::Options::new().with_max_threads(1).with_max_pixels(1 << 17);
+    let options = heifer::Options::new()
+        .with_max_threads(1)
+        .with_max_pixels(1 << 17);
     let from_slice = heifer::decode_with_options(data, &options);
     // The reader path must agree with the slice path.
     let from_reader = heifer::decode_reader_with_options(std::io::Cursor::new(data), &options);
@@ -12,13 +14,17 @@ fuzz_target!(|data: &[u8]| {
     }
     // IPTC: from the file, and the bytes themselves as an IIM block.
     if let Ok(Some(seq)) = heifer::read_sequence(data) {
-        // Frames are in display order: the second and the last one exercise the reordering
-        // (ctts) and the decoding from the keyframe before them.
-        if seq.frames.len() > 1 {
-            let _ = heifer::decode_sequence_frame(data, 1);
-            let _ = heifer::decode_sequence_frame(data, seq.frames.len() - 1);
+        // Frames are in display order: exercise frame 0, frame 1 (reordering / `ctts`), and
+        // the last frame (decoding from its preceding keyframe) with bounded memory.
+        if !seq.frames.is_empty() {
+            let _ = heifer::decode_sequence_frame_with_options(data, 0, &options);
         }
-        if let Ok(frames) = heifer::decode_sequence(data) {
+        if seq.frames.len() > 1 {
+            let _ = heifer::decode_sequence_frame_with_options(data, 1, &options);
+            let _ =
+                heifer::decode_sequence_frame_with_options(data, seq.frames.len() - 1, &options);
+        }
+        if let Ok(frames) = heifer::decode_sequence_with_options(data, &options) {
             for frame in frames.take(8) {
                 let _ = frame;
             }
