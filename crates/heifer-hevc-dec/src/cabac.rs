@@ -110,25 +110,32 @@ impl ContextModel {
     }
 }
 
+/// Shift of `ivlOffset` inside [`ArithmeticDecoder::value`], leaving `SHIFT` read-ahead
+/// bits below it and refills 32 bits (`4` bytes) at a time. With `range < 512`, even
+/// `value << 1` before subtraction in [`ArithmeticDecoder::decode_bypass`] uses at most
+/// `SHIFT + 10 = 41 <= 64` bits.
+const SHIFT: u32 = 31;
+
 /// The arithmetic decoding engine (§9.3.4.3).
 ///
 /// Reads RBSP data (emulation prevention bytes already removed). Bits past the end of the
 /// data are read as zeros, as can legitimately happen at the very end of a slice; reading far
 /// beyond is reported as an error by [`ArithmeticDecoder::check_overrun`].
 ///
-/// `ivlOffset` is kept scaled by `1 << 7` in `value`, with up to seven stream bits read ahead
-/// below it: data is fetched a byte at a time and renormalization is a single shift.
-/// Comparing `value` with `range << 7` is the same as comparing `ivlOffset` with `range`,
-/// since the bits read ahead are below its resolution.
+/// `ivlOffset` is kept scaled by `1 << SHIFT` in `value`, with up to 31 stream bits read ahead
+/// below it: data is fetched 32 bits at a time (`<< bits_needed`) and renormalization is a
+/// single shift. Comparing `value` with `u64::from(range) << SHIFT` is the same as comparing
+/// `ivlOffset` with `range`, since the bits read ahead are below its resolution.
 #[derive(Debug, Clone)]
 pub struct ArithmeticDecoder<'a> {
     data: &'a [u8],
     /// Next byte of `data` to fetch.
     next: usize,
     range: u32,
-    /// `ivlOffset << 7`, plus the bits read ahead.
-    value: u32,
-    /// Minus one minus the number of bits read ahead; a byte is fetched when it reaches 0.
+    /// `ivlOffset << SHIFT`, plus the bits read ahead.
+    value: u64,
+    /// Number of consumed bits since the last 32-bit fetch minus 32; a 32-bit word is fetched
+    /// when it reaches `0`.
     bits_needed: i32,
 }
 
@@ -140,21 +147,28 @@ impl<'a> ArithmeticDecoder<'a> {
             next: 0,
             range: 510,
             value: 0,
-            bits_needed: -8,
+            bits_needed: -24,
         };
-        d.value = (d.fetch() << 8) | d.fetch();
-        if d.value >> 7 >= 510 {
+        d.value = d.fetch_u32() << 8;
+        if d.value >> SHIFT >= 510 {
             return Err(Error::Invalid("CABAC initial offset must be < 510"));
         }
         Ok(d)
     }
 
-    /// Next byte, or zero past the end of the data.
+    /// Next 32 bits (big-endian), zero-padded past the end of the data.
     #[inline(always)]
-    fn fetch(&mut self) -> u32 {
-        let byte = self.data.get(self.next).copied().unwrap_or(0);
-        self.next += 1;
-        u32::from(byte)
+    fn fetch_u32(&mut self) -> u64 {
+        let word = if let Some(chunk) = self.data.get(self.next..self.next + 4) {
+            u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+        } else {
+            let mut bytes = [0u8; 4];
+            let avail = self.data.len().saturating_sub(self.next).min(4);
+            bytes[..avail].copy_from_slice(&self.data[self.next..self.next + avail]);
+            u32::from_be_bytes(bytes)
+        };
+        self.next += 4;
+        u64::from(word)
     }
 
     /// Number of bits of the data consumed by `ivlOffset` so far.
@@ -168,8 +182,8 @@ impl<'a> ArithmeticDecoder<'a> {
         self.value <<= 1;
         self.bits_needed += 1;
         if self.bits_needed == 0 {
-            self.bits_needed = -8;
-            self.value |= self.fetch();
+            self.bits_needed = -32;
+            self.value |= self.fetch_u32();
         }
     }
 
@@ -181,17 +195,19 @@ impl<'a> ArithmeticDecoder<'a> {
     /// renormalized by its leading zeros.
     #[inline(always)]
     pub fn decode(&mut self, ctx: &mut ContextModel) -> u8 {
-        let state = usize::from(ctx.state);
+        let state = usize::from(ctx.state & 63);
         let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
         let range = self.range - lps;
-        let scaled = range << 7;
+        let scaled = u64::from(range) << SHIFT;
         // All ones for the least probable symbol, zero for the most probable one.
-        let lps_mask = u32::from(self.value >= scaled).wrapping_neg();
-        self.value -= scaled & lps_mask;
-        let range = range ^ ((range ^ lps) & lps_mask);
-        let next = NEXT_STATE
-            [(usize::from(ctx.state) << 2) | (usize::from(ctx.mps) << 1) | (lps_mask & 1) as usize];
-        let bin = ctx.mps ^ (lps_mask & 1) as u8;
+        let is_lps = self.value >= scaled;
+        let lps_mask32 = u32::from(is_lps).wrapping_neg();
+        let lps_mask64 = u64::from(is_lps).wrapping_neg();
+        self.value -= scaled & lps_mask64;
+        let range = range ^ ((range ^ lps) & lps_mask32);
+        let mps = ctx.mps & 1;
+        let next = NEXT_STATE[(state << 2) | (usize::from(mps) << 1) | usize::from(is_lps)];
+        let bin = mps ^ u8::from(is_lps);
         ctx.state = next >> 1;
         ctx.mps = next & 1;
         // Shift the range back to 9 bits: none or one bit after the most probable symbol, up to
@@ -201,8 +217,8 @@ impl<'a> ArithmeticDecoder<'a> {
         self.value <<= shift;
         self.bits_needed += shift as i32;
         if self.bits_needed >= 0 {
-            self.value |= self.fetch() << self.bits_needed;
-            self.bits_needed -= 8;
+            self.value |= self.fetch_u32() << self.bits_needed;
+            self.bits_needed -= 32;
         }
         bin
     }
@@ -213,7 +229,7 @@ impl<'a> ArithmeticDecoder<'a> {
         let state = usize::from(ctx.state);
         let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
         let range = self.range - lps;
-        let scaled = range << 7;
+        let scaled = u64::from(range) << SHIFT;
         if self.value < scaled {
             // Most probable symbol: the range loses at most one bit.
             ctx.state = (ctx.state + 1).min(62);
@@ -232,8 +248,8 @@ impl<'a> ArithmeticDecoder<'a> {
             self.value <<= shift;
             self.bits_needed += shift as i32;
             if self.bits_needed >= 0 {
-                self.value |= self.fetch() << self.bits_needed;
-                self.bits_needed -= 8;
+                self.value |= self.fetch_u32() << self.bits_needed;
+                self.bits_needed -= 32;
             }
             let bin = 1 - ctx.mps;
             if ctx.state == 0 {
@@ -248,9 +264,9 @@ impl<'a> ArithmeticDecoder<'a> {
     #[inline(always)]
     pub fn decode_bypass(&mut self) -> u8 {
         self.shift_one();
-        let scaled = self.range << 7;
+        let scaled = u64::from(self.range) << SHIFT;
         // Bypass bins are random, so a branch would be mispredicted half of the time.
-        let bit = u32::from(self.value >= scaled);
+        let bit = u64::from(self.value >= scaled);
         self.value -= scaled & bit.wrapping_neg();
         bit as u8
     }
@@ -258,6 +274,23 @@ impl<'a> ArithmeticDecoder<'a> {
     /// Decodes `n` bypass bins as an unsigned integer, most significant first (`n <= 32`).
     #[inline]
     pub fn decode_bypass_bits(&mut self, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        if n <= 31 && self.bits_needed + (n as i32) < 0 {
+            self.bits_needed += n as i32;
+            let scaled = u64::from(self.range) << SHIFT;
+            let mut value = self.value;
+            let mut acc = 0u32;
+            for _ in 0..n {
+                value <<= 1;
+                let bit = u64::from(value >= scaled);
+                value -= scaled & bit.wrapping_neg();
+                acc = (acc << 1) | (bit as u32);
+            }
+            self.value = value;
+            return acc;
+        }
         (0..n).fold(0, |acc, _| (acc << 1) | u32::from(self.decode_bypass()))
     }
 
@@ -274,7 +307,7 @@ impl<'a> ArithmeticDecoder<'a> {
     #[inline]
     pub fn align_bypass(&mut self) {
         self.range = 256;
-        self.value &= 0x7fff;
+        self.value &= (1u64 << (SHIFT + 8)) - 1;
     }
 
     /// Decodes a terminating bin (`DecodeTerminate`, §9.3.4.3.5), used for
@@ -284,7 +317,7 @@ impl<'a> ArithmeticDecoder<'a> {
     /// [`ArithmeticDecoder::aligned_position_after_terminate`] to find the following data.
     pub fn decode_terminate(&mut self) -> u8 {
         self.range -= 2;
-        if self.value >= self.range << 7 {
+        if self.value >= u64::from(self.range) << SHIFT {
             1
         } else {
             if self.range < 256 {
