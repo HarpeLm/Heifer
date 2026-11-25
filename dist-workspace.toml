@@ -5,6 +5,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.34.0"
 ci = "github"
+allow-dirty = ["ci"]
 installers = ["shell", "powershell", "homebrew", "npm"]
 npm-scope = "@harpelm"
 tap = "HarpeLm/homebrew-tap"
