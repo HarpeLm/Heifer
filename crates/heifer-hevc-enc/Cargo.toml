@@ -1,6 +1,6 @@
 [package]
 name = "heifer-hevc-enc"
-description = "Pure-Rust HEVC (H.265) intra encoder for still images"
+description = "Pure-Rust HEVC (H.265) encoder for HEIF still images and .heics image sequences — no C/x265 dependency, no unsafe code"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
