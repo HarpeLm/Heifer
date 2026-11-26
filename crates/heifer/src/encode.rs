@@ -470,125 +470,117 @@ pub fn encode_sequence_with_format(
         .enumerate()
         .map(|(g, chunk)| (g * interval, chunk))
         .collect();
-    let threads = options.threads().clamp(1, groups.len());
-    let per_thread = groups.len().div_ceil(threads);
     type CodedPair = (EncodedSequenceFrame, Option<EncodedSequenceFrame>);
-    let coded: Vec<Result<CodedPair, Error>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = groups
-            .chunks(per_thread)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    let mut out = Vec::new();
-                    for &(group_start, group) in chunk {
-                        let mut encoder =
-                            SequenceEncoder::new(width, height, coding, config, interval)
-                                .with_b_frames(b_frames);
-                        let mut alpha_encoder = has_alpha.then(|| {
-                            SequenceEncoder::new(
-                                width,
-                                height,
-                                alpha_coding,
-                                alpha_config,
-                                interval,
-                            )
-                            .with_b_frames(b_frames)
-                        });
-                        let mut push_batch =
-                            |colour_batch: Vec<EncodedSequenceFrame>,
-                             alpha_batch: Option<Vec<EncodedSequenceFrame>>| {
-                                match alpha_batch {
-                                    Some(alphas) => {
-                                        debug_assert_eq!(colour_batch.len(), alphas.len());
-                                        for (mut c, mut a) in colour_batch.into_iter().zip(alphas) {
-                                            debug_assert_eq!(c.display_index, a.display_index);
-                                            c.display_index += group_start;
-                                            a.display_index += group_start;
-                                            out.push(Ok((c, Some(a))));
-                                        }
-                                    }
-                                    None => {
-                                        for mut c in colour_batch {
-                                            c.display_index += group_start;
-                                            out.push(Ok((c, None)));
-                                        }
-                                    }
-                                }
-                            };
-                        for frame in group {
-                            let at = |x: usize, y: usize| pixel_at(frame, y * width as usize + x);
-                            let (c0, c1, c2) = if lossless {
-                                gbr_planes(&at, width as usize, height as usize)
-                            } else {
-                                ycbcr_planes(
-                                    &at,
-                                    width as usize,
-                                    height as usize,
-                                    bit_depth,
-                                    format,
-                                )
-                            };
-                            let planes = Planes16 {
-                                y: &c0,
-                                chroma: Some((&c1, &c2)),
-                                bit_depth,
-                            };
-                            let colour_batch = match encoder.push(planes) {
-                                Ok(batch) => batch,
-                                Err(e) => {
-                                    out.push(Err(Error::from(e)));
-                                    return out;
-                                }
-                            };
-                            let alpha_batch = match &mut alpha_encoder {
-                                Some(enc) => {
-                                    let alpha_y: Vec<u16> = (0..(width as usize * height as usize))
-                                        .map(|i| pixel_at(frame, i)[3])
-                                        .collect();
-                                    let alpha_planes = Planes16 {
-                                        y: &alpha_y,
-                                        chroma: None,
-                                        bit_depth,
-                                    };
-                                    match enc.push(alpha_planes) {
-                                        Ok(batch) => Some(batch),
-                                        Err(e) => {
-                                            out.push(Err(Error::from(e)));
-                                            return out;
-                                        }
-                                    }
-                                }
-                                None => None,
-                            };
-                            push_batch(colour_batch, alpha_batch);
+    let encode_chunk = |chunk: &[(usize, &[Image])]| -> Vec<Result<CodedPair, Error>> {
+        let mut out = Vec::new();
+        for &(group_start, group) in chunk {
+            let mut encoder = SequenceEncoder::new(width, height, coding, config, interval)
+                .with_b_frames(b_frames);
+            let mut alpha_encoder = has_alpha.then(|| {
+                SequenceEncoder::new(width, height, alpha_coding, alpha_config, interval)
+                    .with_b_frames(b_frames)
+            });
+            let mut push_batch =
+                |colour_batch: Vec<EncodedSequenceFrame>,
+                 alpha_batch: Option<Vec<EncodedSequenceFrame>>| {
+                    match alpha_batch {
+                        Some(alphas) => {
+                            debug_assert_eq!(colour_batch.len(), alphas.len());
+                            for (mut c, mut a) in colour_batch.into_iter().zip(alphas) {
+                                debug_assert_eq!(c.display_index, a.display_index);
+                                c.display_index += group_start;
+                                a.display_index += group_start;
+                                out.push(Ok((c, Some(a))));
+                            }
                         }
-                        let colour_rest = match encoder.flush() {
-                            Ok(batch) => batch,
+                        None => {
+                            for mut c in colour_batch {
+                                c.display_index += group_start;
+                                out.push(Ok((c, None)));
+                            }
+                        }
+                    }
+                };
+            for frame in group {
+                let at = |x: usize, y: usize| pixel_at(frame, y * width as usize + x);
+                let (c0, c1, c2) = if lossless {
+                    gbr_planes(&at, width as usize, height as usize)
+                } else {
+                    ycbcr_planes(&at, width as usize, height as usize, bit_depth, format)
+                };
+                let planes = Planes16 {
+                    y: &c0,
+                    chroma: Some((&c1, &c2)),
+                    bit_depth,
+                };
+                let colour_batch = match encoder.push(planes) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        out.push(Err(Error::from(e)));
+                        return out;
+                    }
+                };
+                let alpha_batch = match &mut alpha_encoder {
+                    Some(enc) => {
+                        let alpha_y: Vec<u16> = (0..(width as usize * height as usize))
+                            .map(|i| pixel_at(frame, i)[3])
+                            .collect();
+                        let alpha_planes = Planes16 {
+                            y: &alpha_y,
+                            chroma: None,
+                            bit_depth,
+                        };
+                        match enc.push(alpha_planes) {
+                            Ok(batch) => Some(batch),
                             Err(e) => {
                                 out.push(Err(Error::from(e)));
                                 return out;
                             }
-                        };
-                        let alpha_rest = match &mut alpha_encoder {
-                            Some(enc) => match enc.flush() {
-                                Ok(batch) => Some(batch),
-                                Err(e) => {
-                                    out.push(Err(Error::from(e)));
-                                    return out;
-                                }
-                            },
-                            None => None,
-                        };
-                        push_batch(colour_rest, alpha_rest);
+                        }
                     }
-                    out
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("encoding thread panicked"))
-            .collect()
-    });
+                    None => None,
+                };
+                push_batch(colour_batch, alpha_batch);
+            }
+            let colour_rest = match encoder.flush() {
+                Ok(batch) => batch,
+                Err(e) => {
+                    out.push(Err(Error::from(e)));
+                    return out;
+                }
+            };
+            let alpha_rest = match &mut alpha_encoder {
+                Some(enc) => match enc.flush() {
+                    Ok(batch) => Some(batch),
+                    Err(e) => {
+                        out.push(Err(Error::from(e)));
+                        return out;
+                    }
+                },
+                None => None,
+            };
+            push_batch(colour_rest, alpha_rest);
+        }
+        out
+    };
+    let threads = options.threads().clamp(1, groups.len());
+    let coded: Vec<Result<CodedPair, Error>> = if threads <= 1 {
+        // No thread at all: WebAssembly without threads cannot spawn any.
+        encode_chunk(&groups)
+    } else {
+        let per_thread = groups.len().div_ceil(threads);
+        let encode_chunk = &encode_chunk;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = groups
+                .chunks(per_thread)
+                .map(|chunk| scope.spawn(move || encode_chunk(chunk)))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("encoding thread panicked"))
+                .collect()
+        })
+    };
     let coded = coded.into_iter().collect::<Result<Vec<_>, _>>()?;
     let colour_coded: Vec<EncodedSequenceFrame> = coded.iter().map(|(c, _)| c.clone()).collect();
     let mut track = build_sequence_track(width, height, bit_depth, durations, &colour_coded)?;
