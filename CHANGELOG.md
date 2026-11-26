@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.3 — 2026-11-26
+
+Per-thread buffer reuse across grid tiles, direct 8-bit `Frame8` planes with zero-copy
+`CropWindow` decoding, WebAssembly `.heics` sequence demo support, and improved crates.io/docs.rs
+documentation.
+
+**Performance & Memory (100% safe Rust)**
+
+- Per-thread buffer reuse across plain grid tiles:
+  - `heifer-isobmff`: added `HeifFile::hevc_bitstream_into` and `hevc_annex_b_into` helpers.
+  - `heifer-hevc-dec`: added `DecodeWorkspace`, `ReconstructorBuffers`, `PictureBuffers`,
+    `FilterInfo::reset`, reused SAO scratch buffers, and `decode_picture_into`.
+  - `heifer`: added `ColorScratch` and per-worker `GridWorkspace`.
+- Direct 8-bit (`u8` planes) and zero-copy conformance crop path:
+  - `heifer-hevc-dec`: added `Frame8`, `CropWindow`, `DecodedFrameView`,
+    `decode_picture_view_into`, `deblock_8`/`sao_8`, and `PictureHash::compute_like_8`, eliminating
+    `Frame::cropped_into` copies and halving 8-bit plane and SAO memory bandwidth.
+  - `heifer`: added zero-allocation strided tile output (`frame_view_to_rgba_strided_with_scratch`)
+    when `threads <= 1` on plain grids (`decode_grid`) and preallocated tile segment vectors on
+    multi-core grids.
+- Measured results (Apple M5): 200 MP Galaxy (`768` tiles) multi-core `534.1 ms` (down from
+  `1013 ms` in `0.7.1`) and 1-thread `1080.1 ms` best; 48 MP 1-thread `638.9 ms`; 5 MP Xiaomi
+  `68.5 ms`; 12 MP iPhone `109.4 ms` best / `110.1 ms` median vs `129.8 ms` for `heic-rs`
+  (`ratio 0.848`).
+
+**WebAssembly & Sequences**
+
+- `heifer`: avoided spawning worker threads in `encode_sequence` when `max_threads <= 1`, fixing
+  sequence encoding on single-thread WebAssembly builds.
+- Browser demo: added `.heics` image sequence playback, GIF/APNG/PNG-ZIP export, and
+  GIF/APNG-to-`.heics` conversion.
+
+**CI, Docs & Packaging**
+
+- Disabled the Homebrew formula target in `dist-workspace.toml` and `.github/workflows/release.yml`
+  (no `HOMEBREW_TAP_TOKEN` secret configured) so tagged Release CI can complete cleanly alongside
+  crates.io Trusted Publishing.
+- Updated package `Cargo.toml` descriptions/keywords, `docs.rs` crate-level docs, and `README.md`
+  with a `heifer` vs `libheif-rs` / `heic-rs` / `heic` comparison, inline `Migrating from libheif-rs`
+  guide, and copy-paste 5-line `image` crate hook snippet.
+- Validated with a 6-target nightly `cargo-fuzz` campaign across all targets (`0` crashes, `0`
+  timeouts, `0` OOMs).
+
 ## 0.7.2 — 2026-11-26
 
 Second pass of 100% safe-Rust single-thread decoding and colour-conversion optimizations (now
