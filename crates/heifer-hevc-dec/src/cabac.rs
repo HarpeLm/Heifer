@@ -76,6 +76,19 @@ pub struct ContextModel {
 }
 
 impl ContextModel {
+    #[inline(always)]
+    pub(crate) fn pack(self) -> u8 {
+        ((self.state & 63) << 1) | (self.mps & 1)
+    }
+
+    #[inline(always)]
+    pub(crate) fn unpack(v: u8) -> Self {
+        Self {
+            state: (v >> 1) & 63,
+            mps: v & 1,
+        }
+    }
+
     /// Initializes a context from its `initValue` and the slice QP (§9.3.2.2).
     pub fn new(init_value: u8, slice_qp_y: i32) -> Self {
         let slope_idx = i32::from(init_value >> 4);
@@ -163,8 +176,10 @@ impl<'a> ArithmeticDecoder<'a> {
             u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
         } else {
             let mut bytes = [0u8; 4];
-            let avail = self.data.len().saturating_sub(self.next).min(4);
-            bytes[..avail].copy_from_slice(&self.data[self.next..self.next + avail]);
+            if self.next < self.data.len() {
+                let avail = (self.data.len() - self.next).min(4);
+                bytes[..avail].copy_from_slice(&self.data[self.next..self.next + avail]);
+            }
             u32::from_be_bytes(bytes)
         };
         self.next += 4;
@@ -185,6 +200,33 @@ impl<'a> ArithmeticDecoder<'a> {
             self.bits_needed = -32;
             self.value |= self.fetch_u32();
         }
+    }
+
+    /// Decodes one bin with a context packed into `state_mps = (state << 1) | mps`.
+    #[inline(always)]
+    pub(crate) fn decode_packed(&mut self, state_mps: &mut u8) -> u8 {
+        let sm = usize::from(*state_mps & 127);
+        let state = sm >> 1;
+        let mps = (sm & 1) as u8;
+        let lps = u32::from(RANGE_TAB_LPS[state][((self.range >> 6) & 3) as usize]);
+        let range = self.range - lps;
+        let scaled = u64::from(range) << SHIFT;
+        let is_lps = self.value >= scaled;
+        let lps_mask32 = u32::from(is_lps).wrapping_neg();
+        let lps_mask64 = u64::from(is_lps).wrapping_neg();
+        self.value -= scaled & lps_mask64;
+        let range = range ^ ((range ^ lps) & lps_mask32);
+        *state_mps = NEXT_STATE[(sm << 1) | usize::from(is_lps)];
+        let bin = mps ^ u8::from(is_lps);
+        let shift = range.leading_zeros() - 23;
+        self.range = range << shift;
+        self.value <<= shift;
+        self.bits_needed += shift as i32;
+        if self.bits_needed >= 0 {
+            self.value |= self.fetch_u32() << self.bits_needed;
+            self.bits_needed -= 32;
+        }
+        bin
     }
 
     /// Decodes one bin with a context (`DecodeDecision`, §9.3.4.3.2).
@@ -277,11 +319,11 @@ impl<'a> ArithmeticDecoder<'a> {
         if n == 0 {
             return 0;
         }
+        let scaled = u64::from(self.range) << SHIFT;
+        let mut value = self.value;
+        let mut acc = 0u32;
         if n <= 31 && self.bits_needed + (n as i32) < 0 {
             self.bits_needed += n as i32;
-            let scaled = u64::from(self.range) << SHIFT;
-            let mut value = self.value;
-            let mut acc = 0u32;
             for _ in 0..n {
                 value <<= 1;
                 let bit = u64::from(value >= scaled);
@@ -291,7 +333,51 @@ impl<'a> ArithmeticDecoder<'a> {
             self.value = value;
             return acc;
         }
-        (0..n).fold(0, |acc, _| (acc << 1) | u32::from(self.decode_bypass()))
+        let mut bits_needed = self.bits_needed;
+        for _ in 0..n {
+            value <<= 1;
+            bits_needed += 1;
+            if bits_needed == 0 {
+                bits_needed = -32;
+                value |= self.fetch_u32();
+            }
+            let bit = u64::from(value >= scaled);
+            value -= scaled & bit.wrapping_neg();
+            acc = (acc << 1) | (bit as u32);
+        }
+        self.value = value;
+        self.bits_needed = bits_needed;
+        acc
+    }
+
+    /// Decodes a unary `1`-terminated-by-`0` bypass run (up to `max` ones), returning
+    /// `max + 1` if more than `max` consecutive ones appear.
+    #[inline(always)]
+    pub(crate) fn decode_bypass_unary_capped(&mut self, max: u32) -> u32 {
+        let scaled = u64::from(self.range) << SHIFT;
+        let mut value = self.value;
+        let mut bits_needed = self.bits_needed;
+        let mut count = 0u32;
+        loop {
+            value <<= 1;
+            bits_needed += 1;
+            if bits_needed == 0 {
+                bits_needed = -32;
+                value |= self.fetch_u32();
+            }
+            if value < scaled {
+                self.value = value;
+                self.bits_needed = bits_needed;
+                return count;
+            }
+            value -= scaled;
+            count += 1;
+            if count > max {
+                self.value = value;
+                self.bits_needed = bits_needed;
+                return count;
+            }
+        }
     }
 
     /// Aligns the range before aligned bypass decoding (§9.3.4.3.6):
@@ -445,5 +531,61 @@ mod tests {
         // Re-aligning during a bypass run is a no-op.
         d.align_bypass();
         assert_eq!(d.decode_bypass(), 0, "0xA5, bit 6");
+    }
+
+    #[test]
+    fn packed_and_bypass_helpers_match_reference() {
+        let mut seed = 0x9E37_79B9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..500 {
+            let data: Vec<u8> = (0..512).map(|_| next() as u8).collect();
+            let Ok(mut a) = ArithmeticDecoder::new(&data) else {
+                continue;
+            };
+            let mut b = a.clone();
+            let mut ctxs: Vec<ContextModel> = (0..4)
+                .map(|_| ContextModel {
+                    state: (next() % 63) as u8,
+                    mps: (next() & 1) as u8,
+                })
+                .collect();
+            let mut packed: Vec<u8> = ctxs.iter().map(|m| m.pack()).collect();
+            for _ in 0..80 {
+                let i = (next() % 4) as usize;
+                assert_eq!(
+                    a.decode_packed(&mut packed[i]),
+                    b.decode_reference(&mut ctxs[i])
+                );
+                assert_eq!(ContextModel::unpack(packed[i]), ctxs[i]);
+                let n = next() % 33;
+                let ref_bits =
+                    (0..n).fold(0u32, |acc, _| (acc << 1) | u32::from(b.decode_bypass()));
+                assert_eq!(a.decode_bypass_bits(n), ref_bits);
+                assert_eq!(
+                    (a.range, a.value, a.bits_needed, a.next),
+                    (b.range, b.value, b.bits_needed, b.next)
+                );
+            }
+            let mut c = b.clone();
+            let max = 6;
+            let got_u = c.decode_bypass_unary_capped(max);
+            let mut ref_u = 0;
+            while b.decode_bypass() == 1 {
+                ref_u += 1;
+                if ref_u > max {
+                    break;
+                }
+            }
+            assert_eq!(got_u, ref_u);
+            assert_eq!(
+                (c.range, c.value, c.bits_needed, c.next),
+                (b.range, b.value, b.bits_needed, b.next)
+            );
+        }
     }
 }
