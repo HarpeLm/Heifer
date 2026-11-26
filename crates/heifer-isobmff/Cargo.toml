@@ -1,6 +1,6 @@
 [package]
 name = "heifer-isobmff"
-description = "ISOBMFF / HEIF container reading and writing (ISO/IEC 14496-12, 23008-12)"
+description = "Pure-Rust ISOBMFF / HEIF container reader and writer (ISO/IEC 14496-12, 23008-12) — no C dependencies, no unsafe code"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
