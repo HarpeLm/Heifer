@@ -2,32 +2,32 @@
   "machine": "Apple M5, 10 cores",
   "files": {
     "Xiaomi, 5 MP": {
-      "heifer_ms": 14.8,
-      "heifer_1_thread_ms": 74.7,
+      "heifer_ms": 12.1,
+      "heifer_1_thread_ms": 73.9,
       "ffmpeg_ms": 11.0
     },
     "iPhone 13 Pro, 12 MP": {
-      "heifer_ms": 20.6,
-      "heifer_1_thread_ms": 116.3,
+      "heifer_ms": 21.0,
+      "heifer_1_thread_ms": 125.9,
       "ffmpeg_ms": 21.0
     },
     "8000\u00d76000, 48 MP": {
-      "heifer_ms": 116.0,
-      "heifer_1_thread_ms": 700.4,
+      "heifer_ms": 113.4,
+      "heifer_1_thread_ms": 649.7,
       "ffmpeg_ms": 95.0
     },
     "Galaxy S24 Ultra, 200 MP": {
-      "heifer_ms": 433.0,
-      "heifer_1_thread_ms": 1208.8,
+      "heifer_ms": 400.7,
+      "heifer_1_thread_ms": 1220.7,
       "ffmpeg_ms": null
     }
   },
   "scaling": {
-    "1": 117.4,
-    "2": 60.8,
-    "4": 35.7,
-    "6": 28.8,
+    "1": 113.5,
+    "2": 59.4,
+    "4": 34.1,
+    "6": 27.2,
     "8": 22.9,
-    "10": 20.2
+    "10": 20.5
   }
 }
