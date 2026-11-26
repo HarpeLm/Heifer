@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.2 — 2026-11-26
+
+Second pass of 100% safe-Rust single-thread decoding and colour-conversion optimizations (now
+~1.20× faster than `heic-rs` on 12 MP iPhone photos and ~1.18× faster across the 13-file benchmark
+suite), validated bit-exact across all 114 conformance bitstreams (7,115 pictures).
+
+**Performance**
+
+- `heifer-hevc-dec`:
+  - `cabac`: added packed `u8` context state decoding (`decode_packed`), capped bypass Exp-Golomb
+    decoding (`decode_bypass_unary_capped`), inline bypass bit refill fallback, and EOF bounds guard
+    in `fetch_u32`.
+  - `syntax`: replaced `[bool; 64]` coded-subblock grid with a `u64` bitmask, switched
+    `sig_coeff_flag` and `greater1_flag` loops to register-cached `decode_packed`, used capped
+    bypass decoding and whole-row `clear_coeffs`, and deferred `Picture::motion` allocation on
+    intra-only pictures.
+  - `recon`: eliminated per-block intra reference sample heap copies via scratch-buffer
+    `reference_samples_into`, scoped angular buffers, and added a 4-column vectorizable 2-D IDCT
+    (`inverse_2d_dct_x4`) for `N >= 8`.
+  - `filters`: deferred `FilterInfo::motion` vector allocation on intra-only pictures.
+- `heifer`: precomputed luma bias (`y_bias`) in the fixed-point YCbCr-to-RGBA loop (`color.rs`).
+- Measured 1-thread results (`heifer8`, Apple M5): 12 MP iPhone `109 ms` (`decode_rgba8`; `114 ms`
+  16-bit) vs `131 ms` for `heic-rs`, and `641 ms` vs `754 ms` across the 13-file suite (`89 ms`
+  vs `107 ms` on Apple's 12 MP photo).
+- Refreshed [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and pure-Rust decoder numbers in
+  [README.md](README.md).
+
 ## 0.7.1 — 2026-11-25
 
 Single-thread HEVC decoding and YCbCr-to-RGBA speedups (13–21% faster in 100% safe Rust,
