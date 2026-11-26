@@ -2,7 +2,7 @@
 //! decoded picture, written by the encoder so that decoders can check bit-exactness.
 
 use crate::Error;
-use crate::recon::Frame;
+use crate::recon::{Frame, Frame8};
 
 /// A decoded picture hash, one value per colour component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,21 @@ impl PictureHash {
         }
     }
 
+    /// Computes the same kind of hash over an 8-bit `Frame8` (uncropped decoded picture).
+    pub(crate) fn compute_like_8(&self, frame: &Frame8) -> Self {
+        let planes = (0..self.len()).map(|c| {
+            let (w, h) = (frame.widths[c] as usize, frame.heights[c] as usize);
+            (&frame.planes[c][..w * h], w, h)
+        });
+        match self {
+            Self::Md5(_) => Self::Md5(planes.map(|(s, _, _)| md5(s)).collect()),
+            Self::Crc(_) => Self::Crc(planes.map(|(s, w, h)| crc16(s, w, h, 8)).collect()),
+            Self::Checksum(_) => {
+                Self::Checksum(planes.map(|(s, w, h)| checksum(s, w, h, 8)).collect())
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Md5(v) => v.len(),
@@ -69,14 +84,14 @@ fn plane_bytes(samples: &[u16], w: usize, h: usize, bit_depth: u8) -> Vec<u8> {
     }
 }
 
-fn crc16(samples: &[u16], w: usize, h: usize, bit_depth: u8) -> u16 {
+fn crc16<T: Copy + Into<u32>>(samples: &[T], w: usize, h: usize, bit_depth: u8) -> u16 {
     let mut crc: u32 = 0xFFFF;
     let mut push_bit = |bit: u32| {
         let msb = (crc >> 15) & 1;
         crc = (((crc << 1) + bit) & 0xFFFF) ^ (msb * 0x1021);
     };
     for &v in &samples[..w * h] {
-        let v = u32::from(v);
+        let v: u32 = v.into();
         for i in 0..8 {
             push_bit((v >> (7 - i)) & 1);
         }
@@ -92,12 +107,12 @@ fn crc16(samples: &[u16], w: usize, h: usize, bit_depth: u8) -> u16 {
     crc as u16
 }
 
-fn checksum(samples: &[u16], w: usize, h: usize, bit_depth: u8) -> u32 {
+fn checksum<T: Copy + Into<u32>>(samples: &[T], w: usize, h: usize, bit_depth: u8) -> u32 {
     let mut sum: u32 = 0;
     for y in 0..h {
         for x in 0..w {
             let mask = ((x & 0xFF) ^ (y & 0xFF) ^ (x >> 8) ^ (y >> 8)) as u32;
-            let v = u32::from(samples[y * w + x]);
+            let v: u32 = samples[y * w + x].into();
             sum = sum.wrapping_add((v & 0xFF) ^ mask);
             if bit_depth > 8 {
                 sum = sum.wrapping_add((v >> 8) ^ mask);
