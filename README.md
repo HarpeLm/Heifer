@@ -2,8 +2,8 @@
 
 <img src="docs/images/banner.webp" alt="Heifer: HEIF/HEIC decoder and encoder in pure Rust" width="100%">
 
-**A pure-Rust HEIF/HEIC image decoder and encoder.**<br>
-No C dependencies · no `unsafe` code · runs everywhere Rust runs, including the browser.
+**Pure-Rust HEIC/HEIF (and `.heics`) decoder & encoder.**<br>
+`#![forbid(unsafe_code)]` · zero C/`libheif` dependency · WASM-ready · `image` crate support.
 
 [![crates.io](https://img.shields.io/crates/v/heifer.svg)](https://crates.io/crates/heifer)
 [![docs.rs](https://img.shields.io/docsrs/heifer)](https://docs.rs/heifer)
@@ -11,7 +11,7 @@ No C dependencies · no `unsafe` code · runs everywhere Rust runs, including th
 [![Fuzz](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/HarpeLm/Heifer/actions/workflows/fuzz.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**[▶ Try it in your browser](https://harpelm.github.io/Heifer/)** — drop a `.heic` photo to view it, or a PNG/JPEG to convert it to HEIC; everything runs locally in heifer compiled to WebAssembly.
+**[▶ Try it in your browser](https://harpelm.github.io/Heifer/)** — drop a `.heic` photo or `.heics` image sequence to view or play it, or convert PNG/JPEG/GIF/APNG to HEIC/HEICS; everything runs locally in heifer compiled to WebAssembly.
 
 
 <table>
@@ -96,6 +96,23 @@ decoder crates and `thiserror`, nothing else.
 ```toml
 [dependencies]
 heifer = { version = "0.7", default-features = false }
+```
+
+**Drop-in `image` crate hook (5 lines, copy-paste ready)**:
+
+```toml
+[dependencies]
+heifer = { version = "0.7", features = ["image"] }
+image  = "0.25"
+```
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    heifer::image_crate::register_image_decoder_hooks();
+    let img = image::open("photo.heic")?; // .heic / .heif / .hif + magic-byte detection
+    img.save("photo.png")?;
+    Ok(())
+}
 ```
 
 Or try the examples on your own photos:
@@ -377,22 +394,63 @@ vectorizes them (NEON, SSE/AVX), without any `unsafe` code.
 heic, heic-decoder, zune-heic, still265, ffmpeg, libheif with libde265 and x265, Apple),
 reproducible with `python3 benchmarks/run.py`.
 
-### Other pure-Rust decoders
+### Comparison: `heifer` vs `libheif-rs`, `heic-rs` and `heic`
 
-Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine, decoding to
-8-bit RGBA, on the files of this repository (November 2026, `heic` 0.1.6 and `heic-rs` 0.1.4):
+| | **`heifer`** | [`libheif-rs`](https://crates.io/crates/libheif-rs) (`libheif` C/C++) | [`heic-rs`](https://crates.io/crates/heic-rs) (`0.1.4`) | [`heic`](https://crates.io/crates/heic) (`0.1.6`) |
+|---|---|---|---|---|
+| Implementation & safety | **100 % safe Rust (`#![forbid(unsafe_code)]`)** | C/C++ FFI (`libheif` + `libde265` / `x265`) | Pure Rust | Pure Rust |
+| C toolchain / `wasm32-unknown-unknown` | **None · builds to WASM** | Requires C/C++ `libheif` · no `wasm32-unknown-unknown` | None | None |
+| License | **MIT OR Apache-2.0** | `LGPL-3.0` (`libheif`) / `GPL-2.0+` (`x265`) | MIT OR Apache-2.0 | `AGPL-3.0` or commercial |
+| Scope | **HEIC decode + encode + `.heics` sequences + `unci`** | HEIC + AVIF / VVC / AVC / JPEG-in-HEIF | HEIC decode only | HEIC decode only |
+| `image` crate (`ImageDecoder` / `ImageEncoder` / hooks) | **✓** | ✓ | – | – |
+| Real test files decoded (of 55) | **52** (all valid files) | 52 | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
+| Colours vs Apple (13-file suite, median / worst) | **50.2 / 49.3 dB** | 47.4–50.3 dB (4 real photos) | 43.9 / 26.4 dB | 47.0 / 32.6 dB |
+| Apple + ISO 21496-1 HDR gain maps | **✓** (decode + encode) | ✓ | – | extraction only |
+| Decode speed, 12 MP iPhone photo | **109 ms** (1 thread) · **99 ms** (`→ PNG`, multi-core) | `376 ms` (`heif-convert → PNG`) | 131 ms (1 thread) | 226 ms (1 thread) |
+| Encoding size vs `libheif` (`x265`, equal PSNR) | **reference** (`-2.7%` vs `x265 slow`) | +20.5% larger on `photo12.png` | – | – |
 
-| | heifer | [`heic-rs`](https://crates.io/crates/heic-rs) | [`heic`](https://crates.io/crates/heic) |
-|---|---|---|---|
-| License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | AGPL-3.0 or commercial |
-| Test files decoded (of 55) | **52** (all valid files) | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
-| Colours vs Apple's decoder (median of 13 Apple and other files) | **50.2 dB** | 43.9 dB (26.4 dB worst: limited-range mismatch) | 47.0 dB |
-| Apple HDR gain maps applied | ✓ | – | extraction only |
-| Speed, 12 MP iPhone photo, 1 thread | **109 ms** (`decode_rgba8`; 114 ms 16-bit) | 131 ms | 226 ms |
+`heifer` focuses on HEVC-coded HEIF (and ISO/IEC 23001-17 `unci`); choose `libheif-rs` only if you need AVIF, VVC, AVC or JPEG-in-HEIF inside the same library.
 
-heifer is the fastest pure-Rust software decoder (≈1.20× faster than `heic-rs` on 1 thread
-on the 12 MP iPhone photo and ≈1.18× faster across the 13-file benchmark suite), while remaining more
-accurate and complete.
+## Migrating from `libheif-rs`
+
+Replace `libheif-rs` in `Cargo.toml` and drop all C build / `pkg-config` dependencies:
+
+```toml
+# Cargo.toml
+heifer = { version = "0.7", features = ["image"] }   # or default features without `image`
+```
+
+```rust
+let bytes = std::fs::read("photo.heic")?;
+
+// Decode (primary image with alpha & crop/rotation/mirror applied):
+let image = heifer::decode(&bytes)?;                              // 16-bit RGBA samples
+let rgba8 = heifer::decode_rgba8(&bytes, &Default::default())?;   // 8-bit RGBA (half memory)
+let srgb  = heifer::decode_srgb(&bytes)?;                         // convert ICC / nclx to sRGB
+
+// Metadata without decoding pixels (EXIF, XMP, ICC):
+let meta = heifer::read_metadata(&bytes)?;
+
+// Encode RGB/RGBA pixels to HEIC:
+let heic = heifer::encode_rgba8(width, height, &rgba8.data, &heifer::EncodeOptions::default())?;
+
+// Optional `image` crate hooks (`image::open("photo.heic")`):
+heifer::image_crate::register_image_decoder_hooks();
+```
+
+| `libheif-rs` | `heifer` |
+|---|---|
+| `HeifContext::read_from_bytes` + `primary_image_handle` + `decode` | `heifer::decode(&bytes)` / `heifer::decode_rgba8(&bytes, &opts)` |
+| sRGB output (default in `libheif`) | `heifer::decode_srgb(&bytes)` / `heifer::decode_srgb_rgba8(&bytes, &opts)` |
+| `HeifContext::read_from_file` (streaming) | `heifer::decode_reader(file)` (`Read + Seek`) |
+| `check_file_type` / `FileTypeResult` | `heifer::check_file_type` / `heifer::FileTypeResult` |
+| `top_level_image_ids` | `heifer::decode_all(&bytes)` |
+| `metadata_block_ids` / `metadata` | `heifer::read_metadata(&bytes)` (`.exif`, `.xmp`, `.icc_profile`) & `heifer::read_iptc(&bytes)` |
+| `HeifContext::new` + `encode_image` | `heifer::encode`, `encode_rgb8`, `encode_rgba8`, `encode_with_metadata` |
+| Image sequences (`.heics`) | `heifer::read_sequence` / `heifer::decode_sequence` / `heifer::encode_sequence` |
+| `libheif_rs::integration::image::register_all_decoding_hooks` | `heifer::image_crate::register_image_decoder_hooks` |
+
+See **[docs/MIGRATION.md](docs/MIGRATION.md)** for the full side-by-side guide, behavioural differences and migration checklist.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
 
@@ -519,8 +577,8 @@ cargo build --release -p heifer-hevc-dec --example decode
 **Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
 
 ```sh
-git tag -a v0.7.2 -m "0.7.2 — what changed"
-git push origin v0.7.2
+git tag -a v0.7.3 -m "0.7.3 — what changed"
+git push origin v0.7.3
 ```
 
 The `Release` workflow creates the GitHub release, with the annotation as title and the matching
