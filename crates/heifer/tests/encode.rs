@@ -156,11 +156,10 @@ fn rejects_bad_input() {
 fn metadata_is_kept() {
     let rgba = test_image(600, 300, false); // a grid: metadata goes on the grid item
     let image = decode(&encode_rgba8(600, 300, &rgba, &EncodeOptions::default()).unwrap()).unwrap();
-    let metadata = heifer::Metadata {
-        exif: Some(b"II*\0\x08\0\0\0\0\0".to_vec()),
-        xmp: Some(b"<x:xmpmeta/>".to_vec()),
-        icc_profile: Some(b"icc".to_vec()),
-    };
+    let metadata = heifer::Metadata::new()
+        .with_exif(b"II*\0\x08\0\0\0\0\0".to_vec())
+        .with_xmp(b"<x:xmpmeta/>".to_vec())
+        .with_icc_profile(b"icc".to_vec());
     let heic = heifer::encode_with_metadata(&image, &metadata, &EncodeOptions::default()).unwrap();
     assert_eq!(heifer::read_metadata(&heic).unwrap(), metadata);
     assert_eq!(decode(&heic).unwrap().width, 600);
@@ -392,10 +391,7 @@ fn four_two_two_keeps_full_height_chroma() {
 #[test]
 fn lossless_with_metadata_keeps_pixels() {
     let rgba = test_image(70, 30, true);
-    let metadata = heifer::Metadata {
-        xmp: Some(b"<x:xmpmeta/>".to_vec()),
-        ..Default::default()
-    };
+    let metadata = heifer::Metadata::new().with_xmp(b"<x:xmpmeta/>".to_vec());
     let image = decode(
         &heifer::encode_rgba8_with_format(
             70,
