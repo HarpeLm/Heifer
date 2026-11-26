@@ -10,8 +10,8 @@
 use heifer_hevc_dec::decoder::DecodeOptions;
 use heifer_hevc_dec::recon::Frame;
 use heifer_hevc_dec::sequence::SequenceDecoder;
-use heifer_isobmff::hevc_annex_b;
 use heifer_isobmff::track::{Track, parse_tracks};
+use heifer_isobmff::{FourCC, hevc_annex_b};
 
 use crate::color::{ColorParams, frame_to_rgba_sized};
 use crate::{Error, Image, Options};
@@ -69,6 +69,48 @@ fn alpha_track(bytes: &[u8], main: &Track) -> Result<Option<Track>, Error> {
             && t.references
                 .iter()
                 .any(|(kind, ids)| kind.0 == *b"auxl" && ids.contains(&main.id))
+    }))
+}
+
+/// Compact summary of the main image sequence track, read without decoding frames.
+pub(crate) struct SequenceSummary {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub has_alpha: bool,
+    pub coding: FourCC,
+}
+
+/// Whether `bytes` contains a main image/video sequence track.
+pub(crate) fn has_sequence_track(bytes: &[u8]) -> bool {
+    main_track(bytes).ok().flatten().is_some()
+}
+
+/// Returns [`SequenceSummary`] for the main sequence track of `bytes`, if one exists.
+pub(crate) fn sequence_summary(bytes: &[u8]) -> Result<Option<SequenceSummary>, Error> {
+    let Some(track) = main_track(bytes)? else {
+        return Ok(None);
+    };
+    if !matches!(&track.coding.0, b"hvc1" | b"hev1") {
+        return Err(Error::Unsupported(format!(
+            "sequence track coding `{}`",
+            track.coding
+        )));
+    }
+    let bit_depth = track
+        .hevc_config
+        .as_ref()
+        .map(crate::hevc_config_bit_depth)
+        .transpose()?
+        .flatten()
+        .unwrap_or(8);
+    let has_alpha = alpha_track(bytes, &track)?.is_some();
+    Ok(Some(SequenceSummary {
+        width: track.width,
+        height: track.height,
+        bit_depth,
+        has_alpha,
+        coding: track.coding,
     }))
 }
 
