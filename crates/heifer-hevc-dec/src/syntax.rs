@@ -281,33 +281,83 @@ pub struct Picture<'a> {
     last_qp_y: i32,
 }
 
+/// Reusable backing storage for [`Picture`], avoiding allocations across repeated picture decodes.
+#[derive(Debug, Default)]
+pub struct PictureBuffers {
+    sao: Vec<SaoParams>,
+    slice_addr: Vec<u32>,
+    ct_depth: Vec<u8>,
+    intra_mode: Vec<u8>,
+    pcm: Vec<bool>,
+    qp_y: Vec<i8>,
+    skip: Vec<bool>,
+    motion: Vec<Motion>,
+}
+
 impl<'a> Picture<'a> {
     /// Creates the state for a new picture.
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
+        Self::from_buffers(sps, pps, PictureBuffers::default())
+    }
+
+    /// Creates the state for a new picture, reusing heap allocations from `buf`.
+    pub fn from_buffers(sps: &'a Sps, pps: &'a Pps, mut buf: PictureBuffers) -> Self {
         let layout = CtbLayout::new(sps, pps);
         let single_tile = layout.col_bd.len() == 2 && layout.row_bd.len() == 2;
         let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
         let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
         let n = w4 * h4;
+        buf.sao.clear();
+        buf.sao.resize(
+            (layout.width * layout.height) as usize,
+            SaoParams::default(),
+        );
+        buf.slice_addr.clear();
+        buf.slice_addr.resize(n, u32::MAX);
+        buf.ct_depth.clear();
+        buf.ct_depth.resize(n, 0);
+        buf.intra_mode.clear();
+        buf.intra_mode.resize(n, 1);
+        buf.pcm.clear();
+        buf.pcm.resize(n, false);
+        buf.qp_y.clear();
+        buf.qp_y.resize(n, 0);
+        buf.skip.clear();
+        buf.skip.resize(n, false);
+        buf.motion.clear();
         Self {
-            sao: vec![SaoParams::default(); (layout.width * layout.height) as usize],
+            sao: buf.sao,
             layout,
             single_tile,
             sps,
             pps,
             decoded_ctbs: 0,
             w4,
-            slice_addr: vec![u32::MAX; n],
-            ct_depth: vec![0; n],
-            intra_mode: vec![1; n],
-            pcm: vec![false; n],
-            qp_y: vec![0; n],
-            skip: vec![false; n],
-            motion: Vec::new(),
+            slice_addr: buf.slice_addr,
+            ct_depth: buf.ct_depth,
+            intra_mode: buf.intra_mode,
+            pcm: buf.pcm,
+            qp_y: buf.qp_y,
+            skip: buf.skip,
+            motion: buf.motion,
             wpp_saved: None,
             ds_saved: None,
             slice_addr_rs: 0,
             last_qp_y: 0,
+        }
+    }
+
+    /// Releases the internal grid allocations for reuse by [`from_buffers`](Self::from_buffers).
+    pub fn into_buffers(self) -> PictureBuffers {
+        PictureBuffers {
+            sao: self.sao,
+            slice_addr: self.slice_addr,
+            ct_depth: self.ct_depth,
+            intra_mode: self.intra_mode,
+            pcm: self.pcm,
+            qp_y: self.qp_y,
+            skip: self.skip,
+            motion: self.motion,
         }
     }
 
