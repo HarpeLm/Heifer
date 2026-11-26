@@ -9,11 +9,12 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.7.2 — second pass of 100% safe-Rust single-thread decoder optimizations
-  (`109 ms` `heifer8` on 12 MP iPhone / `1.20×` faster than `heic-rs`), building on `0.7.0`–`0.7.1`
+- Latest release: 0.7.3 — per-thread grid buffer reuse, direct 8-bit `Frame8` planes, and
+  zero-copy `CropWindow` decoding (`200 MP` multi-core `534 ms`, 1-thread `1080 ms`; `48 MP`
+  1-thread `639 ms`; `12 MP` iPhone `109 ms` vs `130 ms` for `heic-rs`), building on `0.7.0`–`0.7.2`
   (image sequences with P, B and hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`, alpha
-  auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit, `EncodeSpeed` presets, full `.heics` CLI
-  support, IPTC metadata, reader decoding, and crates.io Trusted Publishing).
+  auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit, `EncodeSpeed` presets, full `.heics` CLI and
+  WASM demo support, IPTC metadata, reader decoding, and crates.io Trusted Publishing).
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   images (`unci`), image sequences (114 conformance bitstreams match their MD5).
 - Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
