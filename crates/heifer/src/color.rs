@@ -159,10 +159,12 @@ pub fn frame_to_rgba_into<S: Sample>(
         // Fixed point with FRAC fractional bits. Every step is a plain loop over a row, with the
         // chroma terms kept apart per channel: that is what the compiler vectorizes.
         const FRAC: u32 = 14;
+        const HALF: i32 = 1 << (FRAC - 1);
         let scale = max_out * f64::from(1u32 << FRAC);
         let fixed = |v: f64| (v * scale).round() as i32;
         let y_base = y_off as i32;
         let y_mul = fixed(1.0 / y_scale);
+        let y_bias = HALF - y_mul * y_base;
         let c_base = c_mid as i32;
         let r_mul = fixed(2.0 * (1.0 - kr) / c_scale);
         let b_mul = fixed(2.0 * (1.0 - kb) / c_scale);
@@ -170,7 +172,7 @@ pub fn frame_to_rgba_into<S: Sample>(
         let gr_mul = fixed(kr * 2.0 * (1.0 - kr) / kg / c_scale);
         let gb_mul = fixed(kb * 2.0 * (1.0 - kb) / kg / c_scale);
         let max = (1i32 << out_depth) - 1;
-        let to_out = |v: i32| S::from_u16(((v + (1 << (FRAC - 1))) >> FRAC).clamp(0, max) as u16);
+        let to_out = |v: i32| S::from_u16((v >> FRAC).clamp(0, max) as u16);
         // Chroma terms (R, G, B contributions) of one chroma row. The conversion is linear, so
         // interpolating the terms is interpolating the chroma samples.
         let row_terms = |yc: usize, t: &mut ChromaTerms| {
@@ -220,18 +222,20 @@ pub fn frame_to_rgba_into<S: Sample>(
                 blended.average(&above, &below);
                 &blended
             };
+            let tr_s = &terms.r;
+            let tg_s = &terms.g;
+            let tb_s = &terms.b;
             let luma = luma_row(y);
             if sx == 2 {
-                // Fuse horizontal chroma widening directly into pixel conversion (2 pixels per chroma step).
                 let pairs = out_row[..done * 4]
                     .chunks_exact_mut(8)
                     .zip(luma[..done].chunks_exact(2))
-                    .zip(terms.r[..=last_column].windows(2))
-                    .zip(terms.g[..=last_column].windows(2))
-                    .zip(terms.b[..=last_column].windows(2));
+                    .zip(tr_s[..=pair_count].windows(2))
+                    .zip(tg_s[..=pair_count].windows(2))
+                    .zip(tb_s[..=pair_count].windows(2));
                 for ((((px, lv), tr), tg), tb) in pairs {
-                    let yf0 = y_mul * (i32::from(lv[0]) - y_base);
-                    let yf1 = y_mul * (i32::from(lv[1]) - y_base);
+                    let yf0 = y_mul * i32::from(lv[0]) + y_bias;
+                    let yf1 = y_mul * i32::from(lv[1]) + y_bias;
                     px[0] = to_out(yf0 + tr[0]);
                     px[1] = to_out(yf0 - tg[0]);
                     px[2] = to_out(yf0 + tb[0]);
@@ -247,21 +251,21 @@ pub fn frame_to_rgba_into<S: Sample>(
                     .enumerate()
                 {
                     let xc = ((done + dx) / 2).min(last_column);
-                    let yf = y_mul * (i32::from(yv) - y_base);
-                    px[0] = to_out(yf + terms.r[xc]);
-                    px[1] = to_out(yf - terms.g[xc]);
-                    px[2] = to_out(yf + terms.b[xc]);
+                    let yf = y_mul * i32::from(yv) + y_bias;
+                    px[0] = to_out(yf + tr_s[xc]);
+                    px[1] = to_out(yf - tg_s[xc]);
+                    px[2] = to_out(yf + tb_s[xc]);
                     px[3] = alpha;
                 }
             } else {
                 let columns = out_row[..width * 4]
                     .chunks_exact_mut(4)
                     .zip(luma)
-                    .zip(&terms.r)
-                    .zip(&terms.g)
-                    .zip(&terms.b);
+                    .zip(tr_s)
+                    .zip(tg_s)
+                    .zip(tb_s);
                 for ((((px, &yv), &r), &g), &b) in columns {
-                    let yf = y_mul * (i32::from(yv) - y_base);
+                    let yf = y_mul * i32::from(yv) + y_bias;
                     px[0] = to_out(yf + r);
                     px[1] = to_out(yf - g);
                     px[2] = to_out(yf + b);
