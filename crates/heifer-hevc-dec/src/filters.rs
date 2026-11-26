@@ -5,7 +5,7 @@
 //! motion on both sides.
 
 use crate::params::{Pps, Sps};
-use crate::recon::Frame;
+use crate::recon::{Frame, Frame8, PlaneSample};
 use crate::scan::CtbLayout;
 use crate::syntax::SaoParams;
 
@@ -194,14 +194,68 @@ pub(crate) fn chroma_qp(qpi: i32, chroma_array_type: u8) -> i32 {
 
 /// Applies the deblocking filter to `frame` in place (§8.7.2).
 pub fn deblock(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &CtbLayout) {
+    deblock_planes(
+        &mut frame.planes,
+        frame.widths,
+        frame.heights,
+        info,
+        sps,
+        pps,
+        layout,
+    );
+}
+
+pub(crate) fn deblock_8(
+    frame: &mut Frame8,
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+) {
+    deblock_planes(
+        &mut frame.planes,
+        frame.widths,
+        frame.heights,
+        info,
+        sps,
+        pps,
+        layout,
+    );
+}
+
+fn deblock_planes<T: PlaneSample>(
+    planes: &mut [Vec<T>; 3],
+    widths: [u32; 3],
+    heights: [u32; 3],
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+) {
     if info.slices.len() == 1 && info.slices[0].deblocking_disabled {
         return;
     }
-    deblock_luma::<true>(frame, info, sps, pps, layout);
-    deblock_luma::<false>(frame, info, sps, pps, layout);
+    deblock_luma::<true, T>(&mut planes[0], widths[0], info, sps, pps, layout);
+    deblock_luma::<false, T>(&mut planes[0], widths[0], info, sps, pps, layout);
     if sps.chroma_array_type() != 0 {
-        deblock_chroma::<true>(frame, info, sps, pps, layout);
-        deblock_chroma::<false>(frame, info, sps, pps, layout);
+        deblock_chroma::<true, T>(
+            &mut planes[1..],
+            widths[1],
+            heights[1],
+            info,
+            sps,
+            pps,
+            layout,
+        );
+        deblock_chroma::<false, T>(
+            &mut planes[1..],
+            widths[1],
+            heights[1],
+            info,
+            sps,
+            pps,
+            layout,
+        );
     }
 }
 
@@ -243,8 +297,9 @@ fn edge_filtered(
 ///
 /// `VERTICAL` is a compile-time constant so both the sample addressing and the outer/inner
 /// cache-friendly row-major traversal collapse with no per-sample branch.
-fn deblock_luma<const VERTICAL: bool>(
-    frame: &mut Frame,
+fn deblock_luma<const VERTICAL: bool, T: PlaneSample>(
+    plane: &mut [T],
+    width: u32,
     info: &FilterInfo,
     sps: &Sps,
     pps: &Pps,
@@ -254,10 +309,9 @@ fn deblock_luma<const VERTICAL: bool>(
         sps.pic_width_in_luma_samples,
         sps.pic_height_in_luma_samples,
     );
-    let stride = frame.widths[0] as usize;
+    let stride = width as usize;
     let bit_depth = i32::from(sps.bit_depth_luma);
     let max = (1 << bit_depth) - 1;
-    let plane = &mut frame.planes[0];
     let edge_bit = if VERTICAL { 1 } else { 2 };
     let any_edge = edge_bit | (edge_bit << 2);
     let all_edges_filtered = info.slices.len() == 1
@@ -301,22 +355,22 @@ fn deblock_luma<const VERTICAL: bool>(
             } else {
                 ((yq as usize - 4) * stride + xq as usize, stride, 1usize)
             };
-            let load = |plane: &[u16], k: usize| -> [i32; 8] {
+            let load = |plane: &[T], k: usize| -> [i32; 8] {
                 let b = base + k * step_k;
                 if VERTICAL {
                     let row = &plane[b..b + 8];
                     [
-                        i32::from(row[0]),
-                        i32::from(row[1]),
-                        i32::from(row[2]),
-                        i32::from(row[3]),
-                        i32::from(row[4]),
-                        i32::from(row[5]),
-                        i32::from(row[6]),
-                        i32::from(row[7]),
+                        row[0].to_i32(),
+                        row[1].to_i32(),
+                        row[2].to_i32(),
+                        row[3].to_i32(),
+                        row[4].to_i32(),
+                        row[5].to_i32(),
+                        row[6].to_i32(),
+                        row[7].to_i32(),
                     ]
                 } else {
-                    core::array::from_fn(|j| i32::from(plane[b + j * step_i]))
+                    core::array::from_fn(|j| plane[b + j * step_i].to_i32())
                 }
             };
             let l0 = load(plane, 0);
@@ -346,7 +400,7 @@ fn deblock_luma<const VERTICAL: bool>(
                 };
                 let b = base + k * step_k;
                 if de_strong {
-                    let c = |v: i32, f: i32| f.clamp(v - 2 * tc, v + 2 * tc) as u16;
+                    let c = |v: i32, f: i32| T::from_in_range(f.clamp(v - 2 * tc, v + 2 * tc));
                     let np0 = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
                     let np1 = c(p1, (p2 + p1 + p0 + q0 + 2) >> 2);
                     let np2 = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
@@ -382,21 +436,21 @@ fn deblock_luma<const VERTICAL: bool>(
                     if delta.abs() < tc * 10 {
                         delta = delta.clamp(-tc, tc);
                         if !no_p {
-                            let np0 = (p0 + delta).clamp(0, max) as u16;
+                            let np0 = T::from_clamped(p0 + delta, max);
                             plane[b + 3 * step_i] = np0;
                             if dep {
                                 let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1)
                                     .clamp(-(tc >> 1), tc >> 1);
-                                plane[b + 2 * step_i] = (p1 + dp).clamp(0, max) as u16;
+                                plane[b + 2 * step_i] = T::from_clamped(p1 + dp, max);
                             }
                         }
                         if !no_q {
-                            let nq0 = (q0 - delta).clamp(0, max) as u16;
+                            let nq0 = T::from_clamped(q0 - delta, max);
                             plane[b + 4 * step_i] = nq0;
                             if deq {
                                 let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1)
                                     .clamp(-(tc >> 1), tc >> 1);
-                                plane[b + 5 * step_i] = (q1 + dq).clamp(0, max) as u16;
+                                plane[b + 5 * step_i] = T::from_clamped(q1 + dq, max);
                             }
                         }
                     }
@@ -407,15 +461,17 @@ fn deblock_luma<const VERTICAL: bool>(
 }
 
 /// Applies the chroma deblocking filter across vertical (`VERTICAL`) or horizontal edges.
-fn deblock_chroma<const VERTICAL: bool>(
-    frame: &mut Frame,
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma<const VERTICAL: bool, T: PlaneSample>(
+    chroma_planes: &mut [Vec<T>],
+    cw: u32,
+    ch: u32,
     info: &FilterInfo,
     sps: &Sps,
     pps: &Pps,
     layout: &CtbLayout,
 ) {
     let (sw, sh) = sps.chroma_subsampling();
-    let (cw, ch) = (frame.widths[1], frame.heights[1]);
     let stride = cw as usize;
     let bit_depth = i32::from(sps.bit_depth_chroma);
     let max = (1 << bit_depth) - 1;
@@ -429,8 +485,8 @@ fn deblock_chroma<const VERTICAL: bool>(
             .is_none_or(|t| t.loop_filter_across_tiles_enabled_flag);
 
     let (yc_start, yc_step, xc_start, xc_step) = if VERTICAL { (0, 1, 8, 8) } else { (8, 8, 0, 1) };
-    for (c, plane) in frame.planes.iter_mut().enumerate().skip(1) {
-        let pic_offset = i32::from(if c == 1 {
+    for (idx, plane) in chroma_planes.iter_mut().enumerate() {
+        let pic_offset = i32::from(if idx == 0 {
             pps.pps_cb_qp_offset
         } else {
             pps.pps_cr_qp_offset
@@ -469,26 +525,21 @@ fn deblock_chroma<const VERTICAL: bool>(
                 };
                 let (p1, p0, q0, q1) = if VERTICAL {
                     let s = &plane[base..base + 4];
-                    (
-                        i32::from(s[0]),
-                        i32::from(s[1]),
-                        i32::from(s[2]),
-                        i32::from(s[3]),
-                    )
+                    (s[0].to_i32(), s[1].to_i32(), s[2].to_i32(), s[3].to_i32())
                 } else {
                     (
-                        i32::from(plane[base]),
-                        i32::from(plane[base + step]),
-                        i32::from(plane[base + 2 * step]),
-                        i32::from(plane[base + 3 * step]),
+                        plane[base].to_i32(),
+                        plane[base + step].to_i32(),
+                        plane[base + 2 * step].to_i32(),
+                        plane[base + 3 * step].to_i32(),
                     )
                 };
                 let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
                 if !info.no_filter[ip] {
-                    plane[base + step] = (p0 + delta).clamp(0, max) as u16;
+                    plane[base + step] = T::from_clamped(p0 + delta, max);
                 }
                 if !info.no_filter[iq] {
-                    plane[base + 2 * step] = (q0 - delta).clamp(0, max) as u16;
+                    plane[base + 2 * step] = T::from_clamped(q0 - delta, max);
                 }
             }
         }
@@ -510,10 +561,53 @@ pub fn sao(
     layout: &CtbLayout,
     scratch: &mut Vec<u16>,
 ) {
+    sao_planes(
+        &mut frame.planes,
+        frame.widths,
+        frame.heights,
+        info,
+        sps,
+        pps,
+        layout,
+        scratch,
+    );
+}
+
+pub(crate) fn sao_8(
+    frame: &mut Frame8,
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+    scratch: &mut Vec<u8>,
+) {
+    sao_planes(
+        &mut frame.planes,
+        frame.widths,
+        frame.heights,
+        info,
+        sps,
+        pps,
+        layout,
+        scratch,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sao_planes<T: PlaneSample>(
+    planes: &mut [Vec<T>; 3],
+    widths: [u32; 3],
+    heights: [u32; 3],
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+    scratch: &mut Vec<T>,
+) {
     let num_comps = if sps.chroma_array_type() != 0 { 3 } else { 1 };
     let ctb = sps.ctb_size();
     let num_ctb = (layout.width * layout.height) as usize;
-    for c in 0..num_comps {
+    for (c, dst_plane) in planes.iter_mut().enumerate().take(num_comps) {
         let mut any_sao = false;
         let mut has_edge = false;
         for p in &info.sao[..num_ctb] {
@@ -524,13 +618,13 @@ pub fn sao(
         if !any_sao {
             continue;
         }
-        let (pw, ph) = (frame.widths[c], frame.heights[c]);
+        let (pw, ph) = (widths[c], heights[c]);
         if has_edge {
             scratch.clear();
-            scratch.extend_from_slice(&frame.planes[c]);
+            scratch.extend_from_slice(dst_plane);
             sao_plane(
                 Some(scratch),
-                &mut frame.planes[c],
+                dst_plane,
                 c,
                 info,
                 sps,
@@ -541,18 +635,7 @@ pub fn sao(
                 ph,
             );
         } else {
-            sao_plane(
-                None,
-                &mut frame.planes[c],
-                c,
-                info,
-                sps,
-                pps,
-                layout,
-                ctb,
-                pw,
-                ph,
-            );
+            sao_plane(None, dst_plane, c, info, sps, pps, layout, ctb, pw, ph);
         }
     }
 }
@@ -560,9 +643,9 @@ pub fn sao(
 /// Applies SAO to one colour plane. `src` is the pre-SAO copy used by edge offset; `None` means
 /// the plane holds no edge-offset CTB and may be filtered in place.
 #[allow(clippy::too_many_arguments)]
-fn sao_plane(
-    src: Option<&[u16]>,
-    dst: &mut [u16],
+fn sao_plane<T: PlaneSample>(
+    src: Option<&[T]>,
+    dst: &mut [T],
     c: usize,
     info: &FilterInfo,
     sps: &Sps,
@@ -611,18 +694,18 @@ fn sao_plane(
                             .iter_mut()
                             .zip(&src[row + xs..row + xe])
                         {
-                            let v = i32::from(sv);
+                            let v = sv.to_i32();
                             let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
                             if k < 4 {
-                                *d = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                                *d = T::from_clamped(v + i32::from(offsets[usize::from(k)]), max);
                             }
                         }
                     } else {
                         for d in &mut dst[row + xs..row + xe] {
-                            let v = i32::from(*d);
+                            let v = d.to_i32();
                             let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
                             if k < 4 {
-                                *d = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                                *d = T::from_clamped(v + i32::from(offsets[usize::from(k)]), max);
                             }
                         }
                     }
@@ -634,10 +717,10 @@ fn sao_plane(
                             continue;
                         }
                         let i = y as usize * stride + x as usize;
-                        let v = i32::from(src.map_or(dst[i], |s| s[i]));
+                        let v = src.map_or(dst[i], |s| s[i]).to_i32();
                         let k = ((v >> shift) as u8).wrapping_sub(band) & 31;
                         if k < 4 {
-                            dst[i] = (v + i32::from(offsets[usize::from(k)])).clamp(0, max) as u16;
+                            dst[i] = T::from_clamped(v + i32::from(offsets[usize::from(k)]), max);
                         }
                     }
                 }
@@ -666,11 +749,11 @@ fn sao_plane(
                         .zip(&src[a_start..a_start + len])
                         .zip(&src[b_start..b_start + len])
                     {
-                        let (v, a, b) = (i32::from(v), i32::from(a), i32::from(b));
+                        let (v, a, b) = (v.to_i32(), a.to_i32(), b.to_i32());
                         let edge = (2 + (v - a).signum() + (v - b).signum()) as usize;
                         let off = eo[edge];
                         if off != 0 {
-                            *d = (v + i32::from(off)).clamp(0, max) as u16;
+                            *d = T::from_clamped(v + i32::from(off), max);
                         }
                     }
                 }
@@ -711,13 +794,13 @@ fn sao_plane(
                         continue;
                     }
                     let i = y as usize * stride + x as usize;
-                    let v = i32::from(src[i]);
-                    let a = i32::from(src[ay as usize * stride + ax as usize]);
-                    let b = i32::from(src[by as usize * stride + bx as usize]);
+                    let v = src[i].to_i32();
+                    let a = src[ay as usize * stride + ax as usize].to_i32();
+                    let b = src[by as usize * stride + bx as usize].to_i32();
                     let edge = (2 + (v - a).signum() + (v - b).signum()) as usize;
                     let off = eo[edge];
                     if off != 0 {
-                        dst[i] = (v + i32::from(off)).clamp(0, max) as u16;
+                        dst[i] = T::from_clamped(v + i32::from(off), max);
                     }
                 }
             }
