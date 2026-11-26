@@ -15,6 +15,40 @@ pub(crate) trait PlaneSample: Copy + Default + Send + Sync + 'static {
     fn from_in_range(v: i32) -> Self;
     fn mid(bit_depth: u8) -> Self;
     fn from_u16_sample(v: u16) -> Self;
+    fn sao_eo_row(dst: &mut [Self], src: &[Self], a: &[Self], b: &[Self], eo: [i16; 4], max: i32);
+}
+
+#[inline]
+fn sao_eo_row_scalar<T: PlaneSample>(
+    dst: &mut [T],
+    src: &[T],
+    a: &[T],
+    b: &[T],
+    eo: [i16; 4],
+    max: i32,
+) {
+    let [e0, e1, e2, e3] = eo.map(i32::from);
+    for (((d, &v), &av), &bv) in dst.iter_mut().zip(src).zip(a).zip(b) {
+        let vi = v.to_i32();
+        let ai = av.to_i32();
+        let bi = bv.to_i32();
+        let c =
+            (i32::from(vi > ai) - i32::from(vi < ai)) + (i32::from(vi > bi) - i32::from(vi < bi));
+        let mut off = 0i32;
+        if c == -2 {
+            off = e0;
+        }
+        if c == -1 {
+            off = e1;
+        }
+        if c == 1 {
+            off = e2;
+        }
+        if c == 2 {
+            off = e3;
+        }
+        *d = T::from_clamped(vi + off, max);
+    }
 }
 
 impl PlaneSample for u8 {
@@ -42,6 +76,39 @@ impl PlaneSample for u8 {
     fn from_u16_sample(v: u16) -> Self {
         v as u8
     }
+
+    #[inline]
+    fn sao_eo_row(dst: &mut [Self], src: &[Self], a: &[Self], b: &[Self], eo: [i16; 4], max: i32) {
+        if max == 255 {
+            if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (
+                i8::try_from(eo[0]),
+                i8::try_from(eo[1]),
+                i8::try_from(eo[2]),
+                i8::try_from(eo[3]),
+            ) {
+                for (((d, &v), &av), &bv) in dst.iter_mut().zip(src).zip(a).zip(b) {
+                    let c = (i8::from(v > av) - i8::from(v < av))
+                        + (i8::from(v > bv) - i8::from(v < bv));
+                    let mut off = 0i8;
+                    if c == -2 {
+                        off = e0;
+                    }
+                    if c == -1 {
+                        off = e1;
+                    }
+                    if c == 1 {
+                        off = e2;
+                    }
+                    if c == 2 {
+                        off = e3;
+                    }
+                    *d = v.saturating_add_signed(off);
+                }
+                return;
+            }
+        }
+        sao_eo_row_scalar(dst, src, a, b, eo, max);
+    }
 }
 
 impl PlaneSample for u16 {
@@ -68,6 +135,11 @@ impl PlaneSample for u16 {
     #[inline(always)]
     fn from_u16_sample(v: u16) -> Self {
         v
+    }
+
+    #[inline]
+    fn sao_eo_row(dst: &mut [Self], src: &[Self], a: &[Self], b: &[Self], eo: [i16; 4], max: i32) {
+        sao_eo_row_scalar(dst, src, a, b, eo, max);
     }
 }
 
@@ -1498,9 +1570,88 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
         let (unit_x, unit_y) = ((4 / sw).max(1) as usize, (4 / sh).max(1) as usize);
         let (x0u, y0u) = (x0 as usize, y0 as usize);
         if self.single_tile && x0u > 0 && y0u > 0 && x0u + 2 * n <= stride && y0u + 2 * n <= ph_c {
+            let swu = sw as usize;
+            let shu = sh as usize;
+            let x4_left = ((x0u - 1) * swu) >> 2;
+            let y4_above = ((y0u - 1) * shu) >> 2;
+            let addr = self.slice_addr;
+            let try_fast = |refs: &mut [i32]| -> bool {
+                if self.decoded[y4_above * self.w4 + x4_left] != addr {
+                    return false;
+                }
+                let tx0 = (x0u * swu) >> 2;
+                let tx1 = ((x0u + n - 1) * swu) >> 2;
+                let top_row_decoded = &self.decoded[y4_above * self.w4..];
+                if top_row_decoded[tx0..=tx1].iter().any(|&v| v != addr) {
+                    return false;
+                }
+                let ty0 = (y0u * shu) >> 2;
+                let ty1 = ((y0u + n - 1) * shu) >> 2;
+                for y4 in ty0..=ty1 {
+                    if self.decoded[y4 * self.w4 + x4_left] != addr {
+                        return false;
+                    }
+                }
+                let tx2 = ((x0u + n) * swu) >> 2;
+                let tx3 = ((x0u + 2 * n - 1) * swu) >> 2;
+                let mut tr_all = true;
+                let mut tr_none = true;
+                for &v in &top_row_decoded[tx2..=tx3] {
+                    let is = v == addr;
+                    tr_all &= is;
+                    tr_none &= !is;
+                }
+                if !tr_all && !tr_none {
+                    return false;
+                }
+                let ty2 = ((y0u + n) * shu) >> 2;
+                let ty3 = ((y0u + 2 * n - 1) * shu) >> 2;
+                let mut bl_all = true;
+                let mut bl_none = true;
+                for y4 in ty2..=ty3 {
+                    let is = self.decoded[y4 * self.w4 + x4_left] == addr;
+                    bl_all &= is;
+                    bl_none &= !is;
+                }
+                if !bl_all && !bl_none {
+                    return false;
+                }
+                for j in 0..n {
+                    refs[2 * n - 1 - j] = plane[(y0u + j) * stride + x0u - 1].to_i32();
+                }
+                if bl_all {
+                    for j in n..2 * n {
+                        refs[2 * n - 1 - j] = plane[(y0u + j) * stride + x0u - 1].to_i32();
+                    }
+                } else {
+                    let fill_bl = refs[n];
+                    refs[..n].fill(fill_bl);
+                }
+                refs[2 * n] = plane[(y0u - 1) * stride + x0u - 1].to_i32();
+                let row_above = (y0u - 1) * stride + x0u;
+                for (dst, &v) in refs[2 * n + 1..3 * n + 1]
+                    .iter_mut()
+                    .zip(&plane[row_above..row_above + n])
+                {
+                    *dst = v.to_i32();
+                }
+                if tr_all {
+                    for (dst, &v) in refs[3 * n + 1..4 * n + 1]
+                        .iter_mut()
+                        .zip(&plane[row_above + n..row_above + 2 * n])
+                    {
+                        *dst = v.to_i32();
+                    }
+                } else {
+                    let fill_tr = refs[3 * n];
+                    refs[3 * n + 1..4 * n + 1].fill(fill_tr);
+                }
+                true
+            };
+            if try_fast(refs) {
+                return;
+            }
             let mut all_avail = true;
-            let x4_left = ((x0u - 1) * sw as usize) >> 2;
-            let y4_above = ((y0u - 1) * sh as usize) >> 2;
             let mut k = 0;
             while k < 2 * n {
                 let y = y0u + k;
