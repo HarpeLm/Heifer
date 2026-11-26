@@ -279,15 +279,14 @@ struct FrameLayout<'a> {
     mode: Mode,
 }
 
-/// Validates the frame and returns its entries, planes and interleave mode.
-fn layout<'a>(
+/// Validates `config` for `id` and returns `(mode, entries)` without reading pixel data.
+fn validate_entries(
     file: &HeifFile<'_>,
     id: ItemId,
     config: &UncompressedConfig,
     width: u32,
     height: u32,
-    data: &'a [u8],
-) -> Result<FrameLayout<'a>, Error> {
+) -> Result<(Mode, Vec<Entry>), Error> {
     if config.version != 0 {
         return Err(unsupported(&format!(
             "configuration version {}",
@@ -411,6 +410,55 @@ fn layout<'a>(
     if !has_rgb && !has_ycbcr && !seen[0] && !seen[1] {
         return Err(unsupported("without a component heifer understands"));
     }
+    Ok((mode, entries))
+}
+
+/// Returns `(width, height, bit_depth, has_alpha)` for an `unci` item without reading pixel data.
+pub(crate) fn info(file: &HeifFile<'_>, id: ItemId) -> Result<(u32, u32, u8, bool), Error> {
+    let config = file.uncompressed_config(id)?.ok_or(Error::Invalid(
+        "uncompressed image without an `uncC` property",
+    ))?;
+    let (width, height) = file.image_size(id)?.ok_or(Error::Invalid(
+        "uncompressed image without an `ispe` property",
+    ))?;
+    if width == 0 || height == 0 {
+        return Err(Error::Invalid("image size is zero or too large"));
+    }
+    let (_, entries) = validate_entries(file, id, config, width, height)?;
+    let has_alpha = entries.iter().any(|entry| entry.role == Role::Alpha);
+    if entries.iter().any(|entry| entry.role == Role::Red) {
+        let red = entry_of(&entries, Role::Red)?;
+        let green = entry_of(&entries, Role::Green)?;
+        let blue = entry_of(&entries, Role::Blue)?;
+        let bit_depth = red.bit_depth.max(green.bit_depth).max(blue.bit_depth) as u8;
+        return Ok((width, height, bit_depth, has_alpha));
+    }
+    if entries.iter().any(|entry| entry.role == Role::Luma) {
+        let luma = entry_of(&entries, Role::Luma)?;
+        if !entries.iter().any(|entry| entry.role == Role::Cb) {
+            return Ok((width, height, luma.bit_depth as u8, false));
+        }
+        let cb = entry_of(&entries, Role::Cb)?;
+        let cr = entry_of(&entries, Role::Cr)?;
+        let bit_depth = luma.bit_depth.max(cb.bit_depth).max(cr.bit_depth) as u8;
+        return Ok((width, height, bit_depth, has_alpha));
+    }
+    if let Some(mono) = entries.iter().find(|entry| entry.role == Role::Mono) {
+        return Ok((width, height, mono.bit_depth as u8, has_alpha));
+    }
+    Err(unsupported("without an image component"))
+}
+
+/// Validates the frame and returns its entries, planes and interleave mode.
+fn layout<'a>(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    config: &UncompressedConfig,
+    width: u32,
+    height: u32,
+    data: &'a [u8],
+) -> Result<FrameLayout<'a>, Error> {
+    let (mode, entries) = validate_entries(file, id, config, width, height)?;
 
     let mut planes: [Option<Plane>; 8] = std::array::from_fn(|_| None);
     for entry in &entries {
