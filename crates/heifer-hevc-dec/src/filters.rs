@@ -63,7 +63,7 @@ impl FilterInfo {
             edges: vec![0; n],
             intra: vec![true; n],
             coded: vec![false; n],
-            motion: vec![EdgeMotion::default(); n],
+            motion: Vec::new(),
             qp_y: vec![0; n],
             no_filter: vec![false; n],
             slice: vec![0; n],
@@ -90,6 +90,9 @@ fn boundary_strength(info: &FilterInfo, ip: usize, iq: usize, transform_edge: bo
     }
     if transform_edge && (info.coded[ip] || info.coded[iq]) {
         return 1;
+    }
+    if info.motion.is_empty() {
+        return 0;
     }
     motion_strength(info.motion[ip], info.motion[iq])
 }
