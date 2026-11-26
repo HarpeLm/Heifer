@@ -137,11 +137,10 @@ fn gain_map_of_a_grid_is_a_hidden_half_size_grid() {
 #[test]
 fn hdr_metadata_is_kept() {
     let (base, hdr) = synthetic(64, 48);
-    let metadata = heifer::Metadata {
-        exif: Some(b"II*\0\x08\0\0\0\0\0".to_vec()),
-        xmp: Some(b"<x:xmpmeta/>".to_vec()),
-        icc_profile: Some(b"icc".to_vec()),
-    };
+    let metadata = heifer::Metadata::new()
+        .with_exif(b"II*\0\x08\0\0\0\0\0".to_vec())
+        .with_xmp(b"<x:xmpmeta/>".to_vec())
+        .with_icc_profile(b"icc".to_vec());
     let bytes =
         encode_hdr_with_metadata(&base, &hdr, &metadata, &EncodeOptions::default()).unwrap();
     assert_eq!(heifer::read_metadata(&bytes).unwrap(), metadata);
