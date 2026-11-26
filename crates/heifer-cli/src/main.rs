@@ -495,9 +495,10 @@ type Decoded = (DynamicImage, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Decodes any supported file.
 fn read(input: &Path) -> Result<Decoded, String> {
-    let reader = ImageReader::open(input)
+    let mut reader = ImageReader::open(input)
         .and_then(ImageReader::with_guessed_format)
         .map_err(|e| e.to_string())?;
+    reader.no_limits();
     let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
     let icc = decoder.icc_profile().ok().flatten();
     let mut exif = decoder.exif_metadata().ok().flatten();
