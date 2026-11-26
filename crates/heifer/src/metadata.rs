@@ -7,6 +7,7 @@ use crate::Error;
 
 /// Metadata attached to an image.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Metadata {
     /// Raw EXIF data (TIFF structure, starting with `II*\0` or `MM\0*`).
     pub exif: Option<Vec<u8>>,
@@ -17,6 +18,36 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Empty metadata (no EXIF, XMP or ICC profile).
+    pub const fn new() -> Self {
+        Self {
+            exif: None,
+            xmp: None,
+            icc_profile: None,
+        }
+    }
+
+    /// Sets the raw EXIF data (TIFF structure, starting with `II*\0` or `MM\0*`).
+    #[must_use]
+    pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
+        self.exif = Some(exif);
+        self
+    }
+
+    /// Sets the XMP metadata packet.
+    #[must_use]
+    pub fn with_xmp(mut self, xmp: Vec<u8>) -> Self {
+        self.xmp = Some(xmp);
+        self
+    }
+
+    /// Sets the embedded ICC colour profile.
+    #[must_use]
+    pub fn with_icc_profile(mut self, icc_profile: Vec<u8>) -> Self {
+        self.icc_profile = Some(icc_profile);
+        self
+    }
+
     /// Parsed view of the EXIF data, if any.
     pub fn exif_fields(&self) -> Option<Exif<'_>> {
         self.exif.as_deref().and_then(Exif::parse)
