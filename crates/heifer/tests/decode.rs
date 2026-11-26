@@ -123,6 +123,15 @@ fn identity_item_of_an_identity_item_applies_both() {
 }
 
 #[test]
+fn zero_length_nal_unit_at_end_of_item_is_skipped() {
+    let Some(bytes) = load("zero_length_nal.heic") else {
+        return;
+    };
+    let image = heifer::decode(&bytes).unwrap();
+    assert_eq!((image.width, image.height), (1280, 720));
+}
+
+#[test]
 fn grid_tiles_are_placed_in_order() {
     let Some(bytes) = load("grid.heic") else {
         return;

@@ -392,7 +392,12 @@ impl HevcConfig {
             let n = r.u16()?;
             for _ in 0..n {
                 let len = r.u16()?;
-                nal_units.push(r.bytes(usize::from(len))?.to_vec());
+                let nal = r.bytes(usize::from(len))?;
+                // A NAL unit has at least a 2-byte header (H.265 §7.3.1), so an empty entry is
+                // malformed; drop it rather than emit a bare start code for it.
+                if !nal.is_empty() {
+                    nal_units.push(nal.to_vec());
+                }
             }
         }
         Ok(Self {
@@ -1044,6 +1049,19 @@ mod tests {
             HevcConfig::parse(&[2; 23]),
             Err(Error::InvalidBox { .. })
         ));
+    }
+
+    #[test]
+    fn hvcc_drops_empty_nal_units() {
+        let mut data = vec![1];
+        data.extend([0; 20]);
+        data.push(0x03); // lengthSizeMinusOne = 3
+        data.extend([1, 0x20, 0, 2]); // one VPS array with two entries
+        data.extend([0, 0]); // empty entry
+        data.extend([0, 3, 0x40, 0x01, 0x0C]);
+        let config = HevcConfig::parse(&data).unwrap();
+        assert_eq!(config.nal_length_size, 4);
+        assert_eq!(config.nal_units, [vec![0x40, 0x01, 0x0C]]);
     }
 
     #[test]
