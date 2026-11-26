@@ -69,10 +69,9 @@ pub fn register_image_decoder_hooks() -> bool {
 /// `max_threads: 1` in applications that already decode several images in parallel.
 ///
 /// ```no_run
-/// heifer::image_crate::register_image_decoder_hooks_with_options(heifer::Options {
-///     max_threads: 1,
-///     ..Default::default()
-/// });
+/// heifer::image_crate::register_image_decoder_hooks_with_options(
+///     heifer::Options::new().with_max_threads(1),
+/// );
 /// ```
 pub fn register_image_decoder_hooks_with_options(options: Options) -> bool {
     let mut all = true;
