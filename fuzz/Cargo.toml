@@ -9,10 +9,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-heifer = { path = "../crates/heifer" }
+heifer = { path = "../crates/heifer", features = ["image"] }
 heifer-isobmff = { path = "../crates/heifer-isobmff" }
 heifer-hevc-dec = { path = "../crates/heifer-hevc-dec" }
 heifer-hevc-enc = { path = "../crates/heifer-hevc-enc" }
+image = { version = "0.25.8", default-features = false }
 
 # Kept out of the main workspace.
 [workspace]
@@ -55,6 +56,20 @@ bench = false
 [[bin]]
 name = "encode"
 path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "info"
+path = "fuzz_targets/info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_decoder"
+path = "fuzz_targets/image_decoder.rs"
 test = false
 doc = false
 bench = false
