@@ -8,6 +8,161 @@ use crate::params::{Pps, ScalingList, Sps};
 use crate::scan::CtbLayout;
 use crate::syntax::{CodingUnit, PredictionUnit, SaoParams, Sink, TransformBlock};
 
+/// Sample storage abstraction shared between 8-bit (`u8`) and wide (`u16`) decoded pictures.
+pub(crate) trait PlaneSample: Copy + Default + Send + Sync + 'static {
+    fn to_i32(self) -> i32;
+    fn from_clamped(v: i32, max: i32) -> Self;
+    fn from_in_range(v: i32) -> Self;
+    fn mid(bit_depth: u8) -> Self;
+    fn from_u16_sample(v: u16) -> Self;
+}
+
+impl PlaneSample for u8 {
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        i32::from(self)
+    }
+
+    #[inline(always)]
+    fn from_clamped(v: i32, _max: i32) -> Self {
+        v.clamp(0, 255) as u8
+    }
+
+    #[inline(always)]
+    fn from_in_range(v: i32) -> Self {
+        v as u8
+    }
+
+    #[inline(always)]
+    fn mid(_bit_depth: u8) -> Self {
+        128
+    }
+
+    #[inline(always)]
+    fn from_u16_sample(v: u16) -> Self {
+        v as u8
+    }
+}
+
+impl PlaneSample for u16 {
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        i32::from(self)
+    }
+
+    #[inline(always)]
+    fn from_clamped(v: i32, max: i32) -> Self {
+        v.clamp(0, max) as u16
+    }
+
+    #[inline(always)]
+    fn from_in_range(v: i32) -> Self {
+        v as u16
+    }
+
+    #[inline(always)]
+    fn mid(bit_depth: u8) -> Self {
+        1u16 << (bit_depth - 1)
+    }
+
+    #[inline(always)]
+    fn from_u16_sample(v: u16) -> Self {
+        v
+    }
+}
+
+/// Conformance crop window of a decoded picture, in per-plane sample coordinates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CropWindow {
+    /// Left crop offset in samples for `[Y, Cb, Cr]`.
+    pub x: [u32; 3],
+    /// Top crop offset in samples for `[Y, Cb, Cr]`.
+    pub y: [u32; 3],
+    /// Cropped width in samples for `[Y, Cb, Cr]`.
+    pub widths: [u32; 3],
+    /// Cropped height in samples for `[Y, Cb, Cr]`.
+    pub heights: [u32; 3],
+}
+
+impl CropWindow {
+    /// Uncropped window covering all samples of `widths` × `heights`.
+    pub fn full(widths: [u32; 3], heights: [u32; 3]) -> Self {
+        Self {
+            x: [0; 3],
+            y: [0; 3],
+            widths,
+            heights,
+        }
+    }
+
+    /// Conformance crop window derived from `sps.conf_win_offsets`.
+    pub fn from_sps(widths: [u32; 3], heights: [u32; 3], sps: &Sps) -> Self {
+        let (sw, sh) = sps.chroma_subsampling();
+        let [l, r, t, b] = sps.conf_win_offsets;
+        let mut out = Self {
+            x: [0; 3],
+            y: [0; 3],
+            widths,
+            heights,
+        };
+        for c in 0..3 {
+            if widths[c] == 0 {
+                out.x[c] = 0;
+                out.y[c] = 0;
+                out.widths[c] = 0;
+                out.heights[c] = 0;
+                continue;
+            }
+            let (fx, fy) = if c == 0 { (sw, sh) } else { (1, 1) };
+            out.x[c] = l * fx;
+            out.y[c] = t * fy;
+            out.widths[c] = widths[c] - (l + r) * fx;
+            out.heights[c] = heights[c] - (t + b) * fy;
+        }
+        out
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reset_plane_storage<T: PlaneSample>(
+    sps: &Sps,
+    widths: &mut [u32; 3],
+    heights: &mut [u32; 3],
+    planes: &mut [Vec<T>; 3],
+    bit_depth: &mut [u8; 2],
+    chroma_format: &mut u8,
+    full_range: &mut bool,
+    matrix_coeffs: &mut u8,
+) {
+    let (w, h) = (
+        sps.pic_width_in_luma_samples,
+        sps.pic_height_in_luma_samples,
+    );
+    let (sw, sh) = sps.chroma_subsampling();
+    let (cw, ch) = if sps.chroma_array_type() == 0 && sps.chroma_format_idc == 0 {
+        (0, 0)
+    } else {
+        (w / sw, h / sh)
+    };
+    *widths = [w, cw, cw];
+    *heights = [h, ch, ch];
+    for (c, (len, fill)) in [
+        ((w * h) as usize, T::mid(sps.bit_depth_luma)),
+        ((cw * ch) as usize, T::mid(sps.bit_depth_chroma)),
+        ((cw * ch) as usize, T::mid(sps.bit_depth_chroma)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        planes[c].clear();
+        planes[c].resize(len, fill);
+    }
+    *bit_depth = [sps.bit_depth_luma, sps.bit_depth_chroma];
+    *chroma_format = sps.chroma_format_idc;
+    *full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
+    *matrix_coeffs = sps.vui.as_ref().map_or(2, |v| v.matrix_coeffs);
+}
+
 /// A decoded picture: three planes of samples (only the first one for monochrome).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frame {
@@ -29,34 +184,26 @@ pub struct Frame {
 
 impl Frame {
     pub(crate) fn reset(&mut self, sps: &Sps) {
-        let (w, h) = (
-            sps.pic_width_in_luma_samples,
-            sps.pic_height_in_luma_samples,
+        reset_plane_storage(
+            sps,
+            &mut self.widths,
+            &mut self.heights,
+            &mut self.planes,
+            &mut self.bit_depth,
+            &mut self.chroma_format,
+            &mut self.full_range,
+            &mut self.matrix_coeffs,
         );
-        let (sw, sh) = sps.chroma_subsampling();
-        let (cw, ch) = if sps.chroma_array_type() == 0 && sps.chroma_format_idc == 0 {
-            (0, 0)
-        } else {
-            (w / sw, h / sh)
-        };
-        let mid = |d: u8| 1u16 << (d - 1);
-        self.widths = [w, cw, cw];
-        self.heights = [h, ch, ch];
-        for (c, (len, fill)) in [
-            ((w * h) as usize, mid(sps.bit_depth_luma)),
-            ((cw * ch) as usize, mid(sps.bit_depth_chroma)),
-            ((cw * ch) as usize, mid(sps.bit_depth_chroma)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            self.planes[c].clear();
-            self.planes[c].resize(len, fill);
-        }
-        self.bit_depth = [sps.bit_depth_luma, sps.bit_depth_chroma];
-        self.chroma_format = sps.chroma_format_idc;
-        self.full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
-        self.matrix_coeffs = sps.vui.as_ref().map_or(2, |v| v.matrix_coeffs);
+    }
+
+    /// Uncropped conformance window covering all samples of `self`.
+    pub fn full_window(&self) -> CropWindow {
+        CropWindow::full(self.widths, self.heights)
+    }
+
+    /// Conformance crop window of `self` derived from `sps`.
+    pub fn crop_window(&self, sps: &Sps) -> CropWindow {
+        CropWindow::from_sps(self.widths, self.heights, sps)
     }
 
     /// Returns a copy cropped to the conformance window of `sps`.
@@ -67,35 +214,213 @@ impl Frame {
     }
 
     pub(crate) fn cropped_into(&self, sps: &Sps, out: &mut Self) {
-        let (sw, sh) = sps.chroma_subsampling();
-        let [l, r, t, b] = sps.conf_win_offsets;
-        out.widths = self.widths;
-        out.heights = self.heights;
+        let crop = self.crop_window(sps);
+        out.widths = crop.widths;
+        out.heights = crop.heights;
         out.bit_depth = self.bit_depth;
         out.chroma_format = self.chroma_format;
         out.full_range = self.full_range;
         out.matrix_coeffs = self.matrix_coeffs;
         for c in 0..3 {
-            if self.widths[c] == 0 {
+            if crop.widths[c] == 0 {
                 out.planes[c].clear();
-                out.widths[c] = 0;
-                out.heights[c] = 0;
                 continue;
             }
-            let (fx, fy) = if c == 0 { (sw, sh) } else { (1, 1) };
-            let (x0, y0) = (l * fx, t * fy);
-            let w = self.widths[c] - (l + r) * fx;
-            let h = self.heights[c] - (t + b) * fy;
             let src_w = self.widths[c] as usize;
+            let (x0, y0) = (crop.x[c] as usize, crop.y[c] as usize);
+            let (w, h) = (crop.widths[c] as usize, crop.heights[c] as usize);
             out.planes[c].clear();
-            out.planes[c].reserve(w as usize * h as usize);
+            out.planes[c].reserve(w * h);
             for y in y0..y0 + h {
-                let row = y as usize * src_w + x0 as usize;
-                out.planes[c].extend_from_slice(&self.planes[c][row..row + w as usize]);
+                let row = y * src_w + x0;
+                out.planes[c].extend_from_slice(&self.planes[c][row..row + w]);
             }
-            out.widths[c] = w;
-            out.heights[c] = h;
         }
+    }
+}
+
+/// An 8-bit decoded picture: three `u8` planes (halves memory bandwidth compared to [`Frame`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Frame8 {
+    /// Width of each plane, in samples.
+    pub widths: [u32; 3],
+    /// Height of each plane, in samples.
+    pub heights: [u32; 3],
+    /// Samples, row-major, one `Vec<u8>` per plane.
+    pub planes: [Vec<u8>; 3],
+    /// Bit depth of luma and chroma samples (always `[8, 8]`).
+    pub bit_depth: [u8; 2],
+    /// `chroma_format_idc` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
+    pub chroma_format: u8,
+    /// `video_full_range_flag` from the VUI (false when the VUI is absent).
+    pub full_range: bool,
+    /// `matrix_coeffs` from the VUI (2 = unspecified when absent).
+    pub matrix_coeffs: u8,
+}
+
+impl Frame8 {
+    pub(crate) fn reset(&mut self, sps: &Sps) {
+        reset_plane_storage(
+            sps,
+            &mut self.widths,
+            &mut self.heights,
+            &mut self.planes,
+            &mut self.bit_depth,
+            &mut self.chroma_format,
+            &mut self.full_range,
+            &mut self.matrix_coeffs,
+        );
+    }
+
+    /// Uncropped conformance window covering all samples of `self`.
+    pub fn full_window(&self) -> CropWindow {
+        CropWindow::full(self.widths, self.heights)
+    }
+
+    /// Conformance crop window of `self` derived from `sps`.
+    pub fn crop_window(&self, sps: &Sps) -> CropWindow {
+        CropWindow::from_sps(self.widths, self.heights, sps)
+    }
+
+    /// Copies the cropped region `crop` into a 16-bit [`Frame`] (for wide callers/tests).
+    pub fn to_frame_cropped(&self, crop: CropWindow) -> Frame {
+        let mut planes = [Vec::new(), Vec::new(), Vec::new()];
+        for c in 0..3 {
+            if crop.widths[c] == 0 {
+                continue;
+            }
+            let src_w = self.widths[c] as usize;
+            let (x0, y0) = (crop.x[c] as usize, crop.y[c] as usize);
+            let (w, h) = (crop.widths[c] as usize, crop.heights[c] as usize);
+            planes[c].reserve(w * h);
+            for y in y0..y0 + h {
+                let row = y * src_w + x0;
+                planes[c].extend(self.planes[c][row..row + w].iter().copied().map(u16::from));
+            }
+        }
+        Frame {
+            widths: crop.widths,
+            heights: crop.heights,
+            planes,
+            bit_depth: self.bit_depth,
+            chroma_format: self.chroma_format,
+            full_range: self.full_range,
+            matrix_coeffs: self.matrix_coeffs,
+        }
+    }
+}
+
+/// Borrowed view of a decoded picture and its conformance crop window.
+#[derive(Debug, Clone, Copy)]
+pub enum DecodedFrameView<'a> {
+    /// 8-bit picture (`bit_depth == [8, 8]`) stored directly in `u8` planes.
+    U8(&'a Frame8, CropWindow),
+    /// General picture (8–16 bit) stored in `u16` planes.
+    U16(&'a Frame, CropWindow),
+}
+
+impl DecodedFrameView<'_> {
+    /// Conformance crop window of this picture.
+    pub fn crop(&self) -> CropWindow {
+        match *self {
+            Self::U8(_, crop) | Self::U16(_, crop) => crop,
+        }
+    }
+
+    /// Cropped luma width in pixels.
+    pub fn width(&self) -> u32 {
+        self.crop().widths[0]
+    }
+
+    /// Cropped luma height in pixels.
+    pub fn height(&self) -> u32 {
+        self.crop().heights[0]
+    }
+
+    /// Bit depth of luma and chroma samples.
+    pub fn bit_depth(&self) -> [u8; 2] {
+        match *self {
+            Self::U8(f, _) => f.bit_depth,
+            Self::U16(f, _) => f.bit_depth,
+        }
+    }
+
+    /// `chroma_format_idc` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
+    pub fn chroma_format(&self) -> u8 {
+        match *self {
+            Self::U8(f, _) => f.chroma_format,
+            Self::U16(f, _) => f.chroma_format,
+        }
+    }
+
+    /// `video_full_range_flag` from the VUI.
+    pub fn full_range(&self) -> bool {
+        match *self {
+            Self::U8(f, _) => f.full_range,
+            Self::U16(f, _) => f.full_range,
+        }
+    }
+
+    /// `matrix_coeffs` from the VUI.
+    pub fn matrix_coeffs(&self) -> u8 {
+        match *self {
+            Self::U8(f, _) => f.matrix_coeffs,
+            Self::U16(f, _) => f.matrix_coeffs,
+        }
+    }
+}
+
+pub(crate) trait ReconFrame {
+    type Sample: PlaneSample;
+    fn widths(&self) -> &[u32; 3];
+    fn heights(&self) -> &[u32; 3];
+    fn bit_depth(&self) -> &[u8; 2];
+    fn plane(&self, c: usize) -> &[Self::Sample];
+    fn plane_mut(&mut self, c: usize) -> &mut [Self::Sample];
+    fn reset(&mut self, sps: &Sps);
+}
+
+impl ReconFrame for Frame {
+    type Sample = u16;
+    fn widths(&self) -> &[u32; 3] {
+        &self.widths
+    }
+    fn heights(&self) -> &[u32; 3] {
+        &self.heights
+    }
+    fn bit_depth(&self) -> &[u8; 2] {
+        &self.bit_depth
+    }
+    fn plane(&self, c: usize) -> &[u16] {
+        &self.planes[c]
+    }
+    fn plane_mut(&mut self, c: usize) -> &mut [u16] {
+        &mut self.planes[c]
+    }
+    fn reset(&mut self, sps: &Sps) {
+        Frame::reset(self, sps);
+    }
+}
+
+impl ReconFrame for Frame8 {
+    type Sample = u8;
+    fn widths(&self) -> &[u32; 3] {
+        &self.widths
+    }
+    fn heights(&self) -> &[u32; 3] {
+        &self.heights
+    }
+    fn bit_depth(&self) -> &[u8; 2] {
+        &self.bit_depth
+    }
+    fn plane(&self, c: usize) -> &[u8] {
+        &self.planes[c]
+    }
+    fn plane_mut(&mut self, c: usize) -> &mut [u8] {
+        &mut self.planes[c]
+    }
+    fn reset(&mut self, sps: &Sps) {
+        Frame8::reset(self, sps);
     }
 }
 
@@ -669,16 +994,22 @@ pub struct IntraReferences {
     n: usize,
 }
 
+#[derive(Debug)]
+enum SaoScratch {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
 /// Reconstructs a picture from the blocks emitted by the parser.
 #[derive(Debug)]
-pub struct Reconstructor<'a> {
+pub struct Reconstructor<'a, F = Frame> {
     sps: &'a Sps,
     pps: &'a Pps,
     layout: CtbLayout,
     /// Whether the picture is a single tile: intra prediction then never crosses a tile.
     single_tile: bool,
     /// The picture being reconstructed (coded size, before cropping).
-    pub frame: Frame,
+    pub frame: F,
     /// Slice that reconstructed each 4×4 luma block (`u32::MAX` = not yet).
     decoded: Vec<u32>,
     w4: usize,
@@ -699,7 +1030,7 @@ pub struct Reconstructor<'a> {
     /// Prediction buffers of inter blocks (two lists), reused across blocks.
     inter_scratch: Vec<i32>,
     /// Pre-SAO plane copy buffer, reused across components and frames.
-    sao_scratch: Vec<u16>,
+    sao_scratch: SaoScratch,
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
 }
@@ -713,7 +1044,7 @@ pub struct ReconstructorBuffers {
     scratch: Vec<i32>,
     filter_info: FilterInfo,
     inter_scratch: Vec<i32>,
-    sao_scratch: Vec<u16>,
+    pub(crate) sao_scratch: Vec<u16>,
 }
 
 /// The deblocking filter's state of an area, saved by [`Reconstructor::save_filter_state`].
@@ -725,7 +1056,48 @@ pub struct FilterState {
     motion: Vec<EdgeMotion>,
 }
 
-impl<'a> Reconstructor<'a> {
+fn init_reconstructor<'a, F: ReconFrame>(
+    sps: &'a Sps,
+    pps: &'a Pps,
+    mut frame: F,
+    sao_scratch: SaoScratch,
+    mut buf: ReconstructorBuffers,
+) -> Reconstructor<'a, F> {
+    let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
+    let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
+    let layout = CtbLayout::new(sps, pps);
+    frame.reset(sps);
+    buf.filter_info.reset(sps, &layout);
+    buf.decoded.clear();
+    buf.decoded.resize(w4 * h4, u32::MAX);
+    buf.luma_residual.clear();
+    buf.luma_residual.resize(32 * 32, 0);
+    buf.scratch.clear();
+    buf.scratch.resize(4 * 32 * 32 + 2 * (4 * 32 + 1), 0);
+    buf.inter_scratch.clear();
+    Reconstructor {
+        sps,
+        pps,
+        filter_info: buf.filter_info,
+        single_tile: layout.col_bd.len() == 2 && layout.row_bd.len() == 2,
+        layout,
+        frame,
+        decoded: buf.decoded,
+        w4,
+        slice_addr: 0,
+        slice_cb_qp_offset: 0,
+        slice_cr_qp_offset: 0,
+        luma_residual: buf.luma_residual,
+        scratch: buf.scratch,
+        refs: [Vec::new(), Vec::new()],
+        weights: [None, None],
+        inter_scratch: buf.inter_scratch,
+        sao_scratch,
+        error: None,
+    }
+}
+
+impl<'a> Reconstructor<'a, Frame> {
     /// Creates a reconstructor for a picture.
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
         Self::from_buffers(sps, pps, ReconstructorBuffers::default())
@@ -733,41 +1105,177 @@ impl<'a> Reconstructor<'a> {
 
     /// Creates a reconstructor for a picture, reusing heap allocations from `buf`.
     pub fn from_buffers(sps: &'a Sps, pps: &'a Pps, mut buf: ReconstructorBuffers) -> Self {
-        let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
-        let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
-        let layout = CtbLayout::new(sps, pps);
-        buf.frame.reset(sps);
-        buf.filter_info.reset(sps, &layout);
-        buf.decoded.clear();
-        buf.decoded.resize(w4 * h4, u32::MAX);
-        buf.luma_residual.clear();
-        buf.luma_residual.resize(32 * 32, 0);
-        buf.scratch.clear();
-        buf.scratch.resize(4 * 32 * 32 + 2 * (4 * 32 + 1), 0);
-        buf.inter_scratch.clear();
-        buf.sao_scratch.clear();
-        Self {
-            sps,
-            pps,
-            filter_info: buf.filter_info,
-            single_tile: layout.col_bd.len() == 2 && layout.row_bd.len() == 2,
-            layout,
-            frame: buf.frame,
-            decoded: buf.decoded,
-            w4,
-            slice_addr: 0,
-            slice_cb_qp_offset: 0,
-            slice_cr_qp_offset: 0,
-            luma_residual: buf.luma_residual,
-            scratch: buf.scratch,
-            refs: [Vec::new(), Vec::new()],
-            weights: [None, None],
-            inter_scratch: buf.inter_scratch,
-            sao_scratch: buf.sao_scratch,
-            error: None,
+        let frame = std::mem::take(&mut buf.frame);
+        let mut sao_scratch = std::mem::take(&mut buf.sao_scratch);
+        sao_scratch.clear();
+        init_reconstructor(sps, pps, frame, SaoScratch::U16(sao_scratch), buf)
+    }
+
+    /// Like [`finish`](Self::finish), also returning the motion of every 4×4 luma block, for
+    /// the pictures that use this one as collocated picture.
+    pub fn finish_with_motion(self, skip_filters: bool, poc: i32) -> (Frame, inter::MotionField) {
+        let w4 = self.filter_info.w4;
+        let mut motion = self.filter_info.motion.clone();
+        if motion.is_empty() {
+            motion.resize(w4 * self.filter_info.h4, EdgeMotion::default());
+        }
+        (
+            self.finish(skip_filters),
+            inter::MotionField::from_blocks(w4, motion, poc),
+        )
+    }
+
+    /// Applies the in-loop filters (unless `skip_filters`) and returns the decoded picture,
+    /// uncropped (see [`Frame::cropped`]).
+    pub fn finish(self, skip_filters: bool) -> Frame {
+        self.finish_into_buffers(skip_filters).frame
+    }
+
+    /// Applies the in-loop filters (unless `skip_filters`) and returns all internal buffers
+    /// (including `frame`) so callers can reuse their heap allocations across pictures.
+    pub fn finish_into_buffers(mut self, skip_filters: bool) -> ReconstructorBuffers {
+        let mut sao_scratch =
+            match std::mem::replace(&mut self.sao_scratch, SaoScratch::U16(Vec::new())) {
+                SaoScratch::U16(v) => v,
+                SaoScratch::U8(_) => Vec::new(),
+            };
+        if !skip_filters {
+            filters::deblock(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+            );
+            filters::sao(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+                &mut sao_scratch,
+            );
+        }
+        ReconstructorBuffers {
+            frame: self.frame,
+            decoded: self.decoded,
+            luma_residual: self.luma_residual,
+            scratch: self.scratch,
+            filter_info: self.filter_info,
+            inter_scratch: self.inter_scratch,
+            sao_scratch,
         }
     }
 
+    /// The deblocked picture, leaving this one as it is: for encoders that choose SAO parameters
+    /// on it.
+    pub fn deblocked(&self) -> Frame {
+        let mut frame = self.frame.clone();
+        filters::deblock(
+            &mut frame,
+            &self.filter_info,
+            self.sps,
+            self.pps,
+            &self.layout,
+        );
+        frame
+    }
+
+    /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (in samples of
+    /// that component) with `mode`, from the samples reconstructed so far, into `pred`
+    /// (row-major). Nothing is written to the picture: for encoders comparing modes.
+    pub fn predict_block(&self, c: usize, x0: u32, y0: u32, n: usize, mode: u8, pred: &mut [i32]) {
+        self.predict(c, x0, y0, n, mode, false, pred);
+    }
+
+    /// The reference samples of the intra prediction of a block (see
+    /// [`predict_block`](Self::predict_block)), to predict it with several modes at once with
+    /// [`predict_from`](Self::predict_from).
+    pub fn intra_references(&self, c: usize, x0: u32, y0: u32, n: usize) -> IntraReferences {
+        let mut samples = [0i32; 4 * 32 + 1];
+        self.reference_samples_into(c, x0, y0, n, &mut samples);
+        IntraReferences { samples, c, n }
+    }
+
+    /// Intra prediction with `mode` from reference samples given by
+    /// [`intra_references`](Self::intra_references), into `pred` (row-major).
+    pub fn predict_from(&self, refs: &IntraReferences, mode: u8, pred: &mut [i32]) {
+        let mut smooth = [0i32; 4 * 32 + 1];
+        self.predict_with(
+            refs.c,
+            refs.n,
+            mode,
+            false,
+            &refs.samples,
+            &mut smooth,
+            pred,
+        );
+    }
+
+    /// Like [`Sink::transform_block`], with the intra prediction of the block already
+    /// computed (by [`predict_block`](Self::predict_block) or
+    /// [`predict_from`](Self::predict_from)): for encoders, which predict before coding.
+    pub fn reconstruct(&mut self, tb: &TransformBlock<'_>, prediction: &[i32]) {
+        if self.error.is_none() {
+            self.transform_block_impl(tb, Some(prediction));
+        }
+    }
+}
+
+impl<'a> Reconstructor<'a, Frame8> {
+    pub(crate) fn from_buffers_8(
+        sps: &'a Sps,
+        pps: &'a Pps,
+        frame8: Frame8,
+        mut sao_scratch8: Vec<u8>,
+        buf: ReconstructorBuffers,
+    ) -> Self {
+        sao_scratch8.clear();
+        init_reconstructor(sps, pps, frame8, SaoScratch::U8(sao_scratch8), buf)
+    }
+
+    pub(crate) fn finish_into_buffers_8(
+        mut self,
+        skip_filters: bool,
+        orig_frame: Frame,
+        orig_sao: Vec<u16>,
+    ) -> (Frame8, Vec<u8>, ReconstructorBuffers) {
+        let mut sao_scratch8 =
+            match std::mem::replace(&mut self.sao_scratch, SaoScratch::U8(Vec::new())) {
+                SaoScratch::U8(v) => v,
+                SaoScratch::U16(_) => Vec::new(),
+            };
+        if !skip_filters {
+            filters::deblock_8(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+            );
+            filters::sao_8(
+                &mut self.frame,
+                &self.filter_info,
+                self.sps,
+                self.pps,
+                &self.layout,
+                &mut sao_scratch8,
+            );
+        }
+        let buf = ReconstructorBuffers {
+            frame: orig_frame,
+            decoded: self.decoded,
+            luma_residual: self.luma_residual,
+            scratch: self.scratch,
+            filter_info: self.filter_info,
+            inter_scratch: self.inter_scratch,
+            sao_scratch: orig_sao,
+        };
+        (self.frame, sao_scratch8, buf)
+    }
+}
+
+impl<'a, F> Reconstructor<'a, F> {
     /// Must be called before the blocks of each slice segment.
     pub fn start_slice(&mut self, header: &crate::slice::SliceHeader) {
         if !header.dependent_slice_segment_flag {
@@ -794,71 +1302,6 @@ impl<'a> Reconstructor<'a> {
     ) {
         self.refs = lists;
         self.weights = weights;
-    }
-
-    /// Like [`finish`](Self::finish), also returning the motion of every 4×4 luma block, for
-    /// the pictures that use this one as collocated picture.
-    pub fn finish_with_motion(self, skip_filters: bool, poc: i32) -> (Frame, inter::MotionField) {
-        let w4 = self.filter_info.w4;
-        let mut motion = self.filter_info.motion.clone();
-        if motion.is_empty() {
-            motion.resize(w4 * self.filter_info.h4, EdgeMotion::default());
-        }
-        (
-            self.finish(skip_filters),
-            inter::MotionField::from_blocks(w4, motion, poc),
-        )
-    }
-
-    /// Applies the in-loop filters (unless `skip_filters`) and returns the decoded picture,
-    /// uncropped (see [`Frame::cropped`]).
-    pub fn finish(self, skip_filters: bool) -> Frame {
-        self.finish_into_buffers(skip_filters).frame
-    }
-
-    /// Applies the in-loop filters (unless `skip_filters`) and returns all internal buffers
-    /// (including `frame`) so callers can reuse their heap allocations across pictures.
-    pub fn finish_into_buffers(mut self, skip_filters: bool) -> ReconstructorBuffers {
-        if !skip_filters {
-            filters::deblock(
-                &mut self.frame,
-                &self.filter_info,
-                self.sps,
-                self.pps,
-                &self.layout,
-            );
-            filters::sao(
-                &mut self.frame,
-                &self.filter_info,
-                self.sps,
-                self.pps,
-                &self.layout,
-                &mut self.sao_scratch,
-            );
-        }
-        ReconstructorBuffers {
-            frame: self.frame,
-            decoded: self.decoded,
-            luma_residual: self.luma_residual,
-            scratch: self.scratch,
-            filter_info: self.filter_info,
-            inter_scratch: self.inter_scratch,
-            sao_scratch: self.sao_scratch,
-        }
-    }
-
-    /// The deblocked picture, leaving this one as it is: for encoders that choose SAO parameters
-    /// on it.
-    pub fn deblocked(&self) -> Frame {
-        let mut frame = self.frame.clone();
-        filters::deblock(
-            &mut frame,
-            &self.filter_info,
-            self.sps,
-            self.pps,
-            &self.layout,
-        );
-        frame
     }
 
     /// Appends the block edge flags of a luma area to `out`, row by row of 4×4 units, to put
@@ -999,38 +1442,11 @@ impl<'a> Reconstructor<'a> {
         self.layout.tile_of_rs((yn >> l) * w + (xn >> l))
             == self.layout.tile_of_rs((y >> l) * w + (x >> l))
     }
+}
 
-    /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (in samples of
-    /// that component) with `mode`, from the samples reconstructed so far, into `pred`
-    /// (row-major). Nothing is written to the picture: for encoders comparing modes.
-    pub fn predict_block(&self, c: usize, x0: u32, y0: u32, n: usize, mode: u8, pred: &mut [i32]) {
-        self.predict(c, x0, y0, n, mode, false, pred);
-    }
-
-    /// The reference samples of the intra prediction of a block (see
-    /// [`predict_block`](Self::predict_block)), to predict it with several modes at once with
-    /// [`predict_from`](Self::predict_from).
-    pub fn intra_references(&self, c: usize, x0: u32, y0: u32, n: usize) -> IntraReferences {
-        let mut samples = [0i32; 4 * 32 + 1];
-        self.reference_samples_into(c, x0, y0, n, &mut samples);
-        IntraReferences { samples, c, n }
-    }
-
-    /// Intra prediction with `mode` from reference samples given by
-    /// [`intra_references`](Self::intra_references), into `pred` (row-major).
-    pub fn predict_from(&self, refs: &IntraReferences, mode: u8, pred: &mut [i32]) {
-        let mut smooth = [0i32; 4 * 32 + 1];
-        self.predict_with(
-            refs.c,
-            refs.n,
-            mode,
-            false,
-            &refs.samples,
-            &mut smooth,
-            pred,
-        );
-    }
-
+// Only private methods live in this impl block.
+#[allow(private_bounds)]
+impl<'a, F: ReconFrame> Reconstructor<'a, F> {
     /// Intra prediction of an `n`×`n` block of component `c` at (`x0`, `y0`) (§8.4.4.2).
     #[allow(clippy::too_many_arguments)]
     fn predict(
@@ -1065,10 +1481,10 @@ impl<'a> Reconstructor<'a> {
         } else {
             self.sps.chroma_subsampling()
         };
-        let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
-        let plane = &self.frame.planes[c];
-        let stride = self.frame.widths[c] as usize;
-        let ph_c = self.frame.heights[c] as usize;
+        let bit_depth = self.frame.bit_depth()[usize::from(c > 0)];
+        let plane = self.frame.plane(c);
+        let stride = self.frame.widths()[c] as usize;
+        let ph_c = self.frame.heights()[c] as usize;
 
         // Reference samples: index 0 = p[-1][2n-1] (bottom of the left column) ... index 2n =
         // p[-1][-1] ... index 4n = p[2n-1][-1] (right end of the top row), as in the
@@ -1091,7 +1507,7 @@ impl<'a> Reconstructor<'a> {
                 let len = (unit_y - y % unit_y).min(2 * n - k);
                 if self.decoded[((y * sh as usize) >> 2) * self.w4 + x4_left] == self.slice_addr {
                     for j in 0..len {
-                        refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
+                        refs[2 * n - 1 - k - j] = plane[(y + j) * stride + x0u - 1].to_i32();
                     }
                     avail_lo |= ((1u128 << len) - 1) << (2 * n - k - len);
                 } else {
@@ -1100,7 +1516,7 @@ impl<'a> Reconstructor<'a> {
                 k += len;
             }
             if self.decoded[y4_above * self.w4 + x4_left] == self.slice_addr {
-                refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
+                refs[2 * n] = plane[(y0u - 1) * stride + x0u - 1].to_i32();
                 avail_lo |= 1u128 << (2 * n);
             } else {
                 all_avail = false;
@@ -1116,7 +1532,7 @@ impl<'a> Reconstructor<'a> {
                         .iter_mut()
                         .zip(&plane[row..row + len])
                     {
-                        *r = i32::from(v);
+                        *r = v.to_i32();
                     }
                     let end = start + len;
                     if end == 129 {
@@ -1145,7 +1561,7 @@ impl<'a> Reconstructor<'a> {
                 let len = (unit_y - y % unit_y).min(2 * n - k);
                 if available(i64::from(x0) - 1, y as i64) {
                     for j in 0..len {
-                        refs[2 * n - 1 - k - j] = i32::from(plane[(y + j) * stride + x0u - 1]);
+                        refs[2 * n - 1 - k - j] = plane[(y + j) * stride + x0u - 1].to_i32();
                     }
                     avail_lo |= ((1u128 << len) - 1) << (2 * n - k - len);
                 }
@@ -1153,7 +1569,7 @@ impl<'a> Reconstructor<'a> {
             }
             // Corner.
             if available(i64::from(x0) - 1, i64::from(y0) - 1) {
-                refs[2 * n] = i32::from(plane[(y0u - 1) * stride + x0u - 1]);
+                refs[2 * n] = plane[(y0u - 1) * stride + x0u - 1].to_i32();
                 avail_lo |= 1u128 << (2 * n);
             }
             // Top row, columns x0..x0+2n, contiguous in the plane.
@@ -1168,7 +1584,7 @@ impl<'a> Reconstructor<'a> {
                         .iter_mut()
                         .zip(&plane[row..row + len])
                     {
-                        *r = i32::from(v);
+                        *r = v.to_i32();
                     }
                     let end = start + len;
                     if end == 129 {
@@ -1222,7 +1638,7 @@ impl<'a> Reconstructor<'a> {
         let boundary_filters = c == 0
             && n < 32
             && !(self.sps.range_extension.implicit_rdpcm_enabled_flag && transquant_bypass);
-        let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
+        let bit_depth = self.frame.bit_depth()[usize::from(c > 0)];
         let total = 4 * n + 1;
         let mut refs: &[i32] = &all_refs[..total];
         // p[-1][y] = left(y), p[x][-1] = top(x), with -1 meaning the corner.
@@ -1472,7 +1888,7 @@ impl<'a> Reconstructor<'a> {
             self.rotate_and_rdpcm(tb, &mut out[..n * n]);
             return;
         }
-        let bit_depth = i32::from(self.frame.bit_depth[usize::from(c > 0)]);
+        let bit_depth = i32::from(self.frame.bit_depth()[usize::from(c > 0)]);
 
         // Quantization parameter (§8.6.1).
         let qp_bd_y = 6 * (i32::from(self.sps.bit_depth_luma) - 8);
@@ -1607,15 +2023,6 @@ impl<'a> Reconstructor<'a> {
         }
     }
 
-    /// Like [`Sink::transform_block`], with the intra prediction of the block already
-    /// computed (by [`predict_block`](Self::predict_block) or
-    /// [`predict_from`](Self::predict_from)): for encoders, which predict before coding.
-    pub fn reconstruct(&mut self, tb: &TransformBlock<'_>, prediction: &[i32]) {
-        if self.error.is_none() {
-            self.transform_block_impl(tb, Some(prediction));
-        }
-    }
-
     fn transform_block_impl(&mut self, tb: &TransformBlock<'_>, prediction: Option<&[i32]>) {
         let n = 1usize << tb.log2_size;
         let c = usize::from(tb.c_idx);
@@ -1652,13 +2059,13 @@ impl<'a> Reconstructor<'a> {
                         );
                     }
                 }
-                let max = (1i32 << self.frame.bit_depth[usize::from(c > 0)]) - 1;
-                let stride = self.frame.widths[c] as usize;
-                let plane = &mut self.frame.planes[c];
+                let max = (1i32 << self.frame.bit_depth()[usize::from(c > 0)]) - 1;
+                let stride = self.frame.widths()[c] as usize;
+                let plane = self.frame.plane_mut(c);
                 for (y, p) in pred.chunks_exact(n).enumerate() {
                     let row = (tb.y as usize + y) * stride + tb.x as usize;
                     for (o, &p) in plane[row..row + n].iter_mut().zip(p) {
-                        *o = p.clamp(0, max) as u16;
+                        *o = F::Sample::from_clamped(p, max);
                     }
                 }
                 self.scratch = scratch;
@@ -1682,11 +2089,12 @@ impl<'a> Reconstructor<'a> {
             Some(p) => pred.copy_from_slice(&p[..n * n]),
             None if tb.inter => {
                 // Motion compensation already wrote the prediction into the picture.
-                let stride = self.frame.widths[c] as usize;
+                let stride = self.frame.widths()[c] as usize;
+                let plane = self.frame.plane(c);
                 for (y, row) in pred.chunks_exact_mut(n).enumerate() {
                     let start = (tb.y as usize + y) * stride + tb.x as usize;
-                    for (o, &v) in row.iter_mut().zip(&self.frame.planes[c][start..start + n]) {
-                        *o = i32::from(v);
+                    for (o, &v) in row.iter_mut().zip(&plane[start..start + n]) {
+                        *o = v.to_i32();
                     }
                 }
             }
@@ -1718,17 +2126,17 @@ impl<'a> Reconstructor<'a> {
         }
         if c > 0 && tb.res_scale_val != 0 {
             let (bd_y, bd_c) = (
-                i32::from(self.frame.bit_depth[0]),
-                i32::from(self.frame.bit_depth[1]),
+                i32::from(self.frame.bit_depth()[0]),
+                i32::from(self.frame.bit_depth()[1]),
             );
             for (r, &ry) in residual.iter_mut().zip(&self.luma_residual) {
                 *r += (i32::from(tb.res_scale_val) * ((ry << bd_c) >> bd_y)) >> 3;
             }
         }
 
-        let max = (1i32 << self.frame.bit_depth[usize::from(c > 0)]) - 1;
-        let stride = self.frame.widths[c] as usize;
-        let plane = &mut self.frame.planes[c];
+        let max = (1i32 << self.frame.bit_depth()[usize::from(c > 0)]) - 1;
+        let stride = self.frame.widths()[c] as usize;
+        let plane = self.frame.plane_mut(c);
         for (y, (p, r)) in pred
             .chunks_exact(n)
             .zip(residual.chunks_exact(n))
@@ -1736,7 +2144,7 @@ impl<'a> Reconstructor<'a> {
         {
             let row = (tb.y as usize + y) * stride + tb.x as usize;
             for ((o, &p), &r) in plane[row..row + n].iter_mut().zip(p).zip(r) {
-                *o = (p + r).clamp(0, max) as u16;
+                *o = F::Sample::from_clamped(p + r, max);
             }
         }
         self.scratch = scratch;
@@ -1774,7 +2182,9 @@ impl<'a> Reconstructor<'a> {
             let (reference, poc, lt) = *self.refs[list]
                 .get(i)
                 .ok_or(Error::Invalid("reference index outside the reference list"))?;
-            if reference.widths != self.frame.widths || reference.heights != self.frame.heights {
+            if reference.widths != *self.frame.widths()
+                || reference.heights != *self.frame.heights()
+            {
                 return Err(Error::Invalid("reference picture of another size"));
             }
             let weight = match &self.weights[list] {
@@ -1815,10 +2225,10 @@ impl<'a> Reconstructor<'a> {
                     );
                 }
             }
-            let bit_depth = self.frame.bit_depth[usize::from(c > 0)];
+            let bit_depth = self.frame.bit_depth()[usize::from(c > 0)];
             let denom_c = usize::from(c > 0);
-            let stride = self.frame.widths[c] as usize;
-            let plane = &mut self.frame.planes[c];
+            let stride = self.frame.widths()[c] as usize;
+            let plane = self.frame.plane_mut(c);
             for yy in 0..h as usize {
                 let start = (y as usize + yy) * stride + x as usize;
                 let dst = &mut plane[start..start + w as usize];
@@ -1828,18 +2238,19 @@ impl<'a> Reconstructor<'a> {
                     (Some((_, _, w0)), Some((_, _, w1))) => match (w0, w1) {
                         (Some(w0), Some(w1)) => {
                             for (o, (&p0, &p1)) in dst.iter_mut().zip(r0.iter().zip(r1)) {
-                                *o = inter::weight_explicit_bi(
+                                *o = F::Sample::from_u16_sample(inter::weight_explicit_bi(
                                     [p0, p1],
                                     bit_depth,
                                     [w0.weight[c], w1.weight[c]],
                                     [w0.offset[c], w1.offset[c]],
                                     w0.log2_denom[denom_c],
-                                );
+                                ));
                             }
                         }
                         _ => {
                             for (o, (&p0, &p1)) in dst.iter_mut().zip(r0.iter().zip(r1)) {
-                                *o = inter::weight_bi(p0, p1, bit_depth);
+                                *o =
+                                    F::Sample::from_u16_sample(inter::weight_bi(p0, p1, bit_depth));
                             }
                         }
                     },
@@ -1848,18 +2259,19 @@ impl<'a> Reconstructor<'a> {
                         match wt {
                             None => {
                                 for (o, &p) in dst.iter_mut().zip(r) {
-                                    *o = inter::weight_uni(p, bit_depth);
+                                    *o =
+                                        F::Sample::from_u16_sample(inter::weight_uni(p, bit_depth));
                                 }
                             }
                             Some(wt) => {
                                 for (o, &p) in dst.iter_mut().zip(r) {
-                                    *o = inter::weight_explicit(
+                                    *o = F::Sample::from_u16_sample(inter::weight_explicit(
                                         p,
                                         bit_depth,
                                         wt.weight[c],
                                         wt.offset[c],
                                         wt.log2_denom[denom_c],
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -1894,16 +2306,14 @@ impl<'a> Reconstructor<'a> {
         }
         Ok(())
     }
-}
 
-impl Sink for Reconstructor<'_> {
-    fn transform_block(&mut self, tb: &TransformBlock<'_>) {
+    fn sink_transform_block(&mut self, tb: &TransformBlock<'_>) {
         if self.error.is_none() {
             self.transform_block_impl(tb, None);
         }
     }
 
-    fn pcm(&mut self, cu_x: u32, cu_y: u32, log2_size: u8, samples: [&[u16]; 3]) {
+    fn sink_pcm(&mut self, cu_x: u32, cu_y: u32, log2_size: u8, samples: [&[u16]; 3]) {
         let Some(pcm) = self.sps.pcm else { return };
         let (sw, sh) = self.sps.chroma_subsampling();
         let size = 1u32 << log2_size;
@@ -1919,25 +2329,26 @@ impl Sink for Reconstructor<'_> {
             let (shift, stride) = if c == 0 {
                 (
                     self.sps.bit_depth_luma - pcm.bit_depth_luma,
-                    self.frame.widths[0],
+                    self.frame.widths()[0],
                 )
             } else {
                 (
                     self.sps.bit_depth_chroma - pcm.bit_depth_chroma,
-                    self.frame.widths[c],
+                    self.frame.widths()[c],
                 )
             };
+            let plane = self.frame.plane_mut(c);
             for y in 0..h {
                 for x in 0..w {
-                    self.frame.planes[c][((y0 + y) * stride + x0 + x) as usize] =
-                        s[(y * w + x) as usize] << shift;
+                    plane[((y0 + y) * stride + x0 + x) as usize] =
+                        F::Sample::from_u16_sample(s[(y * w + x) as usize] << shift);
                 }
             }
         }
         self.mark_decoded(cu_x, cu_y, size, size);
     }
 
-    fn coding_unit(&mut self, cu: &CodingUnit) {
+    fn sink_coding_unit(&mut self, cu: &CodingUnit) {
         let size = 1u32 << cu.log2_size;
         self.mark_edges(cu.x, cu.y, size, size);
         let intra = cu.intra;
@@ -1976,7 +2387,7 @@ impl Sink for Reconstructor<'_> {
         }
     }
 
-    fn prediction_unit(&mut self, pu: &PredictionUnit) {
+    fn sink_prediction_unit(&mut self, pu: &PredictionUnit) {
         if self.error.is_none()
             && let Err(e) = self.predict_inter(pu)
         {
@@ -1984,8 +2395,52 @@ impl Sink for Reconstructor<'_> {
         }
     }
 
-    fn sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
+    fn sink_sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
         self.filter_info.sao[(ctb_y * self.layout.width + ctb_x) as usize] = *params;
+    }
+}
+
+impl Sink for Reconstructor<'_, Frame> {
+    fn transform_block(&mut self, tb: &TransformBlock<'_>) {
+        self.sink_transform_block(tb);
+    }
+
+    fn pcm(&mut self, cu_x: u32, cu_y: u32, log2_size: u8, samples: [&[u16]; 3]) {
+        self.sink_pcm(cu_x, cu_y, log2_size, samples);
+    }
+
+    fn coding_unit(&mut self, cu: &CodingUnit) {
+        self.sink_coding_unit(cu);
+    }
+
+    fn prediction_unit(&mut self, pu: &PredictionUnit) {
+        self.sink_prediction_unit(pu);
+    }
+
+    fn sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
+        self.sink_sao(ctb_x, ctb_y, params);
+    }
+}
+
+impl Sink for Reconstructor<'_, Frame8> {
+    fn transform_block(&mut self, tb: &TransformBlock<'_>) {
+        self.sink_transform_block(tb);
+    }
+
+    fn pcm(&mut self, cu_x: u32, cu_y: u32, log2_size: u8, samples: [&[u16]; 3]) {
+        self.sink_pcm(cu_x, cu_y, log2_size, samples);
+    }
+
+    fn coding_unit(&mut self, cu: &CodingUnit) {
+        self.sink_coding_unit(cu);
+    }
+
+    fn prediction_unit(&mut self, pu: &PredictionUnit) {
+        self.sink_prediction_unit(pu);
+    }
+
+    fn sao(&mut self, ctb_x: u32, ctb_y: u32, params: &SaoParams) {
+        self.sink_sao(ctb_x, ctb_y, params);
     }
 }
 
