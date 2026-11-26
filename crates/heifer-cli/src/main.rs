@@ -1070,7 +1070,7 @@ fn info_lines(input: &Path) -> Result<Vec<String>, String> {
         }
         Err(e) => return Err(e.to_string()),
     };
-    let image = heifer::decode(&bytes).map_err(|e| e.to_string())?;
+    let image = heifer::read_info(&bytes).map_err(|e| e.to_string())?;
     let primary = file.item(file.primary_id).map_err(|e| e.to_string())?;
     let layout = match file.grid(file.primary_id) {
         Ok(g) => format!("grid of {}×{} tiles", g.columns, g.rows),
