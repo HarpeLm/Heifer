@@ -104,6 +104,7 @@ use heifer_isobmff::{HeifFile, ItemId};
 
 /// Errors produced while decoding or encoding a HEIF file.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The HEIF container is invalid.
     #[error("container: {0}")]
@@ -129,6 +130,7 @@ const MAX_DEPTH: u32 = 4;
 
 /// Decoding options.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Options {
     /// Maximum number of threads used to decode grid tiles, and the groups of pictures of an
     /// image sequence, in parallel. `0` uses all available cores; `1` decodes sequentially.
@@ -384,7 +386,13 @@ fn sps_from_config(
     for nal in &config.nal_units {
         sets.add(&NalUnit::parse(nal)?)?;
     }
-    Ok(sets.sps.iter().flatten().next().map(|sps| {
+    let sps = sets
+        .pps
+        .iter()
+        .flatten()
+        .find_map(|pps| sets.sps[usize::from(pps.pps_seq_parameter_set_id)].as_ref())
+        .or_else(|| sets.sps.iter().flatten().next());
+    Ok(sps.map(|sps| {
         let (w, h) = sps.output_size();
         (w, h, sps.bit_depth_luma.max(sps.bit_depth_chroma))
     }))
@@ -449,11 +457,12 @@ fn hvc1_info(file: &HeifFile<'_>, id: ItemId) -> Result<(u32, u32, u8, bool), Er
         .hevc_config(id)?
         .ok_or(heifer_isobmff::Error::MissingBox(FourCC(*b"hvcC")))?;
     let sps = sps_from_config(config)?;
-    let (width, height) = match file.image_size(id)? {
-        Some(size) => size,
-        None => sps
-            .map(|(w, h, _)| (w, h))
-            .ok_or(Error::Invalid("image has no size"))?,
+    let (width, height) = match (file.image_size(id)?, sps) {
+        // `ispe` is authoritative unless malformed/oversized; decoded pixels never exceed SPS bounds.
+        (Some((w, h)), Some((sw, sh, _))) => (w.min(sw), h.min(sh)),
+        (Some((w, h)), None) => (w, h),
+        (None, Some((sw, sh, _))) => (sw, sh),
+        (None, None) => return Err(Error::Invalid("image has no size")),
     };
     if width == 0 || height == 0 {
         return Err(Error::Invalid("image size is zero or too large"));
@@ -1009,9 +1018,11 @@ fn decode_hvc1<S: Sample>(
     let mut image = {
         let (view, _) = decode_picture_view_into(&bitstream, hevc_options, &mut workspace)?;
         // `ispe` is authoritative; HEVC may code a slightly larger picture.
-        let (width, height) = file
-            .image_size(id)?
-            .unwrap_or((view.width(), view.height()));
+        let (width, height) = match file.image_size(id)? {
+            Some((w, h)) => (w.min(view.width()), h.min(view.height())),
+            None => (view.width(), view.height()),
+        };
+        check_size(width, height, options.max_pixels())?;
         let params = color_params_view(file, id, &view)?;
         frame_view_to_rgba_sized(&view, params, width, height)
     };
