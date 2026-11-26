@@ -936,10 +936,61 @@ fn decode_item_with<S: Sample>(
         return Err(Error::Invalid("derived images nested too deeply"));
     }
     let item = file.item(id)?;
+    let mut alpha_id = None;
+    if item.item_type.0 != *b"hvc1" {
+        for aux in file.referencing_items(id, b"auxl") {
+            if is_alpha_item(file, aux)? {
+                alpha_id = Some(aux);
+                break;
+            }
+        }
+    }
+    let mut fused_transforms = false;
     let mut image = match &item.item_type.0 {
         b"hvc1" => decode_hvc1(file, id, options)?,
         b"unci" => uncompressed::decode(file, id, options)?,
-        b"grid" => decode_grid(file, id, depth, options)?,
+        b"grid" => {
+            if alpha_id.is_none() {
+                if let Some((crop, xform)) = fusable_grid_transforms(file, id)? {
+                    if !xform.is_identity() || crop.is_some() {
+                        let (img, applied) =
+                            decode_grid_with_transform(file, id, depth, options, crop, xform)?;
+                        fused_transforms = applied;
+                        img
+                    } else {
+                        decode_grid_with_transform(
+                            file,
+                            id,
+                            depth,
+                            options,
+                            None,
+                            GridTransform::default(),
+                        )?
+                        .0
+                    }
+                } else {
+                    decode_grid_with_transform(
+                        file,
+                        id,
+                        depth,
+                        options,
+                        None,
+                        GridTransform::default(),
+                    )?
+                    .0
+                }
+            } else {
+                decode_grid_with_transform(
+                    file,
+                    id,
+                    depth,
+                    options,
+                    None,
+                    GridTransform::default(),
+                )?
+                .0
+            }
+        }
         b"iovl" => decode_overlay(file, id, depth, options)?,
         b"iden" => match file.referenced_items(id, b"dimg")[..] {
             [source] => decode_item_with(file, source, depth + 1, options)?,
@@ -953,16 +1004,14 @@ fn decode_item_with<S: Sample>(
         }
     };
     // Alpha plane of a derived image (coded images handle theirs when decoded).
-    if item.item_type.0 != *b"hvc1" {
-        for aux in file.referencing_items(id, b"auxl") {
-            if is_alpha_item(file, aux)? {
-                attach_alpha_image(
-                    &mut image,
-                    &decode_item_with(file, aux, depth + 1, options)?,
-                )?;
-                break;
-            }
-        }
+    if let Some(aux) = alpha_id {
+        attach_alpha_image(
+            &mut image,
+            &decode_item_with(file, aux, depth + 1, options)?,
+        )?;
+    }
+    if fused_transforms {
+        return Ok(image);
     }
     // Transformative properties, in association order (clap, then irot, then imir).
     for property in file.item_properties(id)? {
@@ -1175,12 +1224,215 @@ fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
     Ok(())
 }
 
+/// Any composition of 90° rotations and reflections (`D4`) applied as flip-then-swap from
+/// source `(sx, sy)` to destination `(dx, dy)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GridTransform {
+    swap_xy: bool,
+    flip_x: bool,
+    flip_y: bool,
+}
+
+impl GridTransform {
+    fn is_identity(self) -> bool {
+        !self.swap_xy && !self.flip_x && !self.flip_y
+    }
+
+    fn then_rotate_ccw(&mut self, quarters: u8) {
+        for _ in 0..quarters % 4 {
+            if !self.swap_xy {
+                self.swap_xy = true;
+                self.flip_x = !self.flip_x;
+            } else {
+                self.swap_xy = false;
+                self.flip_y = !self.flip_y;
+            }
+        }
+    }
+
+    fn then_mirror(&mut self, top_bottom: bool) {
+        if top_bottom ^ self.swap_xy {
+            self.flip_y = !self.flip_y;
+        } else {
+            self.flip_x = !self.flip_x;
+        }
+    }
+
+    fn output_size(self, w: u32, h: u32) -> (u32, u32) {
+        if self.swap_xy { (h, w) } else { (w, h) }
+    }
+}
+
+/// Leading `clap` rectangle (before any rotation/mirror) followed by composed `irot`/`imir`
+/// transforms for a grid item, or `None` if a `clap` follows a non-identity rotation/mirror.
+#[allow(clippy::type_complexity)]
+fn fusable_grid_transforms(
+    file: &HeifFile<'_>,
+    id: ItemId,
+) -> Result<Option<(Option<(u32, u32, u32, u32)>, GridTransform)>, Error> {
+    let grid = file.grid(id)?;
+    let (mut cw, mut ch) = (grid.output_width, grid.output_height);
+    let mut crop: Option<(u32, u32, u32, u32)> = None;
+    let mut xform = GridTransform::default();
+    for property in file.item_properties(id)? {
+        match *property {
+            Property::CleanAperture {
+                width,
+                height,
+                horiz_offset,
+                vert_offset,
+            } => {
+                if !xform.is_identity() {
+                    return Ok(None);
+                }
+                let (x, y, w, h) = clap_rect(cw, ch, width, height, horiz_offset, vert_offset)?;
+                crop = Some(match crop {
+                    Some((cx, cy, _, _)) => (cx + x, cy + y, w, h),
+                    None => (x, y, w, h),
+                });
+                cw = w;
+                ch = h;
+            }
+            Property::Rotation(q) => xform.then_rotate_ccw(q),
+            Property::Mirror(top_bottom) => xform.then_mirror(top_bottom),
+            _ => {}
+        }
+    }
+    Ok(Some((crop, xform)))
+}
+
 /// Reusable per-worker decode buffers for plain grid tiles (`48`–`768` tiles per photo).
-#[derive(Default)]
-struct GridWorkspace {
+struct GridWorkspace<S> {
     bitstream: Vec<u8>,
     hevc: DecodeWorkspace,
     color: ColorScratch,
+    tile_rgba: Vec<S>,
+}
+
+impl<S> Default for GridWorkspace<S> {
+    fn default() -> Self {
+        Self {
+            bitstream: Vec::new(),
+            hevc: DecodeWorkspace::default(),
+            color: ColorScratch::default(),
+            tile_rgba: Vec::new(),
+        }
+    }
+}
+
+/// Writes an `h × w` sub-rectangle at `(tx0, ty0)` from `src` (row stride `src_w * 4`) into `dst`
+/// (`dw × dh`, row stride `dst_stride`) applying `xform` in 32×32 cache blocks.
+#[allow(clippy::too_many_arguments)]
+fn copy_tile_transformed<S: Copy>(
+    src: &[S],
+    src_w: usize,
+    tx0: usize,
+    ty0: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [S],
+    dst_stride: usize,
+    dx0: usize,
+    dy0: usize,
+    xform: GridTransform,
+) {
+    let (dw, dh) = if xform.swap_xy { (h, w) } else { (w, h) };
+    let src_stride = src_w * 4;
+    if !xform.swap_xy {
+        if !xform.flip_x {
+            for ldy in 0..dh {
+                let sy = ty0 + if xform.flip_y { dh - 1 - ldy } else { ldy };
+                let s = sy * src_stride + tx0 * 4;
+                let d = (dy0 + ldy) * dst_stride + dx0 * 4;
+                dst[d..d + dw * 4].copy_from_slice(&src[s..s + dw * 4]);
+            }
+            return;
+        }
+        for ldy in 0..dh {
+            let sy = ty0 + if xform.flip_y { dh - 1 - ldy } else { ldy };
+            let src_row = &src[sy * src_stride + tx0 * 4..sy * src_stride + (tx0 + dw) * 4];
+            let dst_row = &mut dst
+                [(dy0 + ldy) * dst_stride + dx0 * 4..(dy0 + ldy) * dst_stride + (dx0 + dw) * 4];
+            for ldx in 0..dw {
+                let s = (dw - 1 - ldx) * 4;
+                let d = ldx * 4;
+                dst_row[d..d + 4].copy_from_slice(&src_row[s..s + 4]);
+            }
+        }
+        return;
+    }
+
+    const BLOCK: usize = 32;
+    for by in (0..dh).step_by(BLOCK) {
+        let y_end = (by + BLOCK).min(dh);
+        for bx in (0..dw).step_by(BLOCK) {
+            let x_end = (bx + BLOCK).min(dw);
+            for ldy in by..y_end {
+                let sx = tx0 + if xform.flip_x { dh - 1 - ldy } else { ldy };
+                let dst_row = &mut dst[(dy0 + ldy) * dst_stride + dx0 * 4..];
+                for ldx in bx..x_end {
+                    let sy = ty0 + if xform.flip_y { dw - 1 - ldx } else { ldx };
+                    let s = sy * src_stride + sx * 4;
+                    let d = ldx * 4;
+                    dst_row[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+    }
+}
+
+/// Like [`copy_tile_transformed`], targeting disjoint row segments owned by a single tile.
+#[allow(clippy::too_many_arguments)]
+fn copy_tile_transformed_segments<S: Copy>(
+    src: &[S],
+    src_w: usize,
+    tx0: usize,
+    ty0: usize,
+    w: usize,
+    h: usize,
+    dst_rows: &mut [&mut [S]],
+    xform: GridTransform,
+) {
+    let (dw, dh) = if xform.swap_xy { (h, w) } else { (w, h) };
+    let src_stride = src_w * 4;
+    if !xform.swap_xy {
+        if !xform.flip_x {
+            for (ldy, dst_row) in dst_rows.iter_mut().enumerate().take(dh) {
+                let sy = ty0 + if xform.flip_y { dh - 1 - ldy } else { ldy };
+                let s = sy * src_stride + tx0 * 4;
+                dst_row[..dw * 4].copy_from_slice(&src[s..s + dw * 4]);
+            }
+            return;
+        }
+        for (ldy, dst_row) in dst_rows.iter_mut().enumerate().take(dh) {
+            let sy = ty0 + if xform.flip_y { dh - 1 - ldy } else { ldy };
+            let src_row = &src[sy * src_stride + tx0 * 4..sy * src_stride + (tx0 + dw) * 4];
+            for ldx in 0..dw {
+                let s = (dw - 1 - ldx) * 4;
+                let d = ldx * 4;
+                dst_row[d..d + 4].copy_from_slice(&src_row[s..s + 4]);
+            }
+        }
+        return;
+    }
+
+    const BLOCK: usize = 32;
+    for by in (0..dh).step_by(BLOCK) {
+        let y_end = (by + BLOCK).min(dh);
+        for bx in (0..dw).step_by(BLOCK) {
+            let x_end = (bx + BLOCK).min(dw);
+            for (dy, dst_row) in dst_rows[by..y_end].iter_mut().enumerate() {
+                let ldy = by + dy;
+                let sx = tx0 + if xform.flip_x { dh - 1 - ldy } else { ldy };
+                for ldx in bx..x_end {
+                    let sy = ty0 + if xform.flip_y { dw - 1 - ldx } else { ldx };
+                    let s = sy * src_stride + sx * 4;
+                    let d = ldx * 4;
+                    dst_row[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1209,16 +1461,20 @@ fn decode_plain_tile<'w>(
     Ok((view, params))
 }
 
-fn decode_grid<S: Sample>(
+#[allow(clippy::too_many_arguments)]
+fn decode_grid_with_transform<S: Sample>(
     file: &HeifFile<'_>,
     id: ItemId,
     depth: u32,
     options: &Options,
-) -> Result<Image<S>, Error> {
+    crop: Option<(u32, u32, u32, u32)>,
+    xform: GridTransform,
+) -> Result<(Image<S>, bool), Error> {
     let grid = file.grid(id)?;
     let tiles = file.referenced_items(id, b"dimg");
     let columns = u32::from(grid.columns);
-    if tiles.is_empty() || tiles.len() != usize::from(grid.rows) * usize::from(grid.columns) {
+    let rows = u32::from(grid.rows);
+    if tiles.is_empty() || tiles.len() != rows as usize * columns as usize {
         return Err(Error::Invalid(
             "grid tile count does not match its rows and columns",
         ));
@@ -1243,6 +1499,288 @@ fn decode_grid<S: Sample>(
     if tile_pixels == 0 || tile_pixels > options.max_pixels() {
         return Err(Error::Invalid("grid tile has an invalid size"));
     }
+    // Plain tiles are converted straight into the canvas, without an intermediate image.
+    let plain = first_tile.is_none()
+        && tiles
+            .iter()
+            .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
+    let tiles_cover_grid = u64::from(columns) * u64::from(tw) >= u64::from(grid.output_width)
+        && u64::from(rows) * u64::from(th) >= u64::from(grid.output_height);
+    let apply_xform = plain && tiles_cover_grid && (!xform.is_identity() || crop.is_some());
+    if apply_xform {
+        let (cx, cy, cw, ch) = crop.unwrap_or((0, 0, grid.output_width, grid.output_height));
+        let (final_w, final_h) = xform.output_size(cw, ch);
+        if final_w == 0 || final_h == 0 {
+            return Ok((
+                Image::filled_samples(final_w, final_h, bit_depth, [S::default(); 4]),
+                true,
+            ));
+        }
+        let mut canvas = Image::filled_samples(final_w, final_h, bit_depth, [S::default(); 4]);
+        let stride = final_w as usize * 4;
+
+        let active_cols: Vec<(u32, usize, usize, usize)> = (0..columns)
+            .filter_map(|c| {
+                let x0 = c * tw;
+                let ix0 = x0.max(cx);
+                let ix1 = (x0 + tw).min(grid.output_width).min(cx + cw);
+                (ix0 < ix1).then(|| {
+                    (
+                        c,
+                        (ix0 - x0) as usize,
+                        (ix0 - cx) as usize,
+                        (ix1 - ix0) as usize,
+                    )
+                })
+            })
+            .collect();
+        let active_rows: Vec<(u32, usize, usize, usize)> = (0..rows)
+            .filter_map(|r| {
+                let y0 = r * th;
+                let iy0 = y0.max(cy);
+                let iy1 = (y0 + th).min(grid.output_height).min(cy + ch);
+                (iy0 < iy1).then(|| {
+                    (
+                        r,
+                        (iy0 - y0) as usize,
+                        (iy0 - cy) as usize,
+                        (iy1 - iy0) as usize,
+                    )
+                })
+            })
+            .collect();
+        let (n_c, n_r) = (active_cols.len(), active_rows.len());
+        struct TileJob {
+            tile_id: ItemId,
+            tx0: usize,
+            ty0: usize,
+            w: usize,
+            h: usize,
+            dx0: usize,
+            dy0: usize,
+            slot: usize,
+        }
+        let mut jobs = Vec::with_capacity(n_c * n_r);
+        let n_xb = if xform.swap_xy { n_r } else { n_c };
+        for (r_idx, &(r, ty0, sy0, h)) in active_rows.iter().enumerate() {
+            let py_idx = if xform.flip_y { n_r - 1 - r_idx } else { r_idx };
+            let ry0 = if xform.flip_y {
+                ch as usize - sy0 - h
+            } else {
+                sy0
+            };
+            for (c_idx, &(c, tx0, sx0, w)) in active_cols.iter().enumerate() {
+                let px_idx = if xform.flip_x { n_c - 1 - c_idx } else { c_idx };
+                let rx0 = if xform.flip_x {
+                    cw as usize - sx0 - w
+                } else {
+                    sx0
+                };
+                let (dst_xb, dst_yb, dx0, dy0) = if xform.swap_xy {
+                    (py_idx, px_idx, ry0, rx0)
+                } else {
+                    (px_idx, py_idx, rx0, ry0)
+                };
+                jobs.push(TileJob {
+                    tile_id: tiles[r as usize * columns as usize + c as usize],
+                    tx0,
+                    ty0,
+                    w,
+                    h,
+                    dx0,
+                    dy0,
+                    slot: dst_yb * n_xb + dst_xb,
+                });
+            }
+        }
+        let hevc_options = DecodeOptions {
+            max_pixels: options.max_pixels(),
+            ..Default::default()
+        };
+        let threads = options.threads().min(jobs.len());
+        if threads <= 1 {
+            let mut ws = GridWorkspace::<S>::default();
+            for job in &jobs {
+                let (view, params) = decode_plain_tile(
+                    file,
+                    job.tile_id,
+                    tw,
+                    th,
+                    bit_depth,
+                    S::depth,
+                    hevc_options,
+                    &mut ws.bitstream,
+                    &mut ws.hevc,
+                )?;
+                if xform.is_identity() && job.tx0 == 0 && job.ty0 == 0 {
+                    frame_view_to_rgba_strided_with_scratch(
+                        &view,
+                        params,
+                        &mut canvas.data,
+                        stride,
+                        job.dx0,
+                        job.dy0,
+                        job.w,
+                        job.h,
+                        &mut ws.color,
+                    );
+                } else {
+                    let src_w = job.tx0 + job.w;
+                    let src_h = job.ty0 + job.h;
+                    ws.tile_rgba.resize(src_w * src_h * 4, S::default());
+                    frame_view_to_rgba_strided_with_scratch(
+                        &view,
+                        params,
+                        &mut ws.tile_rgba,
+                        src_w * 4,
+                        0,
+                        0,
+                        src_w,
+                        src_h,
+                        &mut ws.color,
+                    );
+                    copy_tile_transformed(
+                        &ws.tile_rgba,
+                        src_w,
+                        job.tx0,
+                        job.ty0,
+                        job.w,
+                        job.h,
+                        &mut canvas.data,
+                        stride,
+                        job.dx0,
+                        job.dy0,
+                        xform,
+                    );
+                }
+            }
+            return Ok((canvas, true));
+        }
+
+        let col_widths: Vec<usize> = if xform.swap_xy {
+            if xform.flip_y {
+                active_rows.iter().rev().map(|t| t.3).collect()
+            } else {
+                active_rows.iter().map(|t| t.3).collect()
+            }
+        } else if xform.flip_x {
+            active_cols.iter().rev().map(|t| t.3).collect()
+        } else {
+            active_cols.iter().map(|t| t.3).collect()
+        };
+        let row_heights: Vec<usize> = if xform.swap_xy {
+            if xform.flip_x {
+                active_cols.iter().rev().map(|t| t.3).collect()
+            } else {
+                active_cols.iter().map(|t| t.3).collect()
+            }
+        } else if xform.flip_y {
+            active_rows.iter().rev().map(|t| t.3).collect()
+        } else {
+            active_rows.iter().map(|t| t.3).collect()
+        };
+        let mut segments: Vec<Vec<&mut [S]>> = (0..jobs.len())
+            .map(|slot| Vec::with_capacity(row_heights[slot / n_xb]))
+            .collect();
+        let mut canvas_rows = canvas.data.chunks_exact_mut(stride);
+        for (dst_yb, &band_h) in row_heights.iter().enumerate() {
+            let base_slot = dst_yb * n_xb;
+            for _ in 0..band_h {
+                let mut rest = canvas_rows
+                    .next()
+                    .expect("row heights sum to canvas height");
+                for (dst_xb, &band_w) in col_widths.iter().enumerate() {
+                    let (seg, tail) = rest.split_at_mut(band_w * 4);
+                    rest = tail;
+                    segments[base_slot + dst_xb].push(seg);
+                }
+            }
+        }
+        let segments: Vec<std::sync::Mutex<Vec<&mut [S]>>> =
+            segments.into_iter().map(std::sync::Mutex::new).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let error = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let mut ws = GridWorkspace::<S>::default();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= jobs.len() {
+                            break;
+                        }
+                        let job = &jobs[i];
+                        let step = (|| -> Result<(), Error> {
+                            let (view, params) = decode_plain_tile(
+                                file,
+                                job.tile_id,
+                                tw,
+                                th,
+                                bit_depth,
+                                S::depth,
+                                hevc_options,
+                                &mut ws.bitstream,
+                                &mut ws.hevc,
+                            )?;
+                            if xform.is_identity() && job.tx0 == 0 && job.ty0 == 0 {
+                                let mut out =
+                                    segments[job.slot].lock().unwrap_or_else(|e| e.into_inner());
+                                frame_view_to_rgba_into_with_scratch(
+                                    &view,
+                                    params,
+                                    &mut out,
+                                    job.w,
+                                    job.h,
+                                    &mut ws.color,
+                                );
+                            } else {
+                                let src_w = job.tx0 + job.w;
+                                let src_h = job.ty0 + job.h;
+                                ws.tile_rgba.resize(src_w * src_h * 4, S::default());
+                                frame_view_to_rgba_strided_with_scratch(
+                                    &view,
+                                    params,
+                                    &mut ws.tile_rgba,
+                                    src_w * 4,
+                                    0,
+                                    0,
+                                    src_w,
+                                    src_h,
+                                    &mut ws.color,
+                                );
+                                let mut out =
+                                    segments[job.slot].lock().unwrap_or_else(|e| e.into_inner());
+                                copy_tile_transformed_segments(
+                                    &ws.tile_rgba,
+                                    src_w,
+                                    job.tx0,
+                                    job.ty0,
+                                    job.w,
+                                    job.h,
+                                    &mut out,
+                                    xform,
+                                );
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = step {
+                            error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(e);
+                            next.store(jobs.len(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        drop(segments);
+        if let Some(e) = error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(e);
+        }
+        return Ok((canvas, true));
+    }
+
     let mut canvas = Image::filled_samples(
         grid.output_width,
         grid.output_height,
@@ -1251,15 +1789,10 @@ fn decode_grid<S: Sample>(
     );
     let (canvas_w, canvas_h) = (canvas.width, canvas.height);
     let stride = canvas_w as usize * 4;
-    // Plain tiles are converted straight into the canvas, without an intermediate image.
-    let plain = first_tile.is_none()
-        && tiles
-            .iter()
-            .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
     let start = usize::from(first_tile.is_some());
     let threads = options.threads().min(tiles.len() - start);
     if threads <= 1 && plain && first_tile.is_none() {
-        let mut ws = GridWorkspace::default();
+        let mut ws = GridWorkspace::<S>::default();
         let hevc_options = DecodeOptions {
             max_pixels: options.max_pixels(),
             ..Default::default()
@@ -1296,7 +1829,7 @@ fn decode_grid<S: Sample>(
                 &mut ws.color,
             );
         }
-        return Ok(canvas);
+        return Ok((canvas, false));
     }
 
     let tile_stride = tw.min(canvas_w) as usize * 4;
@@ -1318,7 +1851,7 @@ fn decode_grid<S: Sample>(
     let has_alpha = std::sync::atomic::AtomicBool::new(false);
     let place = |i: usize,
                  tile: Option<&Image<S>>,
-                 ws: Option<&mut GridWorkspace>|
+                 ws: Option<&mut GridWorkspace<S>>|
      -> Result<(), Error> {
         let x0 = (u64::from(i as u32 % columns) * u64::from(tw)).min(u64::from(u32::MAX)) as u32;
         let y0 = (u64::from(i as u32 / columns) * u64::from(th)).min(u64::from(u32::MAX)) as u32;
@@ -1330,7 +1863,7 @@ fn decode_grid<S: Sample>(
             let mut fallback = None;
             let ws = match ws {
                 Some(ws) => ws,
-                None => fallback.get_or_insert_with(GridWorkspace::default),
+                None => fallback.get_or_insert_with(GridWorkspace::<S>::default),
             };
             let hevc_options = DecodeOptions {
                 max_pixels: options.max_pixels(),
@@ -1384,7 +1917,7 @@ fn decode_grid<S: Sample>(
 
     // Tiles are independent HEVC streams: decode them on several threads.
     if threads <= 1 {
-        let mut ws = plain.then(GridWorkspace::default);
+        let mut ws = plain.then(GridWorkspace::<S>::default);
         for i in start..tiles.len() {
             place(i, None, ws.as_mut())?;
         }
@@ -1394,7 +1927,7 @@ fn decode_grid<S: Sample>(
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    let mut ws = plain.then(GridWorkspace::default);
+                    let mut ws = plain.then(GridWorkspace::<S>::default);
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if i >= tiles.len() {
@@ -1417,7 +1950,7 @@ fn decode_grid<S: Sample>(
     }
     drop(segments);
     canvas.has_alpha = has_alpha.into_inner();
-    Ok(canvas)
+    Ok((canvas, false))
 }
 
 /// Whether `id` is a coded image without transformative properties or alpha plane, so that
@@ -1547,4 +2080,110 @@ fn clean_aperture<S: Sample>(
 ) -> Result<Image<S>, Error> {
     let (x, y, w, h) = clap_rect(img.width, img.height, width, height, horiz, vert)?;
     Ok(img.crop(x, y, w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_transform_matches_image_ops_over_d4() {
+        let base = Image::<u8> {
+            width: 5,
+            height: 3,
+            bit_depth: 8,
+            has_alpha: false,
+            data: (0..15)
+                .flat_map(|i| [i as u8, i as u8 + 20, i as u8 + 40, 255])
+                .collect(),
+        };
+        let all_d4 = [false, true].into_iter().flat_map(|swap_xy| {
+            [false, true].into_iter().flat_map(move |flip_x| {
+                [false, true].into_iter().map(move |flip_y| GridTransform {
+                    swap_xy,
+                    flip_x,
+                    flip_y,
+                })
+            })
+        });
+        for start in all_d4 {
+            let mut img = Image::filled_samples(
+                start.output_size(base.width, base.height).0,
+                start.output_size(base.width, base.height).1,
+                8,
+                [0u8; 4],
+            );
+            copy_tile_transformed(
+                &base.data,
+                base.width as usize,
+                0,
+                0,
+                base.width as usize,
+                base.height as usize,
+                &mut img.data,
+                img.width as usize * 4,
+                0,
+                0,
+                start,
+            );
+            for op in 0..5 {
+                let mut xf = start;
+                let expected = match op {
+                    0 => {
+                        xf.then_rotate_ccw(1);
+                        img.rotate_ccw(1)
+                    }
+                    1 => {
+                        xf.then_rotate_ccw(2);
+                        img.rotate_ccw(2)
+                    }
+                    2 => {
+                        xf.then_rotate_ccw(3);
+                        img.rotate_ccw(3)
+                    }
+                    3 => {
+                        xf.then_mirror(true);
+                        img.mirror(true)
+                    }
+                    _ => {
+                        xf.then_mirror(false);
+                        img.mirror(false)
+                    }
+                };
+                let (ow, oh) = xf.output_size(base.width, base.height);
+                let mut got = Image::filled_samples(ow, oh, 8, [0u8; 4]);
+                copy_tile_transformed(
+                    &base.data,
+                    base.width as usize,
+                    0,
+                    0,
+                    base.width as usize,
+                    base.height as usize,
+                    &mut got.data,
+                    ow as usize * 4,
+                    0,
+                    0,
+                    xf,
+                );
+                assert_eq!(got, expected, "start={start:?}, op={op}");
+
+                let mut segs: Vec<Vec<u8>> = (0..oh as usize)
+                    .map(|_| vec![0u8; ow as usize * 4])
+                    .collect();
+                let mut refs: Vec<&mut [u8]> = segs.iter_mut().map(Vec::as_mut_slice).collect();
+                copy_tile_transformed_segments(
+                    &base.data,
+                    base.width as usize,
+                    0,
+                    0,
+                    base.width as usize,
+                    base.height as usize,
+                    &mut refs,
+                    xf,
+                );
+                let flat: Vec<u8> = segs.into_iter().flatten().collect();
+                assert_eq!(flat, expected.data, "segments start={start:?}, op={op}");
+            }
+        }
+    }
 }
