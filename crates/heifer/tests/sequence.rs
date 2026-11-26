@@ -202,6 +202,42 @@ fn parallel_decoding_stops_at_the_same_error() {
     eprintln!("{} frames before the error, error: {one_failed}", one.len());
 }
 
+#[test]
+fn sync_samples_that_are_not_random_access_pictures_decode_the_same_in_parallel() {
+    // Fuzzing inputs whose container flags as sync samples pictures that are not random access
+    // points: a fresh decoder, as a group thread uses, refuses to start on them while the
+    // sequential decoder carries on. Such sequences must be decoded on one thread, the same
+    // way whatever the thread count.
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/parallel");
+    for name in [
+        "22cbc4aa0f870c2bcfabeb6d0b5b4ef74756fdc7",
+        "e7181f7d8fcd9f753cf5f2e62ed013d6432e4a5b",
+        "38d51f649602c8461109314e6fa58e0eba4aca19",
+    ] {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        let decode = |threads| -> Vec<Result<heifer::Image, String>> {
+            let options = heifer::Options::new()
+                .with_max_threads(threads)
+                .with_max_pixels(1 << 17);
+            heifer::decode_sequence_with_options(&bytes, &options)
+                .unwrap()
+                .take(8)
+                .map(|frame| frame.map_err(|e| e.to_string()))
+                .collect()
+        };
+        let (one, many) = (decode(1), decode(4));
+        assert_eq!(one.len(), many.len(), "{name}: frame count");
+        for (k, (a, b)) in one.iter().zip(&many).enumerate() {
+            match (a, b) {
+                (Ok(a), Ok(b)) => assert!(a == b, "{name}: frame {k} differs"),
+                (Err(a), Err(b)) => assert_eq!(a, b, "{name}: frame {k} error"),
+                _ => panic!("{name}: frame {k} succeeds in only one mode"),
+            }
+        }
+    }
+}
+
 #[cfg(feature = "encoder")]
 #[test]
 fn encoded_sequences_read_back() {
