@@ -23,7 +23,7 @@ pub struct SliceFilterParams {
 }
 
 /// Information collected during reconstruction, at 4×4 luma granularity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FilterInfo {
     /// Width of the grid (in 4×4 units).
     pub w4: usize,
@@ -52,24 +52,32 @@ pub struct FilterInfo {
 }
 
 impl FilterInfo {
-    /// Creates empty information for a picture.
-    pub fn new(sps: &Sps, layout: &CtbLayout) -> Self {
+    /// Clears and sizes all filter arrays for `sps` and `layout`, keeping existing allocations.
+    pub fn reset(&mut self, sps: &Sps, layout: &CtbLayout) {
         let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
         let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
         let n = w4 * h4;
-        Self {
-            w4,
-            h4,
-            edges: vec![0; n],
-            intra: vec![true; n],
-            coded: vec![false; n],
-            motion: Vec::new(),
-            qp_y: vec![0; n],
-            no_filter: vec![false; n],
-            slice: vec![0; n],
-            slices: Vec::new(),
-            sao: vec![SaoParams::default(); (layout.width * layout.height) as usize],
-        }
+        self.w4 = w4;
+        self.h4 = h4;
+        self.edges.clear();
+        self.edges.resize(n, 0);
+        self.intra.clear();
+        self.intra.resize(n, true);
+        self.coded.clear();
+        self.coded.resize(n, false);
+        self.motion.clear();
+        self.qp_y.clear();
+        self.qp_y.resize(n, 0);
+        self.no_filter.clear();
+        self.no_filter.resize(n, false);
+        self.slice.clear();
+        self.slice.resize(n, 0);
+        self.slices.clear();
+        self.sao.clear();
+        self.sao.resize(
+            (layout.width * layout.height) as usize,
+            SaoParams::default(),
+        );
     }
 
     fn at(&self, x: u32, y: u32) -> usize {
@@ -492,7 +500,16 @@ fn deblock_chroma<const VERTICAL: bool>(
 /// Band offset only reads the sample it writes, so a plane that uses it exclusively is processed
 /// in place. Edge offset reads neighbouring samples of the *pre-SAO* picture, so a plane that
 /// uses it is copied first — and only then.
-pub fn sao(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &CtbLayout) {
+/// Applies SAO to `frame` in place (§8.7.3), reusing `scratch` when an edge-offset plane needs
+/// a pre-SAO copy. `frame` must already be deblocked.
+pub fn sao(
+    frame: &mut Frame,
+    info: &FilterInfo,
+    sps: &Sps,
+    pps: &Pps,
+    layout: &CtbLayout,
+    scratch: &mut Vec<u16>,
+) {
     let num_comps = if sps.chroma_array_type() != 0 { 3 } else { 1 };
     let ctb = sps.ctb_size();
     let num_ctb = (layout.width * layout.height) as usize;
@@ -509,9 +526,10 @@ pub fn sao(frame: &mut Frame, info: &FilterInfo, sps: &Sps, pps: &Pps, layout: &
         }
         let (pw, ph) = (frame.widths[c], frame.heights[c]);
         if has_edge {
-            let src = frame.planes[c].clone();
+            scratch.clear();
+            scratch.extend_from_slice(&frame.planes[c]);
             sao_plane(
-                Some(&src),
+                Some(scratch),
                 &mut frame.planes[c],
                 c,
                 info,
