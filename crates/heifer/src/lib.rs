@@ -1,4 +1,5 @@
-//! Pure-Rust HEIF/HEIC image decoder and encoder.
+//! Pure-Rust HEIC/HEIF (and `.heics`) decoder and encoder — `#![forbid(unsafe_code)]`, zero
+//! C/`libheif` dependency, WASM-ready, and optional [`image`](https://docs.rs/image) crate support.
 //!
 //! ```no_run
 //! let bytes = std::fs::read("photo.heic").unwrap();
@@ -11,13 +12,35 @@
 //! let heic = heifer::encode(&image, &heifer::EncodeOptions::default()).unwrap();
 //! std::fs::write("copy.heic", heic).unwrap();
 //! # }
+//!
+//! # #[cfg(feature = "image")]
+//! # {
+//! heifer::image_crate::register_image_decoder_hooks();
+//! let img = ::image::open("photo.heic").unwrap();
+//! img.save("photo.png").unwrap();
+//! # }
 //! ```
 //!
 //! This crate ties together the container ([`heifer_isobmff`]) and the HEVC codec
 //! ([`heifer_hevc_dec`], and `heifer_hevc_enc` with the default `encoder` feature).
 //!
-//! Features: `encoder` (default) adds HEIC encoding; disable default features for a
-//! decode-only build. `image` adds the `image` crate integration.
+//! ## Migrating from `libheif-rs`
+//!
+//! | `libheif-rs` | `heifer` |
+//! |---|---|
+//! | `HeifContext::read_from_bytes` + `decode` | [`decode`] / [`decode_rgba8`] / [`decode_srgb`] |
+//! | `check_file_type` / `FileTypeResult` | [`check_file_type`] / [`FileTypeResult`] |
+//! | `metadata_block_ids` / `metadata` | [`read_metadata`] / [`read_iptc`] |
+//! | `HeifContext::new` + `encode_image` | `encode` / `encode_rgb8` / `encode_rgba8` |
+//! | Image sequences (`.heics`) | [`read_sequence`] / [`decode_sequence`] / `encode_sequence` |
+//! | `integration::image::register_all_decoding_hooks` | `image_crate::register_image_decoder_hooks` |
+//!
+//! ## Features
+//!
+//! - `encoder` (default): enables HEIC and `.heics` encoding via `heifer_hevc_enc`. Disable
+//!   default features (`default-features = false`) for decode-only builds.
+//! - `image`: enables [`image`](https://docs.rs/image) crate integration (`image_crate` module:
+//!   `HeifDecoder`, `HeifSequenceDecoder`, `HeifEncoder`, and `image::open` hooks).
 
 pub mod color;
 pub mod depth;
@@ -62,9 +85,12 @@ pub use sequence::{
     decode_sequence_frame_with_options, decode_sequence_with_options, read_sequence,
 };
 
-use color::{ColorParams, ColorScratch, frame_to_rgba_into_with_scratch, frame_to_rgba_sized};
+use color::{
+    ColorParams, ColorScratch, frame_view_to_rgba_into_with_scratch, frame_view_to_rgba_sized,
+    frame_view_to_rgba_strided_with_scratch,
+};
 use heifer_hevc_dec::decoder::{
-    DecodeOptions, DecodeWorkspace, decode_picture, decode_picture_into,
+    DecodeOptions, DecodeWorkspace, DecodedFrameView, decode_picture_view_into,
 };
 use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;
@@ -631,10 +657,10 @@ fn decode_item_with<S: Sample>(
 
 /// Colour parameters of an item: its `colr` (nclx) property if present, otherwise those of the
 /// HEVC stream (ISO/IEC 23008-12 defers to the coded bitstream).
-fn color_params(
+fn color_params_view(
     file: &HeifFile<'_>,
     id: ItemId,
-    frame: &heifer_hevc_dec::recon::Frame,
+    view: &DecodedFrameView<'_>,
 ) -> Result<ColorParams, Error> {
     Ok(file
         .item_properties(id)?
@@ -647,16 +673,7 @@ fn color_params(
             }),
             _ => None,
         })
-        .unwrap_or_else(|| ColorParams::from_frame(frame)))
-}
-
-/// Decodes the HEVC picture of a coded image item.
-fn decode_hvc1_frame(file: &HeifFile<'_>, id: ItemId, options: &Options) -> Result<Frame, Error> {
-    let hevc_options = DecodeOptions {
-        max_pixels: options.max_pixels(),
-        ..Default::default()
-    };
-    Ok(decode_picture(&file.hevc_bitstream(id)?, hevc_options)?)
+        .unwrap_or_else(|| ColorParams::from_view(view)))
 }
 
 fn decode_hvc1<S: Sample>(
@@ -668,13 +685,18 @@ fn decode_hvc1<S: Sample>(
         max_pixels: options.max_pixels(),
         ..Default::default()
     };
-    let frame = decode_hvc1_frame(file, id, options)?;
-    // `ispe` is authoritative; HEVC may code a slightly larger picture.
-    let (width, height) = file
-        .image_size(id)?
-        .unwrap_or((frame.widths[0], frame.heights[0]));
-    let params = color_params(file, id, &frame)?;
-    let mut image = frame_to_rgba_sized(&frame, params, width, height);
+    let mut bitstream = Vec::new();
+    let mut workspace = DecodeWorkspace::default();
+    file.hevc_bitstream_into(id, &mut bitstream)?;
+    let mut image = {
+        let (view, _) = decode_picture_view_into(&bitstream, hevc_options, &mut workspace)?;
+        // `ispe` is authoritative; HEVC may code a slightly larger picture.
+        let (width, height) = file
+            .image_size(id)?
+            .unwrap_or((view.width(), view.height()));
+        let params = color_params_view(file, id, &view)?;
+        frame_view_to_rgba_sized(&view, params, width, height)
+    };
 
     // Alpha channel: an auxiliary image of type alpha referencing this item.
     for aux in file.referencing_items(id, b"auxl") {
@@ -687,10 +709,11 @@ fn decode_hvc1<S: Sample>(
             attach_alpha_image(&mut image, &alpha)?;
             break;
         }
-        let alpha = decode_picture(&file.hevc_bitstream(aux)?, hevc_options)?;
+        file.hevc_bitstream_into(aux, &mut bitstream)?;
+        let (alpha, _) = decode_picture_view_into(&bitstream, hevc_options, &mut workspace)?;
         // The alpha plane is the luma of the auxiliary image, with its own range.
-        let range = color_params(file, aux, &alpha)?;
-        attach_alpha_frame(&mut image, &alpha, range.full_range)?;
+        let range = color_params_view(file, aux, &alpha)?;
+        attach_alpha_view(&mut image, &alpha, range.full_range)?;
         break;
     }
     Ok(image)
@@ -725,24 +748,71 @@ pub(crate) fn attach_alpha_frame<S: Sample>(
     alpha: &Frame,
     full_range: bool,
 ) -> Result<(), Error> {
-    // The alpha plane must cover the image: anything smaller would be read out of bounds.
-    if alpha.widths[0] < image.width || alpha.heights[0] < image.height {
-        return Err(Error::Unsupported(
-            "alpha plane smaller than the image".into(),
-        ));
-    }
-    let bd = alpha.bit_depth[0];
+    let view = DecodedFrameView::U16(alpha, alpha.full_window());
+    attach_alpha_view(image, &view, full_range)
+}
+
+fn copy_alpha_plane<P: Copy + Into<f64>, S: Sample>(
+    image: &mut Image<S>,
+    plane: &[P],
+    stride: usize,
+    crop: heifer_hevc_dec::decoder::CropWindow,
+    bd: u8,
+    full_range: bool,
+) {
     let (offset, span) = if full_range {
         (0.0, f64::from((1u32 << bd) - 1))
     } else {
         (f64::from(16u32 << (bd - 8)), f64::from(219u32 << (bd - 8)))
     };
     let max = f64::from(image.max_value());
-    for y in 0..image.height as usize {
-        for x in 0..image.width as usize {
-            let a = f64::from(alpha.planes[0][y * alpha.widths[0] as usize + x]);
+    let img_w = image.width as usize;
+    let img_h = image.height as usize;
+    let (ax0, ay0) = (crop.x[0] as usize, crop.y[0] as usize);
+    for y in 0..img_h {
+        let src_row = &plane[(ay0 + y) * stride + ax0..];
+        for x in 0..img_w {
+            let a = src_row[x].into();
             let a = ((a - offset) / span * max).round().clamp(0.0, max);
-            image.data[(y * image.width as usize + x) * 4 + 3] = S::from_u16(a as u16);
+            image.data[(y * img_w + x) * 4 + 3] = S::from_u16(a as u16);
+        }
+    }
+}
+
+/// Attaches the luma plane of a decoded auxiliary `alpha` view to `image`.
+pub(crate) fn attach_alpha_view<S: Sample>(
+    image: &mut Image<S>,
+    alpha: &DecodedFrameView<'_>,
+    full_range: bool,
+) -> Result<(), Error> {
+    let crop = alpha.crop();
+    // The alpha plane must cover the image: anything smaller would be read out of bounds.
+    if crop.widths[0] < image.width || crop.heights[0] < image.height {
+        return Err(Error::Unsupported(
+            "alpha plane smaller than the image".into(),
+        ));
+    }
+    let bd = alpha.bit_depth()[0];
+    match *alpha {
+        DecodedFrameView::U8(f, _) => {
+            copy_alpha_plane(
+                image,
+                &f.planes[0],
+                f.widths[0] as usize,
+                crop,
+                bd,
+                full_range,
+            );
+        }
+        DecodedFrameView::U16(f, _) => {
+            copy_alpha_plane(
+                image,
+                &f.planes[0],
+                f.widths[0] as usize,
+                crop,
+                bd,
+                full_range,
+            );
         }
     }
     image.has_alpha = true;
@@ -782,6 +852,32 @@ struct GridWorkspace {
     bitstream: Vec<u8>,
     hevc: DecodeWorkspace,
     color: ColorScratch,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_plain_tile<'w>(
+    file: &HeifFile<'_>,
+    tile_id: ItemId,
+    tw: u32,
+    th: u32,
+    bit_depth: u8,
+    sample_depth: fn(u8) -> u8,
+    hevc_options: DecodeOptions,
+    bitstream: &mut Vec<u8>,
+    hevc: &'w mut DecodeWorkspace,
+) -> Result<(DecodedFrameView<'w>, ColorParams), Error> {
+    file.hevc_bitstream_into(tile_id, bitstream)?;
+    let (view, _) = decode_picture_view_into(bitstream, hevc_options, hevc)?;
+    if view.width() < tw
+        || view.height() < th
+        || sample_depth(view.bit_depth()[0].max(view.bit_depth()[1])) != bit_depth
+    {
+        return Err(Error::Invalid(
+            "grid tiles have different sizes or bit depths",
+        ));
+    }
+    let params = color_params_view(file, tile_id, &view)?;
+    Ok((view, params))
 }
 
 fn decode_grid<S: Sample>(
@@ -826,9 +922,60 @@ fn decode_grid<S: Sample>(
     );
     let (canvas_w, canvas_h) = (canvas.width, canvas.height);
     let stride = canvas_w as usize * 4;
+    // Plain tiles are converted straight into the canvas, without an intermediate image.
+    let plain = first_tile.is_none()
+        && tiles
+            .iter()
+            .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
+    let start = usize::from(first_tile.is_some());
+    let threads = options.threads().min(tiles.len() - start);
+    if threads <= 1 && plain && first_tile.is_none() {
+        let mut ws = GridWorkspace::default();
+        let hevc_options = DecodeOptions {
+            max_pixels: options.max_pixels(),
+            ..Default::default()
+        };
+        for (i, &tile_id) in tiles.iter().enumerate() {
+            let x0 =
+                (u64::from(i as u32 % columns) * u64::from(tw)).min(u64::from(u32::MAX)) as u32;
+            let y0 =
+                (u64::from(i as u32 / columns) * u64::from(th)).min(u64::from(u32::MAX)) as u32;
+            let (w, h) = (
+                tw.min(canvas_w.saturating_sub(x0)) as usize,
+                th.min(canvas_h.saturating_sub(y0)) as usize,
+            );
+            let (view, params) = decode_plain_tile(
+                file,
+                tile_id,
+                tw,
+                th,
+                bit_depth,
+                S::depth,
+                hevc_options,
+                &mut ws.bitstream,
+                &mut ws.hevc,
+            )?;
+            frame_view_to_rgba_strided_with_scratch(
+                &view,
+                params,
+                &mut canvas.data,
+                stride,
+                x0 as usize,
+                y0 as usize,
+                w,
+                h,
+                &mut ws.color,
+            );
+        }
+        return Ok(canvas);
+    }
+
     let tile_stride = tw.min(canvas_w) as usize * 4;
+    let tile_rows = (th as usize).min(canvas_h as usize);
     // Each tile gets its own row segments of the canvas, so tiles are written concurrently.
-    let mut segments: Vec<Vec<&mut [S]>> = (0..tiles.len()).map(|_| Vec::new()).collect();
+    let mut segments: Vec<Vec<&mut [S]>> = (0..tiles.len())
+        .map(|_| Vec::with_capacity(tile_rows))
+        .collect();
     for (y, row) in canvas.data.chunks_exact_mut(stride).enumerate() {
         let first = (y / th as usize).saturating_mul(columns as usize);
         for (column, segment) in row.chunks_mut(tile_stride).enumerate() {
@@ -840,11 +987,6 @@ fn decode_grid<S: Sample>(
     let segments: Vec<std::sync::Mutex<Vec<&mut [S]>>> =
         segments.into_iter().map(std::sync::Mutex::new).collect();
     let has_alpha = std::sync::atomic::AtomicBool::new(false);
-    // Plain tiles are converted straight into the canvas, without an intermediate image.
-    let plain = first_tile.is_none()
-        && tiles
-            .iter()
-            .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
     let place = |i: usize,
                  tile: Option<&Image<S>>,
                  ws: Option<&mut GridWorkspace>|
@@ -865,19 +1007,19 @@ fn decode_grid<S: Sample>(
                 max_pixels: options.max_pixels(),
                 ..Default::default()
             };
-            file.hevc_bitstream_into(tiles[i], &mut ws.bitstream)?;
-            let (frame, _) = decode_picture_into(&ws.bitstream, hevc_options, &mut ws.hevc)?;
-            if frame.widths[0] < tw
-                || frame.heights[0] < th
-                || S::depth(frame.bit_depth[0].max(frame.bit_depth[1])) != bit_depth
-            {
-                return Err(Error::Invalid(
-                    "grid tiles have different sizes or bit depths",
-                ));
-            }
-            let params = color_params(file, tiles[i], frame)?;
+            let (view, params) = decode_plain_tile(
+                file,
+                tiles[i],
+                tw,
+                th,
+                bit_depth,
+                S::depth,
+                hevc_options,
+                &mut ws.bitstream,
+                &mut ws.hevc,
+            )?;
             let mut out = segments[i].lock().unwrap_or_else(|e| e.into_inner());
-            frame_to_rgba_into_with_scratch(frame, params, &mut out, w, h, &mut ws.color);
+            frame_view_to_rgba_into_with_scratch(&view, params, &mut out, w, h, &mut ws.color);
             return Ok(());
         }
         let tile_storage;
@@ -907,15 +1049,11 @@ fn decode_grid<S: Sample>(
         }
         Ok(())
     };
-    let start = if let Some(tile) = &first_tile {
+    if let Some(tile) = &first_tile {
         place(0, Some(tile), None)?;
-        1
-    } else {
-        0
-    };
+    }
 
     // Tiles are independent HEVC streams: decode them on several threads.
-    let threads = options.threads().min(tiles.len() - start);
     if threads <= 1 {
         let mut ws = plain.then(GridWorkspace::default);
         for i in start..tiles.len() {
