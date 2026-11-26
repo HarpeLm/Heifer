@@ -144,20 +144,6 @@ impl SigCtx {
             dc: if xs + ys == 0 { Some(chroma) } else { None },
         }
     }
-
-    /// `ctxInc` of non-DC scan position `n` (`n > 0`).
-    #[inline(always)]
-    fn at_nz(&self, n: usize) -> usize {
-        (usize::from(self.table[n & 15]) + self.add).min(43)
-    }
-
-    /// `ctxInc` of scan position `0` (the sub-block DC position).
-    #[inline(always)]
-    fn at_dc(&self) -> usize {
-        self.dc
-            .unwrap_or_else(|| usize::from(self.table[0]) + self.add)
-            .min(43)
-    }
 }
 
 /// SAO parameters of one CTB (§7.3.8.3), per colour component.
@@ -317,7 +303,7 @@ impl<'a> Picture<'a> {
             pcm: vec![false; n],
             qp_y: vec![0; n],
             skip: vec![false; n],
-            motion: vec![Motion::NONE; n],
+            motion: Vec::new(),
             wpp_saved: None,
             ds_saved: None,
             slice_addr_rs: 0,
@@ -430,6 +416,9 @@ pub fn decode_slice_segment(
             Some(*refs)
         }
     };
+    if refs.is_some() && pic.motion.is_empty() {
+        pic.motion.resize(pic.slice_addr.len(), Motion::NONE);
+    }
     let (sps, pps) = (pic.sps, pic.pps);
     let init_type = Contexts::init_type(header.slice_type, header.cabac_init_flag);
     let mut p = Parser {
@@ -1617,8 +1606,12 @@ impl Parser<'_, '_> {
     /// Zeroes the coefficients written by the last `residual_coding`, and only those.
     fn clear_coeffs(&mut self) {
         let (size, cols, rows) = self.coeff_bounds;
-        for row in self.coeffs.chunks_exact_mut(size.max(1)).take(rows) {
-            row[..cols].fill(0);
+        if cols == size {
+            self.coeffs[..rows * size].fill(0);
+        } else {
+            for row in self.coeffs.chunks_exact_mut(size.max(1)).take(rows) {
+                row[..cols].fill(0);
+            }
         }
         self.coeff_bounds = (size, 0, 0);
     }
@@ -1718,7 +1711,7 @@ impl Parser<'_, '_> {
         let last_scan_pos = usize::from(scan_index(2, scan)[(last_y & 3) * 4 + (last_x & 3)]);
         let sr = sub_raster(scan);
 
-        let mut coded_sb = [[false; 8]; 8];
+        let mut coded_sb: u64 = 0;
         // Implicit RDPCM (intra, horizontal/vertical, no transform) and explicit RDPCM disable
         // sign hiding.
         let implicit_rdpcm = !inter
@@ -1744,20 +1737,20 @@ impl Parser<'_, '_> {
         for i in (0..=last_sub_block).rev() {
             let (xs, ys) = sb_scan[i];
             let (xs, ys) = (usize::from(xs), usize::from(ys));
+            let sb_bit = 1u64 << ((ys << 3) | xs);
+            let right = xs + 1 < sb_width && (coded_sb & (1u64 << ((ys << 3) | (xs + 1)))) != 0;
+            let below = ys + 1 < sb_width && (coded_sb & (1u64 << (((ys + 1) << 3) | xs))) != 0;
             let mut infer_sb_dc = false;
-            if i < last_sub_block && i > 0 {
-                let mut csbf_ctx = 0;
-                if xs + 1 < sb_width {
-                    csbf_ctx += usize::from(coded_sb[xs + 1][ys]);
-                }
-                if ys + 1 < sb_width {
-                    csbf_ctx += usize::from(coded_sb[xs][ys + 1]);
-                }
-                let inc = csbf_ctx.min(1) + if luma { 0 } else { 2 };
-                coded_sb[xs][ys] = self.flag(ctx::CODED_SUB_BLOCK_FLAG + inc);
+            let is_coded = if i < last_sub_block && i > 0 {
+                let inc = usize::from(right | below) + if luma { 0 } else { 2 };
+                let c = self.flag(ctx::CODED_SUB_BLOCK_FLAG + inc);
                 infer_sb_dc = true;
+                c
             } else {
-                coded_sb[xs][ys] = true;
+                true
+            };
+            if is_coded {
+                coded_sb |= sb_bit;
             }
 
             // Significant positions, in decreasing scan position.
@@ -1767,9 +1760,8 @@ impl Parser<'_, '_> {
                 sig[0] = last_scan_pos as u8;
                 n_sig = 1;
             }
-            if coded_sb[xs][ys] {
-                let prev_csbf = u8::from(xs + 1 < sb_width && coded_sb[xs + 1][ys])
-                    | (u8::from(ys + 1 < sb_width && coded_sb[xs][ys + 1]) << 1);
+            if is_coded {
+                let prev_csbf = u8::from(right) | (u8::from(below) << 1);
                 let sig_ctx = SigCtx::new(log2_size, luma, xs, ys, prev_csbf, scan, ts_ctx);
                 let start = if i == last_sub_block {
                     last_scan_pos as i32 - 1
@@ -1780,17 +1772,110 @@ impl Parser<'_, '_> {
                     let models = &mut self.ctx.models;
                     let engine = &mut self.engine;
                     let sig_models = &mut models[ctx::SIG_COEFF_FLAG..ctx::SIG_COEFF_FLAG + 44];
-                    for n in (1..=start as usize).rev() {
-                        if engine.decode(&mut sig_models[sig_ctx.at_nz(n)]) == 1 {
-                            infer_sb_dc = false;
-                            sig[n_sig] = n as u8;
+                    let end = start as usize;
+                    let table = sig_ctx.table;
+                    let add = sig_ctx.add;
+                    if ts_ctx {
+                        let idx = add.min(43);
+                        let mut c = sig_models[idx].pack();
+                        for n in (1..=end).rev() {
+                            if engine.decode_packed(&mut c) == 1 {
+                                infer_sb_dc = false;
+                                sig[n_sig] = n as u8;
+                                n_sig += 1;
+                            }
+                        }
+                        if infer_sb_dc || engine.decode_packed(&mut c) == 1 {
+                            sig[n_sig] = 0;
                             n_sig += 1;
                         }
-                    }
-                    // Scan position 0 (DC): inferred significant when no non-DC coefficient was coded.
-                    if infer_sb_dc || engine.decode(&mut sig_models[sig_ctx.at_dc()]) == 1 {
-                        sig[n_sig] = 0;
-                        n_sig += 1;
+                        sig_models[idx] = ContextModel::unpack(c);
+                    } else if log2_size >= 3 && prev_csbf == 3 {
+                        let idx = (add + 2).min(43);
+                        let mut c = sig_models[idx].pack();
+                        for n in (1..=end).rev() {
+                            if engine.decode_packed(&mut c) == 1 {
+                                infer_sb_dc = false;
+                                sig[n_sig] = n as u8;
+                                n_sig += 1;
+                            }
+                        }
+                        let dc_sig = if infer_sb_dc {
+                            true
+                        } else if sig_ctx.dc.is_none() {
+                            engine.decode_packed(&mut c) == 1
+                        } else {
+                            false
+                        };
+                        sig_models[idx] = ContextModel::unpack(c);
+                        if !infer_sb_dc && let Some(dc_idx) = sig_ctx.dc {
+                            if engine.decode(&mut sig_models[dc_idx.min(43)]) == 1 {
+                                sig[n_sig] = 0;
+                                n_sig += 1;
+                            }
+                        } else if dc_sig {
+                            sig[n_sig] = 0;
+                            n_sig += 1;
+                        }
+                    } else if log2_size >= 3 {
+                        // `add` is at most 39 and `table[n]` is in 0..=2, so `add..add + 3` stays in `..44`.
+                        let mut c = [
+                            sig_models[add].pack(),
+                            sig_models[add + 1].pack(),
+                            sig_models[add + 2].pack(),
+                            0,
+                        ];
+                        for n in (1..=end).rev() {
+                            let ci = usize::from(table[n & 15]) & 3;
+                            if engine.decode_packed(&mut c[ci]) == 1 {
+                                infer_sb_dc = false;
+                                sig[n_sig] = n as u8;
+                                n_sig += 1;
+                            }
+                        }
+                        let dc_sig = if infer_sb_dc {
+                            true
+                        } else if sig_ctx.dc.is_none() {
+                            let ci0 = usize::from(table[0]) & 3;
+                            engine.decode_packed(&mut c[ci0]) == 1
+                        } else {
+                            false
+                        };
+                        sig_models[add] = ContextModel::unpack(c[0]);
+                        sig_models[add + 1] = ContextModel::unpack(c[1]);
+                        sig_models[add + 2] = ContextModel::unpack(c[2]);
+                        if !infer_sb_dc && let Some(dc_idx) = sig_ctx.dc {
+                            if engine.decode(&mut sig_models[dc_idx.min(43)]) == 1 {
+                                sig[n_sig] = 0;
+                                n_sig += 1;
+                            }
+                        } else if dc_sig {
+                            sig[n_sig] = 0;
+                            n_sig += 1;
+                        }
+                    } else {
+                        // 4×4 blocks use contexts `add..add + 9` (`add` is 0 or 27).
+                        let mut c = [0u8; 16];
+                        for j in 0..9 {
+                            c[j] = sig_models[add + j].pack();
+                        }
+                        for n in (1..=end).rev() {
+                            let ci = usize::from(table[n & 15]) & 15;
+                            if engine.decode_packed(&mut c[ci]) == 1 {
+                                infer_sb_dc = false;
+                                sig[n_sig] = n as u8;
+                                n_sig += 1;
+                            }
+                        }
+                        if infer_sb_dc
+                            || engine.decode_packed(&mut c[usize::from(table[0]) & 15]) == 1
+                        {
+                            sig[n_sig] = 0;
+                            n_sig += 1;
+                        }
+                        for j in 0..9 {
+                            sig_models[add + j] = ContextModel::unpack(c[j]);
+                        }
                     }
                 }
             }
@@ -1811,9 +1896,15 @@ impl Parser<'_, '_> {
                 ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_set * 4 + if luma { 0 } else { 16 };
             {
                 let g1_models = &mut self.ctx.models[g1_base..g1_base + 4];
+                let mut g = [
+                    g1_models[0].pack(),
+                    g1_models[1].pack(),
+                    g1_models[2].pack(),
+                    g1_models[3].pack(),
+                ];
                 let engine = &mut self.engine;
                 for k in 0..n_sig.min(8) {
-                    if engine.decode(&mut g1_models[usize::from(greater1_ctx_state.min(3))]) == 1 {
+                    if engine.decode_packed(&mut g[usize::from(greater1_ctx_state & 3)]) == 1 {
                         greater1_mask |= 1u8 << k;
                         greater1_ctx_state = 0;
                         greater1_count += 1;
@@ -1821,6 +1912,9 @@ impl Parser<'_, '_> {
                     } else if greater1_ctx_state > 0 && greater1_ctx_state < 3 {
                         greater1_ctx_state += 1;
                     }
+                }
+                for j in 0..4 {
+                    g1_models[j] = ContextModel::unpack(g[j]);
                 }
             }
             let mut greater2 = false;
@@ -1858,12 +1952,13 @@ impl Parser<'_, '_> {
                 } else {
                     signs
                 };
+                let sb = &mut self.coeffs[sb_base..sb_base + 3 * size + 4];
                 for (k, &pos) in sig[..n_sig].iter().enumerate() {
                     let raster = usize::from(sr[usize::from(pos)]);
                     let rx = raster & 3;
                     let ry = raster >> 2;
                     let neg = ((neg_mask >> (n_sig - 1 - k)) & 1) as i32;
-                    self.coeffs[sb_base + ry * size + rx] = 1 - 2 * neg;
+                    sb[ry * size + rx] = 1 - 2 * neg;
                     max_rx = max_rx.max(rx);
                     max_ry = max_ry.max(ry);
                 }
@@ -1937,12 +2032,9 @@ impl Parser<'_, '_> {
 
     /// `coeff_abs_level_remaining` (§9.3.3.11): Rice prefix/suffix, then Exp-Golomb escape.
     fn coeff_abs_level_remaining(&mut self, rice: u32) -> Result<u32, Error> {
-        let mut prefix = 0;
-        while self.bypass() == 1 {
-            prefix += 1;
-            if prefix > 32 {
-                return Err(Error::Invalid("coeff_abs_level_remaining prefix too long"));
-            }
+        let prefix = self.engine.decode_bypass_unary_capped(32);
+        if prefix > 32 {
+            return Err(Error::Invalid("coeff_abs_level_remaining prefix too long"));
         }
         if prefix <= 3 {
             Ok((prefix << rice) + self.engine.decode_bypass_bits(rice))
