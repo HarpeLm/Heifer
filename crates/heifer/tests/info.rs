@@ -238,3 +238,30 @@ fn read_info_classifies_heic_heif_and_sequence() {
     assert_eq!((seq_info.width, seq_info.height), (64, 48));
     assert_eq!(seq_info, read_info_reader(Cursor::new(&seq)).unwrap());
 }
+
+#[cfg(feature = "encoder")]
+#[test]
+fn read_info_clamps_oversized_ispe_to_sps() {
+    let src = heifer::Image::filled(64, 64, 8, [100, 120, 140, 255]);
+    let mut data = heifer::encode(&src, &heifer::EncodeOptions::default()).unwrap();
+    let needle = [b'i', b's', b'p', b'e', 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 64];
+    let pos = data
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("ispe box not found");
+    data[pos + 8..pos + 12].copy_from_slice(&6_906_977u32.to_be_bytes());
+    data[pos + 12..pos + 16].copy_from_slice(&1_946_157_120u32.to_be_bytes());
+
+    let info = read_info(&data).unwrap();
+    assert_eq!(
+        (info.width, info.height, info.bit_depth, info.has_alpha),
+        (64, 64, 8, false)
+    );
+    assert_eq!(read_info_reader(Cursor::new(&data)).unwrap(), info);
+
+    let decoded = heifer::decode(&data).unwrap();
+    assert_eq!(
+        (decoded.width, decoded.height, decoded.bit_depth, false),
+        (64, 64, 8, false)
+    );
+}
