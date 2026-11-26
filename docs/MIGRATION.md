@@ -178,8 +178,16 @@ let xmp:  Option<Vec<u8>> = meta.xmp;          // XML packet
 let icc:  Option<Vec<u8>> = meta.icc_profile;  // embedded ICC profile
 ```
 
-`heifer::read_metadata` never decodes the picture, so it is cheap. There is also a tiny
-bounds-checked EXIF reader for common tags:
+`heifer::read_metadata` never decodes the picture, so it is cheap. To inspect dimensions, bit
+depth, alpha presence and container kind (`heic`/`heif`/`heics`) without decoding pixels either,
+use `read_info` (or `read_info_reader` from a `Read + Seek`):
+
+```rust
+let info = heifer::read_info(&bytes)?;
+println!("{}×{}, {}-bit, alpha: {}", info.width, info.height, info.bit_depth, info.has_alpha);
+```
+
+There is also a tiny bounds-checked EXIF reader for common tags:
 
 ```rust
 if let Some(e) = meta.exif_fields() {
@@ -217,11 +225,11 @@ let bytes = heifer::encode_rgb8(w, h, &rgb, &heifer::EncodeOptions::default())?;
 // or: heifer::encode_rgba8(w, h, &rgba, &options)?
 
 // or from a decoded / built `heifer::Image` (keeps 10-bit when bit_depth > 8)
-let bytes = heifer::encode(&image, &heifer::EncodeOptions { quality: 80, ..Default::default() })?;
+let bytes = heifer::encode(&image, &heifer::EncodeOptions::new().with_quality(80))?;
 ```
 
-`EncodeOptions` is `{ quality: u8 /* 0..=100, default 80 */, max_threads: usize }`. Keeping
-the original metadata is one more call:
+Build options with `EncodeOptions::new().with_*` (`quality`, `max_threads`, `keyframe_interval`,
+`b_frames`, `speed`). Keeping the original metadata is one more call:
 
 ```rust
 let (image, meta) = (heifer::decode(&bytes)?, heifer::read_metadata(&bytes)?);
@@ -350,15 +358,16 @@ match heifer::decode(&bytes) {
 | `ctx.primary_image_handle()` | — (`decode` targets the primary image) |
 | `ctx.image_handle(id)` | `HeifFile::parse` → `heifer::decode_item(...)` (low-level) |
 | `ctx.top_level_image_ids()` / `number_of_top_level_images()` | `heifer::decode_all(&bytes)` (`HeifFile::top_level_image_ids()` for the IDs) |
-| `lib_heif.decode(&handle, ColorSpace::Rgb(_), None)` | `heifer::decode(&bytes)` |
+| `lib_heif.decode(&handle, ColorSpace::Rgb(_), None)` | `heifer::decode(&bytes)` (or `decode_rgba8` / `decode_reader_rgba8`) |
+| `handle.width()` / `height()` / `has_alpha_channel()` | `heifer::read_info(&bytes)` / `read_info_reader(reader)` (no pixel decode) |
 | `check_file_type(&bytes)` / `FileTypeResult` | `heifer::check_file_type(&bytes)` / `heifer::FileTypeResult` |
 | `image.planes()` / `.interleaved` / `stride` | `image.data` (interleaved RGBA), `to_rgba8()`, `to_rgb8()` |
 | `handle.metadata_block_ids(b"Exif")` / `handle.metadata(id)` | `heifer::read_metadata(&bytes)` → `.exif` / `.xmp` / `.icc_profile` |
 | `image.scale(w, h, None)` | — (resize with the `image` crate) |
 | `HeifContext::new()` + `encode_image(...)` | `heifer::encode(&image, &EncodeOptions)`, `encode_rgb8`, `encode_rgba8` |
 | `RgbChroma::C444` / `EncoderQuality::Lossless` | `EncodeFormat::Ycbcr444` / `EncodeFormat::Lossless` with the `_with_format` functions |
-| `EncodingOptions` / `EncoderQuality` | `EncodeOptions { quality, max_threads }` |
-| `DecodingOptions::set_max_decoding_threads` | `Options { max_threads, max_pixels }` |
+| `EncodingOptions` / `EncoderQuality` | `EncodeOptions::new().with_quality(q).with_max_threads(n)` |
+| `DecodingOptions::set_max_decoding_threads` | `Options::new().with_max_threads(n).with_max_pixels(p)` |
 | `integration::image::register_all_decoding_hooks()` | `heifer::image_crate::register_image_decoder_hooks()` |
 | `Image` (planar, `Channel`s) | `heifer::Image` (interleaved RGBA, `u16`/`u8`) |
 
