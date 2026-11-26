@@ -1,6 +1,6 @@
 [package]
 name = "heifer-cli"
-description = "Convert HEIC/HEIF photos to and from PNG, JPEG and WebP, in pure Rust"
+description = "Convert HEIC/HEIF photos and .heics sequences to/from PNG, JPEG, WebP, GIF and APNG — pure Rust, no libheif or ffmpeg"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -17,7 +17,7 @@ name = "heifer"
 path = "src/main.rs"
 
 [dependencies]
-heifer = { path = "../heifer", version = "0.7.2", features = ["image"] }
+heifer = { path = "../heifer", version = "0.7.3", features = ["image"] }
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "gif"] }
 # APNG output (already used by `image` for PNG).
 png = "0.18"
