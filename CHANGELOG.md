@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Fixes** (found by running every Nokia HEIF conformance file)
+
+- Predictively coded image items (`pred` references, `mif2` brand, Nokia C044) are decoded: the
+  items they reference first, then the image, as one HEVC sequence. Decoding from a reader now
+  also loads those reference items.
+- Image sequence samples with a composition offset of -2^31 are decoded as references but no
+  longer shown (Nokia C041: 8 frames and 0.8 s instead of 9 frames and 2,147,484 s).
+- Zero-length NAL units in item and sample data, and empty `hvcC` entries, are skipped (Nokia
+  C034, #12, by @argentist).
+
 ## 0.7.3 — 2026-11-26
 
 Per-thread buffer reuse across grid tiles, direct 8-bit `Frame8` planes with zero-copy

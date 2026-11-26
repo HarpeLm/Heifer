@@ -98,7 +98,8 @@ use heifer_hevc_dec::decoder::{
 };
 use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;
-use heifer_hevc_dec::recon::Frame;
+use heifer_hevc_dec::recon::{CropWindow, Frame};
+use heifer_hevc_dec::sequence::SequenceDecoder;
 use heifer_isobmff::boxes::{ColorInfo, Property};
 use heifer_isobmff::{HeifFile, ItemId};
 
@@ -1063,9 +1064,19 @@ fn decode_hvc1<S: Sample>(
     };
     let mut bitstream = Vec::new();
     let mut workspace = DecodeWorkspace::default();
-    file.hevc_bitstream_into(id, &mut bitstream)?;
+    let predicted;
     let mut image = {
-        let (view, _) = decode_picture_view_into(&bitstream, hevc_options, &mut workspace)?;
+        let view = match file.referenced_items(id, b"pred") {
+            [] => {
+                file.hevc_bitstream_into(id, &mut bitstream)?;
+                decode_picture_view_into(&bitstream, hevc_options, &mut workspace)?.0
+            }
+            refs => {
+                predicted = decode_predicted(file, refs, id, hevc_options, &mut bitstream)?;
+                let crop = CropWindow::full(predicted.widths, predicted.heights);
+                DecodedFrameView::U16(&predicted, crop)
+            }
+        };
         // `ispe` is authoritative; HEVC may code a slightly larger picture.
         let (width, height) = match file.image_size(id)? {
             Some((w, h)) => (w.min(view.width()), h.min(view.height())),
@@ -1095,6 +1106,24 @@ fn decode_hvc1<S: Sample>(
         break;
     }
     Ok(image)
+}
+
+/// A predictively coded image item (`pred` references, ISO/IEC 23008-12 §6.4.12): the items it
+/// references, listed in decoding order, then the item itself, decoded as one HEVC sequence.
+fn decode_predicted(
+    file: &HeifFile<'_>,
+    refs: &[ItemId],
+    id: ItemId,
+    options: DecodeOptions,
+    bitstream: &mut Vec<u8>,
+) -> Result<Frame, Error> {
+    let mut decoder = SequenceDecoder::new(options);
+    for &item in refs {
+        file.hevc_bitstream_into(item, bitstream)?;
+        decoder.decode(bitstream)?;
+    }
+    file.hevc_bitstream_into(id, bitstream)?;
+    Ok(decoder.decode(bitstream)?)
 }
 
 /// Whether an `auxC` / `auxi` type denotes an alpha plane.
@@ -1956,7 +1985,10 @@ fn decode_grid_with_transform<S: Sample>(
 /// Whether `id` is a coded image without transformative properties or alpha plane, so that
 /// its decoded picture can be used as is.
 fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
-    if file.item(id)?.item_type.0 != *b"hvc1" || !file.referencing_items(id, b"auxl").is_empty() {
+    if file.item(id)?.item_type.0 != *b"hvc1"
+        || !file.referencing_items(id, b"auxl").is_empty()
+        || !file.referenced_items(id, b"pred").is_empty()
+    {
         return Ok(false);
     }
     Ok(!file.item_properties(id)?.any(|p| {

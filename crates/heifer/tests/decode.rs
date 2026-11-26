@@ -132,6 +132,25 @@ fn zero_length_nal_unit_at_end_of_item_is_skipped() {
 }
 
 #[test]
+fn predicted_primary_image_is_decoded_after_its_reference() {
+    // Nokia C044: the primary item is a P picture with a `pred` reference to an intra item.
+    let Some(bytes) = load("predicted.heic") else {
+        return;
+    };
+    let image = heifer::decode(&bytes).unwrap();
+    assert_eq!((image.width, image.height), (1280, 720));
+    // Reading only the items it needs, the reader must also load the reference.
+    let from_reader = heifer::decode_reader(std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(from_reader, image);
+    // The prediction is applied: the picture is not the reference picture.
+    let file = HeifFile::parse(&bytes).unwrap();
+    let reference = file.referenced_items(file.primary_id, b"pred")[0];
+    let reference = heifer::decode_item(&file, reference, 0).unwrap();
+    assert_eq!((reference.width, reference.height), (1280, 720));
+    assert_ne!(reference, image);
+}
+
+#[test]
 fn grid_tiles_are_placed_in_order() {
     let Some(bytes) = load("grid.heic") else {
         return;

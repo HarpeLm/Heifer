@@ -72,6 +72,31 @@ fn sequences_describe_and_decode_keyframes() {
 }
 
 #[test]
+fn samples_that_are_not_displayed_are_decoded_but_not_shown() {
+    // Nokia C041: the first sample (an intra picture) has a composition offset of -2^31, so it
+    // is only a reference for the 8 frames shown, 100 ms each.
+    let Some(bytes) = fixture("hidden_first_sample.heic") else {
+        eprintln!("skipping hidden_first_sample.heic: run scripts/fetch-fixtures.sh");
+        return;
+    };
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    assert_eq!(seq.frames.len(), 8);
+    assert!((seq.duration() - 0.8).abs() < 1e-9, "{}", seq.duration());
+    let frames = heifer::decode_sequence(&bytes).unwrap();
+    assert_eq!(frames.len(), 8);
+    let all: Vec<heifer::Image> = frames.collect::<Result<_, _>>().unwrap();
+    assert_eq!(all.len(), 8);
+    for i in [0, 7] {
+        assert_eq!(
+            heifer::decode_sequence_frame(&bytes, i).unwrap(),
+            all[i],
+            "frame {i}"
+        );
+    }
+    assert!(heifer::decode_sequence_frame(&bytes, 8).is_err());
+}
+
+#[test]
 fn still_images_have_no_sequence() {
     let rgba = vec![90u8; 32 * 32 * 4];
     let bytes = heifer::encode_rgba8(32, 32, &rgba, &Default::default()).unwrap();

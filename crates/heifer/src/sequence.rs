@@ -574,12 +574,12 @@ impl<'a> SequenceFrames<'a> {
 
     /// Number of frames of the sequence.
     pub fn len(&self) -> usize {
-        self.track.samples.len()
+        self.order.len()
     }
 
     /// Whether the sequence has no frame.
     pub fn is_empty(&self) -> bool {
-        self.track.samples.is_empty()
+        self.order.is_empty()
     }
 
     /// Decodes the next sample; converts it to an image when `convert`.

@@ -313,6 +313,7 @@ fn wanted_items(file: &HeifFile<'_>, need: Need) -> Vec<ItemId> {
                 .referenced_items(id, b"dimg")
                 .iter()
                 .chain(file.referenced_items(id, b"iloc"))
+                .chain(file.referenced_items(id, b"pred"))
                 .copied()
                 .chain(file.referencing_items(id, b"auxl"))
             {

@@ -79,10 +79,13 @@ impl Track {
     }
 
     /// The sample indices in display order (by composition time; samples with equal times
-    /// keep their decoding order).
+    /// keep their decoding order). Samples with a composition offset of -2^31 are not displayed:
+    /// they are only references for other samples, and left out.
     pub fn display_order(&self) -> Vec<usize> {
         let times = self.composition_times();
-        let mut order: Vec<usize> = (0..self.samples.len()).collect();
+        let mut order: Vec<usize> = (0..self.samples.len())
+            .filter(|&i| self.samples[i].composition_offset != NOT_DISPLAYED)
+            .collect();
         order.sort_by_key(|&i| times[i]);
         order
     }
@@ -104,6 +107,9 @@ fn invalid(box_type: &[u8; 4], reason: &'static str) -> Error {
         reason,
     }
 }
+
+/// The composition offset of a sample that is decoded but not displayed.
+const NOT_DISPLAYED: i32 = i32::MIN;
 
 /// Most samples accepted in one track.
 const MAX_SAMPLES: usize = 1 << 22;
@@ -387,5 +393,7 @@ mod tests {
         assert_eq!(track(&[0, 2, -1, -1]).display_order(), [0, 2, 3, 1]);
         // Without ctts, display order is decoding order.
         assert_eq!(track(&[0; 3]).display_order(), [0, 1, 2]);
+        // A first sample that is only a reference, as in Nokia's C041.
+        assert_eq!(track(&[i32::MIN, 0, 0]).display_order(), [1, 2]);
     }
 }

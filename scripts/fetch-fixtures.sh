@@ -25,6 +25,8 @@ fetch "$CONFORMANCE/C042.heic"                 mirrored.heic
 fetch "$CONFORMANCE/C008.heic"                 iden_rotated.heic
 fetch "$CONFORMANCE/C039.heic"                 iden_nested.heic
 fetch "$CONFORMANCE/C034.heic"                 zero_length_nal.heic
+fetch "$CONFORMANCE/C044.heic"                 predicted.heic
+fetch "$CONFORMANCE/C041.heic"                 hidden_first_sample.heic
 fetch https://raw.githubusercontent.com/strukturag/libheif/master/examples/example.heic libheif_example.heic
 # A Samsung photo with an ISO 21496-1 gain map (tmap item).
 fetch "$PILLOW/tests/images/heif_special/aux_YCbCr.heic" real/heif_special__aux_YCbCr.heic
