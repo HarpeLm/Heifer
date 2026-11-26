@@ -72,6 +72,7 @@ impl EncodeSpeed {
 
 /// Encoding options.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct EncodeOptions {
     /// Quality, from 0 (smallest files) to 100 (best quality). Default: 80.
     pub quality: u8,
@@ -253,7 +254,7 @@ pub fn encode_with_format(
 /// ```no_run
 /// let bytes = std::fs::read("photo.heic").unwrap();
 /// let (image, metadata) = (heifer::decode(&bytes).unwrap(), heifer::read_metadata(&bytes).unwrap());
-/// let options = heifer::EncodeOptions { quality: 60, ..Default::default() };
+/// let options = heifer::EncodeOptions::new().with_quality(60);
 /// let smaller = heifer::encode_with_metadata(&image, &metadata, &options).unwrap();
 /// ```
 ///
