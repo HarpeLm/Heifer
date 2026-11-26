@@ -9,7 +9,7 @@ use crate::scan::CtbLayout;
 use crate::syntax::{CodingUnit, PredictionUnit, SaoParams, Sink, TransformBlock};
 
 /// A decoded picture: three planes of samples (only the first one for monochrome).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frame {
     /// Width of each plane, in samples.
     pub widths: [u32; 3],
@@ -28,7 +28,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    fn new(sps: &Sps) -> Self {
+    pub(crate) fn reset(&mut self, sps: &Sps) {
         let (w, h) = (
             sps.pic_width_in_luma_samples,
             sps.pic_height_in_luma_samples,
@@ -40,31 +40,46 @@ impl Frame {
             (w / sw, h / sh)
         };
         let mid = |d: u8| 1u16 << (d - 1);
-        Self {
-            widths: [w, cw, cw],
-            heights: [h, ch, ch],
-            planes: [
-                vec![mid(sps.bit_depth_luma); (w * h) as usize],
-                vec![mid(sps.bit_depth_chroma); (cw * ch) as usize],
-                vec![mid(sps.bit_depth_chroma); (cw * ch) as usize],
-            ],
-            bit_depth: [sps.bit_depth_luma, sps.bit_depth_chroma],
-            chroma_format: sps.chroma_format_idc,
-            full_range: sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag),
-            matrix_coeffs: sps.vui.as_ref().map_or(2, |v| v.matrix_coeffs),
+        self.widths = [w, cw, cw];
+        self.heights = [h, ch, ch];
+        for (c, (len, fill)) in [
+            ((w * h) as usize, mid(sps.bit_depth_luma)),
+            ((cw * ch) as usize, mid(sps.bit_depth_chroma)),
+            ((cw * ch) as usize, mid(sps.bit_depth_chroma)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.planes[c].clear();
+            self.planes[c].resize(len, fill);
         }
+        self.bit_depth = [sps.bit_depth_luma, sps.bit_depth_chroma];
+        self.chroma_format = sps.chroma_format_idc;
+        self.full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
+        self.matrix_coeffs = sps.vui.as_ref().map_or(2, |v| v.matrix_coeffs);
     }
 
     /// Returns a copy cropped to the conformance window of `sps`.
     pub fn cropped(&self, sps: &Sps) -> Self {
+        let mut out = Self::default();
+        self.cropped_into(sps, &mut out);
+        out
+    }
+
+    pub(crate) fn cropped_into(&self, sps: &Sps, out: &mut Self) {
         let (sw, sh) = sps.chroma_subsampling();
         let [l, r, t, b] = sps.conf_win_offsets;
-        let mut out = Self {
-            planes: Default::default(),
-            ..*self
-        };
+        out.widths = self.widths;
+        out.heights = self.heights;
+        out.bit_depth = self.bit_depth;
+        out.chroma_format = self.chroma_format;
+        out.full_range = self.full_range;
+        out.matrix_coeffs = self.matrix_coeffs;
         for c in 0..3 {
             if self.widths[c] == 0 {
+                out.planes[c].clear();
+                out.widths[c] = 0;
+                out.heights[c] = 0;
                 continue;
             }
             let (fx, fy) = if c == 0 { (sw, sh) } else { (1, 1) };
@@ -72,16 +87,15 @@ impl Frame {
             let w = self.widths[c] - (l + r) * fx;
             let h = self.heights[c] - (t + b) * fy;
             let src_w = self.widths[c] as usize;
-            let mut plane = Vec::with_capacity(w as usize * h as usize);
+            out.planes[c].clear();
+            out.planes[c].reserve(w as usize * h as usize);
             for y in y0..y0 + h {
                 let row = y as usize * src_w + x0 as usize;
-                plane.extend_from_slice(&self.planes[c][row..row + w as usize]);
+                out.planes[c].extend_from_slice(&self.planes[c][row..row + w as usize]);
             }
-            out.planes[c] = plane;
             out.widths[c] = w;
             out.heights[c] = h;
         }
-        out
     }
 }
 
@@ -684,8 +698,22 @@ pub struct Reconstructor<'a> {
     weights: [Option<Vec<crate::slice::PredWeight>>; 2],
     /// Prediction buffers of inter blocks (two lists), reused across blocks.
     inter_scratch: Vec<i32>,
+    /// Pre-SAO plane copy buffer, reused across components and frames.
+    sao_scratch: Vec<u16>,
     /// Deferred error (the sink interface cannot return errors).
     pub error: Option<Error>,
+}
+
+/// Reusable backing storage for [`Reconstructor`], avoiding allocations across repeated decodes.
+#[derive(Debug, Default)]
+pub struct ReconstructorBuffers {
+    pub(crate) frame: Frame,
+    decoded: Vec<u32>,
+    luma_residual: Vec<i32>,
+    scratch: Vec<i32>,
+    filter_info: FilterInfo,
+    inter_scratch: Vec<i32>,
+    sao_scratch: Vec<u16>,
 }
 
 /// The deblocking filter's state of an area, saved by [`Reconstructor::save_filter_state`].
@@ -700,26 +728,42 @@ pub struct FilterState {
 impl<'a> Reconstructor<'a> {
     /// Creates a reconstructor for a picture.
     pub fn new(sps: &'a Sps, pps: &'a Pps) -> Self {
+        Self::from_buffers(sps, pps, ReconstructorBuffers::default())
+    }
+
+    /// Creates a reconstructor for a picture, reusing heap allocations from `buf`.
+    pub fn from_buffers(sps: &'a Sps, pps: &'a Pps, mut buf: ReconstructorBuffers) -> Self {
         let w4 = sps.pic_width_in_luma_samples.div_ceil(4) as usize;
         let h4 = sps.pic_height_in_luma_samples.div_ceil(4) as usize;
         let layout = CtbLayout::new(sps, pps);
+        buf.frame.reset(sps);
+        buf.filter_info.reset(sps, &layout);
+        buf.decoded.clear();
+        buf.decoded.resize(w4 * h4, u32::MAX);
+        buf.luma_residual.clear();
+        buf.luma_residual.resize(32 * 32, 0);
+        buf.scratch.clear();
+        buf.scratch.resize(4 * 32 * 32 + 2 * (4 * 32 + 1), 0);
+        buf.inter_scratch.clear();
+        buf.sao_scratch.clear();
         Self {
             sps,
             pps,
-            filter_info: FilterInfo::new(sps, &layout),
+            filter_info: buf.filter_info,
             single_tile: layout.col_bd.len() == 2 && layout.row_bd.len() == 2,
             layout,
-            frame: Frame::new(sps),
-            decoded: vec![u32::MAX; w4 * h4],
+            frame: buf.frame,
+            decoded: buf.decoded,
             w4,
             slice_addr: 0,
             slice_cb_qp_offset: 0,
             slice_cr_qp_offset: 0,
-            luma_residual: vec![0; 32 * 32],
-            scratch: vec![0; 4 * 32 * 32 + 2 * (4 * 32 + 1)],
+            luma_residual: buf.luma_residual,
+            scratch: buf.scratch,
             refs: [Vec::new(), Vec::new()],
             weights: [None, None],
-            inter_scratch: Vec::new(),
+            inter_scratch: buf.inter_scratch,
+            sao_scratch: buf.sao_scratch,
             error: None,
         }
     }
@@ -768,7 +812,13 @@ impl<'a> Reconstructor<'a> {
 
     /// Applies the in-loop filters (unless `skip_filters`) and returns the decoded picture,
     /// uncropped (see [`Frame::cropped`]).
-    pub fn finish(mut self, skip_filters: bool) -> Frame {
+    pub fn finish(self, skip_filters: bool) -> Frame {
+        self.finish_into_buffers(skip_filters).frame
+    }
+
+    /// Applies the in-loop filters (unless `skip_filters`) and returns all internal buffers
+    /// (including `frame`) so callers can reuse their heap allocations across pictures.
+    pub fn finish_into_buffers(mut self, skip_filters: bool) -> ReconstructorBuffers {
         if !skip_filters {
             filters::deblock(
                 &mut self.frame,
@@ -783,9 +833,18 @@ impl<'a> Reconstructor<'a> {
                 self.sps,
                 self.pps,
                 &self.layout,
+                &mut self.sao_scratch,
             );
         }
-        self.frame
+        ReconstructorBuffers {
+            frame: self.frame,
+            decoded: self.decoded,
+            luma_residual: self.luma_residual,
+            scratch: self.scratch,
+            filter_info: self.filter_info,
+            inter_scratch: self.inter_scratch,
+            sao_scratch: self.sao_scratch,
+        }
     }
 
     /// The deblocked picture, leaving this one as it is: for encoders that choose SAO parameters
