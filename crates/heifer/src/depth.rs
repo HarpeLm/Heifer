@@ -12,6 +12,7 @@ use crate::Error;
 
 /// How the samples of a depth map map to depth or disparity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DepthRepresentation {
     /// Samples are uniform in inverse Z.
     UniformInverseZ,
