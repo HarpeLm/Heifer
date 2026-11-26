@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Heifer · HEIC in your browser</title>
-<meta name="description" content="Open HEIC photos and convert images to HEIC in your browser with Heifer, a pure-Rust HEIF/HEIC decoder and encoder compiled to WebAssembly. Your file never leaves your device.">
-<meta property="og:title" content="Heifer · HEIC in your browser">
-<meta property="og:description" content="A pure-Rust HEIF/HEIC decoder and encoder compiled to WebAssembly. No C, no unsafe, nothing uploaded.">
+<title>Heifer · HEIC &amp; HEICS in your browser</title>
+<meta name="description" content="Open HEIC photos and HEICS sequences, convert GIF/APNG or still images to HEIC/HEICS, and export bursts as GIF, APNG or PNG frames in your browser with safe Rust + WebAssembly.">
+<meta property="og:title" content="Heifer · HEIC &amp; HEICS in your browser">
+<meta property="og:description" content="A pure-Rust HEIF/HEIC/HEICS decoder and encoder compiled to WebAssembly. No C, no unsafe, nothing uploaded.">
 <meta property="og:image" content="https://harpelm.github.io/Heifer/og.webp">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#070a14">
@@ -45,7 +45,7 @@
   .tag { letter-spacing: .32em; font-size: .85rem; font-weight: 600; color: #cfd6ff; }
   .grad { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
   h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); line-height: 1.1; margin: 14px 0 12px; letter-spacing: -.02em; }
-  .lead { color: var(--muted); max-width: 620px; margin: 0 auto; font-size: 1.08rem; }
+  .lead { color: var(--muted); max-width: 660px; margin: 0 auto; font-size: 1.08rem; }
   .pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 20px; }
   .pill { border: 1px solid var(--line); background: rgba(79, 139, 255, .06); border-radius: 999px; padding: 4px 12px; font-size: .85rem; color: #c9d1f5; }
 
@@ -64,19 +64,36 @@
     display: inline-block; margin-top: 16px; padding: 10px 20px; border-radius: 10px; border: 0;
     background: var(--grad); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
   }
+  .btn.secondary {
+    background: var(--card); border: 1px solid var(--line); color: var(--fg);
+  }
+  .btn.secondary:hover:not(:disabled) { border-color: rgba(139, 92, 246, .7); }
+  .btn:disabled { opacity: .55; cursor: progress; }
+  [hidden], .btn[hidden], .player[hidden] { display: none !important; }
   #status { text-align: center; color: var(--muted); min-height: 1.6em; margin: 16px 0 0; }
   #status.error { color: #ff9db0; }
 
   #result { display: none; margin: 24px auto 0; scroll-margin-top: 16px; }
-  #result .frame { border-radius: 16px; overflow: hidden; border: 1px solid var(--line); background: #000; }
+  #result .frame {
+    border-radius: 16px; overflow: hidden; border: 1px solid var(--line); background: #000;
+    content-visibility: auto; contain-intrinsic-size: auto none auto 400px;
+  }
   canvas { display: block; width: 100%; height: auto; }
   .stats { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 0 0 16px; }
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px; text-align: center; min-width: 120px; }
   .stat b { display: block; font-size: 1.1rem; }
   .stat span { color: var(--muted); font-size: .8rem; }
-  .actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 18px; }
-  .actions .btn { margin-top: 16px; }
-  .quality { display: none; align-items: center; gap: 10px; margin-top: 16px; color: var(--muted); font-size: .92rem; }
+  .player {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin-top: 14px; padding: 10px 14px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  .player .btn { margin-top: 0; padding: 6px 12px; font-size: .9rem; }
+  .player input[type="range"] { flex: 1 1 160px; min-width: 100px; accent-color: var(--violet); }
+  .frame-info { color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 10px 14px; margin-top: 14px; }
+  .actions .btn { margin-top: 0; }
+  .quality { display: none; align-items: center; gap: 10px; color: var(--muted); font-size: .92rem; }
   .quality input { accent-color: var(--violet); width: 160px; }
   .quality output { color: var(--fg); font-weight: 600; min-width: 2ch; }
 
@@ -131,36 +148,46 @@
   </header>
 
   <div class="hero">
-    <div class="tag">HEIF / HEIC · <b class="grad">PURE RUST</b></div>
-    <h1>Open and create HEIC,<br><span class="grad">right in your browser</span></h1>
-    <p class="lead">Heifer is a HEIF/HEIC decoder and encoder written in safe Rust and compiled to WebAssembly. Drop a HEIC to view it, or a PNG or JPEG to convert it to HEIC. Your image never leaves your device.</p>
-    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">Decoder + encoder</span><span class="pill">MIT / Apache-2.0</span></div>
+    <div class="tag">HEIF / HEIC / HEICS · <b class="grad">PURE RUST</b></div>
+    <h1>Open and create HEIC &amp; sequences,<br><span class="grad">right in your browser</span></h1>
+    <p class="lead">Heifer is a HEIF/HEIC/HEICS decoder and encoder written in safe Rust and compiled to WebAssembly. Drop a HEIC photo or burst sequence to view and export it, or drop a GIF, APNG, PNG, or JPEG to encode it. Your file never leaves your device.</p>
+    <div class="pills"><span class="pill">No C</span><span class="pill">No unsafe</span><span class="pill">Decoder + encoder</span><span class="pill">Image sequences</span><span class="pill">MIT / Apache-2.0</span></div>
   </div>
 
   <label id="drop">
     <svg viewBox="0 0 24 24" fill="none" stroke="url(#g)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>
-    <strong>Drop a HEIC photo, or a PNG / JPEG to convert</strong>
-    <small>or click to choose one · HEIC from iPhone, Samsung, Xiaomi… · PNG, JPEG, WebP to HEIC</small><br>
-    <span class="btn">Choose a file</span>
-    <input id="file" type="file" accept=".heic,.heif,.hif,image/heic,image/heif,image/png,image/jpeg,image/webp" hidden>
+    <strong>Drop a HEIC / HEICS, or GIF / APNG / PNG / JPEG to convert</strong>
+    <small>or click to choose files · HEIC/HEICS bursts &amp; animations ↔ GIF, APNG, PNG, JPEG, WebP</small><br>
+    <span class="btn">Choose file(s)</span>
+    <input id="file" type="file" accept=".heic,.heif,.heics,.hif,image/heic,image/heif,image/heic-sequence,image/heif-sequence,image/png,image/jpeg,image/webp,image/gif" multiple hidden>
   </label>
   <p id="status">Loading the decoder…</p>
 
   <div id="result">
     <div class="stats" id="stats"></div>
-    <div class="frame"><canvas id="canvas"></canvas></div>
+    <div class="frame" id="frame-box"><canvas id="canvas"></canvas></div>
+    <div class="player" id="player" hidden>
+      <button type="button" class="btn secondary" id="play-toggle" aria-label="Pause animation">Pause</button>
+      <button type="button" class="btn secondary" id="prev-frame" aria-label="Previous frame">◀</button>
+      <input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Frame">
+      <button type="button" class="btn secondary" id="next-frame" aria-label="Next frame">▶</button>
+      <span class="frame-info" id="frame-info">1 / 1</span>
+    </div>
     <div class="actions">
       <label class="quality" id="quality-box">Quality <input id="quality" type="range" min="20" max="95" step="5" value="80"> <output id="quality-value">80</output></label>
-      <button class="btn" id="save">Download as PNG</button>
+      <button type="button" class="btn" id="save">Download as PNG</button>
+      <button type="button" class="btn secondary" id="save-gif" hidden>Download GIF</button>
+      <button type="button" class="btn secondary" id="save-apng" hidden>Download APNG</button>
+      <button type="button" class="btn secondary" id="save-zip" hidden>Download PNG frames (.zip)</button>
     </div>
   </div>
 
   <section>
     <h2>What's inside</h2>
     <div class="grid">
-      <div class="card"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><h3>HEVC decoding</h3><p>A from-scratch H.265 intra decoder: 8–12 bit, 4:0:0 to 4:4:4, Range Extensions.</p></div>
+      <div class="card"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><h3>HEVC stills &amp; sequences</h3><p>A from-scratch H.265 decoder with I, P and hierarchical B-frames, TMVP, 8–12 bit and 4:0:0–4:4:4.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/></svg><h3>Parallel grid tiles</h3><p>iPhone photos are grids of up to 48 tiles, Samsung's 200 MP files have 768. Natively, they are decoded in parallel.</p></div>
-      <div class="card"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg><h3>HEVC encoding</h3><p>A from-scratch H.265 intra encoder with rate-distortion decisions, alpha, and 512×512 tiles like iPhone photos.</p></div>
+      <div class="card"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg><h3>HEIC &amp; HEICS encoding</h3><p>From-scratch HEVC intra &amp; inter encoder with rate-distortion decisions, alpha, GIF/APNG sequences and 512×512 tiles.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg><h3>EXIF / XMP / ICC</h3><p>Metadata is read without decoding pixels. Rotation, crop and mirror are applied for you.</p></div>
       <div class="card"><svg viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg><h3>No unsafe Rust</h3><p><code>#![forbid(unsafe_code)]</code>, size limits, and continuous fuzzing on CI.</p></div>
     </div>
@@ -169,17 +196,17 @@
   <section>
     <h2>Validated, not guessed</h2>
     <div class="numbers">
-      <div><b class="grad">62 / 62</b><span>HEVC conformance streams<br>identical to ffmpeg</span></div>
-      <div><b class="grad">41</b><span>streams verified against<br>reference MD5 hashes</span></div>
-      <div><b class="grad">200 MP</b><span>Galaxy S24 Ultra photo<br>decoded in 0.55 s</span></div>
-      <div><b class="grad">~35 ms</b><span>12 MP iPhone photo<br>on a 10-core Mac</span></div>
+      <div><b class="grad">114</b><span>HEVC conformance streams<br>(7,115 pictures, MD5-verified)</span></div>
+      <div><b class="grad">66 / 66</b><span>still conformance streams<br>identical to ffmpeg</span></div>
+      <div><b class="grad">200 MP</b><span>Galaxy S24 Ultra photo<br>decoded in 0.43 s</span></div>
+      <div><b class="grad">~20 ms</b><span>12 MP iPhone photo<br>on a 10-core Mac</span></div>
     </div>
   </section>
 
   <section>
     <h2>Use it in Rust</h2>
 <pre><span class="c"># Cargo.toml</span>
-heifer = <span class="s">"0.3"</span>
+heifer = <span class="s">"0.7"</span>
 
 <span class="k">let</span> bytes = std::fs::<span class="f">read</span>(<span class="s">"photo.heic"</span>)?;
 <span class="k">let</span> image = heifer::<span class="f">decode</span>(&amp;bytes)?;   <span class="c">// rotation, crop and alpha applied</span>
@@ -198,125 +225,493 @@ std::fs::<span class="f">write</span>(<span class="s">"copy.heic"</span>, heic)?
 <script type="module">
   // Replaced by the commit hash when deployed, so browsers never mix cached and new files.
   const VERSION = "dev";
-  let decode;
+  let mod;
   const $ = id => document.getElementById(id);
-  const status = $("status"), canvas = $("canvas"), save = $("save"), drop = $("drop"), result = $("result"), stats = $("stats");
+  const status = $("status"), canvas = $("canvas"), frameBox = $("frame-box"), drop = $("drop");
+  const result = $("result"), stats = $("stats"), player = $("player");
+  const playToggle = $("play-toggle"), prevFrame = $("prev-frame"), nextFrame = $("next-frame");
+  const scrubber = $("scrubber"), frameInfo = $("frame-info");
   const qualityBox = $("quality-box"), quality = $("quality"), qualityValue = $("quality-value");
-  let name = "image", heic = null, source = null; // last encoded file and the image it came from
+  const save = $("save"), saveGif = $("save-gif"), saveApng = $("save-apng"), saveZip = $("save-zip");
+  const exportBtns = [save, saveGif, saveApng, saveZip];
+
+  let name = "image";
+  let heic = null;       // still HEIC output bytes (encoding mode)
+  let source = null;     // still image source for quality changes
+  let heicsOut = null;   // .heics output bytes (sequence encoding mode)
+  let seqSource = null;  // sequence source frames for quality changes
+  let seqState = null;   // active decoded sequence { width, height, frameCount, durationsMs, rgba, frames, idx }
+  let userPaused = false;
+  let frameOffScreen = false;
+  let rafId = 0;
+  let lastTick = 0;
+  let elapsed = 0;
+  let activeJob = 0;
+
   const ready = import(`./pkg/heifer_demo.js?v=${VERSION}`).then(m => {
-    decode = m.decode;
+    mod = m;
     return m.default({ module_or_path: `./pkg/heifer_demo_bg.wasm?v=${VERSION}` });
   }).then(
     () => { status.textContent = "Ready. Nothing is uploaded: everything happens in this tab."; },
     e => { status.className = "error"; status.textContent = `Heifer failed to load: ${e.message ?? e}`; throw e; },
   );
 
-  // Encoding runs in a worker, started on first use.
-  let worker = null;
-  function encodeInWorker(rgba, width, height, q) {
-    worker ??= new Promise((resolve, reject) => {
+  // Worker dispatches heavy encoding, sequence decoding and exports off the main thread.
+  let workerPromise = null;
+  let nextReqId = 1;
+  const pending = new Map();
+
+  function getWorker() {
+    workerPromise ??= new Promise((resolve, reject) => {
       const w = new Worker(`./worker.js?v=${VERSION}`, { type: "module" });
-      w.onmessage = ({ data }) => data.ready && resolve(w);
-      w.onerror = e => reject(new Error(e.message || "the encoder failed to load"));
+      w.onmessage = ({ data }) => {
+        if (data.ready) return resolve(w);
+        const entry = pending.get(data.id);
+        if (!entry) return;
+        pending.delete(data.id);
+        data.error ? entry.reject(new Error(data.error)) : entry.resolve(data);
+      };
+      w.onerror = e => {
+        const err = new Error(e.message || "the worker failed to load");
+        for (const entry of pending.values()) entry.reject(err);
+        pending.clear();
+        reject(err);
+      };
     });
-    return worker.then(w => new Promise((resolve, reject) => {
-      w.onmessage = ({ data }) => data.error ? reject(new Error(data.error)) : resolve(data);
-      w.postMessage({ rgba, width, height, quality: q });
+    return workerPromise;
+  }
+
+  function runInWorker(payload, transfer = []) {
+    const id = nextReqId++;
+    return getWorker().then(w => new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      w.postMessage({ id, ...payload }, transfer);
     }));
   }
 
   const stat = (value, label) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
-  const size = n => n < 1e6 ? `${Math.round(n / 1e3)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+  const sizeLabel = n => n < 1e6 ? `${Math.round(n / 1e3)} KB` : `${(n / 1e6).toFixed(1)} MB`;
   const fail = msg => { status.className = "error"; status.textContent = msg; };
 
-  function show(img) {
-    canvas.width = img.width; canvas.height = img.height;
+  function stopPlayback() {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    lastTick = 0;
+    elapsed = 0;
+  }
+
+  function renderFrame(index) {
+    if (!seqState) return;
+    const count = seqState.frameCount;
+    const i = ((index % count) + count) % count;
+    seqState.idx = i;
+    canvas.getContext("2d").putImageData(seqState.frames[i], 0, 0);
+    scrubber.value = String(i);
+    frameInfo.textContent = `${i + 1} / ${count} · ${seqState.durationsMs[i]} ms`;
+  }
+
+  function tick(now) {
+    rafId = 0;
+    if (!seqState || userPaused || frameOffScreen || document.hidden) return;
+    if (!lastTick) lastTick = now;
+    const dt = Math.min(250, Math.max(0, now - lastTick));
+    lastTick = now;
+    elapsed += dt;
+    let moved = false;
+    while (elapsed >= seqState.durationsMs[seqState.idx]) {
+      elapsed -= seqState.durationsMs[seqState.idx];
+      seqState.idx = (seqState.idx + 1) % seqState.frameCount;
+      moved = true;
+    }
+    if (moved) renderFrame(seqState.idx);
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function syncPlayback() {
+    if (!seqState || seqState.frameCount <= 1 || userPaused || frameOffScreen || document.hidden) {
+      stopPlayback();
+      return;
+    }
+    if (!rafId) {
+      lastTick = 0;
+      rafId = requestAnimationFrame(tick);
+    }
+  }
+
+  if ("contentVisibility" in document.documentElement.style) {
+    frameBox.addEventListener("contentvisibilityautostatechange", event => {
+      frameOffScreen = Boolean(event.skipped);
+      syncPlayback();
+    });
+  } else if ("IntersectionObserver" in window) {
+    new IntersectionObserver(entries => {
+      frameOffScreen = !entries.some(e => e.isIntersecting);
+      syncPlayback();
+    }, { rootMargin: "200px" }).observe(frameBox);
+  }
+  document.addEventListener("visibilitychange", () => syncPlayback());
+
+  function showStill(img) {
+    stopPlayback();
+    seqState = null;
+    player.hidden = true;
+    canvas.width = img.width;
+    canvas.height = img.height;
     canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(img.rgba), img.width, img.height), 0, 0);
     result.style.display = "block";
+  }
+
+  function showSequence(decoded) {
+    stopPlayback();
+    const { width, height, frameCount, durationsMs, rgba } = decoded;
+    const frameBytes = width * height * 4;
+    const frames = [];
+    for (let i = 0; i < frameCount; i++) {
+      const view = new Uint8ClampedArray(rgba.buffer, rgba.byteOffset + i * frameBytes, frameBytes);
+      frames.push(new ImageData(view, width, height));
+    }
+    canvas.width = width;
+    canvas.height = height;
+    seqState = { width, height, frameCount, durationsMs, rgba, frames, idx: 0 };
+    userPaused = false;
+    playToggle.textContent = "Pause";
+    playToggle.setAttribute("aria-label", "Pause animation");
+    scrubber.max = String(Math.max(0, frameCount - 1));
+    player.hidden = frameCount <= 1;
+    renderFrame(0);
+    result.style.display = "block";
+    syncPlayback();
+  }
+
+  function setBusy(busy) {
+    for (const btn of exportBtns) btn.disabled = busy;
   }
 
   // HEIF files have an `ftyp` box at offset 4.
   const isHeif = bytes => bytes.length > 12 && String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp";
 
-  async function handle(file) {
-    if (!file) return;
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
     try { await ready; } catch { return; }
-    name = file.name.replace(/\.[^.]+$/, "");
+    const job = ++activeJob;
     status.className = "";
+
+    if (files.length > 1) {
+      return handleMultiImages(files, job);
+    }
+
+    const file = files[0];
+    name = file.name.replace(/\.[^.]+$/, "") || "image";
     const bytes = new Uint8Array(await file.arrayBuffer());
-    if (isHeif(bytes)) return view(file, bytes);
+    if (job !== activeJob) return;
+
+    if (isHeif(bytes)) {
+      if (mod.sequence_frame_count(bytes) > 1) {
+        return viewSequence(file, bytes, job);
+      }
+      return view(file, bytes, job);
+    }
+
+    if (mod.is_animated_image(bytes)) {
+      return convertAnimatedFile(file, bytes, job);
+    }
+
     try {
       const bitmap = await createImageBitmap(file, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
-      const c = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d");
-      c.drawImage(bitmap, 0, 0);
-      source = { file, pixels: c.getImageData(0, 0, bitmap.width, bitmap.height) };
+      if (job !== activeJob) return;
+      const ctx = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d");
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      source = { file, pixels: ctx.getImageData(0, 0, bitmap.width, bitmap.height) };
+      seqSource = null;
+      heicsOut = null;
     } catch {
-      return fail(`${file.name} is neither a HEIC file nor an image this browser can read.`);
+      return fail(`${file.name} is neither a HEIC/HEICS file nor an image this browser can read.`);
     }
-    convert();
+    convert(job);
   }
 
-  async function view(file, bytes) {
+  async function handleMultiImages(files, job) {
+    name = "sequence";
+    status.textContent = `Loading ${files.length} images…`;
+    let width = 0, height = 0;
+    const chunks = [];
+    for (const file of files) {
+      try {
+        const bitmap = await createImageBitmap(file, { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+        if (!width) {
+          width = bitmap.width;
+          height = bitmap.height;
+        }
+        const ctx = new OffscreenCanvas(width, height).getContext("2d");
+        ctx.drawImage(bitmap, 0, 0, width, height);
+        bitmap.close();
+        chunks.push(ctx.getImageData(0, 0, width, height).data);
+      } catch {
+        return fail(`${file.name} cannot be decoded by this browser for sequence encoding.`);
+      }
+    }
+    if (job !== activeJob) return;
+    const frameBytes = width * height * 4;
+    const rgba = new Uint8Array(frameBytes * chunks.length);
+    chunks.forEach((chunk, i) => rgba.set(chunk, i * frameBytes));
+    const durationsMs = new Uint32Array(chunks.length).fill(40);
+    const totalInputSize = files.reduce((acc, f) => acc + f.size, 0);
+    seqSource = {
+      label: `${files.length} images`,
+      sourceType: `${files.length} PNG/JPG`,
+      sourceSize: totalInputSize,
+      width,
+      height,
+      rgba,
+      durationsMs,
+    };
+    source = null;
+    heic = null;
+    convertSequence(job);
+  }
+
+  async function convertAnimatedFile(file, bytes, job) {
     status.textContent = `Decoding ${file.name}…`;
-    await new Promise(requestAnimationFrame); // let the message render
+    try {
+      const anim = await runInWorker({ op: "decodeAnimation", bytes }, [bytes.buffer]);
+      if (job !== activeJob) return;
+      seqSource = {
+        label: file.name,
+        sourceType: (file.type.replace("image/", "").toUpperCase() || "ANIM"),
+        sourceSize: file.size,
+        width: anim.width,
+        height: anim.height,
+        rgba: anim.rgba,
+        durationsMs: anim.durationsMs,
+      };
+      source = null;
+      heic = null;
+      convertSequence(job);
+    } catch (e) {
+      if (job !== activeJob) return;
+      fail(`Could not decode this animation: ${e.message ?? e}`);
+    }
+  }
+
+  async function view(file, bytes, job) {
+    status.textContent = `Decoding ${file.name}…`;
+    await new Promise(requestAnimationFrame);
+    if (job !== activeJob) return;
     const t0 = performance.now();
     try {
-      const img = decode(bytes);
+      const img = mod.decode(bytes);
       const ms = Math.round(performance.now() - t0);
-      show(img);
+      showStill(img);
       const mp = (img.width * img.height / 1e6).toFixed(1);
       stats.innerHTML = stat(`${img.width}×${img.height}`, `${mp} MP`) + stat(`${ms} ms`, "decoded in this tab") + stat(img.info, "format");
       img.free();
-      heic = source = null;
+      heic = source = heicsOut = seqSource = null;
       qualityBox.style.display = "none";
       save.textContent = "Download as PNG";
+      save.hidden = false;
+      saveGif.hidden = true;
+      saveApng.hidden = true;
+      saveZip.hidden = true;
       status.textContent = file.name;
       result.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {
+      if (mod.sequence_frame_count(bytes) >= 1) {
+        return viewSequence(file, bytes, job);
+      }
       fail(`Could not decode this file: ${e.message ?? e}`);
     }
   }
 
-  async function convert() {
+  async function viewSequence(file, bytes, job) {
+    status.textContent = `Decoding sequence ${file.name}…`;
+    try {
+      const seq = await runInWorker({ op: "decodeSequence", bytes }, [bytes.buffer]);
+      if (job !== activeJob) return;
+      showSequence(seq);
+      const mp = (seq.width * seq.height / 1e6).toFixed(1);
+      stats.innerHTML = stat(`${seq.width}×${seq.height}`, `${mp} MP`)
+        + stat(`${seq.ms} ms`, "decoded in this tab")
+        + stat(seq.info, "sequence");
+      heic = source = heicsOut = seqSource = null;
+      qualityBox.style.display = "none";
+      save.textContent = "Save frame (PNG)";
+      save.hidden = false;
+      saveGif.hidden = false;
+      saveApng.hidden = false;
+      saveZip.hidden = false;
+      status.textContent = file.name;
+      result.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      if (job !== activeJob) return;
+      fail(`Could not decode this sequence: ${e.message ?? e}`);
+    }
+  }
+
+  async function convert(job) {
     const { file, pixels } = source;
     const q = Number(quality.value);
     status.className = "";
     status.textContent = `Encoding ${file.name} to HEIC at quality ${q}…`;
     try {
-      const { heic: bytes, ms } = await encodeInWorker(pixels.data.slice(), pixels.width, pixels.height, q);
-      if (source?.file !== file || Number(quality.value) !== q) return; // superseded
+      const copy = pixels.data.slice();
+      const { heic: bytes, ms } = await runInWorker(
+        { op: "encode", rgba: copy, width: pixels.width, height: pixels.height, quality: q },
+        [copy.buffer],
+      );
+      if (job !== activeJob || source?.file !== file || Number(quality.value) !== q) return;
       heic = bytes;
-      // Show the HEIC as decoded back by heifer: what the file really contains.
-      const img = decode(heic);
-      show(img);
+      heicsOut = null;
+      const img = mod.decode(heic);
+      showStill(img);
       img.free();
       const mp = (pixels.width * pixels.height / 1e6).toFixed(1);
       stats.innerHTML = stat(`${pixels.width}×${pixels.height}`, `${mp} MP`)
-        + stat(`${size(file.size)} → ${size(heic.length)}`, `${file.type.replace("image/", "").toUpperCase() || "image"} → HEIC`)
+        + stat(`${sizeLabel(file.size)} → ${sizeLabel(heic.length)}`, `${file.type.replace("image/", "").toUpperCase() || "image"} → HEIC`)
         + stat(`${ms} ms`, "encoded in this tab");
       qualityBox.style.display = "flex";
       save.textContent = "Download HEIC";
+      save.hidden = false;
+      saveGif.hidden = true;
+      saveApng.hidden = true;
+      saveZip.hidden = true;
       status.textContent = `${name}.heic · shown as decoded from the HEIC file`;
       result.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (e) {
+      if (job !== activeJob) return;
       fail(`Could not encode this image: ${e.message ?? e}`);
     }
   }
 
-  function download(blob, filename) {
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  async function convertSequence(job) {
+    const current = seqSource;
+    const q = Number(quality.value);
+    status.className = "";
+    status.textContent = `Encoding ${current.label} (${current.durationsMs.length} frames) to HEICS at quality ${q}…`;
+    try {
+      const rgbaCopy = current.rgba.slice();
+      const durCopy = current.durationsMs.slice();
+      const { heics, ms } = await runInWorker(
+        {
+          op: "encodeSequence",
+          rgba: rgbaCopy,
+          width: current.width,
+          height: current.height,
+          durationsMs: durCopy,
+          quality: q,
+          speed: 0,
+        },
+        [rgbaCopy.buffer, durCopy.buffer],
+      );
+      if (job !== activeJob || seqSource !== current || Number(quality.value) !== q) return;
+      heicsOut = heics;
+      const heicsPreviewCopy = heics.slice();
+      const seq = await runInWorker({ op: "decodeSequence", bytes: heicsPreviewCopy }, [heicsPreviewCopy.buffer]);
+      if (job !== activeJob || seqSource !== current || Number(quality.value) !== q) return;
+      showSequence(seq);
+      const mp = (current.width * current.height / 1e6).toFixed(1);
+      stats.innerHTML = stat(`${current.width}×${current.height}`, `${mp} MP · ${seq.frameCount} frames`)
+        + stat(`${sizeLabel(current.sourceSize)} → ${sizeLabel(heicsOut.length)}`, `${current.sourceType} → HEICS`)
+        + stat(`${ms} ms`, "encoded in this tab");
+      qualityBox.style.display = "flex";
+      save.textContent = "Download HEICS";
+      save.hidden = false;
+      saveGif.hidden = true;
+      saveApng.hidden = true;
+      saveZip.hidden = true;
+      status.textContent = `${name}.heics · shown as decoded from the HEICS file`;
+      result.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      if (job !== activeJob) return;
+      fail(`Could not encode this sequence: ${e.message ?? e}`);
+    }
   }
 
-  $("file").addEventListener("change", e => { handle(e.target.files[0]); e.target.value = ""; });
+  async function exportSequence(op, mime, ext, label) {
+    if (!seqState) return;
+    setBusy(true);
+    status.className = "";
+    status.textContent = `Exporting ${label}…`;
+    try {
+      const rgbaCopy = seqState.rgba.slice();
+      const durCopy = seqState.durationsMs.slice();
+      const payload = op === "exportPngZip"
+        ? { op, rgba: rgbaCopy, width: seqState.width, height: seqState.height, stem: name }
+        : { op, rgba: rgbaCopy, width: seqState.width, height: seqState.height, durationsMs: durCopy };
+      const transfer = op === "exportPngZip" ? [rgbaCopy.buffer] : [rgbaCopy.buffer, durCopy.buffer];
+      const { bytes, ms } = await runInWorker(payload, transfer);
+      download(new Blob([bytes], { type: mime }), `${name}${ext}`);
+      status.textContent = `${name}${ext} (${sizeLabel(bytes.length)}, ${ms} ms)`;
+    } catch (e) {
+      fail(`Could not export ${label}: ${e.message ?? e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function download(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }
+
+  $("file").addEventListener("change", e => { handleFiles(e.target.files); e.target.value = ""; });
   drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handleFiles(e.dataTransfer.files); });
+
   quality.addEventListener("input", () => { qualityValue.textContent = quality.value; });
-  quality.addEventListener("change", () => source && convert());
-  save.addEventListener("click", () => {
-    if (heic) return download(new Blob([heic], { type: "image/heic" }), `${name}.heic`);
-    canvas.toBlob(b => download(b, `${name}.png`), "image/png");
+  quality.addEventListener("change", () => {
+    const job = ++activeJob;
+    if (source) convert(job);
+    else if (seqSource) convertSequence(job);
   });
+
+  playToggle.addEventListener("click", () => {
+    if (!seqState) return;
+    userPaused = !userPaused;
+    playToggle.textContent = userPaused ? "Play" : "Pause";
+    playToggle.setAttribute("aria-label", userPaused ? "Play animation" : "Pause animation");
+    syncPlayback();
+  });
+  prevFrame.addEventListener("click", () => {
+    if (!seqState) return;
+    userPaused = true;
+    playToggle.textContent = "Play";
+    playToggle.setAttribute("aria-label", "Play animation");
+    stopPlayback();
+    renderFrame(seqState.idx - 1);
+  });
+  nextFrame.addEventListener("click", () => {
+    if (!seqState) return;
+    userPaused = true;
+    playToggle.textContent = "Play";
+    playToggle.setAttribute("aria-label", "Play animation");
+    stopPlayback();
+    renderFrame(seqState.idx + 1);
+  });
+  scrubber.addEventListener("input", () => {
+    if (!seqState) return;
+    elapsed = 0;
+    lastTick = 0;
+    renderFrame(Number(scrubber.value));
+  });
+
+  save.addEventListener("click", () => {
+    if (heicsOut) return download(new Blob([heicsOut], { type: "image/heic-sequence" }), `${name}.heics`);
+    if (heic) return download(new Blob([heic], { type: "image/heic" }), `${name}.heic`);
+    const suffix = seqState ? `-${String(seqState.idx + 1).padStart(3, "0")}` : "";
+    canvas.toBlob(b => download(b, `${name}${suffix}.png`), "image/png");
+  });
+  saveGif.addEventListener("click", () => exportSequence("exportGif", "image/gif", ".gif", "animated GIF"));
+  saveApng.addEventListener("click", () => exportSequence("exportApng", "image/apng", ".apng", "APNG"));
+  saveZip.addEventListener("click", () => exportSequence("exportPngZip", "application/zip", "-frames.zip", "PNG frames"));
 </script>
 </body>
 </html>
