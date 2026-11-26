@@ -5,6 +5,7 @@ use heifer_hevc_dec::recon::Frame;
 use crate::image::{Image, Sample};
 
 /// The R, G and B contributions of chroma along a row.
+#[derive(Debug, Default)]
 struct ChromaTerms {
     r: Vec<i32>,
     g: Vec<i32>,
@@ -12,12 +13,10 @@ struct ChromaTerms {
 }
 
 impl ChromaTerms {
-    fn new(width: usize) -> Self {
-        Self {
-            r: vec![0; width],
-            g: vec![0; width],
-            b: vec![0; width],
-        }
+    fn resize(&mut self, width: usize) {
+        self.r.resize(width, 0);
+        self.g.resize(width, 0);
+        self.b.resize(width, 0);
     }
 
     /// Sets this row half way between `a` and `b`.
@@ -32,6 +31,14 @@ impl ChromaTerms {
             }
         }
     }
+}
+
+/// Reusable per-thread row buffers for [`frame_to_rgba_into_with_scratch`].
+#[derive(Debug, Default)]
+pub(crate) struct ColorScratch {
+    above: ChromaTerms,
+    below: ChromaTerms,
+    blended: ChromaTerms,
 }
 
 /// How to interpret YCbCr samples.
@@ -108,6 +115,19 @@ pub fn frame_to_rgba_into<S: Sample>(
     out: &mut [&mut [S]],
     width: usize,
     height: usize,
+) {
+    let mut scratch = ColorScratch::default();
+    frame_to_rgba_into_with_scratch(frame, params, out, width, height, &mut scratch);
+}
+
+/// Like [`frame_to_rgba_into`], reusing `scratch` row buffers across tiles of a grid.
+pub(crate) fn frame_to_rgba_into_with_scratch<S: Sample>(
+    frame: &Frame,
+    params: ColorParams,
+    out: &mut [&mut [S]],
+    width: usize,
+    height: usize,
+    scratch: &mut ColorScratch,
 ) {
     let (w, h) = (frame.widths[0] as usize, frame.heights[0] as usize);
     let (width, height) = (width.min(w), height.min(h));
@@ -193,8 +213,11 @@ pub fn frame_to_rgba_into<S: Sample>(
         let pair_count = last_column.min(width / 2);
         let done = pair_count * 2;
         // Terms of the chroma rows above and below the current luma row.
-        let (mut above, mut below) = (ChromaTerms::new(cwu), ChromaTerms::new(cwu));
-        let mut blended = ChromaTerms::new(cwu);
+        scratch.above.resize(cwu);
+        scratch.below.resize(cwu);
+        scratch.blended.resize(cwu);
+        let (mut above, mut below, blended) =
+            (&mut scratch.above, &mut scratch.below, &mut scratch.blended);
         let mut loaded = (usize::MAX, usize::MAX);
         for (y, out_row) in rows {
             // Vertically: chroma rows sit on even luma rows (4:2:0); odd rows are in between.
@@ -208,19 +231,19 @@ pub fn frame_to_rgba_into<S: Sample>(
                 if loaded.1 == j {
                     std::mem::swap(&mut above, &mut below);
                 } else {
-                    row_terms(j.min(chh as usize - 1), &mut above);
+                    row_terms(j.min(chh as usize - 1), above);
                 }
                 loaded = (j, usize::MAX);
             }
             if next != j && loaded.1 != next {
-                row_terms(next, &mut below);
+                row_terms(next, below);
                 loaded.1 = next;
             }
             let terms = if next == j {
-                &above
+                &*above
             } else {
-                blended.average(&above, &below);
-                &blended
+                blended.average(above, below);
+                &*blended
             };
             let tr_s = &terms.r;
             let tg_s = &terms.g;
