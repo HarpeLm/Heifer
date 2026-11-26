@@ -71,6 +71,7 @@ pub use heifer_hevc_dec;
 #[cfg(feature = "encoder")]
 pub use heifer_hevc_enc;
 pub use heifer_isobmff;
+pub use heifer_isobmff::FourCC;
 pub use heifer_isobmff::region::{Geometry, RegionItem, UserDescription};
 pub use heifer_isobmff::writer::{ALPHA_URN, DEPTH_URN};
 pub use image::{Image, Sample};
@@ -79,7 +80,10 @@ pub use metadata::{
     Exif, Metadata, Regions, item_iptc, item_metadata, item_regions, read_iptc, read_metadata,
     read_regions,
 };
-pub use reader::{ReadError, decode_reader, decode_reader_with_options, read_metadata_reader};
+pub use reader::{
+    ReadError, decode_reader, decode_reader_rgba8, decode_reader_with_options, read_info_reader,
+    read_metadata_reader,
+};
 pub use sequence::{
     FrameInfo, SequenceFrames, SequenceInfo, decode_sequence, decode_sequence_frame,
     decode_sequence_frame_with_options, decode_sequence_with_options, read_sequence,
@@ -96,7 +100,7 @@ use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;
 use heifer_hevc_dec::recon::Frame;
 use heifer_isobmff::boxes::{ColorInfo, Property};
-use heifer_isobmff::{FourCC, HeifFile, ItemId};
+use heifer_isobmff::{HeifFile, ItemId};
 
 /// Errors produced while decoding or encoding a HEIF file.
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +238,320 @@ pub fn check_file_type(data: &[u8]) -> FileTypeResult {
         b"mif1" | b"mif2" | b"msf1" => FileTypeResult::MayBe,
         _ => FileTypeResult::Unsupported,
     }
+}
+
+/// Kind of HEIF container, inferred from the container structure and `ftyp` major brand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileKind {
+    /// HEVC-coded still image (`heic` / `heix`, no image sequence track).
+    Heic,
+    /// Generic or uncompressed HEIF still image (`mif1` / `mif2`, no image sequence track).
+    Heif,
+    /// Image sequence (`.heics` or MP4/HEIF file with a sequence track).
+    Sequence,
+}
+
+impl FileKind {
+    /// Short extension / format name (`"heic"`, `"heif"`, or `"heics"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heic => "heic",
+            Self::Heif => "heif",
+            Self::Sequence => "heics",
+        }
+    }
+
+    /// MIME media type (`"image/heic"`, `"image/heif"`, or `"image/heic-sequence"`).
+    pub const fn mime_type(self) -> &'static str {
+        match self {
+            Self::Heic => "image/heic",
+            Self::Heif => "image/heif",
+            Self::Sequence => "image/heic-sequence",
+        }
+    }
+}
+
+/// Lightweight container metadata read without decoding pixel data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImageInfo {
+    /// Displayed image width in pixels, after `clap`, `irot` and `imir` transforms.
+    pub width: u32,
+    /// Displayed image height in pixels, after `clap`, `irot` and `imir` transforms.
+    pub height: u32,
+    /// Bits per colour sample (typically 8, 10 or 12).
+    pub bit_depth: u8,
+    /// Whether the image carries an alpha channel or transparency.
+    pub has_alpha: bool,
+    /// Container kind ([`FileKind::Heic`], [`FileKind::Heif`], or [`FileKind::Sequence`]).
+    pub kind: FileKind,
+    /// Major brand from the `ftyp` box (e.g. `heic`, `mif1`, `msf1`).
+    pub major_brand: FourCC,
+    /// Primary item type (e.g. `hvc1`, `grid`, `iovl`, `unci`), or sequence sample coding
+    /// (`hvc1` / `hev1`) when the file has no still image.
+    pub item_type: FourCC,
+    /// Whether the file has a still primary image item (`pitm` in `meta`).
+    pub has_primary_image: bool,
+    /// Whether the file contains an image sequence track (`moov`/`trak`).
+    pub has_sequence: bool,
+}
+
+pub(crate) fn classify_file_kind(major_brand: FourCC, has_sequence: bool) -> FileKind {
+    if has_sequence || matches!(&major_brand.0, b"hevc" | b"hevx" | b"msf1") {
+        FileKind::Sequence
+    } else if matches!(&major_brand.0, b"heic" | b"heix") {
+        FileKind::Heic
+    } else {
+        FileKind::Heif
+    }
+}
+
+/// Reads container dimensions, bit depth, alpha presence and format kind without decoding
+/// pixel data (supports still images and sequence-only `.heics` / MP4 files).
+pub fn read_info(bytes: &[u8]) -> Result<ImageInfo, Error> {
+    match HeifFile::parse(bytes) {
+        Ok(file) => {
+            let mut info = item_info(&file, file.primary_id)?;
+            let has_sequence = sequence::has_sequence_track(bytes);
+            info.has_sequence = has_sequence;
+            info.kind = classify_file_kind(info.major_brand, has_sequence);
+            Ok(info)
+        }
+        Err(parse_err) => match read_sequence_only_info(bytes) {
+            Ok(Some(info)) => Ok(info),
+            Ok(None) => Err(parse_err.into()),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+/// Like [`read_info`], requiring a still primary image item (skipping sequence track lookup).
+#[cfg(feature = "image")]
+pub(crate) fn read_still_info(bytes: &[u8]) -> Result<ImageInfo, Error> {
+    let file = HeifFile::parse(bytes)?;
+    item_info(&file, file.primary_id)
+}
+
+/// Reads container info from a parsed sequence track when no `meta` still image exists.
+pub(crate) fn read_sequence_only_info(bytes: &[u8]) -> Result<Option<ImageInfo>, Error> {
+    let mut file_type = None;
+    for b in heifer_isobmff::BoxIter::new(bytes) {
+        let b = b?;
+        if &b.header.box_type.0 == b"ftyp" {
+            file_type = Some(heifer_isobmff::boxes::FileType::parse(b.content)?);
+            break;
+        }
+    }
+    let file_type = file_type.ok_or(heifer_isobmff::Error::MissingBox(FourCC(*b"ftyp")))?;
+    let Some(summary) = sequence::sequence_summary(bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(ImageInfo {
+        width: summary.width,
+        height: summary.height,
+        bit_depth: summary.bit_depth,
+        has_alpha: summary.has_alpha,
+        kind: FileKind::Sequence,
+        major_brand: file_type.major_brand,
+        item_type: summary.coding,
+        has_primary_image: false,
+        has_sequence: true,
+    }))
+}
+
+/// Reads lightweight info for one still image item without decoding its pixel payload.
+pub fn item_info(file: &HeifFile<'_>, id: ItemId) -> Result<ImageInfo, Error> {
+    let item = file.item(id)?;
+    let (width, height, bit_depth, has_alpha) = item_core_info(file, id, 0)?;
+    Ok(ImageInfo {
+        width,
+        height,
+        bit_depth,
+        has_alpha,
+        kind: classify_file_kind(file.file_type.major_brand, false),
+        major_brand: file.file_type.major_brand,
+        item_type: item.item_type,
+        has_primary_image: true,
+        has_sequence: false,
+    })
+}
+
+fn sps_from_config(
+    config: &heifer_isobmff::boxes::HevcConfig,
+) -> Result<Option<(u32, u32, u8)>, Error> {
+    let mut sets = ParameterSets::default();
+    for nal in &config.nal_units {
+        sets.add(&NalUnit::parse(nal)?)?;
+    }
+    Ok(sets.sps.iter().flatten().next().map(|sps| {
+        let (w, h) = sps.output_size();
+        (w, h, sps.bit_depth_luma.max(sps.bit_depth_chroma))
+    }))
+}
+
+pub(crate) fn hevc_config_bit_depth(
+    config: &heifer_isobmff::boxes::HevcConfig,
+) -> Result<Option<u8>, Error> {
+    if let Some((_, _, bit_depth)) = sps_from_config(config)? {
+        return Ok(Some(bit_depth));
+    }
+    let bit_depth = config.bit_depth_luma.max(config.bit_depth_chroma);
+    Ok((bit_depth > 0).then_some(bit_depth))
+}
+
+fn has_alpha_aux(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
+    for aux in file.referencing_items(id, b"auxl") {
+        if is_alpha_item(file, aux)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn item_has_alpha(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<bool, Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Invalid("derived images nested too deeply"));
+    }
+    let item = file.item(id)?;
+    if has_alpha_aux(file, id)? {
+        return Ok(true);
+    }
+    match &item.item_type.0 {
+        b"hvc1" => Ok(false),
+        b"unci" => Ok(uncompressed::info(file, id)?.3),
+        b"grid" => {
+            for &tile in file.referenced_items(id, b"dimg") {
+                if item_has_alpha(file, tile, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        b"iovl" => {
+            let data = file.item_data(id)?;
+            let inputs = file.referenced_items(id, b"dimg");
+            Ok(parse_iovl_header(&data, inputs.len())?.fill[3] != 65535)
+        }
+        b"iden" => match file.referenced_items(id, b"dimg") {
+            [source] => item_has_alpha(file, *source, depth + 1),
+            _ => Err(Error::Invalid("iden item without exactly one source")),
+        },
+        _ => Err(Error::Unsupported(format!(
+            "image item type `{}`",
+            item.item_type
+        ))),
+    }
+}
+
+fn hvc1_info(file: &HeifFile<'_>, id: ItemId) -> Result<(u32, u32, u8, bool), Error> {
+    let config = file
+        .hevc_config(id)?
+        .ok_or(heifer_isobmff::Error::MissingBox(FourCC(*b"hvcC")))?;
+    let sps = sps_from_config(config)?;
+    let (width, height) = match file.image_size(id)? {
+        Some(size) => size,
+        None => sps
+            .map(|(w, h, _)| (w, h))
+            .ok_or(Error::Invalid("image has no size"))?,
+    };
+    if width == 0 || height == 0 {
+        return Err(Error::Invalid("image size is zero or too large"));
+    }
+    let bit_depth = sps
+        .map(|(_, _, bd)| bd)
+        .unwrap_or_else(|| config.bit_depth_luma.max(config.bit_depth_chroma))
+        .max(8);
+    let has_alpha = has_alpha_aux(file, id)?;
+    Ok((width, height, bit_depth, has_alpha))
+}
+
+fn item_core_info(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    depth: u32,
+) -> Result<(u32, u32, u8, bool), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::Invalid("derived images nested too deeply"));
+    }
+    let item = file.item(id)?;
+    let (mut w, mut h, bit_depth, mut has_alpha) = match &item.item_type.0 {
+        b"hvc1" => hvc1_info(file, id)?,
+        b"unci" => uncompressed::info(file, id)?,
+        b"grid" => {
+            let grid = file.grid(id)?;
+            let tiles = file.referenced_items(id, b"dimg");
+            if tiles.is_empty() || tiles.len() != usize::from(grid.rows) * usize::from(grid.columns)
+            {
+                return Err(Error::Invalid(
+                    "grid tile count does not match its rows and columns",
+                ));
+            }
+            if grid.output_width == 0 || grid.output_height == 0 {
+                return Err(Error::Invalid("image size is zero or too large"));
+            }
+            let bit_depth = match file.hevc_config(tiles[0])? {
+                Some(c) => hevc_config_bit_depth(c)?.unwrap_or(8),
+                None => item_core_info(file, tiles[0], depth + 1)?.2,
+            };
+            let mut tile_alpha = false;
+            for &tile in tiles {
+                if item_has_alpha(file, tile, depth + 1)? {
+                    tile_alpha = true;
+                    break;
+                }
+            }
+            (grid.output_width, grid.output_height, bit_depth, tile_alpha)
+        }
+        b"iovl" => {
+            let data = file.item_data(id)?;
+            let inputs = file.referenced_items(id, b"dimg");
+            let header = parse_iovl_header(&data, inputs.len())?;
+            if header.width == 0 || header.height == 0 {
+                return Err(Error::Invalid("image size is zero or too large"));
+            }
+            let mut bit_depth = 8u8;
+            for &input in inputs {
+                bit_depth = bit_depth.max(item_core_info(file, input, depth + 1)?.2);
+            }
+            (
+                header.width,
+                header.height,
+                bit_depth,
+                header.fill[3] != 65535,
+            )
+        }
+        b"iden" => match file.referenced_items(id, b"dimg")[..] {
+            [source] => item_core_info(file, source, depth + 1)?,
+            _ => return Err(Error::Invalid("iden item without exactly one source")),
+        },
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "image item type `{}`",
+                item.item_type
+            )));
+        }
+    };
+    if item.item_type.0 != *b"hvc1" {
+        has_alpha |= has_alpha_aux(file, id)?;
+    }
+    for property in file.item_properties(id)? {
+        match *property {
+            Property::CleanAperture {
+                width,
+                height,
+                horiz_offset,
+                vert_offset,
+            } => {
+                let (_, _, cw, ch) = clap_rect(w, h, width, height, horiz_offset, vert_offset)?;
+                w = cw;
+                h = ch;
+            }
+            Property::Rotation(q) if q % 2 == 1 => std::mem::swap(&mut w, &mut h),
+            _ => {}
+        }
+    }
+    Ok((w, h, bit_depth, has_alpha))
 }
 
 /// Decodes the primary image of a HEIF/HEIC file, with its alpha channel if any, and applies
@@ -889,7 +1207,7 @@ fn decode_grid<S: Sample>(
     let grid = file.grid(id)?;
     let tiles = file.referenced_items(id, b"dimg");
     let columns = u32::from(grid.columns);
-    if tiles.len() != usize::from(grid.rows) * usize::from(grid.columns) {
+    if tiles.is_empty() || tiles.len() != usize::from(grid.rows) * usize::from(grid.columns) {
         return Err(Error::Invalid(
             "grid tile count does not match its rows and columns",
         ));
@@ -1105,14 +1423,14 @@ fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> 
     }))
 }
 
-fn decode_overlay<S: Sample>(
-    file: &HeifFile<'_>,
-    id: ItemId,
-    depth: u32,
-    options: &Options,
-) -> Result<Image<S>, Error> {
-    let data = file.item_data(id)?;
-    let inputs = file.referenced_items(id, b"dimg");
+struct IovlHeader {
+    width: u32,
+    height: u32,
+    fill: [u16; 4],
+    offsets: Vec<(i64, i64)>,
+}
+
+fn parse_iovl_header(data: &[u8], input_count: usize) -> Result<IovlHeader, Error> {
     let mut r = data.iter().copied();
     let mut next = || r.next().ok_or(Error::Invalid("truncated iovl data"));
     if next()? != 0 {
@@ -1139,11 +1457,28 @@ fn decode_overlay<S: Sample>(
             }
         })
     };
-    let (w, h) = (field(false)? as u32, field(false)? as u32);
-    check_size(w, h, options.max_pixels())?;
-    let offsets = (0..inputs.len())
+    let (width, height) = (field(false)? as u32, field(false)? as u32);
+    let offsets = (0..input_count)
         .map(|_| Ok((field(true)?, field(true)?)))
         .collect::<Result<Vec<_>, Error>>()?;
+    Ok(IovlHeader {
+        width,
+        height,
+        fill,
+        offsets,
+    })
+}
+
+fn decode_overlay<S: Sample>(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    depth: u32,
+    options: &Options,
+) -> Result<Image<S>, Error> {
+    let data = file.item_data(id)?;
+    let inputs = file.referenced_items(id, b"dimg");
+    let header = parse_iovl_header(&data, inputs.len())?;
+    check_size(header.width, header.height, options.max_pixels())?;
 
     let images = inputs
         .iter()
@@ -1152,14 +1487,43 @@ fn decode_overlay<S: Sample>(
     let bit_depth = images.iter().map(|i| i.bit_depth).max().unwrap_or(8);
     // canvas_fill_value is given on 16 bits.
     let scale = |v: u16| ((u32::from(v) * ((1u32 << bit_depth) - 1) + 32767) / 65535) as u16;
-    let mut canvas = Image::filled_samples(w, h, bit_depth, fill.map(|v| S::from_u16(scale(v))));
-    canvas.has_alpha = fill[3] != 65535;
-    for (img, (x, y)) in images.iter().zip(offsets) {
+    let mut canvas = Image::filled_samples(
+        header.width,
+        header.height,
+        bit_depth,
+        header.fill.map(|v| S::from_u16(scale(v))),
+    );
+    canvas.has_alpha = header.fill[3] != 65535;
+    for (img, (x, y)) in images.iter().zip(header.offsets) {
         canvas.draw(img, x, y);
     }
     let opaque = canvas.max_value();
     canvas.has_alpha = canvas.data.chunks_exact(4).any(|p| p[3].to_u16() != opaque);
     Ok(canvas)
+}
+
+fn clap_rect(
+    img_w: u32,
+    img_h: u32,
+    width: (u32, u32),
+    height: (u32, u32),
+    horiz: (i32, u32),
+    vert: (i32, u32),
+) -> Result<(u32, u32, u32, u32), Error> {
+    if width.1 == 0 || height.1 == 0 || horiz.1 == 0 || vert.1 == 0 {
+        return Err(Error::Invalid("clap with a zero denominator"));
+    }
+    let cw = f64::from(width.0) / f64::from(width.1);
+    let ch = f64::from(height.0) / f64::from(height.1);
+    let cx = f64::from(horiz.0) / f64::from(horiz.1) + (f64::from(img_w) - 1.0) / 2.0;
+    let cy = f64::from(vert.0) / f64::from(vert.1) + (f64::from(img_h) - 1.0) / 2.0;
+    let left = (cx - (cw - 1.0) / 2.0).round().max(0.0) as u32;
+    let top = (cy - (ch - 1.0) / 2.0).round().max(0.0) as u32;
+    let x = left.min(img_w);
+    let y = top.min(img_h);
+    let w = (cw.round() as u32).min(img_w - x);
+    let h = (ch.round() as u32).min(img_h - y);
+    Ok((x, y, w, h))
 }
 
 /// Applies a `clap` (clean aperture) crop, centred as specified by ISO/IEC 14496-12.
@@ -1170,14 +1534,6 @@ fn clean_aperture<S: Sample>(
     horiz: (i32, u32),
     vert: (i32, u32),
 ) -> Result<Image<S>, Error> {
-    if width.1 == 0 || height.1 == 0 || horiz.1 == 0 || vert.1 == 0 {
-        return Err(Error::Invalid("clap with a zero denominator"));
-    }
-    let cw = f64::from(width.0) / f64::from(width.1);
-    let ch = f64::from(height.0) / f64::from(height.1);
-    let cx = f64::from(horiz.0) / f64::from(horiz.1) + (f64::from(img.width) - 1.0) / 2.0;
-    let cy = f64::from(vert.0) / f64::from(vert.1) + (f64::from(img.height) - 1.0) / 2.0;
-    let left = (cx - (cw - 1.0) / 2.0).round().max(0.0) as u32;
-    let top = (cy - (ch - 1.0) / 2.0).round().max(0.0) as u32;
-    Ok(img.crop(left, top, cw.round() as u32, ch.round() as u32))
+    let (x, y, w, h) = clap_rect(img.width, img.height, width, height, horiz, vert)?;
+    Ok(img.crop(x, y, w, h))
 }
