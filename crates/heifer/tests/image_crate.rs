@@ -244,3 +244,156 @@ fn sequences_decode_as_animations() {
         assert!(HeifSequenceDecoder::from_bytes(still, &heifer::Options::default()).is_err());
     }
 }
+
+fn corrupt_primary_image_payload(heic: &mut [u8]) {
+    let file = heifer::heifer_isobmff::HeifFile::parse(heic).unwrap();
+    let item = file.primary_item().unwrap();
+    let loc = item.location.as_ref().unwrap();
+    let ranges: Vec<(usize, usize)> = loc
+        .extents
+        .iter()
+        .map(|e| (e.offset as usize, e.offset as usize + e.length as usize))
+        .collect();
+    for (start, end) in ranges {
+        for byte in &mut heic[start..end] {
+            *byte ^= 0xFF;
+        }
+    }
+}
+
+#[test]
+fn image_dimensions_uses_headers_without_decoding() {
+    heifer::image_crate::register_image_decoder_hooks();
+    if let Some(p) = path("real/heif_other__arrow.heic") {
+        assert_eq!(image::image_dimensions(&p).unwrap(), (3024, 4032));
+    }
+    if let Some(p) = path("real/heif_special__200MP.heic") {
+        assert_eq!(image::image_dimensions(&p).unwrap(), (12240, 16320));
+    }
+}
+
+#[test]
+fn decoder_is_lazy_and_does_not_decode_on_construct() {
+    use image::ImageEncoder;
+
+    let exif = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x01\0\0\0\0\0\0".to_vec();
+    let img = gradient(32, 24);
+    let mut heic = Vec::new();
+    let mut encoder = heifer::image_crate::HeifEncoder::new(&mut heic);
+    encoder.set_icc_profile(b"fake icc".to_vec()).unwrap();
+    encoder.set_exif_metadata(exif).unwrap();
+    encoder
+        .write_image(img.as_raw(), 32, 24, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    corrupt_primary_image_payload(&mut heic);
+
+    let mut dec =
+        heifer::image_crate::HeifDecoder::from_bytes(&heic, &heifer::Options::default()).unwrap();
+    assert_eq!(dec.dimensions(), (32, 24));
+    assert_eq!(dec.color_type(), ColorType::Rgba8);
+    assert_eq!(
+        dec.orientation().unwrap(),
+        image::metadata::Orientation::NoTransforms
+    );
+    assert_eq!(
+        dec.icc_profile().unwrap().as_deref(),
+        Some(&b"fake icc"[..])
+    );
+    assert!(dec.exif_metadata().unwrap().is_some());
+
+    // Decoding happens only now, when pixels are requested.
+    assert!(matches!(
+        DynamicImage::from_decoder(dec),
+        Err(image::ImageError::Decoding(_))
+    ));
+}
+
+#[test]
+fn decoder_enforces_limits_before_decoding() {
+    heifer::image_crate::register_image_decoder_hooks();
+    let mut heic = heifer::encode_rgb8(
+        64,
+        48,
+        &[140u8; 64 * 48 * 3],
+        &heifer::EncodeOptions::default(),
+    )
+    .unwrap();
+    corrupt_primary_image_payload(&mut heic);
+
+    let mut dec =
+        heifer::image_crate::HeifDecoder::from_bytes(&heic, &heifer::Options::default()).unwrap();
+    let mut dim_limits = image::Limits::no_limits();
+    dim_limits.max_image_width = Some(32);
+    assert!(matches!(
+        dec.set_limits(dim_limits),
+        Err(image::ImageError::Limits(_))
+    ));
+
+    let mut mem_limits = image::Limits::no_limits();
+    mem_limits.max_alloc = Some(16);
+    dec.set_limits(mem_limits).unwrap();
+    // Because limits are enforced before decoding, `InsufficientMemory` fires instead of `DecodingError`.
+    let mut buf = vec![0u8; dec.total_bytes() as usize];
+    assert!(matches!(
+        dec.read_image(&mut buf),
+        Err(image::ImageError::Limits(_))
+    ));
+
+    // HookDecoder enforces limits via `ImageReader::limits` too.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&heic))
+        .with_guessed_format()
+        .unwrap();
+    let mut hook_limits = image::Limits::no_limits();
+    hook_limits.max_alloc = Some(16);
+    reader.limits(hook_limits);
+    assert!(matches!(reader.decode(), Err(image::ImageError::Limits(_))));
+}
+
+#[test]
+fn decoder_8bit_and_16bit_pixel_parity() {
+    heifer::image_crate::register_image_decoder_hooks();
+
+    let rgba = gradient(48, 36);
+    let rgba_heic =
+        heifer::encode_rgba8(48, 36, rgba.as_raw(), &heifer::EncodeOptions::default()).unwrap();
+    let direct_rgba = heifer::decode(&rgba_heic).unwrap();
+    let dec_rgba = heifer::image_crate::HeifDecoder::new(&rgba_heic[..]).unwrap();
+    assert_eq!(dec_rgba.color_type(), ColorType::Rgba8);
+    let img_rgba = DynamicImage::from_decoder(dec_rgba).unwrap();
+    assert_eq!(img_rgba.to_rgba8().into_raw(), direct_rgba.to_rgba8());
+    let hook_rgba = image::load_from_memory(&rgba_heic).unwrap();
+    assert_eq!(hook_rgba.to_rgba8().into_raw(), direct_rgba.to_rgba8());
+
+    let rgb = DynamicImage::ImageRgba8(rgba).to_rgb8();
+    let rgb_heic =
+        heifer::encode_rgb8(48, 36, rgb.as_raw(), &heifer::EncodeOptions::default()).unwrap();
+    let direct_rgb = heifer::decode(&rgb_heic).unwrap();
+    let dec_rgb = heifer::image_crate::HeifDecoder::new(&rgb_heic[..]).unwrap();
+    assert_eq!(dec_rgb.color_type(), ColorType::Rgb8);
+    let img_rgb = DynamicImage::from_decoder(dec_rgb).unwrap();
+    assert_eq!(img_rgb.to_rgb8().into_raw(), direct_rgb.to_rgb8());
+
+    // 10-bit RGB and RGBA via 16-bit encoder -> 16-bit output parity.
+    let rgb16 = image::RgbImage::from_fn(32, 24, |x, y| {
+        image::Rgb([(x * 8) as u8, (y * 10) as u8, 200])
+    });
+    let wide_rgb16 = DynamicImage::ImageRgb8(rgb16).to_rgb16();
+    let mut heic10_rgb = Vec::new();
+    DynamicImage::ImageRgb16(wide_rgb16)
+        .write_with_encoder(heifer::image_crate::HeifEncoder::new(&mut heic10_rgb))
+        .unwrap();
+    let dec10 = heifer::image_crate::HeifDecoder::new(&heic10_rgb[..]).unwrap();
+    assert_eq!(dec10.color_type(), ColorType::Rgb16);
+    let img10 = DynamicImage::from_decoder(dec10).unwrap();
+    assert_eq!(
+        img10.to_rgb16().into_raw(),
+        DynamicImage::from_decoder(
+            heifer::image_crate::HeifDecoder::from_bytes(&heic10_rgb, &Default::default()).unwrap()
+        )
+        .unwrap()
+        .to_rgb16()
+        .into_raw()
+    );
+    let hook10 = image::load_from_memory(&heic10_rgb).unwrap();
+    assert_eq!(hook10.to_rgb16().into_raw(), img10.to_rgb16().into_raw());
+}
