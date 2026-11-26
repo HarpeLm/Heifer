@@ -10,11 +10,15 @@ Items are ordered by user impact.
 ## Status
 
 - Latest release: 0.7.3 — per-thread grid buffer reuse, direct 8-bit `Frame8` planes, and
-  zero-copy `CropWindow` decoding (`200 MP` multi-core `534 ms`, 1-thread `1080 ms`; `48 MP`
-  1-thread `639 ms`; `12 MP` iPhone `109 ms` vs `130 ms` for `heic-rs`), building on `0.7.0`–`0.7.2`
-  (image sequences with P, B and hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`, alpha
-  auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit, `EncodeSpeed` presets, full `.heics` CLI and
-  WASM demo support, IPTC metadata, reader decoding, and crates.io Trusted Publishing).
+  zero-copy `CropWindow` decoding (`200 MP` multi-core `401 ms`, 1-thread `1221 ms`; `48 MP`
+  multi-core `113 ms`, 1-thread `650 ms`; `12 MP` iPhone `89 ms` `heifer8` 1-thread vs `105 ms`
+  for `heic-rs`, `15 ms` on 10 cores), building on `0.7.0`–`0.7.2` (image sequences with P, B and
+  hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`, alpha auxiliary tracks, 4:2:2/4:4:4/lossless
+  & 10-bit, `EncodeSpeed` presets, full `.heics` CLI and WASM demo support, IPTC metadata, reader
+  decoding, and crates.io Trusted Publishing). Post-`0.7.3` on `main`: header-only `read_info` /
+  `read_info_reader` + `decode_reader_rgba8`, lazy limit-enforcing `HeifDecoder` with 8-bit fast
+  path, differential fuzz targets (`info`, `image_decoder`), and `#[non_exhaustive]` pre-1.0 API
+  hardening.
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   images (`unci`), image sequences (114 conformance bitstreams match their MD5).
 - Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
@@ -85,17 +89,28 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 - Fuzz targets covering container and HEVC sequence decoding, B-frame reordering, TMVP and
   sequence round trips.
 
+### Header-only info, lazy `image` decoder, and pre-1.0 hardening
+
+- `read_info` / `item_info` / `read_info_reader` + `decode_reader_rgba8` (`FileKind`,
+  `ImageInfo`), reading post-transform dimensions, bit depth, alpha presence and container kind
+  without decoding pixel payloads.
+- Lazy `HeifDecoder` and seekable `HookDecoder`: header-only construction, `image::Limits`
+  enforced before decoding, and 8-bit `decode_rgba8` fast path.
+- Pre-1.0 API hardening: `#[non_exhaustive]` on `Error`, `ReadError`, `Options`, `EncodeOptions`,
+  `Metadata` (with builders `new()` / `with_*`) and `DepthRepresentation`; differential fuzz targets
+  `info` and `image_decoder`.
+
 ## Next
 
 ### 1. Single-thread hot loops
 
-Multi-threaded decoding is already faster than libheif. Two 100% safe-Rust optimization passes
-across CABAC, residual parsing, transforms/intra prediction, lazy motion allocation,
-deblocking/SAO, inter interpolation and YCbCr→RGBA conversion cut single-thread decode time cleanly
-(12 MP iPhone `134.7 → 109 ms` `heifer8`, beating `heic-rs` at `109` vs `131 ms` — `1.20×` faster;
-13-file suite `641` vs `754 ms`; 5 MP Xiaomi `91.6 → 69.5 ms`; 48 MP `792 → 661 ms`; 114 conformance
-streams / 7115 pictures bit-exact). Zero-copy `Frame` reuse across grid tiles and direct `u8` tile
-output remain targets for further single-thread and memory-bandwidth gains without `unsafe`.
+Multi-threaded decoding is already faster than libheif. Safe-Rust optimization passes across CABAC,
+residual parsing, transforms/intra prediction, lazy motion allocation, deblocking/SAO, inter
+interpolation, buffer reuse, direct `Frame8` planes and zero-copy `CropWindow` decoding cut
+single-thread decode time cleanly (`0.7.3` on Apple M5: 12 MP iPhone `89 ms` `heifer8` vs
+`105 ms` for `heic-rs` — `1.18×` faster; 13-file suite `632` vs `740 ms`; 5 MP Xiaomi `74 ms`;
+48 MP `650 ms`; 114 conformance streams / 7115 pictures bit-exact). Direct `u8` tile output
+remains a target for further single-thread and memory-bandwidth gains without `unsafe`.
 
 ### 2. More encoding knobs
 
