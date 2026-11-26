@@ -1,6 +1,6 @@
 # Benchmarks
 
-heifer 0.7.1 against the other HEIC decoders and encoders, measured in November 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
+heifer 0.7.3 against the other HEIC decoders and encoders, measured in November 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
 
 Competitors: `heic-rs` 0.1.4, `heic` 0.1.6, `heic-decoder` 0.1.1, `zune-heic` 0.5.0, `still265` 0.6.0, ffmpeg 9.0.2, and Apple's ImageIO (`sips`, hardware HEVC).
 
@@ -12,25 +12,25 @@ Fidelity: PSNR of the 8-bit RGB output against Apple's decoder (what Apple's app
 
 | Decoder | Files decoded | 1 thread | 10 threads | Fidelity vs Apple (median / worst) |
 |---|---|---|---|---|
-| `heifer` | 13/13 | 668 ms | 158 ms | 50.2 / 49.3 dB |
-| `heifer8` | 13/13 | 641 ms | 141 ms | 50.2 / 49.3 dB |
-| `heic-rs` | 13/13 | 754 ms | 175 ms | 43.9 / 26.4 dB |
-| `heic` | 13/13 | 1189 ms | 1210 ms | 47.0 / 32.6 dB |
-| `heic-decoder` | 13/13 | 934 ms | 237 ms | 48.7 / 39.8 dB |
-| `zune-heic` | 4/13 | 316 ms | 336 ms | 47.2 / 32.6 dB |
-| `zune-heic+hw` | 13/13 | 142 ms | 148 ms | 39.9 / 6.9 dB |
+| `heifer` | 13/13 | 672 ms | 157 ms | 50.2 / 49.3 dB |
+| `heifer8` | 13/13 | 632 ms | 138 ms | 50.2 / 49.3 dB |
+| `heic-rs` | 13/13 | 740 ms | 162 ms | 43.9 / 26.4 dB |
+| `heic` | 13/13 | 1169 ms | 1179 ms | 47.0 / 32.6 dB |
+| `heic-decoder` | 13/13 | 898 ms | 242 ms | 48.7 / 39.8 dB |
+| `zune-heic` | 4/13 | 321 ms | 347 ms | 47.2 / 32.6 dB |
+| `zune-heic+hw` | 13/13 | 139 ms | 147 ms | 39.9 / 6.9 dB |
 
 12 MP photo encoded by Apple (48 tiles):
 
 | Decoder | 1 thread | 10 threads | Fidelity vs Apple |
 |---|---|---|---|
-| `heifer` | 94 ms | 20 ms | 49.3 dB |
+| `heifer` | 97 ms | 18 ms | 49.3 dB |
 | `heifer8` | 89 ms | 15 ms | 49.3 dB |
-| `heic-rs` | 107 ms | 19 ms | 26.4 dB |
-| `heic` | 176 ms | 174 ms | 47.2 dB |
-| `heic-decoder` | 139 ms | 35 ms | 48.7 dB |
-| `zune-heic` | 114 ms | 124 ms | 47.3 dB |
-| `zune-heic+hw` | 25 ms | 24 ms | 47.3 dB |
+| `heic-rs` | 105 ms | 20 ms | 26.4 dB |
+| `heic` | 175 ms | 179 ms | 47.2 dB |
+| `heic-decoder` | 136 ms | 33 ms | 48.7 dB |
+| `zune-heic` | 114 ms | 132 ms | 47.3 dB |
+| `zune-heic+hw` | 25 ms | 28 ms | 47.3 dB |
 
 Failures: `zune-heic` on 38ba6f5cf9.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on 3b6c2d0177.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on 582d81e02d.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on a29a71bd3a.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on be880a5d0e.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on e344de67c7.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on e6036430ec.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on f1de131216.heic (ERR: NalErrors(Generic("end_of_sub_stream_one_bit was 0!"))); `zune-heic` on gradient10.heic (ERR: NalErrors(ParameterOutOfRange { limit: 8, value: 10, fi).
 
@@ -44,31 +44,31 @@ All encoders produce 4:2:0, except `still265-slow-444` (4:4:4, which hardware de
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 351 ms | 1072 ms |
-| `still265-fast` | +14.2% | wrong colours | 185 ms | same |
-| `still265-slow` | +0.1% | wrong colours | 376 ms | same |
-| `still265-slow-444` | -6.8% | wrong colours | 462 ms | same |
-| `apple` (hardware) | +51.0% | +50.5% | 91 ms | — |
+| `heifer` | reference | reference | 357 ms | 1160 ms |
+| `still265-fast` | +14.2% | wrong colours | 190 ms | same |
+| `still265-slow` | +0.1% | wrong colours | 361 ms | same |
+| `still265-slow-444` | -6.8% | wrong colours | 441 ms | same |
+| `apple` (hardware) | +51.0% | +50.5% | 89 ms | — |
 
 ### graphics
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 76 ms | 194 ms |
-| `still265-fast` | +23.4% | +22.4% | 60 ms | same |
-| `still265-slow` | +1.7% | -3.1% | 108 ms | same |
-| `still265-slow-444` | no overlap | wrong colours | 143 ms | same |
-| `apple` (hardware) | +211.5% | +195.2% | 67 ms | — |
+| `heifer` | reference | reference | 71 ms | 189 ms |
+| `still265-fast` | +23.4% | +22.4% | 55 ms | same |
+| `still265-slow` | +1.7% | -3.1% | 101 ms | same |
+| `still265-slow-444` | no overlap | wrong colours | 136 ms | same |
+| `apple` (hardware) | +211.5% | +195.2% | 69 ms | — |
 
 ### photo12
 
 | Encoder | BD-rate (decoded by heifer) | BD-rate (decoded by Apple) | Time per file | 1 thread |
 |---|---|---|---|---|
-| `heifer` | reference | reference | 712 ms | 3850 ms |
-| `still265-fast` | +14.0% | wrong colours | 676 ms | same |
-| `still265-slow` | +0.5% | wrong colours | 1099 ms | same |
-| `still265-slow-444` | -6.6% | wrong colours | 1439 ms | same |
-| `apple` (hardware) | +37.0% | +35.4% | 205 ms | — |
+| `heifer` | reference | reference | 692 ms | 3855 ms |
+| `still265-fast` | +14.0% | wrong colours | 608 ms | same |
+| `still265-slow` | +0.5% | wrong colours | 1022 ms | same |
+| `still265-slow-444` | -6.6% | wrong colours | 1290 ms | same |
+| `apple` (hardware) | +37.0% | +35.4% | 198 ms | — |
 
 still265 writes a `colr` box that Apple's decoder and ffmpeg do not honour: its files show wrong colours in Apple's apps ("wrong colours" above). still265 runs on one thread; heifer encodes tiles on all cores.
 
@@ -90,25 +90,25 @@ Decoding the four real photos of `tests/fixtures/real`: time of the whole comman
 
 | File | heifer decode | heifer → PNG | libheif → PNG | PSNR heifer | PSNR libheif |
 |---|---|---|---|---|---|
-| Xiaomi, 5 MP | 15 ms | 48 ms | 201 ms | 47.9 dB | 47.4 dB |
-| iPhone 13 Pro, 12 MP | 20 ms | 99 ms | 376 ms | 49.6 dB | 49.5 dB |
-| 8000×6000, 48 MP | 113 ms | 411 ms | 1914 ms | 50.4 dB | 48.9 dB |
-| Galaxy S24 Ultra, 200 MP | 1013 ms | 1748 ms | 4264 ms | 50.4 dB | 50.3 dB |
+| Xiaomi, 5 MP | 14 ms | 41 ms | 199 ms | 47.9 dB | 47.4 dB |
+| iPhone 13 Pro, 12 MP | 20 ms | 86 ms | 378 ms | 49.6 dB | 49.5 dB |
+| 8000×6000, 48 MP | 108 ms | 320 ms | 1757 ms | 50.4 dB | 48.9 dB |
+| Galaxy S24 Ultra, 200 MP | 411 ms | 949 ms | 3878 ms | 50.4 dB | 50.3 dB |
 
 Encoding `photo12.png`, median of 3 runs each. PSNR against the source, decoded by heifer.
 
 | Encoder | Quality | Size | PSNR | Time |
 |---|---|---|---|---|
-| heifer | 40 | 62 KB | 31.5 dB | 495 ms |
-| heifer | 60 | 245 KB | 38.6 dB | 665 ms |
-| heifer | 75 | 567 KB | 44.1 dB | 981 ms |
-| heifer | 85 | 939 KB | 47.0 dB | 1316 ms |
-| heifer | 95 | 1523 KB | 49.1 dB | 1486 ms |
-| libheif x265 | 30 | 184 KB | 36.7 dB | 793 ms |
-| libheif x265 | 40 | 322 KB | 39.9 dB | 921 ms |
-| libheif x265 | 50 | 538 KB | 42.8 dB | 1010 ms |
-| libheif x265 | 60 | 884 KB | 45.5 dB | 1165 ms |
-| libheif x265 | 70 | 1469 KB | 47.3 dB | 1569 ms |
-| libheif x265 | 80 | 2511 KB | 48.5 dB | 1959 ms |
+| heifer | 40 | 62 KB | 31.5 dB | 434 ms |
+| heifer | 60 | 245 KB | 38.6 dB | 631 ms |
+| heifer | 75 | 567 KB | 44.1 dB | 922 ms |
+| heifer | 85 | 939 KB | 47.0 dB | 1381 ms |
+| heifer | 95 | 1523 KB | 49.1 dB | 1406 ms |
+| libheif x265 | 30 | 184 KB | 36.7 dB | 711 ms |
+| libheif x265 | 40 | 322 KB | 39.9 dB | 806 ms |
+| libheif x265 | 50 | 538 KB | 42.8 dB | 922 ms |
+| libheif x265 | 60 | 884 KB | 45.5 dB | 1056 ms |
+| libheif x265 | 70 | 1469 KB | 47.3 dB | 1286 ms |
+| libheif x265 | 80 | 2511 KB | 48.5 dB | 1610 ms |
 
 At equal PSNR, libheif's files are 20.5% larger than heifer's (Bjøntegaard, size difference at matched quality).
