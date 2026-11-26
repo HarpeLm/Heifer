@@ -9,9 +9,11 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.7.0 — image sequences (P, B and hierarchical B-frames, TMVP, `ctts` v0 +
-  `edts`/`elst`, alpha auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit), `EncodeSpeed` presets,
-  full `.heics` CLI support, IPTC metadata, decoding from a reader, faster CABAC.
+- Latest release: 0.7.2 — second pass of 100% safe-Rust single-thread decoder optimizations
+  (`109 ms` `heifer8` on 12 MP iPhone / `1.20×` faster than `heic-rs`), building on `0.7.0`–`0.7.1`
+  (image sequences with P, B and hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`, alpha
+  auxiliary tracks, 4:2:2/4:4:4/lossless & 10-bit, `EncodeSpeed` presets, full `.heics` CLI
+  support, IPTC metadata, reader decoding, and crates.io Trusted Publishing).
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   images (`unci`), image sequences (114 conformance bitstreams match their MD5).
 - Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
@@ -86,12 +88,13 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 
 ### 1. Single-thread hot loops
 
-Multi-threaded decoding is already faster than libheif. A 100% safe-Rust pass across CABAC,
-residual parsing, transforms/intra prediction, deblocking/SAO, inter interpolation and
-YCbCr→RGBA conversion cut single-thread decode time by 13–21% (12 MP iPhone `134.7 → 114.9 ms`,
-beating single-thread `heic-rs` at `117.0` vs `129.2 ms` median; 5 MP Xiaomi `91.6 → 74.9 ms`;
-48 MP `792 → 685 ms`; 114 conformance streams / 7115 pictures bit-exact). One thread on large
-grids still trails ffmpeg and remains a target for further gains without `unsafe`.
+Multi-threaded decoding is already faster than libheif. Two 100% safe-Rust optimization passes
+across CABAC, residual parsing, transforms/intra prediction, lazy motion allocation,
+deblocking/SAO, inter interpolation and YCbCr→RGBA conversion cut single-thread decode time cleanly
+(12 MP iPhone `134.7 → 109 ms` `heifer8`, beating `heic-rs` at `109` vs `131 ms` — `1.20×` faster;
+13-file suite `641` vs `754 ms`; 5 MP Xiaomi `91.6 → 69.5 ms`; 48 MP `792 → 661 ms`; 114 conformance
+streams / 7115 pictures bit-exact). Zero-copy `Frame` reuse across grid tiles and direct `u8` tile
+output remain targets for further single-thread and memory-bandwidth gains without `unsafe`.
 
 ### 2. More encoding knobs
 
