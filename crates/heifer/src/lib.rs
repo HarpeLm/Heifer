@@ -62,8 +62,10 @@ pub use sequence::{
     decode_sequence_frame_with_options, decode_sequence_with_options, read_sequence,
 };
 
-use color::{ColorParams, frame_to_rgba_into, frame_to_rgba_sized};
-use heifer_hevc_dec::decoder::{DecodeOptions, decode_picture};
+use color::{ColorParams, ColorScratch, frame_to_rgba_into_with_scratch, frame_to_rgba_sized};
+use heifer_hevc_dec::decoder::{
+    DecodeOptions, DecodeWorkspace, decode_picture, decode_picture_into,
+};
 use heifer_hevc_dec::nal::{NalUnit, split_annex_b};
 use heifer_hevc_dec::params::ParameterSets;
 use heifer_hevc_dec::recon::Frame;
@@ -774,6 +776,14 @@ fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
     Ok(())
 }
 
+/// Reusable per-worker decode buffers for plain grid tiles (`48`–`768` tiles per photo).
+#[derive(Default)]
+struct GridWorkspace {
+    bitstream: Vec<u8>,
+    hevc: DecodeWorkspace,
+    color: ColorScratch,
+}
+
 fn decode_grid<S: Sample>(
     file: &HeifFile<'_>,
     id: ItemId,
@@ -835,66 +845,70 @@ fn decode_grid<S: Sample>(
         && tiles
             .iter()
             .all(|&t| is_plain_coded_image(file, t).unwrap_or(false));
-    let place = |i: usize, tile: Option<&Image<S>>| -> Result<(), Error> {
+    let place = |i: usize,
+                 tile: Option<&Image<S>>,
+                 ws: Option<&mut GridWorkspace>|
+     -> Result<(), Error> {
         let x0 = (u64::from(i as u32 % columns) * u64::from(tw)).min(u64::from(u32::MAX)) as u32;
         let y0 = (u64::from(i as u32 / columns) * u64::from(th)).min(u64::from(u32::MAX)) as u32;
         let (w, h) = (
             tw.min(canvas_w.saturating_sub(x0)) as usize,
             th.min(canvas_h.saturating_sub(y0)) as usize,
         );
-        let tile_image;
+        if tile.is_none() && plain {
+            let mut fallback = None;
+            let ws = match ws {
+                Some(ws) => ws,
+                None => fallback.get_or_insert_with(GridWorkspace::default),
+            };
+            let hevc_options = DecodeOptions {
+                max_pixels: options.max_pixels(),
+                ..Default::default()
+            };
+            file.hevc_bitstream_into(tiles[i], &mut ws.bitstream)?;
+            let (frame, _) = decode_picture_into(&ws.bitstream, hevc_options, &mut ws.hevc)?;
+            if frame.widths[0] < tw
+                || frame.heights[0] < th
+                || S::depth(frame.bit_depth[0].max(frame.bit_depth[1])) != bit_depth
+            {
+                return Err(Error::Invalid(
+                    "grid tiles have different sizes or bit depths",
+                ));
+            }
+            let params = color_params(file, tiles[i], frame)?;
+            let mut out = segments[i].lock().unwrap_or_else(|e| e.into_inner());
+            frame_to_rgba_into_with_scratch(frame, params, &mut out, w, h, &mut ws.color);
+            return Ok(());
+        }
+        let tile_storage;
         let tile = match tile {
-            Some(t) => Some(t),
-            None if plain => None,
+            Some(t) => t,
             None => {
-                tile_image = decode_item_with(file, tiles[i], depth + 1, options)?;
-                Some(&tile_image)
+                tile_storage = decode_item_with(file, tiles[i], depth + 1, options)?;
+                &tile_storage
             }
         };
-        let frame = match tile {
-            Some(_) => None,
-            None => {
-                let frame = decode_hvc1_frame(file, tiles[i], options)?;
-                let params = color_params(file, tiles[i], &frame)?;
-                Some((frame, params))
-            }
-        };
-        let size_ok = match (tile, &frame) {
-            (Some(t), _) => (t.width, t.height, t.bit_depth) == (tw, th, bit_depth),
-            (None, Some((f, _))) => {
-                f.widths[0] >= tw
-                    && f.heights[0] >= th
-                    && S::depth(f.bit_depth[0].max(f.bit_depth[1])) == bit_depth
-            }
-            (None, None) => false,
-        };
-        if !size_ok {
+        if (tile.width, tile.height, tile.bit_depth) != (tw, th, bit_depth) {
             return Err(Error::Invalid(
                 "grid tiles have different sizes or bit depths",
             ));
         }
         let mut out = segments[i].lock().unwrap_or_else(|e| e.into_inner());
-        match (tile, frame) {
-            (Some(tile), _) => {
-                // Copy rows (no blending): tiles are opaque unless they carry alpha.
-                for (dst, src) in out
-                    .iter_mut()
-                    .zip(tile.data.chunks_exact(tile.width as usize * 4))
-                    .take(h)
-                {
-                    dst[..w * 4].copy_from_slice(&src[..w * 4]);
-                }
-                if tile.has_alpha {
-                    has_alpha.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            (None, Some((frame, params))) => frame_to_rgba_into(&frame, params, &mut out, w, h),
-            (None, None) => unreachable!("checked above"),
+        // Copy rows (no blending): tiles are opaque unless they carry alpha.
+        for (dst, src) in out
+            .iter_mut()
+            .zip(tile.data.chunks_exact(tile.width as usize * 4))
+            .take(h)
+        {
+            dst[..w * 4].copy_from_slice(&src[..w * 4]);
+        }
+        if tile.has_alpha {
+            has_alpha.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     };
     let start = if let Some(tile) = &first_tile {
-        place(0, Some(tile))?;
+        place(0, Some(tile), None)?;
         1
     } else {
         0
@@ -903,8 +917,9 @@ fn decode_grid<S: Sample>(
     // Tiles are independent HEVC streams: decode them on several threads.
     let threads = options.threads().min(tiles.len() - start);
     if threads <= 1 {
+        let mut ws = plain.then(GridWorkspace::default);
         for i in start..tiles.len() {
-            place(i, None)?;
+            place(i, None, ws.as_mut())?;
         }
     } else {
         let next = std::sync::atomic::AtomicUsize::new(start);
@@ -912,12 +927,13 @@ fn decode_grid<S: Sample>(
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
+                    let mut ws = plain.then(GridWorkspace::default);
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if i >= tiles.len() {
                             break;
                         }
-                        if let Err(e) = place(i, None) {
+                        if let Err(e) = place(i, None, ws.as_mut()) {
                             error
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
