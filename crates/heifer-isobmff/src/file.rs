@@ -537,22 +537,32 @@ impl<'a> HeifFile<'a> {
         Grid::parse(&self.item_data(id)?)
     }
 
-    /// Builds a complete HEVC Annex B bitstream for an `hvc1` item:
-    /// the parameter sets from `hvcC` followed by the item's NAL units, each preceded by a
-    /// `00 00 00 01` start code. This is what an HEVC decoder (or `ffmpeg`) expects.
-    pub fn hevc_bitstream(&self, id: ItemId) -> Result<Vec<u8>, Error> {
+    /// Writes a complete HEVC Annex B bitstream for an `hvc1` item into `out`, clearing any
+    /// previous contents so callers decoding many tiles can reuse the buffer.
+    pub fn hevc_bitstream_into(&self, id: ItemId, out: &mut Vec<u8>) -> Result<(), Error> {
         let config = self
             .hevc_config(id)?
             .ok_or(Error::MissingBox(FourCC(*b"hvcC")))?;
         let data = self.item_data(id)?;
-        hevc_annex_b(config, &data)
+        hevc_annex_b_into(config, &data, out)
+    }
+
+    /// Builds a complete HEVC Annex B bitstream for an `hvc1` item:
+    /// the parameter sets from `hvcC` followed by the item's NAL units, each preceded by a
+    /// `00 00 00 01` start code. This is what an HEVC decoder (or `ffmpeg`) expects.
+    pub fn hevc_bitstream(&self, id: ItemId) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.hevc_bitstream_into(id, &mut out)?;
+        Ok(out)
     }
 }
 
-/// An Annex B HEVC stream: the parameter sets of `config`, then the length-prefixed NAL units of
-/// `data` (an item's data or a track sample), each behind a start code.
-pub fn hevc_annex_b(config: &HevcConfig, data: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(data.len() + 256);
+/// Writes an Annex B HEVC stream into `out` (replacing its previous contents): the parameter sets
+/// of `config`, then the length-prefixed NAL units of `data` (an item's data or a track sample),
+/// each behind a start code.
+pub fn hevc_annex_b_into(config: &HevcConfig, data: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    out.clear();
+    out.reserve(data.len() + 256);
     for nal in &config.nal_units {
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
@@ -571,6 +581,14 @@ pub fn hevc_annex_b(config: &HevcConfig, data: &[u8]) -> Result<Vec<u8>, Error> 
         out.extend_from_slice(nal);
         rest = tail;
     }
+    Ok(())
+}
+
+/// An Annex B HEVC stream: the parameter sets of `config`, then the length-prefixed NAL units of
+/// `data` (an item's data or a track sample), each behind a start code.
+pub fn hevc_annex_b(config: &HevcConfig, data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    hevc_annex_b_into(config, data, &mut out)?;
     Ok(out)
 }
 
