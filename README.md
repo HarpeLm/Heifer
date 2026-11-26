@@ -388,10 +388,10 @@ Two other pure-Rust HEIC decoders appeared in 2026. Measured on the same machine
 | Test files decoded (of 55) | **52** (all valid files) | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
 | Colours vs Apple's decoder (median of 13 Apple and other files) | **50.2 dB** | 43.9 dB (26.4 dB worst: limited-range mismatch) | 47.0 dB |
 | Apple HDR gain maps applied | ✓ | – | extraction only |
-| Speed, 12 MP iPhone photo, 1 thread | **115 ms** (`decode_rgba8`; 119 ms 16-bit) | 129 ms | 225 ms |
+| Speed, 12 MP iPhone photo, 1 thread | **109 ms** (`decode_rgba8`; 114 ms 16-bit) | 131 ms | 226 ms |
 
-heifer is now the fastest pure-Rust software decoder (≈1.13× faster than `heic-rs` on 1 thread,
-both on the 12 MP iPhone photo and across the 13-file benchmark suite), while remaining more
+heifer is the fastest pure-Rust software decoder (≈1.20× faster than `heic-rs` on 1 thread
+on the 12 MP iPhone photo and ≈1.18× faster across the 13-file benchmark suite), while remaining more
 accurate and complete.
 
 ## <img src="docs/icons/workflow.svg" width="24" height="24" align="top"> Architecture
