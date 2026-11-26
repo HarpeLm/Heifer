@@ -18,7 +18,7 @@
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.43 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.40 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -162,17 +162,16 @@ refused with `Error::Unsupported`. PQ and HLG files are HDR: `decode_srgb` refus
 Limit threads and image size, for example on a server that accepts uploads:
 
 ```rust
-let options = heifer::Options {
-    max_threads: 1,            // 0 = all cores (default); grid tiles are decoded in parallel
-    max_pixels: 50_000_000,    // reject larger images (default: 2^28 pixels)
-};
+let options = heifer::Options::new()
+    .with_max_threads(1)         // 0 = all cores (default); grid tiles are decoded in parallel
+    .with_max_pixels(50_000_000); // reject larger images (default: 2^28 pixels)
 let image = heifer::decode_with_options(&bytes, &options)?;
 ```
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Encode a HEIC
 
 ```rust
-let options = heifer::EncodeOptions { quality: 80, ..Default::default() };   // 0..=100
+let options = heifer::EncodeOptions::new().with_quality(80);                  // 0..=100
 let heic: Vec<u8> = heifer::encode_rgba8(width, height, &rgba, &options)?;    // or encode_rgb8
 std::fs::write("photo.heic", heic)?;
 
@@ -210,21 +209,26 @@ colour space. Without one, files are tagged sRGB with `nclx`.
 By default images are stored as YCbCr 4:2:0 (sRGB, BT.601 full range), in 10 bits (HEVC Main 10)
 when the image has more than 8 bits per sample (e.g. 16-bit PNGs), which keeps gradients free of
 banding, and split into 512×512 tiles that are encoded in parallel, like iPhone photos;
-transparency is kept as an alpha plane. A 12 MP image takes about 0.77 s on 10 cores. At quality
+transparency is kept as an alpha plane. A 12 MP image takes about 0.69 s on 10 cores. At quality
 80, a re-encoded Apple photo has a PSNR of 42.0 dB against the original, both decoded by Apple
 (1.0 bit per pixel).
 
 The files are decoded by Apple's ImageIO (used by Preview and `sips`) and by ffmpeg. The encoder
 chooses block sizes (64×64 down to 4×4), transform splits and prediction modes by rate-distortion
-cost, with RDOQ, sign data hiding, transform skip and SAO. At equal quality its files are 5%
+cost, with RDOQ, sign data hiding, transform skip and SAO. At equal quality its files are 4.9%
 smaller than those of x265's `medium` preset and 2.7% smaller than `slow` (PSNR, 6:1:1), and
-slightly smaller than still265's Slow preset (0.3 to 0.6%, [benchmarks](docs/BENCHMARKS.md)).
+within 0.1–0.5% of still265's Slow preset ([benchmarks](docs/BENCHMARKS.md)).
 
-## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Read metadata
+## <img src="docs/icons/code.svg" width="24" height="24" align="top"> Inspect containers and metadata
 
-Read EXIF, XMP, IPTC and the ICC profile without decoding pixels:
+Read post-transform dimensions, bit depth, alpha presence and EXIF/XMP/IPTC/ICC without decoding
+pixels:
 
 ```rust
+let info = heifer::read_info(&bytes)?;
+println!("{}×{}, {}-bit, alpha: {}, kind: {}",
+    info.width, info.height, info.bit_depth, info.has_alpha, info.kind.as_str());
+
 let meta = heifer::read_metadata(&bytes)?;
 if let Some(exif) = meta.exif_fields() {
     println!("{:?} {:?} taken {:?}", exif.make(), exif.model(), exif.date_time());
@@ -237,8 +241,10 @@ if let Some(block) = heifer::read_iptc(&bytes)? {
     println!("{:?} {:?} {:?}", iptc.caption(), iptc.keywords(), iptc.city());
 }
 
-// Only the container and the metadata items, from a reader: a few kilobytes of a large file.
-let meta = heifer::read_metadata_reader(std::fs::File::open("photo.heic")?)?;
+// Header-only reads from any `Read + Seek`: a few kilobytes of a large file.
+let mut file = std::fs::File::open("photo.heic")?;
+let info = heifer::read_info_reader(&mut file)?;
+let meta = heifer::read_metadata_reader(&mut file)?;
 ```
 
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> HDR photos
@@ -301,10 +307,12 @@ img.write_with_encoder(heifer::image_crate::HeifEncoder::new(file))?;   // write
 ```
 
 Applications that already decode several images in parallel can register the hooks with
-`register_image_decoder_hooks_with_options(heifer::Options { max_threads: 1, ..Default::default() })`.
+`register_image_decoder_hooks_with_options(heifer::Options::new().with_max_threads(1))`.
 
-`HeifDecoder` implements `image::ImageDecoder` (8- and 16-bit RGB/RGBA, EXIF/XMP/ICC). The HEIF
-orientation is already applied, so it is never applied twice.
+`HeifDecoder` implements `image::ImageDecoder` (8- and 16-bit RGB/RGBA, EXIF/XMP/ICC) lazily: container
+metadata, dimensions (including `image::image_dimensions`), and `ImageDecoder::set_limits` are
+resolved from headers before decoding pixels, and 8-bit images decode directly without a 16-bit
+intermediate buffer. The HEIF orientation is already applied, so it is never applied twice.
 
 `HeifEncoder` implements `image::ImageEncoder`: 8- and 16-bit grey and RGB, with or without alpha,
 and the ICC profile and EXIF set by `image`. (`image::save` only knows the formats built into
@@ -367,22 +375,22 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 15 ms (ffmpeg 11), iPhone 12 MP 21 ms (ffmpeg 21), 48 MP 116 ms (ffmpeg 95), Galaxy 200 MP 0.43 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 12 ms (ffmpeg 11), iPhone 12 MP 21 ms (ffmpeg 21), 48 MP 113 ms (ffmpeg 95), Galaxy 200 MP 0.40 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 15 ms | 75 ms | 11 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 21 ms | 116 ms | 21 ms |
-| 8000×6000, 48 MP | 116 ms | 0.70 s | 95 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.43 s | 1.21 s | fails |
+| Xiaomi, 5 MP | 12 ms | 74 ms | 11 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 21 ms | 126 ms | 21 ms |
+| 8000×6000, 48 MP | 113 ms | 0.65 s | 95 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.40 s | 1.22 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 117 ms on 1 thread to 20 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 114 ms on 1 thread to 21 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 117 ms with 1 thread down to 20 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 114 ms with 1 thread down to 21 ms with 10" width="100%">
 </picture>
 
 On multi-core machines heifer matches FFmpeg 9 on the 12 MP iPhone photo (and includes the
@@ -406,7 +414,7 @@ reproducible with `python3 benchmarks/run.py`.
 | Real test files decoded (of 55) | **52** (all valid files) | 52 | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
 | Colours vs Apple (13-file suite, median / worst) | **50.2 / 49.3 dB** | 47.4–50.3 dB (4 real photos) | 43.9 / 26.4 dB | 47.0 / 32.6 dB |
 | Apple + ISO 21496-1 HDR gain maps | **✓** (decode + encode) | ✓ | – | extraction only |
-| Decode speed, 12 MP iPhone photo | **109 ms** (1 thread) · **99 ms** (`→ PNG`, multi-core) | `376 ms` (`heif-convert → PNG`) | 131 ms (1 thread) | 226 ms (1 thread) |
+| Decode speed, 12 MP iPhone photo | **89 ms** (1 thread) · **86 ms** (`→ PNG`, multi-core) | `378 ms` (`heif-convert → PNG`) | 105 ms (1 thread) | 175 ms (1 thread) |
 | Encoding size vs `libheif` (`x265`, equal PSNR) | **reference** (`-2.7%` vs `x265 slow`) | +20.5% larger on `photo12.png` | – | – |
 
 `heifer` focuses on HEVC-coded HEIF (and ISO/IEC 23001-17 `unci`); choose `libheif-rs` only if you need AVIF, VVC, AVC or JPEG-in-HEIF inside the same library.
@@ -524,7 +532,7 @@ may not.
 - [x] **0.5**: image sequences with P and B frames in display order, as `image` animations and GIF/APNG in the CLI
 - [x] **0.6**: B-frame `.heics` encoding (`ctts`, GOP reordering), `auxl` alpha tracks, sequence size targets and keyframe intervals
 - [x] **0.7**: hierarchical B-frames, TMVP, per-slice QP offsets, `EncodeSpeed` presets, 4:2:2 / 4:4:4 / lossless & 10-bit `.heics`, `ctts` v0 + `edts`/`elst`, full `.heics` CLI support
-- [ ] **Next**: further single-thread decoding optimizations
+- [ ] **Next**: header-only `read_info` / `read_info_reader`, lazy limit-enforcing `HeifDecoder`, `#[non_exhaustive]` pre-1.0 API hardening, differential fuzz targets (`info`, `image_decoder`), and further single-thread decoding optimizations
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
