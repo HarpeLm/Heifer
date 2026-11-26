@@ -215,16 +215,28 @@ fn closed_gops(track: &Track, bytes: &[u8]) -> Option<Vec<std::ops::Range<usize>
     }
     for index in 0..track.samples.len() {
         let mut data = track.sample_data(bytes, index).ok()?;
+        let mut first_picture_type = None;
         while data.len() > len_size {
             let (len, rest) = data.split_at(len_size);
             let len = len
                 .iter()
                 .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
             let nal = rest.get(..len)?;
-            if matches!(nal.first().map(|b| (b >> 1) & 0x3f), Some(8 | 9)) {
+            let nal_type = nal.first().map(|b| (b >> 1) & 0x3f);
+            if matches!(nal_type, Some(8 | 9)) {
                 return None;
             }
+            if first_picture_type.is_none() && nal_type.is_some_and(|t| t < 32) {
+                first_picture_type = nal_type;
+            }
             data = &rest[len..];
+        }
+        // A sync sample flagged by the container that is not a random access picture (types 16
+        // to 23) may depend on the samples before it: decoding it with a fresh decoder, as a
+        // group thread does, could fail where the sequential decoder succeeds.
+        if track.samples[index].sync && !first_picture_type.is_some_and(|t| (16..=23).contains(&t))
+        {
+            return None;
         }
     }
     let starts: Vec<usize> = (0..track.samples.len())
