@@ -6,11 +6,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.34.0"
 ci = "github"
 allow-dirty = ["ci"]
-installers = ["shell", "powershell", "homebrew", "npm"]
+installers = ["shell", "powershell", "npm"]
 npm-scope = "@harpelm"
-tap = "HarpeLm/homebrew-tap"
-publish-jobs = ["homebrew", "npm"]
-formula = "heifer"
+publish-jobs = ["npm"]
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
