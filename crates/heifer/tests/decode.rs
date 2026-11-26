@@ -354,3 +354,63 @@ fn reads_iptc_of_a_real_file() {
     let plain = heifer::encode_rgba8(16, 16, &[128; 16 * 16 * 4], &Default::default()).unwrap();
     assert_eq!(heifer::read_iptc(&plain).unwrap(), None);
 }
+
+fn bytes_without_irot(bytes: &[u8]) -> Option<(Vec<u8>, u8)> {
+    let mut plain = bytes.to_vec();
+    let mut angle = None;
+    let mut pos = 0;
+    while let Some(rel) = plain[pos..]
+        .windows(8)
+        .position(|w| w[..4] == [0, 0, 0, 9] && &w[4..8] == b"irot")
+    {
+        let at = pos + rel + 4;
+        angle.get_or_insert_with(|| plain.get(at + 4).copied().unwrap_or(0) & 3);
+        plain[at..at + 4].copy_from_slice(b"free");
+        pos = at + 4;
+    }
+    angle.map(|a| (plain, a))
+}
+
+#[test]
+fn fused_grid_transforms_match_unfused_and_preserve_real_photos() {
+    for name in ["heif_other__arrow.heic", "heif_other__invalid_id.heic"] {
+        let Some(bytes) = load_real(name) else {
+            continue;
+        };
+        let opts1 = heifer::Options::new()
+            .with_max_threads(1)
+            .with_max_pixels(1 << 29);
+        let opts_mt = heifer::Options::new()
+            .with_max_threads(0)
+            .with_max_pixels(1 << 29);
+        let fused_1t = heifer::decode_rgba8(&bytes, &opts1).unwrap();
+        let fused_mt = heifer::decode_rgba8(&bytes, &opts_mt).unwrap();
+        assert_eq!(
+            (fused_1t.width, fused_1t.height, fused_1t.bit_depth),
+            (fused_mt.width, fused_mt.height, fused_mt.bit_depth),
+            "{name}"
+        );
+        assert!(
+            fused_1t.data == fused_mt.data,
+            "{name}: 1t vs multi-thread fused"
+        );
+
+        let fused_wide = heifer::decode_with_options(&bytes, &opts1).unwrap();
+        assert!(fused_1t.data == fused_wide.to_rgba8(), "{name}: u8 vs u16");
+
+        if let Some((without_irot, angle)) = bytes_without_irot(&bytes) {
+            let unfused = heifer::decode_rgba8(&without_irot, &opts_mt)
+                .unwrap()
+                .rotate_ccw(angle);
+            assert_eq!(
+                (fused_1t.width, fused_1t.height),
+                (unfused.width, unfused.height),
+                "{name}"
+            );
+            assert!(
+                fused_1t.data == unfused.data,
+                "{name}: fused vs unfused rotation"
+            );
+        }
+    }
+}
