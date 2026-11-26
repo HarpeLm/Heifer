@@ -577,9 +577,17 @@ pub fn hevc_annex_b_into(config: &HevcConfig, data: &[u8], out: &mut Vec<u8>) ->
             .iter()
             .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
         let (nal, tail) = tail.split_at_checked(len).ok_or(Error::UnexpectedEof)?;
+        rest = tail;
+        // A NAL unit has at least a 2-byte header (H.265 §7.3.1), so a zero length prefix is
+        // malformed. It occurs in practice: the `hvc1` item of Nokia conformance file C034 is 4
+        // bytes too long and overlaps the following Exif item, whose leading zero
+        // exif_tiff_header_offset reads as such a prefix. Tolerate it like ffmpeg, which skips
+        // NAL units of size 0, instead of emitting a bare start code the decoder cannot parse.
+        if nal.is_empty() {
+            continue;
+        }
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
-        rest = tail;
     }
     Ok(())
 }
@@ -654,4 +662,37 @@ fn concat(parts: &[&[u8]], limit: usize, budget: &mut Budget) -> Result<Vec<u8>,
         .ok_or_else(|| invalid_iloc("item data larger than its source"))?;
     budget.bytes -= total;
     Ok(parts.concat())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> HevcConfig {
+        HevcConfig {
+            profile_idc: 1,
+            level_idc: 93,
+            chroma_format: 1,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            nal_length_size: 4,
+            nal_units: vec![vec![0x40, 0x01, 0xAA]],
+        }
+    }
+
+    #[test]
+    fn annex_b_skips_zero_length_nal_units() {
+        // A slice NAL unit, then a zero length prefix as in Nokia's C034.heic.
+        let data = [0, 0, 0, 3, 0x26, 0x01, 0xBB, 0, 0, 0, 0];
+        assert_eq!(
+            hevc_annex_b(&config(), &data).unwrap(),
+            [0, 0, 0, 1, 0x40, 0x01, 0xAA, 0, 0, 0, 1, 0x26, 0x01, 0xBB]
+        );
+    }
+
+    #[test]
+    fn annex_b_rejects_truncated_nal_units() {
+        assert!(hevc_annex_b(&config(), &[0, 0, 0, 5, 0x26, 0x01]).is_err());
+        assert!(hevc_annex_b(&config(), &[0, 0]).is_err());
+    }
 }
