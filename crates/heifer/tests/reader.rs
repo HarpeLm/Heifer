@@ -38,6 +38,17 @@ fn reader_and_slice_decode_identically() {
             (Err(_), Err(_)) => {}
             (a, b) => panic!("{name}: slice {:?}, reader {:?}", a.err(), b.err()),
         }
+        let rgba8_slice = heifer::decode_rgba8(&bytes, &heifer::Options::default());
+        let rgba8_reader =
+            heifer::decode_reader_rgba8(Cursor::new(&bytes), &heifer::Options::default());
+        match (rgba8_slice, rgba8_reader) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{name}: rgba8"),
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!("{name}: rgba8 slice {:?}, reader {:?}", a.err(), b.err()),
+        }
+        let info = heifer::read_info(&bytes).ok();
+        let info_reader = heifer::read_info_reader(Cursor::new(&bytes)).ok();
+        assert_eq!(info, info_reader, "{name}: info");
         let meta = heifer::read_metadata(&bytes).ok();
         let meta_reader = heifer::read_metadata_reader(Cursor::new(&bytes)).ok();
         assert_eq!(meta, meta_reader, "{name}");
@@ -75,12 +86,22 @@ fn failing_reader_returns_an_error() {
     let rgba = vec![200u8; 64 * 64 * 4];
     let bytes = heifer::encode_rgba8(64, 64, &rgba, &Default::default()).unwrap();
     for limit in (0..bytes.len()).step_by(7) {
-        let reader = Failing {
+        let make = || Failing {
             inner: Cursor::new(&bytes),
             read: 0,
             limit,
         };
-        assert!(heifer::decode_reader(reader).is_err(), "limit {limit}");
+        assert!(heifer::decode_reader(make()).is_err(), "limit {limit}");
+        assert!(
+            heifer::decode_reader_rgba8(make(), &heifer::Options::default()).is_err(),
+            "rgba8 limit {limit}"
+        );
+        if limit < 12 {
+            assert!(
+                heifer::read_info_reader(make()).is_err(),
+                "info limit {limit}"
+            );
+        }
     }
     // Truncated files: errors, never panics.
     for end in (0..bytes.len()).step_by(5) {
@@ -88,5 +109,11 @@ fn failing_reader_returns_an_error() {
             heifer::decode_reader(Cursor::new(&bytes[..end])).is_err(),
             "end {end}"
         );
+        assert!(
+            heifer::decode_reader_rgba8(Cursor::new(&bytes[..end]), &heifer::Options::default())
+                .is_err(),
+            "rgba8 end {end}"
+        );
+        let _ = heifer::read_info_reader(Cursor::new(&bytes[..end]));
     }
 }
