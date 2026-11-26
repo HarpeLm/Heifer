@@ -115,10 +115,7 @@ fn icc_profile_replaces_nclx_on_every_item() {
         return;
     };
     let image = gradient(600, 600); // a grid of four tiles, plus a thumbnail
-    let metadata = Metadata {
-        icc_profile: Some(icc.clone()),
-        ..Default::default()
-    };
+    let metadata = Metadata::new().with_icc_profile(icc.clone());
     let bytes = heifer::encode_with_metadata(&image, &metadata, &EncodeOptions::default()).unwrap();
 
     let file = HeifFile::parse(&bytes).unwrap();
@@ -149,10 +146,7 @@ fn srgb_icc_conversion_is_nearly_the_identity() {
         return;
     };
     let image = gradient(64, 48);
-    let metadata = Metadata {
-        icc_profile: Some(icc),
-        ..Default::default()
-    };
+    let metadata = Metadata::new().with_icc_profile(icc);
     let options = EncodeOptions::new().with_quality(100);
     let bytes = heifer::encode_with_metadata(&image, &metadata, &options).unwrap();
 
