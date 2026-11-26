@@ -6,19 +6,19 @@
 <rect x="214" y="372" width="11" height="11" rx="2" fill="#9cbbe0"/><text x="231" y="381.5" font-size="12" fill="#59636e">heifer, 1 thread</text>
 <rect x="404" y="372" width="11" height="11" rx="2" fill="#c2803a"/><text x="421" y="381.5" font-size="12" fill="#59636e">ffmpeg (libavcodec)</text>
 <text x="178" y="109.0" font-size="13" text-anchor="end" fill="#1f2328">Xiaomi, 5 MP</text>
-<rect x="190" y="85" width="186.2" height="11" rx="2" fill="#2f6fb3"/><text x="382.2" y="95" font-size="11.5" fill="#59636e">15 ms</text>
-<rect x="190" y="99" width="298.0" height="11" rx="2" fill="#9cbbe0"/><text x="494.0" y="109" font-size="11.5" fill="#59636e">75 ms</text>
-<rect x="190" y="113" width="165.7" height="11" rx="2" fill="#c2803a"/><text x="361.7" y="123" font-size="11.5" fill="#59636e">11 ms</text>
+<rect x="190" y="85" width="172.0" height="11" rx="2" fill="#2f6fb3"/><text x="368.0" y="95" font-size="11.5" fill="#59636e">12 ms</text>
+<rect x="190" y="99" width="296.9" height="11" rx="2" fill="#9cbbe0"/><text x="492.9" y="109" font-size="11.5" fill="#59636e">74 ms</text>
+<rect x="190" y="113" width="165.4" height="11" rx="2" fill="#c2803a"/><text x="361.4" y="123" font-size="11.5" fill="#59636e">11 ms</text>
 <text x="178" y="177.0" font-size="13" text-anchor="end" fill="#1f2328">iPhone 13 Pro, 12 MP</text>
-<rect x="190" y="153" width="209.0" height="11" rx="2" fill="#2f6fb3"/><text x="405.0" y="163" font-size="11.5" fill="#59636e">21 ms</text>
-<rect x="190" y="167" width="328.6" height="11" rx="2" fill="#9cbbe0"/><text x="524.6" y="177" font-size="11.5" fill="#59636e">116 ms</text>
-<rect x="190" y="181" width="210.3" height="11" rx="2" fill="#c2803a"/><text x="406.3" y="191" font-size="11.5" fill="#59636e">21 ms</text>
+<rect x="190" y="153" width="210.1" height="11" rx="2" fill="#2f6fb3"/><text x="406.1" y="163" font-size="11.5" fill="#59636e">21 ms</text>
+<rect x="190" y="167" width="333.6" height="11" rx="2" fill="#9cbbe0"/><text x="529.6" y="177" font-size="11.5" fill="#59636e">126 ms</text>
+<rect x="190" y="181" width="210.1" height="11" rx="2" fill="#c2803a"/><text x="406.1" y="191" font-size="11.5" fill="#59636e">21 ms</text>
 <text x="178" y="245.0" font-size="13" text-anchor="end" fill="#1f2328">8000×6000, 48 MP</text>
-<rect x="190" y="221" width="328.4" height="11" rx="2" fill="#2f6fb3"/><text x="524.4" y="231" font-size="11.5" fill="#59636e">116 ms</text>
-<rect x="190" y="235" width="452.6" height="11" rx="2" fill="#9cbbe0"/><text x="648.6" y="245" font-size="11.5" fill="#59636e">700 ms</text>
-<rect x="190" y="249" width="314.6" height="11" rx="2" fill="#c2803a"/><text x="510.6" y="259" font-size="11.5" fill="#59636e">95 ms</text>
+<rect x="190" y="221" width="326.4" height="11" rx="2" fill="#2f6fb3"/><text x="522.4" y="231" font-size="11.5" fill="#59636e">113 ms</text>
+<rect x="190" y="235" width="446.8" height="11" rx="2" fill="#9cbbe0"/><text x="642.8" y="245" font-size="11.5" fill="#59636e">650 ms</text>
+<rect x="190" y="249" width="314.2" height="11" rx="2" fill="#c2803a"/><text x="510.2" y="259" font-size="11.5" fill="#59636e">95 ms</text>
 <text x="178" y="313.0" font-size="13" text-anchor="end" fill="#1f2328">Galaxy S24 Ultra, 200 MP</text>
-<rect x="190" y="289" width="419.4" height="11" rx="2" fill="#2f6fb3"/><text x="615.4" y="299" font-size="11.5" fill="#59636e">433 ms</text>
-<rect x="190" y="303" width="490.3" height="11" rx="2" fill="#9cbbe0"/><text x="686.3" y="313" font-size="11.5" fill="#59636e">1,209 ms</text>
+<rect x="190" y="289" width="413.5" height="11" rx="2" fill="#2f6fb3"/><text x="609.5" y="299" font-size="11.5" fill="#59636e">401 ms</text>
+<rect x="190" y="303" width="490.4" height="11" rx="2" fill="#9cbbe0"/><text x="686.4" y="313" font-size="11.5" fill="#59636e">1,221 ms</text>
 <text x="194" y="327" font-size="11.5" fill="#59636e">fails to decode</text>
 </svg>
