@@ -2,7 +2,8 @@
 //!
 //! ```no_run
 //! heifer::image_crate::register_image_decoder_hooks();
-//! let img = image::open("photo.heic").unwrap(); // decoded by heifer
+//! let img = image::open("photo.heic").unwrap(); // .heic / .heif / .hif + content detection
+//! img.save("photo.png").unwrap();
 //! ```
 //!
 //! [`HeifDecoder`] can also be used directly with `image::DynamicImage::from_decoder`.
