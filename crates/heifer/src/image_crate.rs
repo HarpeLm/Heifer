@@ -34,11 +34,16 @@
 
 use std::io::Read;
 
-use image::error::{DecodingError, ImageFormatHint};
+use image::error::{DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind};
+use image::hooks::GenericReader;
 use image::metadata::Orientation;
-use image::{ColorType, ImageDecoder, ImageError, ImageResult};
+use image::{ColorType, ImageDecoder, ImageError, ImageResult, Limits};
 
-use crate::{Image, Metadata, Options};
+use crate::reader::{
+    ReadError, decode_reader_rgba8, decode_reader_with_options, read_metadata_reader,
+    read_still_info_reader,
+};
+use crate::{Image, ImageInfo, Metadata, Options, check_size, read_still_info};
 
 #[cfg(feature = "encoder")]
 pub use encoder::HeifEncoder;
@@ -54,7 +59,8 @@ const BRANDS: [&[u8; 4]; 4] = [b"heic", b"heix", b"heim", b"heis"];
 /// already registered for one of these extensions.
 ///
 /// After this call, `image::open`, `image::ImageReader` and `image::load_from_memory` decode
-/// HEIC files with heifer.
+/// HEIC files with heifer, reading dimensions and metadata from headers without decoding pixels
+/// upfront and checking `image::Limits` before allocating decode buffers.
 pub fn register_image_decoder_hooks() -> bool {
     register_image_decoder_hooks_with_options(Options::default())
 }
@@ -73,7 +79,7 @@ pub fn register_image_decoder_hooks_with_options(options: Options) -> bool {
     for ext in EXTENSIONS {
         all &= image::hooks::register_decoding_hook(
             ext.into(),
-            Box::new(move |reader| Ok(Box::new(HeifDecoder::with_options(reader, &options)?))),
+            Box::new(move |reader| Ok(Box::new(HookDecoder::new(reader, &options)?))),
         );
     }
     // Box size (4 bytes, any value) then `ftyp` and the major brand.
@@ -100,15 +106,21 @@ pub fn register_image_decoder_hooks_with_options(options: Options) -> bool {
 
 /// An [`image::ImageDecoder`] for HEIF/HEIC files.
 ///
-/// The image is decoded when the decoder is created; crop, rotation and mirror transforms are
-/// already applied, so [`ImageDecoder::orientation`] reports no remaining transform.
+/// Only the container headers are parsed when the decoder is created: dimensions, colour type
+/// and limits (`set_limits`) are checked before pixels are decoded in `read_image`, and 8-bit
+/// images decode via the packed 8-bit path ([`decode_rgba8`](crate::decode_rgba8)).
+/// Crop, rotation and mirror transforms are applied by heifer, so [`ImageDecoder::orientation`]
+/// reports [`Orientation::NoTransforms`].
 pub struct HeifDecoder {
-    image: Image,
-    metadata: Metadata,
+    bytes: Vec<u8>,
+    info: ImageInfo,
+    metadata: Option<Metadata>,
+    options: Options,
+    limits: Option<Limits>,
 }
 
 impl HeifDecoder {
-    /// Reads a whole HEIF file and decodes its primary image.
+    /// Reads a HEIF file and inspects its container headers (without decoding pixels yet).
     pub fn new(reader: impl Read) -> ImageResult<Self> {
         Self::with_options(reader, &Options::default())
     }
@@ -119,14 +131,72 @@ impl HeifDecoder {
         reader
             .read_to_end(&mut bytes)
             .map_err(ImageError::IoError)?;
-        Self::from_bytes(&bytes, options)
+        Self::from_vec(bytes, options)
     }
 
-    /// Decodes a HEIF file held in memory, with heifer options.
+    /// Creates a lazy decoder from a HEIF file held in memory, with heifer options.
     pub fn from_bytes(bytes: &[u8], options: &Options) -> ImageResult<Self> {
-        let image = crate::decode_with_options(bytes, options).map_err(decoding_error)?;
-        let metadata = crate::read_metadata(bytes).map_err(decoding_error)?;
-        Ok(Self { image, metadata })
+        let info = read_still_info(bytes).map_err(decoding_error)?;
+        check_size(info.width, info.height, options.max_pixels()).map_err(decoding_error)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            info,
+            metadata: None,
+            options: *options,
+            limits: None,
+        })
+    }
+
+    /// Like [`from_bytes`](Self::from_bytes), taking ownership of the buffer without copying it.
+    pub fn from_vec(bytes: Vec<u8>, options: &Options) -> ImageResult<Self> {
+        let info = read_still_info(&bytes).map_err(decoding_error)?;
+        check_size(info.width, info.height, options.max_pixels()).map_err(decoding_error)?;
+        Ok(Self {
+            bytes,
+            info,
+            metadata: None,
+            options: *options,
+            limits: None,
+        })
+    }
+
+    fn metadata(&mut self) -> ImageResult<&Metadata> {
+        if self.metadata.is_none() {
+            self.metadata = Some(crate::read_metadata(&self.bytes).map_err(decoding_error)?);
+        }
+        Ok(self.metadata.as_ref().expect("metadata populated above"))
+    }
+}
+
+/// Seekable decoder backing `image::hooks` so `image::image_dimensions` and limit checks read
+/// only container headers instead of buffering the whole file upfront.
+struct HookDecoder<'a> {
+    reader: GenericReader<'a>,
+    info: ImageInfo,
+    metadata: Option<Metadata>,
+    options: Options,
+    limits: Option<Limits>,
+}
+
+impl<'a> HookDecoder<'a> {
+    fn new(mut reader: GenericReader<'a>, options: &Options) -> ImageResult<Self> {
+        let info = read_still_info_reader(&mut reader).map_err(read_error)?;
+        check_size(info.width, info.height, options.max_pixels()).map_err(decoding_error)?;
+        Ok(Self {
+            reader,
+            info,
+            metadata: None,
+            options: *options,
+            limits: None,
+        })
+    }
+
+    fn metadata(&mut self) -> ImageResult<&Metadata> {
+        if self.metadata.is_none() {
+            let meta = read_metadata_reader(&mut self.reader).map_err(read_error)?;
+            self.metadata = Some(meta);
+        }
+        Ok(self.metadata.as_ref().expect("metadata populated above"))
     }
 }
 
@@ -209,30 +279,109 @@ fn decoding_error(e: crate::Error) -> ImageError {
     ImageError::Decoding(DecodingError::new(ImageFormatHint::Name("HEIF".into()), e))
 }
 
+fn read_error(e: ReadError) -> ImageError {
+    match e {
+        ReadError::Io(io) => ImageError::IoError(io),
+        ReadError::Heif(heif) => decoding_error(heif),
+    }
+}
+
+fn info_color_type(info: &ImageInfo) -> ColorType {
+    match (info.bit_depth > 8, info.has_alpha) {
+        (false, false) => ColorType::Rgb8,
+        (false, true) => ColorType::Rgba8,
+        (true, false) => ColorType::Rgb16,
+        (true, true) => ColorType::Rgba16,
+    }
+}
+
+fn check_decoder_limits(info: &ImageInfo, limits: &Limits) -> ImageResult<()> {
+    limits.check_support(&image::LimitSupport::default())?;
+    limits.check_dimensions(info.width, info.height)?;
+    Ok(())
+}
+
+fn prepare_decode(
+    info: &ImageInfo,
+    base_options: Options,
+    limits: Option<Limits>,
+    buf_len: usize,
+    total_bytes: u64,
+) -> ImageResult<Options> {
+    if buf_len as u64 != total_bytes {
+        return Err(ImageError::Parameter(ParameterError::from_kind(
+            ParameterErrorKind::DimensionMismatch,
+        )));
+    }
+    let mut options = base_options;
+    if let Some(mut limits) = limits {
+        limits.check_dimensions(info.width, info.height)?;
+        let internal_bpp = if info.bit_depth > 8 { 8u64 } else { 4u64 };
+        let internal_bytes = u64::from(info.width)
+            .saturating_mul(u64::from(info.height))
+            .saturating_mul(internal_bpp);
+        let max_alloc_before = limits.max_alloc;
+        limits.reserve(internal_bytes)?;
+        if let Some(max_alloc) = max_alloc_before {
+            let cap = (max_alloc / internal_bpp).max(1);
+            options.max_pixels = options.max_pixels().min(cap);
+        }
+    }
+    Ok(options)
+}
+
+fn write_image_u8(info: &ImageInfo, image: &Image<u8>, buf: &mut [u8]) -> ImageResult<()> {
+    if (image.width, image.height) != (info.width, info.height) {
+        return Err(decoding_error(crate::Error::Invalid(
+            "decoded image dimensions do not match container header",
+        )));
+    }
+    if info.has_alpha {
+        buf.copy_from_slice(&image.data);
+    } else {
+        for (dst, src) in buf.chunks_exact_mut(3).zip(image.data.chunks_exact(4)) {
+            dst.copy_from_slice(&src[..3]);
+        }
+    }
+    Ok(())
+}
+
+fn write_image_u16(info: &ImageInfo, image: &Image<u16>, buf: &mut [u8]) -> ImageResult<()> {
+    if (image.width, image.height) != (info.width, info.height) {
+        return Err(decoding_error(crate::Error::Invalid(
+            "decoded image dimensions do not match container header",
+        )));
+    }
+    let channels = if info.has_alpha { 4 } else { 3 };
+    let max = u32::from(image.max_value());
+    let pixels = image.data.chunks_exact(4).map(|p| &p[..channels]);
+    // 16-bit native endian, scaled to the full 0..=65535 range.
+    for (out, v) in buf.chunks_exact_mut(2).zip(pixels.flatten()) {
+        let v16 = ((u32::from(*v) * 65535 + max / 2) / max) as u16;
+        out.copy_from_slice(&v16.to_ne_bytes());
+    }
+    Ok(())
+}
+
 impl ImageDecoder for HeifDecoder {
     fn dimensions(&self) -> (u32, u32) {
-        (self.image.width, self.image.height)
+        (self.info.width, self.info.height)
     }
 
     fn color_type(&self) -> ColorType {
-        match (self.image.bit_depth > 8, self.image.has_alpha) {
-            (false, false) => ColorType::Rgb8,
-            (false, true) => ColorType::Rgba8,
-            (true, false) => ColorType::Rgb16,
-            (true, true) => ColorType::Rgba16,
-        }
+        info_color_type(&self.info)
     }
 
     fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.metadata.icc_profile.clone())
+        Ok(self.metadata()?.icc_profile.clone())
     }
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.metadata.exif.clone())
+        Ok(self.metadata()?.exif.clone())
     }
 
     fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.metadata.xmp.clone())
+        Ok(self.metadata()?.xmp.clone())
     }
 
     /// HEIF transforms (`irot`/`imir`) are already applied, and the EXIF orientation is only
@@ -241,28 +390,72 @@ impl ImageDecoder for HeifDecoder {
         Ok(Orientation::NoTransforms)
     }
 
-    fn set_limits(&mut self, limits: image::Limits) -> ImageResult<()> {
-        limits.check_support(&image::LimitSupport::default())?;
-        limits.check_dimensions(self.image.width, self.image.height)?;
+    fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
+        check_decoder_limits(&self.info, &limits)?;
+        self.limits = Some(limits);
         Ok(())
     }
 
     fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
-        let channels = if self.image.has_alpha { 4 } else { 3 };
-        let max = u32::from(self.image.max_value());
-        let pixels = self.image.data.chunks_exact(4).map(|p| &p[..channels]);
-        if self.image.bit_depth > 8 {
-            // 16-bit native endian, scaled to the full 0..=65535 range.
-            for (out, v) in buf.chunks_exact_mut(2).zip(pixels.flatten()) {
-                let v16 = ((u32::from(*v) * 65535 + max / 2) / max) as u16;
-                out.copy_from_slice(&v16.to_ne_bytes());
-            }
+        let total = self.total_bytes();
+        let options = prepare_decode(&self.info, self.options, self.limits, buf.len(), total)?;
+        if self.info.bit_depth <= 8 {
+            let image = crate::decode_rgba8(&self.bytes, &options).map_err(decoding_error)?;
+            write_image_u8(&self.info, &image, buf)
         } else {
-            for (out, v) in buf.iter_mut().zip(pixels.flatten()) {
-                *out = *v as u8;
-            }
+            let image =
+                crate::decode_with_options(&self.bytes, &options).map_err(decoding_error)?;
+            write_image_u16(&self.info, &image, buf)
         }
+    }
+
+    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
+        (*self).read_image(buf)
+    }
+}
+
+impl ImageDecoder for HookDecoder<'_> {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.info.width, self.info.height)
+    }
+
+    fn color_type(&self) -> ColorType {
+        info_color_type(&self.info)
+    }
+
+    fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        Ok(self.metadata()?.icc_profile.clone())
+    }
+
+    fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        Ok(self.metadata()?.exif.clone())
+    }
+
+    fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        Ok(self.metadata()?.xmp.clone())
+    }
+
+    fn orientation(&mut self) -> ImageResult<Orientation> {
+        Ok(Orientation::NoTransforms)
+    }
+
+    fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
+        check_decoder_limits(&self.info, &limits)?;
+        self.limits = Some(limits);
         Ok(())
+    }
+
+    fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()> {
+        let total = self.total_bytes();
+        let options = prepare_decode(&self.info, self.options, self.limits, buf.len(), total)?;
+        if self.info.bit_depth <= 8 {
+            let image = decode_reader_rgba8(&mut self.reader, &options).map_err(read_error)?;
+            write_image_u8(&self.info, &image, buf)
+        } else {
+            let image =
+                decode_reader_with_options(&mut self.reader, &options).map_err(read_error)?;
+            write_image_u16(&self.info, &image, buf)
+        }
     }
 
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
