@@ -4,11 +4,11 @@ use crate::Error;
 use crate::nal::NalUnitType;
 use crate::nal::{NalUnit, split_annex_b};
 use crate::params::ParameterSets;
-use crate::recon::{Frame, Reconstructor};
+use crate::recon::{Frame, Reconstructor, ReconstructorBuffers};
 use crate::scan::tiles_fit;
 use crate::sei::{PictureHash, parse_picture_hash};
 use crate::slice::SliceHeader;
-use crate::syntax::{Picture, decode_slice_segment};
+use crate::syntax::{Picture, PictureBuffers, decode_slice_segment};
 
 /// Options for [`decode_picture`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,6 +70,15 @@ pub enum HashCheck {
     Verified(&'static str),
 }
 
+/// Reusable scratch buffers for decoding many pictures (such as tiles of a grid) on one
+/// thread without repeating picture/plane heap allocations.
+#[derive(Debug, Default)]
+pub struct DecodeWorkspace {
+    pic: PictureBuffers,
+    recon: ReconstructorBuffers,
+    cropped: Frame,
+}
+
 /// Decodes the first picture of an HEVC Annex B bitstream (as produced by
 /// `heifer_isobmff::HeifFile::hevc_bitstream`), cropped to its conformance window.
 pub fn decode_picture(stream: &[u8], options: DecodeOptions) -> Result<Frame, Error> {
@@ -81,6 +90,37 @@ pub fn decode_picture_checked(
     stream: &[u8],
     options: DecodeOptions,
 ) -> Result<(Frame, HashCheck), Error> {
+    let mut workspace = DecodeWorkspace::default();
+    let (cropped, check) = decode_picture_with_workspace(stream, options, &mut workspace)?;
+    let frame = if cropped {
+        workspace.cropped
+    } else {
+        workspace.recon.frame
+    };
+    Ok((frame, check))
+}
+
+/// Like [`decode_picture_checked`], reusing heap allocations in `workspace` and borrowing the
+/// decoded frame from it.
+pub fn decode_picture_into<'w>(
+    stream: &[u8],
+    options: DecodeOptions,
+    workspace: &'w mut DecodeWorkspace,
+) -> Result<(&'w Frame, HashCheck), Error> {
+    let (cropped, check) = decode_picture_with_workspace(stream, options, workspace)?;
+    let frame = if cropped {
+        &workspace.cropped
+    } else {
+        &workspace.recon.frame
+    };
+    Ok((frame, check))
+}
+
+fn decode_picture_with_workspace(
+    stream: &[u8],
+    options: DecodeOptions,
+    ws: &mut DecodeWorkspace,
+) -> Result<(bool, HashCheck), Error> {
     let nals: Vec<NalUnit<'_>> = split_annex_b(stream)
         .map(NalUnit::parse)
         .collect::<Result<_, _>>()?;
@@ -137,8 +177,12 @@ pub fn decode_picture_checked(
                 ));
             }
         }
-        let (pic, recon) =
-            state.get_or_insert_with(|| (Picture::new(sps, pps), Reconstructor::new(sps, pps)));
+        let (pic, recon) = state.get_or_insert_with(|| {
+            (
+                Picture::from_buffers(sps, pps, std::mem::take(&mut ws.pic)),
+                Reconstructor::from_buffers(sps, pps, std::mem::take(&mut ws.recon)),
+            )
+        });
         recon.start_slice(&header);
         let data = &nal.rbsp[header.header_size..];
         decode_slice_segment(pic, &header, header.slice_qp_y(&sets)?, data, None, recon)?;
@@ -154,21 +198,82 @@ pub fn decode_picture_checked(
         return Err(Error::Invalid("picture is incomplete"));
     }
     let sps = pic.sps;
-    let frame = recon.finish(options.skip_loop_filters);
+    let has_crop = sps.conf_win_offsets != [0; 4];
+    ws.pic = pic.into_buffers();
+    ws.recon = recon.finish_into_buffers(options.skip_loop_filters);
     let check = match &hash {
         Some(expected) if !options.skip_loop_filters => {
-            if expected.compute_like(&frame) != *expected {
+            if expected.compute_like(&ws.recon.frame) != *expected {
                 return Err(Error::HashMismatch(expected.kind()));
             }
             HashCheck::Verified(expected.kind())
         }
         _ => HashCheck::NotChecked,
     };
-    // Most pictures have no conformance window: avoid copying them.
-    let frame = if sps.conf_win_offsets == [0; 4] {
-        frame
-    } else {
-        frame.cropped(sps)
-    };
-    Ok((frame, check))
+    if has_crop {
+        ws.recon.frame.cropped_into(sps, &mut ws.cropped);
+    }
+    Ok((has_crop, check))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heifer_isobmff::HeifFile;
+
+    #[test]
+    fn workspace_reuse_matches_fresh_decode_across_sizes_and_errors() {
+        let base = format!("{}/../../tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let Ok(grid_bytes) = std::fs::read(format!("{base}/grid.heic")) else {
+            return;
+        };
+        let Ok(alpha_bytes) = std::fs::read(format!("{base}/alpha.heic")) else {
+            return;
+        };
+        let Ok(single_bytes) = std::fs::read(format!("{base}/single_image.heic")) else {
+            return;
+        };
+
+        let mut streams = Vec::new();
+        for (file_bytes, rel) in [(&grid_bytes, b"dimg"), (&alpha_bytes, b"dimg")] {
+            let f = HeifFile::parse(file_bytes).unwrap();
+            let primary = f.primary_item().unwrap().id;
+            if let Ok(bs) = f.hevc_bitstream(primary) {
+                streams.push(bs);
+            }
+            for child in f.referenced_items(primary, rel) {
+                if let Ok(bs) = f.hevc_bitstream(*child) {
+                    streams.push(bs);
+                }
+            }
+            for aux in f.referencing_items(primary, b"auxl") {
+                if let Ok(bs) = f.hevc_bitstream(aux) {
+                    streams.push(bs);
+                }
+            }
+        }
+        let single = HeifFile::parse(&single_bytes).unwrap();
+        streams.push(
+            single
+                .hevc_bitstream(single.primary_item().unwrap().id)
+                .unwrap(),
+        );
+        assert!(streams.len() >= 3);
+
+        let mut ws = DecodeWorkspace::default();
+        let opts = DecodeOptions::new();
+        for (idx, stream) in streams.iter().enumerate() {
+            let expected = decode_picture(stream, opts).unwrap();
+            let (actual, _) = decode_picture_into(stream, opts, &mut ws).unwrap();
+            assert_eq!(actual, &expected, "mismatch before error at stream {idx}");
+        }
+
+        // A failing decode must leave the workspace usable for subsequent pictures.
+        assert!(decode_picture_into(&[0, 0, 0, 1, 0], opts, &mut ws).is_err());
+        for (idx, stream) in streams.iter().enumerate().rev() {
+            let expected = decode_picture(stream, opts).unwrap();
+            let (actual, _) = decode_picture_into(stream, opts, &mut ws).unwrap();
+            assert_eq!(actual, &expected, "mismatch after error at stream {idx}");
+        }
+    }
 }
