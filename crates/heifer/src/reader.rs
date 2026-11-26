@@ -25,6 +25,7 @@ const MAX_TOP_LEVEL_BOXES: usize = 4096;
 
 /// Errors of the reader-based API: reading failed, or the file could not be decoded.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReadError {
     /// The reader returned an error, or ended before the data a box or item declares.
     #[error("read: {0}")]
