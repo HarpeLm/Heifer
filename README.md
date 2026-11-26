@@ -519,8 +519,8 @@ cargo build --release -p heifer-hevc-dec --example decode
 **Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
 
 ```sh
-git tag -a v0.7.1 -m "0.7.1 — what changed"
-git push origin v0.7.1
+git tag -a v0.7.2 -m "0.7.2 — what changed"
+git push origin v0.7.2
 ```
 
 The `Release` workflow creates the GitHub release, with the annotation as title and the matching
