@@ -67,7 +67,10 @@ pub use encode::{
     encode_to_size, encode_with_format, encode_with_metadata, encode_with_metadata_and_format,
     fit_to_size,
 };
-pub use hdr::{GainMap, HdrImage, decode_hdr, read_gain_map};
+pub use hdr::{
+    APPLE_GAIN_MAP, GainMap, HdrImage, decode_hdr, decode_hdr_with_options, read_gain_map,
+    read_gain_map_with_options,
+};
 pub use heifer_hevc_dec;
 #[cfg(feature = "encoder")]
 pub use heifer_hevc_enc;
