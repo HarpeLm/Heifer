@@ -1,8 +1,40 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-11-27
 
-**Fixes** (found by running every Nokia HEIF conformance file)
+Header-only image probing (`read_info`), lazy limit-enforcing `image` crate decoding, pre-1.0
+`#[non_exhaustive]` API hardening, fused grid transforms and loop-filter speedups (200 MP multi-core
+`185 ms`, down from `401 ms` in `0.7.3`), full Nokia HEIF conformance fixes (edit lists, predicted
+items, zero-length NALs), and fuzzing hardening.
+
+**Breaking / Pre-1.0 API Hardening**
+
+- Marked `Error`, `ReadError`, `Options`, `EncodeOptions`, `Metadata`, and `DepthRepresentation` as
+  `#[non_exhaustive]` and added `new()` / `with_*` builders for forward compatibility.
+
+**New APIs**
+
+- Added header-only `read_info`, `item_info`, and `read_info_reader` (`FileKind`, `ImageInfo`) to
+  query post-transform dimensions, bit depth, alpha presence, and container kind without decoding
+  pixel payloads, plus `decode_reader_rgba8`.
+- Made `HeifDecoder` and seekable `HookDecoder` (`image` crate integration) lazy: metadata and
+  dimensions are parsed from container headers on construction, `image::Limits` are enforced before
+  decoding pixels, and 8-bit images take the direct `decode_rgba8` fast path.
+
+**Performance (100% safe Rust)**
+
+- `heifer`: fused `clap` + `irot` + `imir` transforms directly into grid tile placement
+  (`GridTransform`, `decode_grid_with_transform`), avoiding full-image post-transform copies and
+  skipping out-of-crop tiles.
+- `heifer-hevc-dec`: sped up `deblock` / `SAO` loops (zero-offset CTB skip, 32-entry `band_lut`,
+  row-wise 8-bit `PlaneSample::sao_eo_row`) and added a single-tile intra reference fast path
+  (`try_fast` in `reference_samples_into`).
+- Measured results (Apple M5): 200 MP Galaxy `185 ms` multi-core (`2.17×` faster than `0.7.3`) /
+  `885 ms` 1-thread; 48 MP `106 ms` / `622 ms`; 12 MP Apple photo `83 ms` `heifer8` 1-thread
+  (`1.30×` faster than `heic-rs` at `108 ms`) / `14 ms` on 10 cores; 13-file suite `582 ms`
+  1-thread / `127 ms` on 10 cores; 5 MP Xiaomi `13 ms` / `64 ms`.
+
+**Fixes & Fuzzing** (including Nokia HEIF conformance files)
 
 - Predictively coded image items (`pred` references, `mif2` brand, Nokia C044) are decoded: the
   items they reference first, then the image, as one HEVC sequence. Decoding from a reader now
@@ -19,6 +51,15 @@
   `heifer-isobmff`.
 - Zero-length NAL units in item and sample data, and empty `hvcC` entries, are skipped (Nokia
   C034, #12, by @argentist).
+- `heifer`: fall back to sequential sequence decoding in `closed_gops` when a container flags a
+  non-random-access sample as sync (fixes parallel vs sequential divergence found by fuzzing).
+- `heifer-isobmff`: bounded cumulative sample counts across all tracks in `parse_tracks`
+  (`MAX_SAMPLES = 1 << 18`) and eliminated redundant `vec![uniform; sample_count]` allocations for
+  uniform `stsz` (fixes 214 MB OOM on a 5.6 KB input found by 8-hour overnight fuzzing).
+- `heifer-hevc-dec`: skip `view_reuse` test cleanly when optional local fixtures and conformance
+  streams are absent, so `cargo test --workspace` passes on a fresh clone.
+- Added differential fuzz targets `info` and `image_decoder` plus regression inputs under
+  `fuzz/regressions/{parallel,container}`.
 
 ## 0.7.3 — 2026-11-26
 
