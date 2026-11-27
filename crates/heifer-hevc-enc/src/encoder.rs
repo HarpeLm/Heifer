@@ -2406,7 +2406,12 @@ impl<'a> Encoder<'a> {
         let j_whole = d_whole + self.lambda * (self.log.bit_count() - start_bits);
         // Blocks that cost little per pixel are smooth enough: splitting them almost never pays.
         let per_pixel = j_whole / (self.lambda * f64::from(size * size));
-        if !residual || per_pixel < split_threshold(log2_size) {
+        let split_thresh = match self.speed {
+            SpeedPreset::Fast => split_threshold(log2_size) * 2.5,
+            SpeedPreset::Medium => split_threshold(log2_size),
+            SpeedPreset::Slow => split_threshold(log2_size) * 0.75,
+        };
+        if !residual || per_pixel < split_thresh {
             self.recycle(start);
             return d_whole;
         }
@@ -2542,7 +2547,12 @@ impl<'a> Encoder<'a> {
                 mode,
             ));
         };
-        for &mode in [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34].iter().chain(&mpm) {
+        let coarse: &[u8] = if self.speed == SpeedPreset::Fast {
+            &[0, 1, 2, 10, 18, 26, 34]
+        } else {
+            &[0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34]
+        };
+        for &mode in coarse.iter().chain(&mpm) {
             eval(self, &mut costs, mode);
         }
         let best_angle = costs
@@ -2563,7 +2573,12 @@ impl<'a> Encoder<'a> {
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.last_satd = costs[0].0 / f64::from(1u32 << (2 * log2_size)) / self.sqrt_lambda;
         // Only modes whose estimate is close to the best one are worth coding for real.
-        let limit = costs[0].0 * 1.25;
+        let factor = if self.speed == SpeedPreset::Fast {
+            1.12
+        } else {
+            1.25
+        };
+        let limit = costs[0].0 * factor;
         costs
             .into_iter()
             .take(count)
@@ -2610,7 +2625,8 @@ impl<'a> Encoder<'a> {
             sse: sse as f64 * w,
         };
         // Tried while it wins often enough (graphics, text), not on photos where it hardly does.
-        let worth = self.ts_trials.0 < 256 || self.ts_trials.1 * 32 >= self.ts_trials.0;
+        let worth = self.speed != SpeedPreset::Fast
+            && (self.ts_trials.0 < 256 || self.ts_trials.1 * 32 >= self.ts_trials.0);
         if log2_size != 2 || !tb.coded() || !TRANSFORM_SKIP || !worth {
             return tb;
         }
@@ -2736,6 +2752,7 @@ impl<'a> Encoder<'a> {
             );
         }
         let mut exact = std::mem::take(&mut self.exact);
+        let fast = self.speed == SpeedPreset::Fast;
         let has_levels = quantize_levels(
             &mut coeffs[..n * n],
             log2_size,
@@ -2743,6 +2760,21 @@ impl<'a> Encoder<'a> {
             bd,
             Some(&mut exact[..n * n]),
         );
+        if fast {
+            let levels = &mut coeffs[..n * n];
+            if has_levels {
+                let scan = scan_type(log2_size, c == 0 || self.csx == 1, mode);
+                hide_signs(levels, &exact[..n * n], log2_size, scan, self.sdh_rate);
+            }
+            self.exact = exact;
+            let levels = if has_levels && levels.iter().any(|&v| v != 0) {
+                levels.to_vec()
+            } else {
+                Vec::new()
+            };
+            self.coeffs = coeffs;
+            return levels;
+        }
         if !has_levels && exact[..n * n].iter().all(|&level| level.abs() < 0.5) {
             self.exact = exact;
             self.coeffs = coeffs;
@@ -2878,7 +2910,14 @@ impl<'a> Encoder<'a> {
             costs.push((cost, syntax, mode));
         }
         costs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let tried = 2;
+        if self.speed == SpeedPreset::Fast {
+            return (costs[0].1, costs[0].2);
+        }
+        let tried = match self.speed {
+            SpeedPreset::Fast => 1,
+            SpeedPreset::Medium => 2,
+            SpeedPreset::Slow => 3,
+        };
         // The best few by SATD are coded (as one transform block per component), and the
         // cheapest in rate and distortion is kept.
         let log2_tb = log2_c.min(self.max_chroma_log2());
@@ -3087,10 +3126,10 @@ impl<'a> Encoder<'a> {
             }
         }
         let mpm = self.mpm_candidates(x0, y0);
-        let mode_count = if self.speed == SpeedPreset::Fast {
-            3
-        } else {
-            5
+        let mode_count = match self.speed {
+            SpeedPreset::Fast => 2,
+            SpeedPreset::Medium => 5,
+            SpeedPreset::Slow => 6,
         };
         let modes = match self.mode_cache.take() {
             Some((key, modes)) if key == (x0, y0, log2_size) => modes,
@@ -3137,16 +3176,23 @@ impl<'a> Encoder<'a> {
         // A prediction good enough to need no residual, or cheap enough, is not improved by
         // smaller blocks.
         let per_pixel = best.as_ref().map_or(0.0, |b| b.0) / (self.lambda * f64::from(size * size));
-        if *residual && log2_size <= LOG2_MAX_TB && per_pixel >= small_blocks_threshold(log2_size) {
+        let small_thresh = if self.speed == SpeedPreset::Fast {
+            small_blocks_threshold(log2_size) * 2.5
+        } else {
+            small_blocks_threshold(log2_size)
+        };
+        if *residual && log2_size <= LOG2_MAX_TB && per_pixel >= small_thresh {
             let mode = *mode;
             try_kind(self, &mut best, &mut current, CuKind::SplitTransform, mode);
             // Where split transforms win, the next modes may win with them too.
-            if best.as_ref().is_some_and(|b| b.2 == CuKind::SplitTransform) {
+            if self.speed != SpeedPreset::Fast
+                && best.as_ref().is_some_and(|b| b.2 == CuKind::SplitTransform)
+            {
                 for &m in modes.iter().filter(|&&m| m != mode).take(2) {
                     try_kind(self, &mut best, &mut current, CuKind::SplitTransform, m);
                 }
             }
-            if log2_size == LOG2_MIN_CB {
+            if log2_size == LOG2_MIN_CB && self.speed != SpeedPreset::Fast {
                 try_kind(self, &mut best, &mut current, CuKind::FourBlocks, mode);
             }
         }
