@@ -1,6 +1,6 @@
 # Benchmarks
 
-heifer 0.8.0 against the other HEIC decoders and encoders, measured in November 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
+heifer 0.9.0 against the other HEIC decoders and encoders, measured in November 2026, on an Apple M5 (4 performance + 6 efficiency cores), macOS 27.0.1. Reproduce with `python3 benchmarks/run.py` (macOS, ffmpeg with libx265, numpy).
 
 Competitors: `heic-rs` 0.1.4, `heic` 0.1.6, `heic-decoder` 0.1.1, `zune-heic` 0.5.0, `still265` 0.6.0, ffmpeg 9.0.2, and Apple's ImageIO (`sips`, hardware HEVC).
 
@@ -99,11 +99,13 @@ Encoding `photo12.png`, median of 3 runs each. PSNR against the source, decoded 
 
 | Encoder | Quality | Size | PSNR | Time |
 |---|---|---|---|---|
-| heifer | 40 | 62 KB | 31.5 dB | 514 ms |
-| heifer | 60 | 245 KB | 38.6 dB | 765 ms |
-| heifer | 75 | 567 KB | 44.1 dB | 1119 ms |
-| heifer | 85 | 939 KB | 47.0 dB | 1277 ms |
-| heifer | 95 | 1523 KB | 49.1 dB | 1388 ms |
+| heifer (`medium`) | 40 | 62 KB | 31.5 dB | 514 ms |
+| heifer (`medium`) | 60 | 245 KB | 38.6 dB | 765 ms |
+| heifer (`medium`) | 75 | 567 KB | 44.1 dB | 815 ms |
+| heifer (`medium`) | 85 | 939 KB | 47.0 dB | 1016 ms |
+| heifer (`medium`) | 95 | 1523 KB | 49.1 dB | 1388 ms |
+| heifer (`fast`) | 75 | 594 KB | — | 374 ms |
+| heifer (`fast`) | 85 | 983 KB | — | 459 ms |
 | libheif x265 | 30 | 184 KB | 36.7 dB | 724 ms |
 | libheif x265 | 40 | 322 KB | 39.9 dB | 802 ms |
 | libheif x265 | 50 | 538 KB | 42.8 dB | 910 ms |
