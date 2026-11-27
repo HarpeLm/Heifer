@@ -125,6 +125,66 @@ fn edit_lists_show_frames_again() {
 }
 
 #[test]
+fn edit_lists_wait_before_the_first_frame() {
+    // Nokia C030: an empty edit of 0.5 s, then the 0.8 s of media.
+    let Some(bytes) = fixture("edit_list_delay.heic") else {
+        eprintln!("skipping edit_list_delay.heic: run scripts/fetch-fixtures.sh");
+        return;
+    };
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    assert!((seq.start_delay - 0.5).abs() < 1e-9, "{}", seq.start_delay);
+    assert!((seq.duration() - 0.8).abs() < 1e-9, "{}", seq.duration());
+    assert!(!seq.repeats_forever);
+    let frames = heifer::decode_sequence(&bytes).unwrap();
+    assert_eq!(frames.len(), seq.frames.len());
+}
+
+#[test]
+fn repeated_edit_lists_play_until_the_track_ends() {
+    // Nokia C036, C037, C038: an all-intra sequence of 0.8 s with the repeat flag, and a
+    // track lasting 2.4 s, 1.2 s and forever.
+    for (name, passes, duration, forever) in [
+        ("edit_list_loop_3.heic", 3.0, 2.4, false),
+        ("edit_list_loop_1_5.heic", 1.5, 1.2, false),
+        ("edit_list_loop_forever.heic", 1.0, 0.8, true),
+    ] {
+        let Some(bytes) = fixture(name) else {
+            eprintln!("skipping {name}: run scripts/fetch-fixtures.sh");
+            continue;
+        };
+        let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+        assert!(
+            (seq.duration() - duration).abs() < 1e-9,
+            "{name}: {}",
+            seq.duration()
+        );
+        assert_eq!(seq.repeats_forever, forever, "{name}");
+        assert_eq!(seq.start_delay, 0.0, "{name}");
+        let all: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(all.len(), seq.frames.len(), "{name}");
+        let pass = (all.len() as f64 / passes).round() as usize;
+        assert!(
+            pass > 1 && pass < all.len() || forever,
+            "{name}: {} frames",
+            all.len()
+        );
+        for i in pass..all.len() {
+            assert_eq!(all[i], all[i - pass], "{name}: frame {i} shown again");
+        }
+        assert_ne!(all[0], all[1], "{name}");
+        let last = all.len() - 1;
+        assert_eq!(
+            heifer::decode_sequence_frame(&bytes, last).unwrap(),
+            all[last],
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn still_images_have_no_sequence() {
     let rgba = vec![90u8; 32 * 32 * 4];
     let bytes = heifer::encode_rgba8(32, 32, &rgba, &Default::default()).unwrap();

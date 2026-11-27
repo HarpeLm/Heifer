@@ -28,6 +28,10 @@ fetch "$CONFORMANCE/C034.heic"                 zero_length_nal.heic
 fetch "$CONFORMANCE/C044.heic"                 predicted.heic
 fetch "$CONFORMANCE/C041.heic"                 hidden_first_sample.heic
 fetch "$CONFORMANCE/C029.heic"                 edit_list_repeat.heic
+fetch "$CONFORMANCE/C030.heic"                 edit_list_delay.heic
+fetch "$CONFORMANCE/C036.heic"                 edit_list_loop_3.heic
+fetch "$CONFORMANCE/C037.heic"                 edit_list_loop_1_5.heic
+fetch "$CONFORMANCE/C038.heic"                 edit_list_loop_forever.heic
 fetch https://raw.githubusercontent.com/strukturag/libheif/master/examples/example.heic libheif_example.heic
 # A Samsung photo with an ISO 21496-1 gain map (tmap item).
 fetch "$PILLOW/tests/images/heif_special/aux_YCbCr.heic" real/heif_special__aux_YCbCr.heic

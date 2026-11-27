@@ -38,10 +38,16 @@ pub struct SequenceInfo {
     pub height: u32,
     /// The frames, in display order.
     pub frames: Vec<FrameInfo>,
+    /// How long to wait before the first frame, in seconds (empty edits of the edit list).
+    pub start_delay: f64,
+    /// Whether the frames play again forever (the edit list's repeat flag with an indefinite
+    /// duration). A finite number of repeats is already in [`frames`](Self::frames).
+    pub repeats_forever: bool,
 }
 
 impl SequenceInfo {
-    /// Total duration, in seconds.
+    /// Total duration of the frames, in seconds, without the
+    /// [`start_delay`](Self::start_delay).
     pub fn duration(&self) -> f64 {
         self.frames.iter().map(|f| f.duration).sum()
     }
@@ -133,6 +139,8 @@ pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
         width: track.width,
         height: track.height,
         frames,
+        start_delay: track.start_delay() as f64 / scale,
+        repeats_forever: track.repeats_forever(),
     }))
 }
 

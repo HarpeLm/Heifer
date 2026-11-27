@@ -11,8 +11,12 @@
   longer shown (Nokia C041: 8 frames and 0.8 s instead of 9 frames and 2,147,484 s).
 - Image sequence edit lists (`edts`/`elst`) are applied: frames an edit skips are not shown,
   frames it selects again are shown again (Nokia C029: 13 frames and 1.3 s instead of 8), and a
-  media rate of 0 holds one picture. Empty edits (a start delay) and the repeat flag are still
-  ignored. New `Track::edits` and `Track::presentation` in `heifer-isobmff`.
+  media rate of 0 holds one picture. Leading empty edits become
+  `SequenceInfo::start_delay` (Nokia C030) and a later one keeps the previous frame on screen.
+  With the repeat flag, the frames play again until the track's duration is over (C036, C037);
+  an indefinite duration sets `SequenceInfo::repeats_forever` (C038). New `Track::edits`,
+  `repeat_edits`, `presented_duration`, `presentation`, `start_delay` and `repeats_forever` in
+  `heifer-isobmff`.
 - Zero-length NAL units in item and sample data, and empty `hvcC` entries, are skipped (Nokia
   C034, #12, by @argentist).
 
