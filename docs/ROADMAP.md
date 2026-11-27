@@ -9,16 +9,13 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.7.3 — per-thread grid buffer reuse, direct 8-bit `Frame8` planes, and
-  zero-copy `CropWindow` decoding (`200 MP` multi-core `401 ms`, 1-thread `1221 ms`; `48 MP`
-  multi-core `113 ms`, 1-thread `650 ms`; `12 MP` iPhone `89 ms` `heifer8` 1-thread vs `105 ms`
-  for `heic-rs`, `15 ms` on 10 cores), building on `0.7.0`–`0.7.2` (image sequences with P, B and
-  hierarchical B-frames, TMVP, `ctts` v0 + `edts`/`elst`, alpha auxiliary tracks, 4:2:2/4:4:4/lossless
-  & 10-bit, `EncodeSpeed` presets, full `.heics` CLI and WASM demo support, IPTC metadata, reader
-  decoding, and crates.io Trusted Publishing). Post-`0.7.3` on `main`: header-only `read_info` /
-  `read_info_reader` + `decode_reader_rgba8`, lazy limit-enforcing `HeifDecoder` with 8-bit fast
-  path, differential fuzz targets (`info`, `image_decoder`), and `#[non_exhaustive]` pre-1.0 API
-  hardening.
+- Latest release: 0.8.0 — header-only `read_info` / `read_info_reader` + `decode_reader_rgba8`,
+  lazy limit-enforcing `HeifDecoder` with 8-bit fast path, `#[non_exhaustive]` pre-1.0 API
+  hardening, fused `clap`/`irot`/`imir` grid tile transforms, faster `deblock`/`SAO` and intra
+  reference loops, edit lists (`edts`/`elst`), predicted image items (`pred`), and zero-length NAL
+  tolerance (`200 MP` multi-core `185 ms`, 1-thread `885 ms`; `48 MP` multi-core `106 ms`,
+  1-thread `622 ms`; `12 MP` Apple photo `83 ms` `heifer8` 1-thread vs `108 ms` for `heic-rs`,
+  `14 ms` on 10 cores; 13-file suite `582 ms` 1-thread / `127 ms` on 10 cores).
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   images (`unci`), image sequences (114 conformance bitstreams match their MD5).
 - Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
@@ -106,11 +103,13 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
 
 Multi-threaded decoding is already faster than libheif. Safe-Rust optimization passes across CABAC,
 residual parsing, transforms/intra prediction, lazy motion allocation, deblocking/SAO, inter
-interpolation, buffer reuse, direct `Frame8` planes and zero-copy `CropWindow` decoding cut
-single-thread decode time cleanly (`0.7.3` on Apple M5: 12 MP iPhone `89 ms` `heifer8` vs
-`105 ms` for `heic-rs` — `1.18×` faster; 13-file suite `632` vs `740 ms`; 5 MP Xiaomi `74 ms`;
-48 MP `650 ms`; 114 conformance streams / 7115 pictures bit-exact). Direct `u8` tile output
-remains a target for further single-thread and memory-bandwidth gains without `unsafe`.
+interpolation, buffer reuse, direct `Frame8` planes, zero-copy `CropWindow` decoding, and fused
+`clap`/`irot`/`imir` grid tile transforms cut both single-thread and multi-core decode times
+(`0.8.0` on Apple M5: 12 MP Apple photo `83 ms` `heifer8` vs `108 ms` for `heic-rs` — `1.30×`
+faster, `14 ms` on 10 cores; 13-file suite `582` vs `738 ms`, `127 ms` on 10 cores; 5 MP Xiaomi
+`64 ms` / `13 ms`; 48 MP `622 ms` / `106 ms`; 200 MP Galaxy `885 ms` / `185 ms`; 114 conformance
+streams / 7115 pictures bit-exact). Remaining single-thread hotspots (such as `residual_coding`)
+remain targets for further gains without `unsafe`.
 
 ### 2. More encoding knobs
 
