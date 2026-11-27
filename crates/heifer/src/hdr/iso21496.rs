@@ -38,6 +38,51 @@ pub(super) fn decode(
     .map(Some)
 }
 
+/// Reads the gain map of the file's `tmap` item as linear `0.0..=1.0` gains with its headroom,
+/// or `None` when the file has no ISO 21496-1 gain map.
+pub(super) fn read_gain_map(
+    file: &HeifFile<'_>,
+    options: &Options,
+) -> Result<Option<super::GainMap>, Error> {
+    let Some(gain) = find(file)? else {
+        return Ok(None);
+    };
+    let headroom = 2.0_f32.powf(
+        gain.metadata
+            .base_headroom
+            .max(gain.metadata.alternate_headroom),
+    );
+    if !headroom.is_finite() {
+        return Err(Error::Invalid("ISO 21496-1 headroom is out of range"));
+    }
+    let map = decode_item_with::<u16>(file, gain.map, 1, options)?;
+    let max = f32::from(map.max_value());
+    let data = if gain.metadata.multichannel {
+        let inv_gamma = gain.metadata.gamma.map(|g| 1.0 / g);
+        map.data
+            .chunks_exact(4)
+            .map(|p| {
+                let r = (f32::from(p[0]) / max).powf(inv_gamma[0]);
+                let g = (f32::from(p[1]) / max).powf(inv_gamma[1]);
+                let b = (f32::from(p[2]) / max).powf(inv_gamma[2]);
+                (r + g + b) / 3.0
+            })
+            .collect()
+    } else {
+        let inv_gamma = 1.0 / gain.metadata.gamma[0];
+        map.data
+            .chunks_exact(4)
+            .map(|p| (f32::from(p[0]) / max).powf(inv_gamma))
+            .collect()
+    };
+    Ok(Some(super::GainMap {
+        width: map.width,
+        height: map.height,
+        data,
+        headroom: headroom.max(1.0),
+    }))
+}
+
 /// The gain map metadata of a `tmap` item. Headrooms and gains are log2 values.
 #[derive(Clone, Copy)]
 struct Metadata {
