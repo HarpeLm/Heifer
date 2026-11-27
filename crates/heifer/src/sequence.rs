@@ -120,21 +120,12 @@ pub fn read_sequence(bytes: &[u8]) -> Result<Option<SequenceInfo>, Error> {
         return Ok(None);
     };
     let scale = f64::from(track.timescale.max(1));
-    let times = track.composition_times();
-    let order = track.display_order();
-    // A frame is shown until the next one; the last one for its sample duration.
-    let frames = order
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| {
-            let ticks = match order.get(k + 1) {
-                Some(&next) => times[next] - times[i],
-                None => i64::from(track.samples[i].duration),
-            };
-            FrameInfo {
-                duration: ticks as f64 / scale,
-                keyframe: track.samples[i].sync,
-            }
+    let frames = track
+        .presentation()
+        .into_iter()
+        .map(|(i, ticks)| FrameInfo {
+            duration: ticks as f64 / scale,
+            keyframe: track.samples[i].sync,
         })
         .collect();
     Ok(Some(SequenceInfo {
@@ -187,8 +178,8 @@ pub fn decode_sequence_frame_with_options(
     options: &Options,
 ) -> Result<Image, Error> {
     let track = main_track(bytes)?.ok_or(Error::Invalid("file has no image sequence"))?;
-    let sample = *track
-        .display_order()
+    let (sample, _) = *track
+        .presentation()
         .get(index)
         .ok_or(Error::Invalid("frame index out of range"))?;
     let start = track.samples[..=sample]
@@ -261,8 +252,10 @@ pub struct SequenceFrames<'a> {
     alpha: Option<(Track, SequenceDecoder)>,
     /// Next sample to decode, in decoding order.
     next: usize,
-    /// Sample indices in display order.
+    /// Sample indices in presentation order (display order, edited by the edit list).
     order: Vec<usize>,
+    /// Display rank of each sample, `usize::MAX` for samples that are not displayed.
+    rank: Vec<usize>,
     /// Next frame to return, in display order.
     shown: usize,
     /// Decoded frames waiting for their turn: sample index and image.
@@ -531,8 +524,14 @@ impl<'a> SequenceFrames<'a> {
             .ok_or_else(|| Error::Unsupported(format!("sequence coding `{}`", track.coding)))?;
         let decoder = new_sequence_decoder(config, options.max_pixels())?;
         let alpha_track = alpha_track(&bytes, &track)?;
-        // Several groups of pictures at once, when decoding the whole sequence.
-        let parallel = if start == 0 {
+        let order: Vec<usize> = track.presentation().into_iter().map(|(i, _)| i).collect();
+        let mut rank = vec![usize::MAX; track.samples.len()];
+        for (r, i) in track.display_order().into_iter().enumerate() {
+            rank[i] = r;
+        }
+        // Several groups of pictures at once, when decoding the whole sequence and the frames
+        // are shown in decoding's direction (an edit list may show a sample again).
+        let parallel = if start == 0 && order.windows(2).all(|w| rank[w[0]] < rank[w[1]]) {
             Parallel::new(&track, alpha_track.as_ref(), &bytes, options)
         } else {
             None
@@ -562,7 +561,8 @@ impl<'a> SequenceFrames<'a> {
             parallel,
             max_pixels: options.max_pixels(),
             bytes,
-            order: track.display_order(),
+            order,
+            rank,
             track,
             decoder,
             alpha,
@@ -580,6 +580,25 @@ impl<'a> SequenceFrames<'a> {
     /// Whether the sequence has no frame.
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// Restarts decoding at the keyframe before `sample`, then decodes up to it, so that
+    /// `sample` is decoded next.
+    fn rewind(&mut self, sample: usize) -> Result<(), Error> {
+        let start = self.track.samples[..=sample]
+            .iter()
+            .rposition(|s| s.sync)
+            .ok_or(Error::Invalid("no keyframe before the frame"))?;
+        let bytes = std::mem::replace(&mut self.bytes, std::borrow::Cow::Borrowed(&[]));
+        let options = Options::new().with_max_pixels(self.max_pixels);
+        let mut fresh = Self::new(bytes, self.track.clone(), start, &options)?;
+        for _ in start..sample {
+            fresh.decode_next(false)?;
+        }
+        fresh.order = std::mem::take(&mut self.order);
+        fresh.shown = self.shown;
+        *self = fresh;
+        Ok(())
     }
 
     /// Decodes the next sample; converts it to an image when `convert`.
@@ -644,6 +663,14 @@ impl Iterator for SequenceFrames<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let &sample = self.order.get(self.shown)?;
         self.shown += 1;
+        let ready = self.pending.iter().any(|(i, _)| *i == sample);
+        if !ready && self.parallel.is_none() && sample < self.next {
+            // Shown again (edit list): decode it again, from its keyframe.
+            if let Err(e) = self.rewind(sample) {
+                self.shown = self.order.len();
+                return Some(Err(e));
+            }
+        }
         // Decode in decoding order until the frame shown next is ready.
         loop {
             if let Some(k) = self.pending.iter().position(|(i, _)| *i == sample) {
@@ -651,7 +678,14 @@ impl Iterator for SequenceFrames<'_> {
             }
             match self.next_decoded() {
                 None => return Some(Err(Error::Invalid("frame missing from the decoding order"))),
-                Some((index, Ok(image))) => self.pending.push((index, image)),
+                // Keep it only if it is shown later in this pass: not a frame left out by the
+                // edit list or by `ctts`, nor one shown again later after a rewind.
+                Some((index, Ok(image))) => {
+                    let rank = self.rank[index];
+                    if index == sample || (rank != usize::MAX && rank > self.rank[sample]) {
+                        self.pending.push((index, image));
+                    }
+                }
                 Some((_, Err(e))) => {
                     // Stop after an error.
                     self.shown = self.order.len();
@@ -755,6 +789,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn edit_lists_skip_and_show_frames_again() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/bframes.mp4"),
+        )
+        .unwrap();
+        let plain = main_track(&bytes).unwrap().unwrap();
+        let decode = |track: Track| {
+            let frames = SequenceFrames::new(
+                bytes.as_slice(),
+                track,
+                0,
+                &Options::new().with_max_threads(4),
+            )
+            .unwrap();
+            let parallel = frames.parallel.is_some();
+            let images: Vec<Image> = frames.collect::<Result<_, _>>().unwrap();
+            (images, parallel)
+        };
+        let (all, _) = decode(plain.clone());
+        assert_eq!(all.len(), 24);
+        // Edits selecting display frames 10 to 13, then 2 and 3, inside a B-frame group.
+        let (times, order) = (plain.composition_times(), plain.display_order());
+        let at = |k: usize| times[order[k]];
+        let mut ahead = plain.edits[0];
+        ahead.media_time = at(10);
+        ahead.duration = at(10).abs_diff(at(14));
+        let mut again = ahead;
+        again.media_time = at(2);
+        again.duration = at(2).abs_diff(at(4));
+        let mut edited = plain.clone();
+        edited.edits = vec![ahead];
+        let (images, parallel) = decode(edited.clone());
+        assert!(parallel, "frames shown forward still decode in parallel");
+        assert_eq!(images, all[10..14]);
+        edited.edits = vec![ahead, again];
+        let (images, parallel) = decode(edited);
+        assert!(!parallel);
+        let expected: Vec<Image> = [10, 11, 12, 13, 2, 3].map(|k| all[k].clone()).into();
+        assert_eq!(images, expected);
     }
 
     #[test]

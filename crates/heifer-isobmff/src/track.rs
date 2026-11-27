@@ -28,6 +28,20 @@ pub struct Sample {
     pub composition_offset: i32,
 }
 
+/// One segment of a track's edit list (`elst`): which part of the media is shown, in the
+/// track's [`Track::timescale`] units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Edit {
+    /// How long the segment lasts.
+    pub duration: u64,
+    /// Composition time where the segment starts in the media; -1 for an empty edit, which
+    /// shows nothing.
+    pub media_time: i64,
+    /// Media rate 0: the picture at `media_time` is held for `duration`.
+    pub dwell: bool,
+}
+
 /// A track of a HEIF file: an image sequence (`pict` handler) or a video (`vide`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -52,6 +66,8 @@ pub struct Track {
     pub samples: Vec<Sample>,
     /// Track references (`tref`): type and referenced track IDs, e.g. `thmb`.
     pub references: Vec<(FourCC, Vec<u32>)>,
+    /// Edit list (`edts`/`elst`), empty when the track has none.
+    pub edits: Vec<Edit>,
 }
 
 impl Track {
@@ -90,6 +106,61 @@ impl Track {
         order
     }
 
+    /// The frames as presented, in order: sample index and how long it is shown, in
+    /// [`timescale`](Self::timescale) units. Without an edit list, the samples of
+    /// [`display_order`](Self::display_order); with one, the part of the media each edit
+    /// selects, so samples can be skipped or shown again.
+    ///
+    /// shortcut: empty edits (a delay before the first frame) and the repeat flag of `elst`
+    /// are ignored; model them if a caller needs the presentation timeline itself.
+    pub fn presentation(&self) -> Vec<(usize, u64)> {
+        let times = self.composition_times();
+        let order = self.display_order();
+        // Each displayed sample is shown from its composition time until the next one's.
+        let spans: Vec<(usize, i64, i64)> = order
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let start = times[i];
+                let end = order.get(k + 1).map_or_else(
+                    || start.saturating_add(i64::from(self.samples[i].duration)),
+                    |&next| times[next],
+                );
+                (i, start, end)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for edit in self.edits.iter().filter(|e| e.media_time >= 0) {
+            let start = edit.media_time;
+            if edit.dwell {
+                if let Some(&(i, ..)) = spans.iter().find(|&&(_, s, e)| s <= start && start < e) {
+                    out.push((i, edit.duration));
+                }
+                continue;
+            }
+            let end = start.saturating_add(i64::try_from(edit.duration).unwrap_or(i64::MAX));
+            for &(i, s, e) in &spans {
+                let (from, to) = (s.max(start), e.min(end));
+                if from < to {
+                    out.push((i, from.abs_diff(to)));
+                }
+            }
+            // Edits can repeat the media; keep the list as bounded as the sample tables.
+            if out.len() > MAX_SAMPLES {
+                out.truncate(MAX_SAMPLES);
+                break;
+            }
+        }
+        if out.is_empty() {
+            // No edit, or none that selects a picture: show the media as it is.
+            out = spans
+                .iter()
+                .map(|&(i, s, e)| (i, s.abs_diff(e.max(s))))
+                .collect();
+        }
+        out
+    }
+
     /// The data of sample `index` in `file` (the whole file the track was parsed from).
     pub fn sample_data<'a>(&self, file: &'a [u8], index: usize) -> Result<&'a [u8], Error> {
         let s = self.samples.get(index).ok_or(Error::UnexpectedEof)?;
@@ -122,10 +193,19 @@ pub fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, Error> {
         if b.header.box_type.0 != *b"moov" {
             continue;
         }
+        // Edit list durations are in the movie's timescale (`mvhd`).
+        let movie_timescale = match child(b.content, b"mvhd")? {
+            Some(mvhd) => {
+                let (version, mut r) = full_box(mvhd)?;
+                r.bytes(if version == 1 { 16 } else { 8 })?; // creation and modification times
+                r.u32()?
+            }
+            None => 0,
+        };
         for t in BoxIter::new(b.content) {
             let t = t?;
             if t.header.box_type.0 == *b"trak" {
-                tracks.push(parse_track(t.content)?);
+                tracks.push(parse_track(t.content, movie_timescale)?);
             }
         }
     }
@@ -164,7 +244,7 @@ fn count(r: &mut Reader<'_>, entry_size: usize, kind: &[u8; 4]) -> Result<usize,
     Ok(n)
 }
 
-fn parse_track(trak: &[u8]) -> Result<Track, Error> {
+fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
     // tkhd: track ID and visual size.
     let (version, mut r) = full_box(required(trak, b"tkhd")?)?;
     let skip_times = if version == 1 { 16 } else { 8 };
@@ -193,6 +273,10 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
     let (version, mut r) = full_box(required(mdia, b"mdhd")?)?;
     r.bytes(if version == 1 { 16 } else { 8 })?; // creation and modification times
     let timescale = r.u32()?;
+    let edits = match child(trak, b"edts")? {
+        Some(edts) => parse_edits(edts, movie_timescale, timescale)?,
+        None => Vec::new(),
+    };
     let (_, mut r) = full_box(required(mdia, b"hdlr")?)?;
     r.bytes(4)?; // pre_defined
     let handler = r.fourcc()?;
@@ -352,7 +436,38 @@ fn parse_track(trak: &[u8]) -> Result<Track, Error> {
         auxiliary_type,
         samples,
         references,
+        edits,
     })
+}
+
+/// The edit list of an `edts` box, with segment durations converted from the movie's
+/// timescale to the track's. Empty without an `elst` box or a movie timescale.
+fn parse_edits(edts: &[u8], movie_timescale: u32, timescale: u32) -> Result<Vec<Edit>, Error> {
+    let Some(elst) = child(edts, b"elst")? else {
+        return Ok(Vec::new());
+    };
+    if movie_timescale == 0 {
+        return Ok(Vec::new());
+    }
+    let (version, mut r) = full_box(elst)?;
+    let n = count(&mut r, if version == 1 { 20 } else { 12 }, b"elst")?;
+    let mut edits = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (duration, media_time) = if version == 1 {
+            (r.u64()?, r.u64()? as i64)
+        } else {
+            (u64::from(r.u32()?), i64::from(r.u32()? as i32))
+        };
+        let rate = r.u16()?;
+        r.bytes(2)?; // media_rate_fraction
+        let duration = u128::from(duration) * u128::from(timescale) / u128::from(movie_timescale);
+        edits.push(Edit {
+            duration: u64::try_from(duration).unwrap_or(u64::MAX),
+            media_time,
+            dwell: rate == 0,
+        });
+    }
+    Ok(edits)
 }
 
 #[cfg(test)]
@@ -380,6 +495,7 @@ mod tests {
                 })
                 .collect(),
             references: Vec::new(),
+            edits: Vec::new(),
         }
     }
 
@@ -395,5 +511,37 @@ mod tests {
         assert_eq!(track(&[0; 3]).display_order(), [0, 1, 2]);
         // A first sample that is only a reference, as in Nokia's C041.
         assert_eq!(track(&[i32::MIN, 0, 0]).display_order(), [1, 2]);
+    }
+
+    #[test]
+    fn presentation_follows_the_edit_list() {
+        let edit = |media_time, duration| Edit {
+            duration,
+            media_time,
+            dwell: false,
+        };
+        let shown = |edits: Vec<Edit>| {
+            let mut t = track(&[0; 4]);
+            t.edits = edits;
+            t.presentation()
+        };
+        let all = vec![(0, 1), (1, 1), (2, 1), (3, 1)];
+        assert_eq!(shown(Vec::new()), all);
+        // The first two samples, then all of them (Nokia C029, scaled down).
+        assert_eq!(
+            shown(vec![edit(0, 2), edit(0, 100)]),
+            [(0, 1), (1, 1), (0, 1), (1, 1), (2, 1), (3, 1)]
+        );
+        // Starting later skips samples; a segment past the media ends with it.
+        assert_eq!(shown(vec![edit(1, 2)]), [(1, 1), (2, 1)]);
+        assert_eq!(shown(vec![edit(2, 50)]), [(2, 1), (3, 1)]);
+        // An empty edit is a delay, ignored; edits selecting nothing show the media as it is.
+        assert_eq!(shown(vec![edit(-1, 5), edit(0, 4)]), all);
+        assert_eq!(shown(vec![edit(-1, 5)]), all);
+        assert_eq!(shown(vec![edit(10, 5)]), all);
+        // Media rate 0 holds one picture.
+        let mut hold = edit(2, 7);
+        hold.dwell = true;
+        assert_eq!(shown(vec![hold]), [(2, 7)]);
     }
 }

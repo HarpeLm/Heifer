@@ -97,6 +97,34 @@ fn samples_that_are_not_displayed_are_decoded_but_not_shown() {
 }
 
 #[test]
+fn edit_lists_show_frames_again() {
+    // Nokia C029: an edit list shows the first 5 of 8 frames, then all 8 (100 ms each).
+    let Some(bytes) = fixture("edit_list_repeat.heic") else {
+        eprintln!("skipping edit_list_repeat.heic: run scripts/fetch-fixtures.sh");
+        return;
+    };
+    let seq = heifer::read_sequence(&bytes).unwrap().unwrap();
+    assert_eq!(seq.frames.len(), 13);
+    assert!((seq.duration() - 1.3).abs() < 1e-9, "{}", seq.duration());
+    let all: Vec<heifer::Image> = heifer::decode_sequence(&bytes)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(all.len(), 13);
+    for i in 0..5 {
+        assert_eq!(all[i], all[i + 5], "frame {i} shown again");
+    }
+    assert_ne!(all[0], all[1]);
+    for i in [0, 5, 12] {
+        assert_eq!(
+            heifer::decode_sequence_frame(&bytes, i).unwrap(),
+            all[i],
+            "frame {i}"
+        );
+    }
+}
+
+#[test]
 fn still_images_have_no_sequence() {
     let rgba = vec![90u8; 32 * 32 * 4];
     let bytes = heifer::encode_rgba8(32, 32, &rgba, &Default::default()).unwrap();
