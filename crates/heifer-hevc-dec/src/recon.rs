@@ -1831,8 +1831,8 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
                         f[(65 + x) as usize] = ((63 - x) * corner + (x + 1) * t63 + 32) >> 6;
                     }
                 } else {
-                    for i in 1..total - 1 {
-                        f[i] = (refs[i - 1] + 2 * refs[i] + refs[i + 1] + 2) >> 2;
+                    for (dst, w) in f[1..total - 1].iter_mut().zip(refs.windows(3)) {
+                        *dst = (w[0] + 2 * w[1] + w[2] + 2) >> 2;
                     }
                 }
                 refs = &smoothed[..total];
@@ -1902,10 +1902,28 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
             _ => {
                 let angle = INTRA_PRED_ANGLE[usize::from(mode) - 2];
                 let vertical = mode >= 18;
-                let mut r = [0i32; 3 * 32 + 1];
-                let (ref_base, ref_slice): (usize, &[i32]) = if vertical && angle >= 0 {
-                    (2 * n, refs)
+                // j runs along the prediction direction: rows for vertical modes. Rows are
+                // computed contiguously (vectorizable), then transposed for horizontal modes.
+                if vertical && angle >= 0 {
+                    let ref_base = 2 * n;
+                    for (j, line) in pred.chunks_exact_mut(n).enumerate() {
+                        let step = (j as i32 + 1) * angle;
+                        let idx = step >> 5;
+                        let fact = step & 31;
+                        let start = (idx + 1 + ref_base as i32) as usize;
+                        if fact == 0 {
+                            line.copy_from_slice(&refs[start..start + n]);
+                        } else {
+                            let w0 = 32 - fact;
+                            let s0 = &refs[start..start + n];
+                            let s1 = &refs[start + 1..start + n + 1];
+                            for ((o, &a), &b) in line.iter_mut().zip(s0).zip(s1) {
+                                *o = (w0 * a + fact * b + 16) >> 5;
+                            }
+                        }
+                    }
                 } else {
+                    let mut r = [0i32; 3 * 32 + 1];
                     let main = |i: i32| {
                         if vertical {
                             top(refs, i - 1)
@@ -1936,27 +1954,27 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
                             r[(x + n_i) as usize] = main(x);
                         }
                     }
-                    (n, &r)
-                };
-                // j runs along the prediction direction: rows for vertical modes. Rows are
-                // computed contiguously (vectorizable), then transposed for horizontal modes.
-                for (j, line) in pred.chunks_exact_mut(n).enumerate() {
-                    let j = j as i32;
-                    let idx = ((j + 1) * angle) >> 5;
-                    let fact = ((j + 1) * angle) & 31;
-                    let src = &ref_slice[(idx + 1 + ref_base as i32) as usize..];
-                    if fact == 0 {
-                        line.copy_from_slice(&src[..n]);
-                    } else {
-                        for ((o, &a), &b) in line.iter_mut().zip(src).zip(&src[1..]) {
-                            *o = ((32 - fact) * a + fact * b + 16) >> 5;
+                    for (j, line) in pred.chunks_exact_mut(n).enumerate() {
+                        let step = (j as i32 + 1) * angle;
+                        let idx = step >> 5;
+                        let fact = step & 31;
+                        let start = (idx + 1 + n_i) as usize;
+                        if fact == 0 {
+                            line.copy_from_slice(&r[start..start + n]);
+                        } else {
+                            let w0 = 32 - fact;
+                            let s0 = &r[start..start + n];
+                            let s1 = &r[start + 1..start + n + 1];
+                            for ((o, &a), &b) in line.iter_mut().zip(s0).zip(s1) {
+                                *o = (w0 * a + fact * b + 16) >> 5;
+                            }
                         }
                     }
-                }
-                if !vertical {
-                    for y in 0..n {
-                        for x in y + 1..n {
-                            pred.swap(y * n + x, x * n + y);
+                    if !vertical {
+                        for y in 0..n {
+                            for x in y + 1..n {
+                                pred.swap(y * n + x, x * n + y);
+                            }
                         }
                     }
                 }
@@ -2186,40 +2204,45 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
                 self.luma_residual[..n * n].fill(0);
             }
             if !(tb.inter && prediction.is_none()) {
-                let mut scratch = std::mem::take(&mut self.scratch);
-                let (pred_buf, rest) = scratch.split_at_mut(32 * 32);
-                let (_, rest) = rest.split_at_mut(3 * 32 * 32);
-                let (refs_buf, smooth_buf) = rest.split_at_mut(4 * 32 + 1);
-                let pred = &mut pred_buf[..n * n];
-                match prediction {
-                    Some(p) => pred.copy_from_slice(&p[..n * n]),
-                    None => {
-                        let refs_arr: &mut [i32; 4 * 32 + 1] =
-                            (&mut refs_buf[..4 * 32 + 1]).try_into().unwrap();
-                        let smooth_arr: &mut [i32; 4 * 32 + 1] =
-                            (&mut smooth_buf[..4 * 32 + 1]).try_into().unwrap();
-                        self.reference_samples_into(c, tb.x, tb.y, n, refs_arr);
-                        self.predict_with(
-                            c,
-                            n,
-                            tb.intra_mode,
-                            tb.transquant_bypass,
-                            refs_arr,
-                            smooth_arr,
-                            pred,
-                        );
-                    }
-                }
                 let max = (1i32 << self.frame.bit_depth()[usize::from(c > 0)]) - 1;
                 let stride = self.frame.widths()[c] as usize;
-                let plane = self.frame.plane_mut(c);
-                for (y, p) in pred.chunks_exact(n).enumerate() {
-                    let row = (tb.y as usize + y) * stride + tb.x as usize;
-                    for (o, &p) in plane[row..row + n].iter_mut().zip(p) {
-                        *o = F::Sample::from_clamped(p, max);
+                if let Some(p) = prediction {
+                    let plane = self.frame.plane_mut(c);
+                    for (y, p) in p[..n * n].chunks_exact(n).enumerate() {
+                        let row = (tb.y as usize + y) * stride + tb.x as usize;
+                        for (o, &p) in plane[row..row + n].iter_mut().zip(p) {
+                            *o = F::Sample::from_clamped(p, max);
+                        }
                     }
+                } else {
+                    let mut scratch = std::mem::take(&mut self.scratch);
+                    let (pred_buf, rest) = scratch.split_at_mut(32 * 32);
+                    let (_, rest) = rest.split_at_mut(3 * 32 * 32);
+                    let (refs_buf, smooth_buf) = rest.split_at_mut(4 * 32 + 1);
+                    let pred = &mut pred_buf[..n * n];
+                    let refs_arr: &mut [i32; 4 * 32 + 1] =
+                        (&mut refs_buf[..4 * 32 + 1]).try_into().unwrap();
+                    let smooth_arr: &mut [i32; 4 * 32 + 1] =
+                        (&mut smooth_buf[..4 * 32 + 1]).try_into().unwrap();
+                    self.reference_samples_into(c, tb.x, tb.y, n, refs_arr);
+                    self.predict_with(
+                        c,
+                        n,
+                        tb.intra_mode,
+                        tb.transquant_bypass,
+                        refs_arr,
+                        smooth_arr,
+                        pred,
+                    );
+                    let plane = self.frame.plane_mut(c);
+                    for (y, p) in pred.chunks_exact(n).enumerate() {
+                        let row = (tb.y as usize + y) * stride + tb.x as usize;
+                        for (o, &p) in plane[row..row + n].iter_mut().zip(p) {
+                            *o = F::Sample::from_clamped(p, max);
+                        }
+                    }
+                    self.scratch = scratch;
                 }
-                self.scratch = scratch;
             }
             if c == 0 {
                 if !(tb.inter && self.pps.constrained_intra_pred_flag) {
@@ -2236,8 +2259,8 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
         let (g_buf, rest) = rest.split_at_mut(32 * 32);
         let (refs_buf, smooth_buf) = rest.split_at_mut(4 * 32 + 1);
         let (pred, residual) = (&mut pred[..n * n], &mut residual[..n * n]);
-        match prediction {
-            Some(p) => pred.copy_from_slice(&p[..n * n]),
+        let pred_slice: &[i32] = match prediction {
+            Some(p) => &p[..n * n],
             None if tb.inter => {
                 // Motion compensation already wrote the prediction into the picture.
                 let stride = self.frame.widths()[c] as usize;
@@ -2248,6 +2271,7 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
                         *o = v.to_i32();
                     }
                 }
+                pred
             }
             None => {
                 let refs_arr: &mut [i32; 4 * 32 + 1] =
@@ -2264,8 +2288,9 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
                     smooth_arr,
                     pred,
                 );
+                pred
             }
-        }
+        };
 
         if let Some(coeffs) = tb.coeffs {
             self.residual(tb, coeffs, residual, d, g_buf);
@@ -2288,7 +2313,7 @@ impl<'a, F: ReconFrame> Reconstructor<'a, F> {
         let max = (1i32 << self.frame.bit_depth()[usize::from(c > 0)]) - 1;
         let stride = self.frame.widths()[c] as usize;
         let plane = self.frame.plane_mut(c);
-        for (y, (p, r)) in pred
+        for (y, (p, r)) in pred_slice
             .chunks_exact(n)
             .zip(residual.chunks_exact(n))
             .enumerate()
