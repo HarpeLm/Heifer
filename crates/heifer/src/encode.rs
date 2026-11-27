@@ -877,6 +877,7 @@ fn encode_monochrome(
     // The gain map shapes every tone: code it with the same quality as the base image.
     let config = EncoderConfig {
         qp: options.qp(),
+        speed: options.speed.preset(),
         ..EncoderConfig::default()
     };
     if width <= TILE && height <= TILE {
