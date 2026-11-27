@@ -9,13 +9,12 @@ Items are ordered by user impact.
 
 ## Status
 
-- Latest release: 0.8.0 — header-only `read_info` / `read_info_reader` + `decode_reader_rgba8`,
-  lazy limit-enforcing `HeifDecoder` with 8-bit fast path, `#[non_exhaustive]` pre-1.0 API
-  hardening, fused `clap`/`irot`/`imir` grid tile transforms, faster `deblock`/`SAO` and intra
-  reference loops, edit lists (`edts`/`elst`), predicted image items (`pred`), and zero-length NAL
-  tolerance (`200 MP` multi-core `185 ms`, 1-thread `885 ms`; `48 MP` multi-core `106 ms`,
-  1-thread `622 ms`; `12 MP` Apple photo `83 ms` `heifer8` 1-thread vs `108 ms` for `heic-rs`,
-  `14 ms` on 10 cores; 13-file suite `582 ms` 1-thread / `127 ms` on 10 cores).
+- Latest release: 0.9.0 — bounded-memory tile-by-tile preview decoding (`PreviewOptions`,
+  `decode_preview_rgba8`, `decode_reader_preview_rgba8`), `decode_reader_srgb_rgba8` +
+  `Options::fallback_to_coded_color`, ISO 21496-1 `tmap` + Apple `hdrgainmap` extraction in
+  `read_gain_map`, still-image `EncodeSpeed::Fast` (~2.2× faster end-to-end on 12 MP: `371 ms` at
+  q=75, `456 ms` at q=85), and safe-Rust encoder/decoder hot-loop speedups (`12 MP` q=82 `Medium`
+  `823 ms` vs `903 ms` in `0.8.0`).
 - Decoding: HEVC still images, grids, overlays, alpha planes, depth maps, gain maps, uncompressed
   images (`unci`), image sequences (114 conformance bitstreams match their MD5).
 - Encoding: 4:2:0, 4:2:2, 4:4:4, lossless, alpha, grids, `tmap` gain maps, and `.heics` image
@@ -97,9 +96,29 @@ codec: AVIF, VVC, AVC, JPEG and JPEG 2000 stay out of scope.
   `Metadata` (with builders `new()` / `with_*`) and `DepthRepresentation`; differential fuzz targets
   `info` and `image_decoder`.
 
+### Bounded previews, fast still encoding, and ISO 21496-1 gain map reader (`0.9.0`)
+
+- Bounded-memory tile-by-tile preview decoding (`PreviewOptions`, `decode_preview_rgba8`,
+  `decode_reader_preview_rgba8`) for large grids (48–200 MP), servers, and WASM.
+- `decode_reader_srgb_rgba8` and `Options::with_fallback_to_coded_color(bool)`.
+- `read_gain_map` / `read_gain_map_with_options` extended to ISO 21496-1 (`tmap`) in addition to
+  Apple (`urn:com:apple:photo:2020:aux:hdrgainmap`), with crate-root re-exports.
+- Still-image `EncodeSpeed::Fast` / `Slow` wired up in `heifer-hevc-enc` (`12 MP` q=75 `371 ms`
+  vs `806 ms` in `Medium`) plus safe-Rust encoder/decoder hot-loop optimizations.
+
 ## Next
 
-### 1. Single-thread hot loops
+### 1. Preparing `heifer 1.0.0`
+
+- Add `read_gain_map_reader` (streaming `Read + Seek` HDR gain map extraction, consistent with
+  `read_metadata_reader` and `decode_reader_preview_rgba8`).
+- Full public API audit (`#[non_exhaustive]`, builders, re-exports, error types, naming
+  consistency) before locking SemVer compatibility for `1.0.0`.
+- Complete `docs.rs` documentation pass, verifying all rustdoc links (`-D warnings`), examples,
+  and pre-1.0 invariants across all feature combinations (`default`, `--no-default-features`,
+  `--all-features`).
+
+### 2. Single-thread hot loops
 
 Multi-threaded decoding is already faster than libheif. Safe-Rust optimization passes across CABAC,
 residual parsing, transforms/intra prediction, lazy motion allocation, deblocking/SAO, inter
@@ -111,14 +130,14 @@ faster, `14 ms` on 10 cores; 13-file suite `582` vs `738 ms`, `127 ms` on 10 cor
 streams / 7115 pictures bit-exact). Remaining single-thread hotspots (such as `residual_coding`)
 remain targets for further gains without `unsafe`.
 
-### 2. More encoding knobs
+### 3. More encoding knobs
 
 - ~~Size targets~~: done (`encode_to_size`, `--max-size`).
 - ~~4:2:2 encoding~~: done.
 - ~~Speed presets~~: done (`EncodeSpeed`, `--speed`).
 - Advanced HEVC parameters for users who need them.
 
-### 3. Fixtures and fuzzing
+### 4. Fixtures and fuzzing
 
 - More real files from phones and cameras.
 - Keep the fuzzing corpus growing.
