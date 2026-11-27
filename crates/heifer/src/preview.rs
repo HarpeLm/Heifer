@@ -67,7 +67,7 @@ impl PreviewOptions {
         self
     }
 
-    /// Sets [`max_canvas_pixels`](Self::max_canvas_pixels): `0` means the default limit (2^28).
+    /// Sets [`max_canvas_pixels`](field@Self::max_canvas_pixels): `0` means the default limit (2^28).
     #[must_use]
     pub const fn with_max_canvas_pixels(mut self, max_canvas_pixels: u64) -> Self {
         self.max_canvas_pixels = max_canvas_pixels;
