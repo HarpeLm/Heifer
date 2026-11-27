@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-11-27
+
+Bounded-memory tile-by-tile preview decoding (`decode_preview_rgba8` / `decode_reader_preview_rgba8`),
+reader sRGB decoding with graceful ICC fallback (`decode_reader_srgb_rgba8`, `Options::fallback_to_coded_color`),
+ISO 21496-1 `tmap` gain-map extraction in `read_gain_map`, still-image `EncodeSpeed::Fast` (~2.2× faster
+end-to-end / ~3× faster pure HEIC encoding on 12 MP), and safe-Rust encoder/decoder hot-loop speedups.
+
+**New APIs**
+
+- Added bounded-memory preview decoding (`PreviewOptions`, `decode_preview_rgba8`,
+  `decode_reader_preview_rgba8`) that decodes grid tiles directly into a downscaled RGBA buffer
+  without allocating the full-resolution image (ideal for 48–200 MP photos, galleries, and WASM).
+- Added `decode_reader_srgb_rgba8` and `Options::with_fallback_to_coded_color(bool)` so callers
+  can decode from a `Read + Seek` stream to sRGB and gracefully fall back to coded color when an
+  unsupported ICC profile is present.
+- Extended `read_gain_map` and `read_gain_map_with_options` to extract ISO 21496-1 (`tmap`) gain
+  maps in addition to Apple (`urn:com:apple:photo:2020:aux:hdrgainmap`) gain maps, and re-exported
+  `APPLE_GAIN_MAP`, `decode_hdr_with_options`, and `read_gain_map_with_options` at the crate root.
+
+**Performance (100% safe Rust)**
+
+- `heifer-hevc-enc`: wired up `SpeedPreset::Fast` / `Slow` for still-image intra encoding (12 MP
+  `photo12.png` CLI encode drops from `806 ms` → `371 ms` at q=75 and `1019 ms` → `456 ms` at q=85
+  with `EncodeSpeed::Fast`, ~4.7–4.9% larger files; `Medium` remains bit-exact).
+- `heifer-hevc-enc`: optimized `rdoq`, `hide_signs`, even/odd butterfly `forward_transform`,
+  `residual_coding`, `quantize`, `reconstruct`, and `block_sse` (`-8%` to `-10%` faster `Medium`
+  encoding with byte-for-byte identical output: 12 MP q=82 `903 ms` → `823 ms` on 10 threads).
+- `heifer-hevc-dec`: tightened `residual_coding` hot loops, avoided redundant prediction buffer
+  copies in `transform_block_impl`, and eliminated unnecessary stack zeroing in `predict_with`
+  (`-1%` to `-2.2%` faster 1-thread decoding).
 
 **Fixes**
 
