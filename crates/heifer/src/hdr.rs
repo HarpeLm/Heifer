@@ -201,7 +201,9 @@ pub struct HdrImage {
     pub data: Vec<f32>,
 }
 
-/// Reads the HDR gain map of the primary image, if the file has a valid Apple gain map.
+/// Reads the HDR gain map of the primary image, if the file has an ISO 21496-1 (`tmap`) or valid
+/// Apple (`urn:com:apple:photo:2020:aux:hdrgainmap`) gain map. ISO 21496-1 metadata is preferred
+/// when present, matching [`decode_hdr`].
 pub fn read_gain_map(bytes: &[u8]) -> Result<Option<GainMap>, Error> {
     read_gain_map_with_options(bytes, &Options::default())
 }
@@ -211,7 +213,11 @@ pub fn read_gain_map_with_options(
     bytes: &[u8],
     options: &Options,
 ) -> Result<Option<GainMap>, Error> {
-    gain_map(&HeifFile::parse(bytes)?, options)
+    let file = HeifFile::parse(bytes)?;
+    if let Some(map) = iso21496::read_gain_map(&file, options)? {
+        return Ok(Some(map));
+    }
+    gain_map(&file, options)
 }
 
 /// Decodes an ISO 21496-1 or Apple gain-mapped image, or an image with a PQ or HLG transfer, in
