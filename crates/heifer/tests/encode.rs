@@ -529,3 +529,78 @@ fn encode_to_size_fits_the_budget() {
     .unwrap();
     assert_eq!(q, 100);
 }
+
+#[test]
+fn still_speed_presets_round_trip() {
+    let rgba = test_image(128, 96, false);
+    for speed in [
+        heifer::EncodeSpeed::Fast,
+        heifer::EncodeSpeed::Medium,
+        heifer::EncodeSpeed::Slow,
+    ] {
+        let options = EncodeOptions::new().with_quality(80).with_speed(speed);
+        let heic = encode_rgba8(128, 96, &rgba, &options).unwrap();
+        let decoded = decode(&heic).unwrap();
+        assert_eq!((decoded.width, decoded.height), (128, 96));
+        let p = psnr(&rgba, &decoded.to_rgba8(), |c| c < 3);
+        assert!(p > 30.0, "{speed:?}: PSNR {p:.2} dB");
+    }
+}
+
+#[test]
+fn read_gain_map_handles_iso_tmap_and_apple_gain_maps() {
+    let (w, h) = (64u32, 48u32);
+    let rgba = test_image(w, h, false);
+    let base = Image {
+        width: w,
+        height: h,
+        bit_depth: 8,
+        has_alpha: false,
+        data: rgba.iter().map(|&v| u16::from(v)).collect(),
+    };
+    let mut hdr_data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let boost = if x >= w / 2 { 4.0 } else { 1.0 };
+            let i = ((y * w + x) * 4) as usize;
+            for c in 0..3 {
+                let srgb = f32::from(rgba[i + c]) / 255.0;
+                let linear = srgb.powf(2.2).max(0.01);
+                hdr_data.push(linear * boost);
+            }
+        }
+    }
+    let hdr = heifer::HdrImage {
+        width: w,
+        height: h,
+        headroom: 4.0,
+        data: hdr_data,
+    };
+    let heic = heifer::encode_hdr(
+        &base,
+        &hdr,
+        &EncodeOptions::new()
+            .with_quality(80)
+            .with_speed(heifer::EncodeSpeed::Fast),
+    )
+    .unwrap();
+    let gm = heifer::read_gain_map(&heic)
+        .unwrap()
+        .expect("ISO 21496-1 tmap gain map should be readable via read_gain_map");
+    assert_eq!((gm.width, gm.height), (w / 2, h / 2));
+    assert!((gm.headroom - 4.0).abs() < 0.05, "headroom={}", gm.headroom);
+    assert_eq!(gm.data.len(), (gm.width * gm.height) as usize);
+    assert!(gm.data.iter().all(|&v| (0.0..=1.0).contains(&v)));
+    assert!(gm.sample(w - 4, h / 2, w, h) > gm.sample(4, h / 2, w, h) + 0.3);
+
+    // Real ISO 21496-1 `tmap` fixture (when present locally).
+    let fixture = "../../tests/fixtures/real/heif_special__aux_YCbCr.heic";
+    if let Ok(bytes) = std::fs::read(fixture) {
+        let gm = heifer::read_gain_map(&bytes)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected ISO 21496-1 gain map in {fixture}"));
+        assert!(gm.width > 0 && gm.height > 0);
+        assert!(gm.headroom >= 1.0);
+        assert_eq!(gm.data.len(), (gm.width * gm.height) as usize);
+    }
+}
