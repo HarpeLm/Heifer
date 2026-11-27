@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Fixes**
+
+- A forged HEVC stream could make the decoder panic (index out of bounds) instead of returning an
+  error: a dependent slice segment naming another PPS had its address checked against that PPS's
+  picture size, then used the previous segment's smaller picture. Slice segments of one picture
+  must now use the same parameter sets, for still images as for sequences. Found by the `hevc`
+  fuzz target.
+
 ## 0.8.0 — 2026-11-27
 
 Header-only image probing (`read_info`), lazy limit-enforcing `image` crate decoding, pre-1.0

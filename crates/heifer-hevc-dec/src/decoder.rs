@@ -289,6 +289,11 @@ fn decode_picture_with_workspace(
             };
             (pic, recon_state)
         });
+        if !std::ptr::eq(pic.sps, sps) || !std::ptr::eq(pic.pps, pps) {
+            return Err(Error::Invalid(
+                "slices of one picture use different parameter sets",
+            ));
+        }
         recon_state.start_slice(&header);
         let data = &nal.rbsp[header.header_size..];
         recon_state.decode_slice(pic, &header, header.slice_qp_y(&sets)?, data)?;

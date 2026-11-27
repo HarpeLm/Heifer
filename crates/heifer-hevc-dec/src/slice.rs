@@ -227,6 +227,12 @@ impl SliceHeader {
             let prev = previous.ok_or(Error::Invalid(
                 "dependent slice segment without a preceding slice",
             ))?;
+            // The address was checked against this PPS's picture size.
+            if u32::from(prev.slice_pic_parameter_set_id) != pps_id {
+                return Err(Error::Invalid(
+                    "slice segments of one picture use different parameter sets",
+                ));
+            }
             Self {
                 first_slice_segment_in_pic_flag,
                 dependent_slice_segment_flag,
