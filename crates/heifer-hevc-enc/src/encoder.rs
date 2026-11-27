@@ -1225,6 +1225,12 @@ struct Encoder<'a> {
     /// Rate cost of a level made significant or zero, for sign data hiding, in units of the
     /// squared quantization step.
     sdh_rate: f32,
+    /// Precomputed `2^((Qp' - 4) / 3)` for luma and chroma.
+    step2_luma: f64,
+    step2_chroma: f64,
+    /// Precomputed `lambda / weight / step2` for RDOQ (luma and chroma).
+    rdoq_lambda_luma: f32,
+    rdoq_lambda_chroma: f32,
 }
 
 impl<'a> Encoder<'a> {
@@ -1279,6 +1285,11 @@ impl<'a> Encoder<'a> {
         } else {
             chroma_qp(qp)
         };
+        let qp_luma = qp + bd_offset;
+        let qp_c_eff = qp_c + bd_offset;
+        let step2_luma = 2f64.powf(f64::from(qp_luma - 4) / 3.0);
+        let step2_chroma = 2f64.powf(f64::from(qp_c_eff - 4) / 3.0);
+        let chroma_w = if csx == 1 { 1.0 } else { CHROMA_WEIGHT };
         Self {
             recon,
             log: BinLog::new(),
@@ -1296,8 +1307,8 @@ impl<'a> Encoder<'a> {
             width: params.width,
             height: params.height,
             qp,
-            qp_luma: qp + bd_offset,
-            qp_c: qp_c + bd_offset,
+            qp_luma,
+            qp_c: qp_c_eff,
             bit_depth: planes.bit_depth,
             lambda,
             sqrt_lambda: lambda.sqrt(),
@@ -1332,10 +1343,15 @@ impl<'a> Encoder<'a> {
             ts_trials: (0, 0),
             deferred: false,
             // About 3 bits, at λ / step² (step = 2^((Qp′ - 4) / 6)).
-            sdh_rate: (3.0 * lambda / 2f64.powf(f64::from(qp + bd_offset - 4) / 3.0)) as f32,
+            sdh_rate: (3.0 * lambda / step2_luma) as f32,
+            step2_luma,
+            step2_chroma,
+            rdoq_lambda_luma: (lambda / step2_luma) as f32,
+            rdoq_lambda_chroma: (lambda / chroma_w / step2_chroma) as f32,
         }
     }
 
+    #[inline(always)]
     fn bin(&mut self, i: usize, bin: bool) {
         self.log.encode(&mut self.ctx[i], i, u8::from(bin));
     }
@@ -2645,18 +2661,21 @@ impl<'a> Encoder<'a> {
         }
         if levels.is_empty() {
             // The reconstruction is the prediction.
-            return self.diff[..n * n]
-                .iter()
-                .map(|&d| i64::from(d) * i64::from(d))
-                .sum();
+            return self.diff[..n * n].iter().map(|&d| i64::from(d * d)).sum();
         }
         // The transforms preserve energy: the errors of the levels, in quantization steps.
-        let qp = if c == 0 { self.qp_luma } else { self.qp_c };
-        let step2 = 2f64.powf(f64::from(qp - 4) / 3.0);
+        let step2 = if c == 0 {
+            self.step2_luma
+        } else {
+            self.step2_chroma
+        };
         let error: f64 = self.exact[..n * n]
             .iter()
             .zip(levels)
-            .map(|(&e, &l)| (f64::from(e) - f64::from(l)).powi(2))
+            .map(|(&e, &l)| {
+                let d = f64::from(e) - f64::from(l);
+                d * d
+            })
             .sum();
         (error * step2).round() as i64
     }
@@ -2732,8 +2751,11 @@ impl<'a> Encoder<'a> {
         // 4:4:4 chroma scan follows the luma rules at 8×8 too (§7.4.9.11).
         let scan = scan_type(log2_size, c == 0 || self.csx == 1, mode);
         // λ in units of the squared quantization step, 2^((QP - 4) / 3).
-        let w = if c == 0 { 1.0 } else { self.chroma_weight() };
-        let lambda = (self.lambda / w / 2f64.powf(f64::from(qp - 4) / 3.0)) as f32;
+        let lambda = if c == 0 {
+            self.rdoq_lambda_luma
+        } else {
+            self.rdoq_lambda_chroma
+        };
         let levels = &mut coeffs[..n * n];
         rdoq(
             levels,
@@ -2770,10 +2792,14 @@ impl<'a> Encoder<'a> {
         transform_skip: bool,
     ) -> i64 {
         let n = 1usize << log2_size;
-        let (mut cols, mut rows) = (0, 0);
-        for (i, _) in levels.iter().enumerate().filter(|(_, v)| **v != 0) {
-            cols = cols.max(i % n + 1);
-            rows = rows.max(i / n + 1);
+        let (mut cols, mut rows) = (0usize, 0usize);
+        if !levels.is_empty() {
+            for (r, row) in levels[..n * n].chunks_exact(n).enumerate() {
+                if let Some(c_last) = row.iter().rposition(|&v| v != 0) {
+                    cols = cols.max(c_last + 1);
+                    rows = r + 1;
+                }
+            }
         }
         let prediction = std::mem::take(&mut self.pred);
         self.recon.reconstruct(
@@ -2808,10 +2834,12 @@ impl<'a> Encoder<'a> {
         for row in 0..n {
             let r = (y as usize + row) * stride + x as usize;
             let s = (y as usize + row) * src.width + x as usize;
-            for col in 0..n {
-                let d = i64::from(src.samples[s + col]) - i64::from(rec[r + col]);
-                sse += d * d;
+            let mut row_sse = 0i64;
+            for (&sv, &rv) in src.samples[s..s + n].iter().zip(&rec[r..r + n]) {
+                let d = sv - i32::from(rv);
+                row_sse += i64::from(d * d);
             }
+            sse += row_sse;
         }
         sse
     }
@@ -3525,15 +3553,13 @@ impl<'a> Encoder<'a> {
         let log2_sb = log2_size - 2;
         let sb_scan = scan_order(log2_sb, scan);
         let positions = scan_positions(log2_size, scan);
-        let level =
-            |sb: usize, pos: usize| -> i32 { coeffs[usize::from(positions[sb * 16 + pos].0)] };
 
         // Last significant coefficient, in scan order.
         let last_index = positions
             .iter()
             .rposition(|&(i, _, _)| coeffs[usize::from(i)] != 0)
             .expect("the block has a non-zero level");
-        let (last_sb, last_pos) = (last_index / 16, last_index % 16);
+        let (last_sb, last_pos) = (last_index >> 4, last_index & 15);
         let (_, x, y) = positions[last_index];
         let mut last = [u32::from(x), u32::from(y)];
         if scan == ScanType::Vertical {
@@ -3542,64 +3568,91 @@ impl<'a> Encoder<'a> {
         self.last_sig_coeff(last, log2_size, luma);
 
         let sb_width = 1usize << log2_sb;
-        let mut coded_sb = [[false; 8]; 8];
+        let mut coded_sb = 0u64;
         let mut greater1_ctx_state: u8 = 1;
+        let csbf_c_off = if luma { 0 } else { 2 };
+        let g1_c_off = if luma { 0 } else { 16 };
+        let g2_c_off = if luma { 0 } else { 4 };
         for i in (0..=last_sb).rev() {
             let (xs, ys) = sb_scan[i];
             let (xs, ys) = (usize::from(xs), usize::from(ys));
+            let sb_pos = &positions[i * 16..i * 16 + 16];
+            let right = if xs + 1 < sb_width {
+                ((coded_sb >> (ys * 8 + xs + 1)) & 1) as u8
+            } else {
+                0
+            };
+            let below = if ys + 1 < sb_width {
+                ((coded_sb >> ((ys + 1) * 8 + xs)) & 1) as u8
+            } else {
+                0
+            };
+
+            let mut sb_levels = [0i32; 16];
             let mut infer_sb_dc = false;
             if i < last_sb && i > 0 {
-                let mut csbf_ctx = 0;
-                if xs + 1 < sb_width {
-                    csbf_ctx += usize::from(coded_sb[xs + 1][ys]);
+                let mut any_nz = 0i32;
+                for (dst, &(idx, _, _)) in sb_levels.iter_mut().zip(sb_pos) {
+                    let v = coeffs[usize::from(idx)];
+                    *dst = v;
+                    any_nz |= v;
                 }
-                if ys + 1 < sb_width {
-                    csbf_ctx += usize::from(coded_sb[xs][ys + 1]);
+                let csbf_ctx = usize::from((right | below) != 0);
+                let flag = any_nz != 0;
+                self.bin(ctx::CODED_SUB_BLOCK_FLAG + csbf_ctx + csbf_c_off, flag);
+                if !flag {
+                    continue;
                 }
-                let inc = csbf_ctx.min(1) + if luma { 0 } else { 2 };
-                let flag = (0..16).any(|n| level(i, n) != 0);
-                self.bin(ctx::CODED_SUB_BLOCK_FLAG + inc, flag);
-                coded_sb[xs][ys] = flag;
+                coded_sb |= 1u64 << (ys * 8 + xs);
                 infer_sb_dc = true;
             } else {
-                coded_sb[xs][ys] = true;
+                let end = if i == last_sb { last_pos + 1 } else { 16 };
+                for (dst, &(idx, _, _)) in sb_levels[..end].iter_mut().zip(&sb_pos[..end]) {
+                    *dst = coeffs[usize::from(idx)];
+                }
+                coded_sb |= 1u64 << (ys * 8 + xs);
             }
 
             // Significant positions, in decreasing scan position, and their levels.
             let mut sig = [0i32; 16];
-            let mut sig_pos = [0usize; 16];
-            let mut n_sig = 0;
+            let mut sig_abs = [0i32; 16];
+            let mut sig_pos = [0u8; 16];
+            let mut n_sig = 0usize;
             if i == last_sb {
-                sig[0] = level(i, last_pos);
-                sig_pos[0] = last_pos;
+                let v = sb_levels[last_pos];
+                sig[0] = v;
+                sig_abs[0] = v.abs();
+                sig_pos[0] = last_pos as u8;
                 n_sig = 1;
             }
-            if coded_sb[xs][ys] {
-                let prev_csbf = u8::from(xs + 1 < sb_width && coded_sb[xs + 1][ys])
-                    | (u8::from(ys + 1 < sb_width && coded_sb[xs][ys + 1]) << 1);
-                let sig_ctxs = sig_ctx_table(log2_size, scan, luma, prev_csbf, xs + ys == 0);
-                let start = if i == last_sb {
-                    last_pos as i32 - 1
-                } else {
-                    15
-                };
-                for n in (0..=start).rev() {
-                    let n = n as usize;
-                    let v = level(i, n);
-                    if n > 0 || !infer_sb_dc {
-                        let inc = usize::from(sig_ctxs[n]);
-                        self.bin(ctx::SIG_COEFF_FLAG + inc, v != 0);
-                        if v != 0 {
-                            infer_sb_dc = false;
-                        }
-                    }
-                    // Otherwise: the DC of a coded sub-block whose other levels are all zero,
-                    // inferred significant (and therefore non-zero).
-                    if v != 0 {
+
+            let prev_csbf = right | (below << 1);
+            let sig_ctxs = sig_ctx_table(log2_size, scan, luma, prev_csbf, xs + ys == 0);
+            let start = if i == last_sb { last_pos } else { 16 };
+            if start > 0 {
+                for n in (1..start).rev() {
+                    let v = sb_levels[n];
+                    let nz = v != 0;
+                    self.bin(ctx::SIG_COEFF_FLAG + usize::from(sig_ctxs[n]), nz);
+                    if nz {
+                        infer_sb_dc = false;
                         sig[n_sig] = v;
-                        sig_pos[n_sig] = n;
+                        sig_abs[n_sig] = v.abs();
+                        sig_pos[n_sig] = n as u8;
                         n_sig += 1;
                     }
+                }
+                // Position 0 (DC of the sub-block): inferred significant if all other levels were 0.
+                let v0 = sb_levels[0];
+                let nz0 = v0 != 0;
+                if !infer_sb_dc {
+                    self.bin(ctx::SIG_COEFF_FLAG + usize::from(sig_ctxs[0]), nz0);
+                }
+                if nz0 {
+                    sig[n_sig] = v0;
+                    sig_abs[n_sig] = v0.abs();
+                    sig_pos[n_sig] = 0;
+                    n_sig += 1;
                 }
             }
             if n_sig == 0 {
@@ -3612,26 +3665,28 @@ impl<'a> Encoder<'a> {
                 ctx_set += 1;
             }
             greater1_ctx_state = 1;
-            let mut greater1 = [false; 16];
-            let mut first_g1: Option<usize> = None;
-            for k in 0..n_sig.min(8) {
-                let inc = ctx_set * 4
-                    + usize::from(greater1_ctx_state.min(3))
-                    + if luma { 0 } else { 16 };
-                greater1[k] = sig[k].abs() > 1;
-                self.bin(ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + inc, greater1[k]);
-                if greater1[k] {
+            let g1_base = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_set * 4 + g1_c_off;
+            let mut g1_mask = 0u8;
+            let mut first_g1 = usize::MAX;
+            let g1_count = n_sig.min(8);
+            for (k, &abs) in sig_abs[..g1_count].iter().enumerate() {
+                let g1 = abs > 1;
+                self.bin(g1_base + usize::from(greater1_ctx_state), g1);
+                if g1 {
+                    g1_mask |= 1u8 << k;
                     greater1_ctx_state = 0;
-                    first_g1.get_or_insert(k);
+                    if first_g1 == usize::MAX {
+                        first_g1 = k;
+                    }
                 } else if greater1_ctx_state > 0 && greater1_ctx_state < 3 {
                     greater1_ctx_state += 1;
                 }
             }
             let mut greater2 = false;
-            if let Some(k) = first_g1 {
-                greater2 = sig[k].abs() > 2;
+            if first_g1 != usize::MAX {
+                greater2 = sig_abs[first_g1] > 2;
                 self.bin(
-                    ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set + if luma { 0 } else { 4 },
+                    ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set + g2_c_off,
                     greater2,
                 );
             }
@@ -3644,20 +3699,29 @@ impl<'a> Encoder<'a> {
                 self.log.encode_bypass(u8::from(v < 0));
             }
 
+            if first_g1 == usize::MAX && n_sig <= 8 {
+                continue;
+            }
             let mut rice = 0u32;
-            for k in 0..n_sig {
-                let base = 1 + i32::from(greater1[k]) + i32::from(first_g1 == Some(k) && greater2);
-                let threshold = if k < 8 {
-                    if first_g1 == Some(k) { 3 } else { 2 }
+            for (k, &abs) in sig_abs[..n_sig].iter().enumerate() {
+                let base = if k < 8 {
+                    if (g1_mask & (1u8 << k)) == 0 {
+                        continue;
+                    }
+                    if k == first_g1 {
+                        if !greater2 {
+                            continue;
+                        }
+                        3
+                    } else {
+                        2
+                    }
                 } else {
                     1
                 };
-                let abs = sig[k].abs();
-                if base == threshold {
-                    self.coeff_abs_level_remaining((abs - base) as u32, rice);
-                    if abs > 3 * (1 << rice) {
-                        rice = (rice + 1).min(4);
-                    }
+                self.coeff_abs_level_remaining((abs - base) as u32, rice);
+                if abs > 3 * (1 << rice) {
+                    rice = (rice + 1).min(4);
                 }
             }
         }
@@ -3694,6 +3758,7 @@ impl<'a> Encoder<'a> {
     }
 
     /// `coeff_abs_level_remaining` (§9.3.3.11): Rice code, with an Exp-Golomb escape.
+    #[inline]
     fn coeff_abs_level_remaining(&mut self, value: u32, rice: u32) {
         if value < (4 << rice) {
             let prefix = value >> rice;
@@ -3701,7 +3766,9 @@ impl<'a> Encoder<'a> {
                 self.log.encode_bypass(1);
             }
             self.log.encode_bypass(0);
-            self.log.encode_bypass_bits(value & ((1 << rice) - 1), rice);
+            if rice > 0 {
+                self.log.encode_bypass_bits(value & ((1 << rice) - 1), rice);
+            }
         } else {
             let mut prefix = 4;
             while value >= (((2u32 << (prefix - 3)) + 2) << rice) {
