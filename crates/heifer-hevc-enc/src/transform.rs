@@ -41,10 +41,81 @@ pub fn forward_transform(
     let bd = i32::from(bit_depth);
     match log2_size {
         2 if dst => forward(residual, &DST4, bd, out),
-        2 => forward(residual, &DCT4, bd, out),
-        3 => forward(residual, &DCT8, bd, out),
-        4 => forward(residual, &DCT16, bd, out),
-        _ => forward(residual, &DCT32, bd, out),
+        2 => forward_dct_sym::<4, 2>(residual, &DCT4, bd, out),
+        3 => forward_dct_sym::<8, 4>(residual, &DCT8, bd, out),
+        4 => forward_dct_sym::<16, 8>(residual, &DCT16, bd, out),
+        _ => forward_dct_sym::<32, 16>(residual, &DCT32, bd, out),
+    }
+}
+
+/// Even/odd butterfly forward 2-D DCT (bit-exact with [`forward`], half the multiplications).
+fn forward_dct_sym<const N: usize, const H: usize>(
+    residual: &[i32],
+    basis: &[[i32; N]; N],
+    bit_depth: i32,
+    out: &mut [i32],
+) {
+    let log2_size = N.trailing_zeros() as i32;
+    let shift1 = log2_size + bit_depth - 9;
+    let add1 = 1 << shift1 >> 1;
+    let shift2 = log2_size + 6;
+    let add2 = 1 << (shift2 - 1);
+
+    // Column pass: fold symmetric pairs of rows first.
+    let mut sum_rows = [[0i32; N]; H];
+    let mut diff_rows = [[0i32; N]; H];
+    for y in 0..H {
+        let top = &residual[y * N..y * N + N];
+        let bot = &residual[(N - 1 - y) * N..(N - 1 - y) * N + N];
+        for x in 0..N {
+            sum_rows[y][x] = top[x] + bot[x];
+            diff_rows[y][x] = top[x] - bot[x];
+        }
+    }
+
+    let mut tmp = [[0i32; N]; N];
+    for k in (0..N).step_by(2) {
+        let mut acc_e = [0i32; N];
+        let mut acc_o = [0i32; N];
+        let be = &basis[k];
+        let bo = &basis[k + 1];
+        for y in 0..H {
+            let we = be[y];
+            let wo = bo[y];
+            let sr = &sum_rows[y];
+            let dr = &diff_rows[y];
+            for x in 0..N {
+                acc_e[x] += we * sr[x];
+                acc_o[x] += wo * dr[x];
+            }
+        }
+        for x in 0..N {
+            tmp[k][x] = (acc_e[x] + add1) >> shift1;
+            tmp[k + 1][x] = (acc_o[x] + add1) >> shift1;
+        }
+    }
+
+    // Row pass: fold symmetric pairs within each intermediate row.
+    for (k, row) in tmp.iter().enumerate() {
+        let mut e = [0i32; H];
+        let mut o = [0i32; H];
+        for x in 0..H {
+            e[x] = row[x] + row[N - 1 - x];
+            o[x] = row[x] - row[N - 1 - x];
+        }
+        let dst = &mut out[k * N..k * N + N];
+        for l in (0..N).step_by(2) {
+            let mut se = 0i32;
+            let mut so = 0i32;
+            let be = &basis[l];
+            let bo = &basis[l + 1];
+            for x in 0..H {
+                se += be[x] * e[x];
+                so += bo[x] * o[x];
+            }
+            dst[l] = (se + add2) >> shift2;
+            dst[l + 1] = (so + add2) >> shift2;
+        }
     }
 }
 
@@ -103,19 +174,19 @@ pub fn quantize_levels(
     let qbits = 14 + qp / 6 + transform_shift;
     let scale = QUANT_SCALE[(qp % 6) as usize];
     if let Some(exact) = exact {
-        let unit = 1.0 / f64::from(1u32 << qbits);
+        let exact_scale = (scale as f64 / f64::from(1u32 << qbits)) as f32;
         for (e, &c) in exact.iter_mut().zip(coeffs.iter()) {
-            *e = (f64::from(c) * scale as f64 * unit) as f32;
+            *e = c as f32 * exact_scale;
         }
     }
     let offset = 171i64 << (qbits - 9);
-    let mut any = false;
+    let mut any_bits = 0i32;
     for c in coeffs.iter_mut() {
         let level = ((i64::from(c.unsigned_abs()) * scale + offset) >> qbits).min(32767) as i32;
         *c = if *c < 0 { -level } else { level };
-        any |= level != 0;
+        any_bits |= level;
     }
-    any
+    any_bits != 0
 }
 
 /// `QpC` of 4:2:0 chroma for a luma QP (Table 8-10), without chroma QP offsets.
@@ -142,14 +213,16 @@ pub fn satd(diff: &[i32], n: usize) -> u64 {
                 *row = [a + c, b + e, a - c, b - e];
             }
             let [m0, m1, m2, m3] = m;
+            let mut block_sum = 0u32;
             for x in 0..4 {
                 let (a, b) = (m0[x] + m3[x], m0[x] - m3[x]);
                 let (c, e) = (m1[x] + m2[x], m1[x] - m2[x]);
-                total += u64::from((a + c).unsigned_abs())
-                    + u64::from((b + e).unsigned_abs())
-                    + u64::from((a - c).unsigned_abs())
-                    + u64::from((b - e).unsigned_abs());
+                block_sum += (a + c).unsigned_abs()
+                    + (b + e).unsigned_abs()
+                    + (a - c).unsigned_abs()
+                    + (b - e).unsigned_abs();
             }
+            total += u64::from(block_sum);
         }
     }
     total / 2
