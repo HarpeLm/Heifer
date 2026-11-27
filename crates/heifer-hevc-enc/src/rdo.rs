@@ -237,97 +237,144 @@ pub(crate) fn rdoq(
         *m = exact[usize::from(i)].abs();
     }
     let magnitudes = &*magnitudes;
-    let index = |g: usize| -> (usize, usize, usize) {
-        let (i, x, y) = positions[g];
-        (usize::from(i), usize::from(x), usize::from(y))
-    };
-    let magnitude = |g: usize| magnitudes[g];
     let ctx_bits = |i: usize, bin: bool| bits(table, &contexts[i], bin);
-    let mut coded_sb = [[false; 8]; 8];
-    let mut sb_cost = [0f32; 64]; // chosen cost of each sub-block (with its flag)
-    let mut sb_zero = [0f32; 64]; // cost of dropping it
+    let mut coded_sb: u64 = 0;
     let mut greater1_ctx_state: u8 = 1;
+    let last_sb = last_start / 16;
 
-    for sb in (0..=last_start / 16).rev() {
+    for sb in (0..=last_sb).rev() {
         let (xs, ys) = sb_scan[sb];
         let (xs, ys) = (usize::from(xs), usize::from(ys));
-        let prev_csbf = u8::from(xs + 1 < sb_width && coded_sb[xs + 1][ys])
-            | (u8::from(ys + 1 < sb_width && coded_sb[xs][ys + 1]) << 1);
+        let right = xs + 1 < sb_width && (coded_sb & (1u64 << ((ys << 3) | (xs + 1)))) != 0;
+        let below = ys + 1 < sb_width && (coded_sb & (1u64 << (((ys + 1) << 3) | xs))) != 0;
+        let prev_csbf = u8::from(right) | (u8::from(below) << 1);
         let mut ctx_set = if sb == 0 || !luma { 0 } else { 2 };
         if greater1_ctx_state == 0 {
             ctx_set += 1;
         }
+        let g1_base = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_set * 4 + if luma { 0 } else { 16 };
+        let g1_l: [(f32, f32); 4] = core::array::from_fn(|s| {
+            let m = &contexts[g1_base + s];
+            (
+                lambda * bits(table, m, false),
+                lambda * bits(table, m, true),
+            )
+        });
+        let g2_model =
+            &contexts[ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set + if luma { 0 } else { 4 }];
+        let g2_0_l = lambda * bits(table, g2_model, false);
+        let g2_1_l = lambda * bits(table, g2_model, true);
+
         let mut state: u8 = 1; // greater1Ctx within the sub-block
         let (mut count, mut seen_g1, mut rice) = (0usize, false, 0u32);
         let sig_ctxs = sig_ctx_table(log2_size, scan, luma, prev_csbf, xs + ys == 0);
-        let top = if sb == last_start / 16 {
-            last_start % 16
-        } else {
-            15
-        };
+        let top = if sb == last_sb { last_start % 16 } else { 15 };
+        let sb_base = sb * 16;
+        let mut coded_cost = 0.0f32;
+        let mut zero_cost = 0.0f32;
+        let mut any = false;
+
         for pos in (0..=top).rev() {
-            let g = sb * 16 + pos;
-            let e = magnitude(g);
-            let sig_ctx = ctx::SIG_COEFF_FLAG + usize::from(sig_ctxs[pos]);
+            let g = sb_base + pos;
+            let e = magnitudes[g];
+            let e_sq = e * e;
+            zero_cost += e_sq;
             let is_last = g == last_start;
-            cost_sig1[g] = if is_last {
+            let sig_model = &contexts[ctx::SIG_COEFF_FLAG + usize::from(sig_ctxs[pos])];
+            let sig0_l = if is_last {
                 0.0
             } else {
-                lambda * ctx_bits(sig_ctx, true)
+                lambda * bits(table, sig_model, false)
             };
-            cost_zero[g] = e * e
-                + if is_last {
-                    0.0
-                } else {
-                    lambda * ctx_bits(sig_ctx, false)
-                };
+            let c_zero = e_sq + sig0_l;
+            cost_zero[g] = c_zero;
+
+            // Fast path for the ~75% of coefficients below 0.5 (never rounded above 0).
+            if e < 0.5 && !is_last {
+                cost_sig1[g] = 0.0;
+                chosen[g] = 0;
+                cost_level[g] = c_zero;
+                coded_cost += c_zero;
+                continue;
+            }
+
+            let sig1_l = if is_last {
+                0.0
+            } else {
+                lambda * bits(table, sig_model, true)
+            };
+            cost_sig1[g] = sig1_l;
 
             let rounded = (e + 0.5) as u32;
-            let g1_ctx = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG
-                + ctx_set * 4
-                + usize::from(state.min(3))
-                + if luma { 0 } else { 16 };
-            let g2_ctx = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set + if luma { 0 } else { 4 };
-            let rate = |level: u32| -> f32 {
-                let mut r = 1.0; // sign
-                if count < 8 {
-                    r += ctx_bits(g1_ctx, level > 1);
-                    let first_g1 = level > 1 && !seen_g1;
-                    if first_g1 {
-                        r += ctx_bits(g2_ctx, level > 2);
-                    }
-                    let base = 1 + u32::from(level > 1) + u32::from(first_g1 && level > 2);
-                    let threshold = if first_g1 { 3 } else { 2 };
-                    if base == threshold {
-                        r += remaining_bits(level - base, rice);
-                    }
-                } else {
-                    r += remaining_bits(level - 1, rice);
-                }
-                r
+            let mut best = if is_last {
+                (f32::MAX, 0u32)
+            } else {
+                (c_zero, 0u32)
             };
-            let mut best = (cost_zero[g], 0u32);
-            if is_last {
-                best.0 = f32::MAX; // the last position is significant by definition
-            }
-            for level in [rounded, rounded.saturating_sub(1)] {
-                if level == 0 {
-                    continue;
-                }
-                let d = e - level as f32;
-                let cost = d * d + cost_sig1[g] + lambda * rate(level);
+
+            if rounded == 1 {
+                // Only candidate level is 1: no greater2 or remaining_bits loop needed.
+                let rate_l = if count < 8 {
+                    lambda + g1_l[usize::from(state.min(3))].0
+                } else {
+                    lambda * (2 + rice) as f32
+                };
+                let d = e - 1.0;
+                let cost = d * d + sig1_l + rate_l;
                 if cost < best.0 {
-                    best = (cost, level);
+                    best = (cost, 1);
+                }
+            } else {
+                let g1_pair = g1_l[usize::from(state.min(3))];
+                let rate_l = |level: u32| -> f32 {
+                    let mut r_l = lambda; // sign
+                    if count < 8 {
+                        let gt1 = level > 1;
+                        r_l += if gt1 { g1_pair.1 } else { g1_pair.0 };
+                        let first_g1 = gt1 && !seen_g1;
+                        if first_g1 {
+                            r_l += if level > 2 { g2_1_l } else { g2_0_l };
+                        }
+                        let base = 1 + u32::from(gt1) + u32::from(first_g1 && level > 2);
+                        let threshold = if first_g1 { 3 } else { 2 };
+                        if base == threshold {
+                            r_l += lambda * remaining_bits(level - base, rice);
+                        }
+                    } else {
+                        r_l += lambda * remaining_bits(level - 1, rice);
+                    }
+                    r_l
+                };
+                for level in [rounded, rounded.saturating_sub(1)] {
+                    if level == 0 {
+                        continue;
+                    }
+                    let d = e - level as f32;
+                    let cost = d * d + sig1_l + rate_l(level);
+                    if cost < best.0 {
+                        best = (cost, level);
+                    }
+                }
+                if best.1 == 0 && is_last {
+                    let level = 1.max(rounded);
+                    let d = e - level as f32;
+                    best = (d * d + rate_l(level), level);
                 }
             }
             if best.1 == 0 && is_last {
-                best = (cost_zero[g], 1.max(rounded));
-                let d = e - best.1 as f32;
-                best.0 = d * d + lambda * rate(best.1);
+                let rate_l = if count < 8 {
+                    lambda + g1_l[usize::from(state.min(3))].0
+                } else {
+                    lambda * (2 + rice) as f32
+                };
+                let d = e - 1.0;
+                best = (d * d + rate_l, 1);
             }
             chosen[g] = best.1;
             cost_level[g] = best.0;
+            coded_cost += best.0;
             if best.1 > 0 {
+                any = true;
                 if count < 8 {
                     if best.1 > 1 {
                         state = 0;
@@ -352,78 +399,52 @@ pub(crate) fn rdoq(
         }
 
         // Dropping the whole sub-block (not possible for the first and last ones).
-        let range = sb * 16..=sb * 16 + top;
-        let coded_cost: f32 = range.clone().map(|g| cost_level[g]).sum();
-        let zero_cost: f32 = range.clone().map(|g| magnitude(g).powi(2)).sum();
-        let inc = usize::from(prev_csbf != 0) + if luma { 0 } else { 2 };
-        let flag = ctx::CODED_SUB_BLOCK_FLAG + inc;
-        let any = range.clone().any(|g| chosen[g] > 0);
-        if sb > 0 && sb < last_start / 16 {
-            sb_cost[sb] = coded_cost + lambda * ctx_bits(flag, true);
-            sb_zero[sb] = zero_cost + lambda * ctx_bits(flag, false);
-            if !any || sb_zero[sb] < sb_cost[sb] {
-                for g in range {
+        if sb > 0 && sb < last_sb {
+            let inc = usize::from(prev_csbf != 0) + if luma { 0 } else { 2 };
+            let flag = ctx::CODED_SUB_BLOCK_FLAG + inc;
+            let sb_c = coded_cost + lambda * ctx_bits(flag, true);
+            let sb_z = zero_cost + lambda * ctx_bits(flag, false);
+            if !any || sb_z < sb_c {
+                for g in sb_base..=sb_base + top {
                     chosen[g] = 0;
-                    cost_level[g] = magnitude(g).powi(2);
+                    let e = magnitudes[g];
+                    cost_level[g] = e * e;
                 }
-                sb_cost[sb] = sb_zero[sb];
+                any = false;
             }
-        } else {
-            sb_cost[sb] = coded_cost;
         }
-        coded_sb[xs][ys] = range_any(chosen, sb * 16, sb * 16 + top);
+        if any {
+            coded_sb |= 1u64 << ((ys << 3) | xs);
+        }
     }
 
     // Last significant position: keep the levels up to it, drop the ones after.
     let (ctx_offset, ctx_shift) = last_ctx(log2_size, luma);
     let c_max = (u32::from(log2_size) << 1) - 1;
-    // Bins of the last position prefixes, per coordinate (x then y, swapped for the vertical
-    // scan). The x part of each coordinate is summed once; the y bins are added to it in the
-    // same order as when coding them.
     let size = 1usize << log2_size;
     let prefix_bits = |k: usize, bin: bool, i: usize| {
         let base = [ctx::LAST_SIG_COEFF_X_PREFIX, ctx::LAST_SIG_COEFF_Y_PREFIX][k];
         ctx_bits(base + usize::from(ctx_offset) + (i >> ctx_shift), bin)
     };
     let mut first_axis = [0f32; 32];
-    let mut ones = [0f32; 10];
-    let mut zeros = [0f32; 10];
-    for (i, (one, zero)) in ones
-        .iter_mut()
-        .zip(&mut zeros)
-        .enumerate()
-        .take(c_max as usize)
-    {
-        (*one, *zero) = (prefix_bits(1, true, i), prefix_bits(1, false, i));
-    }
-    for (coord, total) in first_axis.iter_mut().enumerate().take(size) {
+    let mut second_axis = [0f32; 32];
+    for coord in 0..size {
         let (prefix, suffix) = last_prefix(coord as u32);
-        let mut r = 0.0;
-        for i in 0..prefix.min(c_max) {
-            r += prefix_bits(0, true, i as usize);
+        let suf = suffix.map_or(0.0, |(_, b)| b as f32);
+        let mut r0 = 0.0;
+        let mut r1 = 0.0;
+        for i in 0..prefix.min(c_max) as usize {
+            r0 += prefix_bits(0, true, i);
+            r1 += prefix_bits(1, true, i);
         }
         if prefix < c_max {
-            r += prefix_bits(0, false, prefix as usize);
+            r0 += prefix_bits(0, false, prefix as usize);
+            r1 += prefix_bits(1, false, prefix as usize);
         }
-        *total = r + suffix.map_or(0.0, |(_, bits)| bits as f32);
+        first_axis[coord] = r0 + suf;
+        second_axis[coord] = r1 + suf;
     }
-    let last_bits = |g: usize| -> f32 {
-        let (_, x, y) = index(g);
-        let (a, b) = if scan == ScanType::Vertical {
-            (y, x)
-        } else {
-            (x, y)
-        };
-        let mut r = first_axis[a];
-        let (prefix, suffix) = last_prefix(b as u32);
-        for one in &ones[..prefix.min(c_max) as usize] {
-            r += one;
-        }
-        if prefix < c_max {
-            r += zeros[prefix as usize];
-        }
-        r + suffix.map_or(0.0, |(_, bits)| bits as f32)
-    };
+    let vertical = scan == ScanType::Vertical;
     // Cost of everything up to and including position g when g is the last one: the sum of the
     // chosen costs before it, its own cost without sig flag, the dropped errors after it.
     let mut best: Option<(f32, usize)> = None;
@@ -431,24 +452,29 @@ pub(crate) fn rdoq(
     let total_zero_after = {
         zero_after[last_start + 1] = 0.0;
         for g in (0..=last_start).rev() {
-            zero_after[g] = zero_after[g + 1] + magnitude(g).powi(2);
+            let e = magnitudes[g];
+            zero_after[g] = zero_after[g + 1] + e * e;
         }
         &*zero_after
     };
     for g in 0..=last_start {
         if chosen[g] > 0 {
+            let (_, x, y) = positions[g];
+            let (a, b) = if vertical {
+                (usize::from(y), usize::from(x))
+            } else {
+                (usize::from(x), usize::from(y))
+            };
             let cost = before + cost_level[g] - cost_sig1[g]
                 + total_zero_after[g + 1]
-                + lambda * last_bits(g);
+                + lambda * (first_axis[a] + second_axis[b]);
             if best.is_none_or(|(c, _)| cost < c) {
                 best = Some((cost, g));
             }
-        }
-        before += if chosen[g] > 0 {
-            cost_level[g]
+            before += cost_level[g];
         } else {
-            cost_zero[g]
-        };
+            before += cost_zero[g];
+        }
     }
     let Some((cost, last)) = best else { return };
     // Coding nothing at all (cbf 0) may be cheaper.
@@ -460,15 +486,13 @@ pub(crate) fn rdoq(
     if total_zero_after[0] + lambda * ctx_bits(cbf, false) <= cost + lambda * ctx_bits(cbf, true) {
         return;
     }
-    for (g, &level) in chosen.iter().enumerate().take(last + 1) {
-        let (i, _, _) = index(g);
-        let level = level as i32;
-        levels[i] = if exact[i] < 0.0 { -level } else { level };
+    for (&(i, _, _), &level) in positions.iter().zip(chosen.iter()).take(last + 1) {
+        if level != 0 {
+            let i = usize::from(i);
+            let level = level as i32;
+            levels[i] = if exact[i] < 0.0 { -level } else { level };
+        }
     }
-}
-
-fn range_any(chosen: &[u32], from: usize, to: usize) -> bool {
-    chosen[from..=to].iter().any(|&l| l > 0)
 }
 
 /// Sign data hiding (H.265 §7.4.9.11): in each 4×4 sub-block whose first and last non-zero
@@ -484,63 +508,96 @@ pub(crate) fn hide_signs(
     rate_weight: f32,
 ) {
     for positions in scan_positions(log2_size, scan).chunks_exact(16) {
-        let index: [usize; 16] = core::array::from_fn(|n| usize::from(positions[n].0));
-        if index.iter().all(|&i| levels[i] == 0) {
+        let mut v = [0i32; 16];
+        let mut first = 16usize;
+        let mut last = 0usize;
+        let mut sum = 0i32;
+        for (n, &(i, _, _)) in positions.iter().enumerate() {
+            let lv = levels[usize::from(i)];
+            v[n] = lv;
+            if lv != 0 {
+                if first == 16 {
+                    first = n;
+                }
+                last = n;
+                sum += lv.abs();
+            }
+        }
+        if first == 16 || last - first <= 3 {
             continue;
         }
+        let mut changed = false;
         // A few passes: a change can move the first or last level, which changes the rule.
-        for _ in 0..4 {
-            let first = (0..16).find(|&n| levels[index[n]] != 0);
-            let last = (0..16).rev().find(|&n| levels[index[n]] != 0);
-            let (Some(first), Some(last)) = (first, last) else {
-                break;
-            };
-            if last - first <= 3 {
-                break;
+        for pass in 0..4 {
+            if pass > 0 {
+                first = 16;
+                last = 0;
+                sum = 0;
+                for (n, &lv) in v.iter().enumerate() {
+                    if lv != 0 {
+                        if first == 16 {
+                            first = n;
+                        }
+                        last = n;
+                        sum += lv.abs();
+                    }
+                }
+                if first == 16 || last - first <= 3 {
+                    break;
+                }
             }
-            let sum: i32 = index.iter().map(|&i| levels[i].abs()).sum();
-            let negative = levels[index[first]] < 0;
+            let negative = v[first] < 0;
             if (sum & 1 == 1) == negative {
                 break;
             }
             // Cheapest ±1 change of one level (`step` in the direction of its magnitude).
             let mut best = (f32::MAX, 0usize, 0i32);
-            for (n, &i) in index.iter().enumerate() {
-                let (level, e) = (levels[i], exact[i]);
-                let error = e.abs() - level.abs() as f32; // unrounded minus rounded magnitude
-                let mut consider = |cost: f32, step: i32| {
-                    if cost < best.0 {
-                        best = (cost, n, step);
+            for (n, &lv) in v.iter().enumerate() {
+                let e = exact[usize::from(positions[n].0)];
+                let error = e.abs() - lv.abs() as f32; // unrounded minus rounded magnitude
+                if lv != 0 {
+                    let c_up = 1.0 - 2.0 * error;
+                    if c_up < best.0 {
+                        best = (c_up, n, 1);
                     }
-                };
-                if level != 0 {
-                    consider(1.0 - 2.0 * error, 1);
-                    if level.abs() > 1 {
-                        consider(1.0 + 2.0 * error, -1);
+                    if lv.abs() > 1 {
+                        let c_dn = 1.0 + 2.0 * error;
+                        if c_dn < best.0 {
+                            best = (c_dn, n, -1);
+                        }
                     } else if n != first {
-                        consider(1.0 + 2.0 * error - rate_weight, -1);
+                        let c_dn = 1.0 + 2.0 * error - rate_weight;
+                        if c_dn < best.0 {
+                            best = (c_dn, n, -1);
+                        }
                     }
                 } else if e != 0.0 && n < last {
                     // A new level takes the sign of its coefficient. Below the first level, it
                     // becomes the hidden one: its sign must be the one the new parity gives.
                     if n > first || (e < 0.0) == negative {
-                        consider(1.0 - 2.0 * error + rate_weight, 1);
+                        let c_up = 1.0 - 2.0 * error + rate_weight;
+                        if c_up < best.0 {
+                            best = (c_up, n, 1);
+                        }
                     }
                 }
             }
             let (cost, n, step) = best;
-            let i = index[n];
             if cost == f32::MAX {
                 // Always possible, and keeps the positions: raise the last level.
-                let i = index[last];
-                levels[i] += levels[i].signum();
-                continue;
-            }
-            levels[i] = if levels[i] == 0 {
-                if exact[i] < 0.0 { -1 } else { 1 }
+                v[last] += v[last].signum();
+            } else if v[n] == 0 {
+                let e = exact[usize::from(positions[n].0)];
+                v[n] = if e < 0.0 { -1 } else { 1 };
             } else {
-                levels[i] + step * levels[i].signum()
-            };
+                v[n] += step * v[n].signum();
+            }
+            changed = true;
+        }
+        if changed {
+            for (n, &(i, _, _)) in positions.iter().enumerate() {
+                levels[usize::from(i)] = v[n];
+            }
         }
     }
 }
