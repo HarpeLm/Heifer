@@ -18,7 +18,7 @@
   <tr>
     <td align="center" width="25%"><h2>62 / 62</h2><sub>HEVC conformance streams<br>identical to ffmpeg</sub></td>
     <td align="center" width="25%"><h2>0</h2><sub>lines of <code>unsafe</code><br>or C code</sub></td>
-    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.40 s</sub></td>
+    <td align="center" width="25%"><h2>200 MP</h2><sub>Galaxy S24 Ultra photos<br>decoded in 0.19 s</sub></td>
     <td align="center" width="25%"><h2>≈ 250 KB</h2><sub>WebAssembly build<br>for the browser</sub></td>
   </tr>
 </table>
@@ -87,7 +87,7 @@ heifer info IMG_1234.heic                           # size, tiles, camera, auxil
 
 ```toml
 [dependencies]
-heifer = "0.7"
+heifer = "0.8"
 ```
 
 Decoding only? Turn off the default `encoder` feature: heifer then depends on its container and
@@ -95,14 +95,14 @@ decoder crates and `thiserror`, nothing else.
 
 ```toml
 [dependencies]
-heifer = { version = "0.7", default-features = false }
+heifer = { version = "0.8", default-features = false }
 ```
 
 **Drop-in `image` crate hook (5 lines, copy-paste ready)**:
 
 ```toml
 [dependencies]
-heifer = { version = "0.7", features = ["image"] }
+heifer = { version = "0.8", features = ["image"] }
 image  = "0.25"
 ```
 
@@ -295,7 +295,7 @@ ISO 21496-1 `log2` gain range, so any headroom above 1 works.
 ## <img src="docs/icons/code.svg" width="24" height="24" align="top"> `image` crate integration
 
 ```toml
-heifer = { version = "0.7", features = ["image"] }
+heifer = { version = "0.8", features = ["image"] }
 ```
 
 ```rust
@@ -375,22 +375,22 @@ Decode time on a 10-core Apple Silicon Mac (release build, median of several run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-decode-dark.svg">
-  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 12 ms (ffmpeg 11), iPhone 12 MP 21 ms (ffmpeg 21), 48 MP 113 ms (ffmpeg 95), Galaxy 200 MP 0.40 s (ffmpeg fails)" width="100%">
+  <img src="docs/images/bench-decode-light.svg" alt="Decode time: Xiaomi 5 MP 13 ms (ffmpeg 11), iPhone 12 MP 19 ms (ffmpeg 21), 48 MP 106 ms (ffmpeg 95), Galaxy 200 MP 0.19 s (ffmpeg fails)" width="100%">
 </picture>
 
 | Image | heifer | heifer, 1 thread | ffmpeg |
 |---|---|---|---|
-| Xiaomi, 5 MP | 12 ms | 74 ms | 11 ms |
-| iPhone 13 Pro, 12 MP (48 tiles) | 21 ms | 126 ms | 21 ms |
-| 8000×6000, 48 MP | 113 ms | 0.65 s | 95 ms |
-| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.40 s | 1.22 s | fails |
+| Xiaomi, 5 MP | 13 ms | 64 ms | 11 ms |
+| iPhone 13 Pro, 12 MP (48 tiles) | 19 ms | 104 ms | 21 ms |
+| 8000×6000, 48 MP | 106 ms | 0.62 s | 95 ms |
+| Galaxy S24 Ultra, 200 MP (768 tiles) | 0.19 s | 0.88 s | fails |
 | In the browser (WebAssembly, 1 thread), 1280×854 | ~80 ms | | |
 
-Grid tiles are decoded in parallel; the iPhone photo scales from 114 ms on 1 thread to 21 ms on 10:
+Grid tiles are decoded in parallel; the iPhone photo scales from 104 ms on 1 thread to 19 ms on 10:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-scaling-dark.svg">
-  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 114 ms with 1 thread down to 21 ms with 10" width="100%">
+  <img src="docs/images/bench-scaling-light.svg" alt="Thread scaling on a 12 MP iPhone photo: 104 ms with 1 thread down to 19 ms with 10" width="100%">
 </picture>
 
 On multi-core machines heifer matches FFmpeg 9 on the 12 MP iPhone photo (and includes the
@@ -414,7 +414,7 @@ reproducible with `python3 benchmarks/run.py`.
 | Real test files decoded (of 55) | **52** (all valid files) | 52 | 43 (no 4:4:4 or `unci`) | 43 (refuses 200 MP; no `unci`) |
 | Colours vs Apple (13-file suite, median / worst) | **50.2 / 49.3 dB** | 47.4–50.3 dB (4 real photos) | 43.9 / 26.4 dB | 47.0 / 32.6 dB |
 | Apple + ISO 21496-1 HDR gain maps | **✓** (decode + encode) | ✓ | – | extraction only |
-| Decode speed, 12 MP iPhone photo | **89 ms** (1 thread) · **86 ms** (`→ PNG`, multi-core) | `378 ms` (`heif-convert → PNG`) | 105 ms (1 thread) | 175 ms (1 thread) |
+| Decode speed, 12 MP iPhone photo | **83 ms** (1 thread) · **85 ms** (`→ PNG`, multi-core) | `378 ms` (`heif-convert → PNG`) | 108 ms (1 thread) | 174 ms (1 thread) |
 | Encoding size vs `libheif` (`x265`, equal PSNR) | **reference** (`-2.7%` vs `x265 slow`) | +20.5% larger on `photo12.png` | – | – |
 
 `heifer` focuses on HEVC-coded HEIF (and ISO/IEC 23001-17 `unci`); choose `libheif-rs` only if you need AVIF, VVC, AVC or JPEG-in-HEIF inside the same library.
@@ -425,7 +425,7 @@ Replace `libheif-rs` in `Cargo.toml` and drop all C build / `pkg-config` depende
 
 ```toml
 # Cargo.toml
-heifer = { version = "0.7", features = ["image"] }   # or default features without `image`
+heifer = { version = "0.8", features = ["image"] }   # or default features without `image`
 ```
 
 ```rust
@@ -585,8 +585,8 @@ cargo build --release -p heifer-hevc-dec --example decode
 **Releasing** — bump the version, update the CHANGELOG, push `main`, then tag:
 
 ```sh
-git tag -a v0.7.3 -m "0.7.3 — what changed"
-git push origin v0.7.3
+git tag -a v0.8.0 -m "0.8.0 — what changed"
+git push origin v0.8.0
 ```
 
 The `Release` workflow creates the GitHub release, with the annotation as title and the matching
