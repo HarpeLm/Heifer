@@ -53,6 +53,7 @@ pub mod image;
 pub mod image_crate;
 pub mod iptc;
 pub mod metadata;
+pub mod preview;
 pub mod reader;
 pub mod sequence;
 mod uncompressed;
@@ -80,9 +81,10 @@ pub use metadata::{
     Exif, Metadata, Regions, item_iptc, item_metadata, item_regions, read_iptc, read_metadata,
     read_regions,
 };
+pub use preview::{PreviewOptions, decode_preview_rgba8};
 pub use reader::{
-    ReadError, decode_reader, decode_reader_rgba8, decode_reader_with_options, read_info_reader,
-    read_metadata_reader,
+    ReadError, decode_reader, decode_reader_preview_rgba8, decode_reader_rgba8,
+    decode_reader_srgb_rgba8, decode_reader_with_options, read_info_reader, read_metadata_reader,
 };
 pub use sequence::{
     FrameInfo, SequenceFrames, SequenceInfo, decode_sequence, decode_sequence_frame,
@@ -126,11 +128,11 @@ pub enum Error {
 }
 
 /// Limits protecting against malicious files.
-const MAX_PIXELS: u64 = 1 << 28;
+pub(crate) const MAX_PIXELS: u64 = 1 << 28;
 const MAX_DEPTH: u32 = 4;
 
 /// Decoding options.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Options {
     /// Maximum number of threads used to decode grid tiles, and the groups of pictures of an
@@ -139,6 +141,12 @@ pub struct Options {
     /// Maximum size, in pixels, of any decoded or assembled image (protects against malicious
     /// files). `0` means the default, 2^28 pixels (e.g. a 16384×16384 image).
     pub max_pixels: u64,
+    /// When `true`, sRGB-converting entry points ([`decode_srgb_with_options`],
+    /// [`decode_srgb_rgba8`], [`decode_reader_srgb_rgba8`], [`decode_all_srgb_rgba8`],
+    /// [`decode_preview_rgba8`]) return the already-decoded image as coded instead of failing
+    /// with [`Error::Unsupported`] if its ICC profile or `nclx` colour space cannot be converted
+    /// to sRGB (for example a non-RGB ICC profile or a PQ/HLG transfer). Defaults to `false`.
+    pub fallback_to_coded_color: bool,
 }
 
 /// Construction methods: they keep working when new options are added, unlike a struct
@@ -149,11 +157,12 @@ pub struct Options {
 /// assert_eq!((options.max_threads, options.max_pixels), (1, 1 << 24));
 /// ```
 impl Options {
-    /// The default options: all cores, the default size limit.
+    /// The default options: all cores, the default size limit, strict sRGB conversion.
     pub const fn new() -> Self {
         Self {
             max_threads: 0,
             max_pixels: 0,
+            fallback_to_coded_color: false,
         }
     }
 
@@ -170,10 +179,17 @@ impl Options {
         self.max_pixels = max_pixels;
         self
     }
+
+    /// Sets [`fallback_to_coded_color`](Self::fallback_to_coded_color).
+    #[must_use]
+    pub const fn with_fallback_to_coded_color(mut self, fallback: bool) -> Self {
+        self.fallback_to_coded_color = fallback;
+        self
+    }
 }
 
 impl Options {
-    fn max_pixels(&self) -> u64 {
+    pub(crate) fn max_pixels(&self) -> u64 {
         if self.max_pixels == 0 {
             MAX_PIXELS
         } else {
@@ -181,7 +197,7 @@ impl Options {
         }
     }
 
-    fn threads(&self) -> usize {
+    pub(crate) fn threads(&self) -> usize {
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
         if self.max_threads == 0 {
             available
@@ -607,7 +623,7 @@ pub fn decode_srgb_with_options(bytes: &[u8], options: &Options) -> Result<Image
     let file = HeifFile::parse(bytes)?;
     let id = file.primary_id;
     let image = decode_item_with(&file, id, 0, options)?;
-    to_srgb(&file, id, image)
+    to_srgb_with_options(&file, id, image, options)
 }
 
 /// Like [`decode_srgb`], at 8 bits per sample whatever the coded depth: half the memory, which
@@ -616,7 +632,7 @@ pub fn decode_srgb_rgba8(bytes: &[u8], options: &Options) -> Result<Image<u8>, E
     let file = HeifFile::parse(bytes)?;
     let id = file.primary_id;
     let image = decode_item_with(&file, id, 0, options)?;
-    to_srgb(&file, id, image)
+    to_srgb_with_options(&file, id, image, options)
 }
 
 /// Decodes every top-level image of a HEIF/HEIC file, not just the primary one.
@@ -807,7 +823,7 @@ fn decode_all_images<S: Sample>(
         .map(|id| {
             let image = decode_item_with::<S>(file, id, 0, options)?;
             if srgb {
-                to_srgb(file, id, image)
+                to_srgb_with_options(file, id, image, options)
             } else {
                 Ok(image)
             }
@@ -816,13 +832,27 @@ fn decode_all_images<S: Sample>(
 }
 
 /// Converts a decoded image to sRGB from its ICC profile, else from its `nclx` colour
-/// information, else leaves it untouched.
-fn to_srgb<S: Sample>(file: &HeifFile<'_>, id: ItemId, image: Image<S>) -> Result<Image<S>, Error> {
+/// information, else leaves it untouched. When `options.fallback_to_coded_color` is set, an
+/// unsupported ICC profile or transfer leaves the decoded image untouched instead of failing.
+pub(crate) fn to_srgb_with_options<S: Sample>(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    image: Image<S>,
+    options: &Options,
+) -> Result<Image<S>, Error> {
     if let Some(icc) = file.icc_profile(id)? {
-        return Ok(icc::Profile::parse(icc)?.to_srgb(&image));
+        return match icc::Profile::parse(icc) {
+            Ok(profile) => Ok(profile.to_srgb(&image)),
+            Err(Error::Unsupported(_)) if options.fallback_to_coded_color => Ok(image),
+            Err(e) => Err(e),
+        };
     }
     match nclx(file, id)? {
-        Some((primaries, transfer)) => icc::from_primaries(&image, primaries, transfer),
+        Some((primaries, transfer)) => match icc::from_primaries(&image, primaries, transfer) {
+            Ok(converted) => Ok(converted),
+            Err(Error::Unsupported(_)) if options.fallback_to_coded_color => Ok(image),
+            Err(e) => Err(e),
+        },
         None => Ok(image),
     }
 }
@@ -1246,7 +1276,7 @@ fn attach_alpha_image<S: Sample>(image: &mut Image<S>, alpha: &Image<S>) -> Resu
     Ok(())
 }
 
-fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
+pub(crate) fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > max_pixels {
         return Err(Error::Invalid("image size is zero or too large"));
     }
@@ -1256,14 +1286,14 @@ fn check_size(w: u32, h: u32, max_pixels: u64) -> Result<(), Error> {
 /// Any composition of 90° rotations and reflections (`D4`) applied as flip-then-swap from
 /// source `(sx, sy)` to destination `(dx, dy)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct GridTransform {
-    swap_xy: bool,
-    flip_x: bool,
-    flip_y: bool,
+pub(crate) struct GridTransform {
+    pub(crate) swap_xy: bool,
+    pub(crate) flip_x: bool,
+    pub(crate) flip_y: bool,
 }
 
 impl GridTransform {
-    fn is_identity(self) -> bool {
+    pub(crate) fn is_identity(self) -> bool {
         !self.swap_xy && !self.flip_x && !self.flip_y
     }
 
@@ -1287,15 +1317,21 @@ impl GridTransform {
         }
     }
 
-    fn output_size(self, w: u32, h: u32) -> (u32, u32) {
+    pub(crate) fn output_size(self, w: u32, h: u32) -> (u32, u32) {
         if self.swap_xy { (h, w) } else { (w, h) }
+    }
+
+    pub(crate) fn map_point(self, cx: u32, cy: u32, crop_w: u32, crop_h: u32) -> (u32, u32) {
+        let fx = if self.flip_x { crop_w - 1 - cx } else { cx };
+        let fy = if self.flip_y { crop_h - 1 - cy } else { cy };
+        if self.swap_xy { (fy, fx) } else { (fx, fy) }
     }
 }
 
 /// Leading `clap` rectangle (before any rotation/mirror) followed by composed `irot`/`imir`
 /// transforms for a grid item, or `None` if a `clap` follows a non-identity rotation/mirror.
 #[allow(clippy::type_complexity)]
-fn fusable_grid_transforms(
+pub(crate) fn fusable_grid_transforms(
     file: &HeifFile<'_>,
     id: ItemId,
 ) -> Result<Option<(Option<(u32, u32, u32, u32)>, GridTransform)>, Error> {
@@ -1331,11 +1367,11 @@ fn fusable_grid_transforms(
 }
 
 /// Reusable per-worker decode buffers for plain grid tiles (`48`–`768` tiles per photo).
-struct GridWorkspace<S> {
-    bitstream: Vec<u8>,
-    hevc: DecodeWorkspace,
-    color: ColorScratch,
-    tile_rgba: Vec<S>,
+pub(crate) struct GridWorkspace<S> {
+    pub(crate) bitstream: Vec<u8>,
+    pub(crate) hevc: DecodeWorkspace,
+    pub(crate) color: ColorScratch,
+    pub(crate) tile_rgba: Vec<S>,
 }
 
 impl<S> Default for GridWorkspace<S> {
@@ -1465,7 +1501,7 @@ fn copy_tile_transformed_segments<S: Copy>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_plain_tile<'w>(
+pub(crate) fn decode_plain_tile<'w>(
     file: &HeifFile<'_>,
     tile_id: ItemId,
     tw: u32,
@@ -1984,7 +2020,7 @@ fn decode_grid_with_transform<S: Sample>(
 
 /// Whether `id` is a coded image without transformative properties or alpha plane, so that
 /// its decoded picture can be used as is.
-fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
+pub(crate) fn is_plain_coded_image(file: &HeifFile<'_>, id: ItemId) -> Result<bool, Error> {
     if file.item(id)?.item_type.0 != *b"hvc1"
         || !file.referencing_items(id, b"auxl").is_empty()
         || !file.referenced_items(id, b"pred").is_empty()
