@@ -68,6 +68,11 @@ pub struct Track {
     pub references: Vec<(FourCC, Vec<u32>)>,
     /// Edit list (`edts`/`elst`), empty when the track has none.
     pub edits: Vec<Edit>,
+    /// Repeat flag of the edit list: it plays again until [`presented_duration`](Self::presented_duration) is over.
+    pub repeat_edits: bool,
+    /// Duration of the track's presentation (`tkhd`), in [`timescale`](Self::timescale)
+    /// units; `None` when indefinite.
+    pub presented_duration: Option<u64>,
 }
 
 impl Track {
@@ -111,8 +116,10 @@ impl Track {
     /// [`display_order`](Self::display_order); with one, the part of the media each edit
     /// selects, so samples can be skipped or shown again.
     ///
-    /// shortcut: empty edits (a delay before the first frame) and the repeat flag of `elst`
-    /// are ignored; model them if a caller needs the presentation timeline itself.
+    /// Leading empty edits are the [`start_delay`](Self::start_delay); a later one keeps the
+    /// previous frame on screen. With the repeat flag, the edit list plays again until
+    /// [`presented_duration`](Self::presented_duration), or once when that is indefinite (see
+    /// [`repeats_forever`](Self::repeats_forever)).
     pub fn presentation(&self) -> Vec<(usize, u64)> {
         let times = self.composition_times();
         let order = self.display_order();
@@ -129,27 +136,46 @@ impl Track {
                 (i, start, end)
             })
             .collect();
-        let mut out = Vec::new();
-        for edit in self.edits.iter().filter(|e| e.media_time >= 0) {
-            let start = edit.media_time;
-            if edit.dwell {
-                if let Some(&(i, ..)) = spans.iter().find(|&&(_, s, e)| s <= start && start < e) {
-                    out.push((i, edit.duration));
+        let mut out: Vec<(usize, u64)> = Vec::new();
+        let end = self.presented_duration.filter(|_| self.repeat_edits);
+        let pass = self
+            .edits
+            .iter()
+            .fold(0u64, |t, e| t.saturating_add(e.duration));
+        let passes = if end.is_some() && pass > 0 {
+            usize::MAX
+        } else {
+            1
+        };
+        // Repeated edits that show nothing must not loop for long either.
+        let mut budget = MAX_SAMPLES;
+        let mut elapsed = 0u64;
+        'passes: for _ in 0..passes {
+            for edit in &self.edits {
+                if end.is_some_and(|end| elapsed >= end) || out.len() > MAX_SAMPLES || budget == 0 {
+                    break 'passes;
                 }
-                continue;
-            }
-            let end = start.saturating_add(i64::try_from(edit.duration).unwrap_or(i64::MAX));
-            for &(i, s, e) in &spans {
-                let (from, to) = (s.max(start), e.min(end));
-                if from < to {
-                    out.push((i, from.abs_diff(to)));
+                budget -= 1;
+                elapsed = elapsed.saturating_add(edit.duration);
+                if edit.media_time < 0 {
+                    if let Some(last) = out.last_mut() {
+                        last.1 = last.1.saturating_add(edit.duration);
+                    }
+                    continue;
                 }
+                Self::push_edit(*edit, &spans, &mut out);
             }
-            // Edits can repeat the media; keep the list as bounded as the sample tables.
-            if out.len() > MAX_SAMPLES {
-                out.truncate(MAX_SAMPLES);
-                break;
-            }
+        }
+        // Edits can repeat the media; keep the list as bounded as the sample tables.
+        out.truncate(MAX_SAMPLES);
+        if let Some(end) = end {
+            // The last pass is cut where the track ends.
+            let mut left = end.saturating_sub(self.start_delay());
+            out.retain_mut(|(_, d)| {
+                *d = (*d).min(left);
+                left -= *d;
+                *d > 0
+            });
         }
         if out.is_empty() {
             // No edit, or none that selects a picture: show the media as it is.
@@ -159,6 +185,38 @@ impl Track {
                 .collect();
         }
         out
+    }
+
+    /// Pushes the frames one non-empty edit shows.
+    fn push_edit(edit: Edit, spans: &[(usize, i64, i64)], out: &mut Vec<(usize, u64)>) {
+        let start = edit.media_time;
+        if edit.dwell {
+            if let Some(&(i, ..)) = spans.iter().find(|&&(_, s, e)| s <= start && start < e) {
+                out.push((i, edit.duration));
+            }
+            return;
+        }
+        let end = start.saturating_add(i64::try_from(edit.duration).unwrap_or(i64::MAX));
+        for &(i, s, e) in spans {
+            let (from, to) = (s.max(start), e.min(end));
+            if from < to {
+                out.push((i, from.abs_diff(to)));
+            }
+        }
+    }
+
+    /// How long the edit list waits before the first frame (its leading empty edits), in
+    /// [`timescale`](Self::timescale) units.
+    pub fn start_delay(&self) -> u64 {
+        self.edits
+            .iter()
+            .take_while(|e| e.media_time < 0)
+            .fold(0, |t, e| t.saturating_add(e.duration))
+    }
+
+    /// Whether the edit list loops forever: the repeat flag with an indefinite track duration.
+    pub fn repeats_forever(&self) -> bool {
+        self.repeat_edits && self.presented_duration.is_none()
     }
 
     /// The data of sample `index` in `file` (the whole file the track was parsed from).
@@ -182,12 +240,13 @@ fn invalid(box_type: &[u8; 4], reason: &'static str) -> Error {
 /// The composition offset of a sample that is decoded but not displayed.
 const NOT_DISPLAYED: i32 = i32::MIN;
 
-/// Most samples accepted in one track.
-const MAX_SAMPLES: usize = 1 << 22;
+/// Most samples accepted across all tracks of a file.
+const MAX_SAMPLES: usize = 1 << 18;
 
 /// Parses the tracks of the `moov` box of a file, or none if it has no `moov`.
 pub fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, Error> {
     let mut tracks = Vec::new();
+    let mut remaining_samples = MAX_SAMPLES;
     for b in crate::header::top_level_boxes(data) {
         let b = b?;
         if b.header.box_type.0 != *b"moov" {
@@ -205,7 +264,9 @@ pub fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, Error> {
         for t in BoxIter::new(b.content) {
             let t = t?;
             if t.header.box_type.0 == *b"trak" {
-                tracks.push(parse_track(t.content, movie_timescale)?);
+                let track = parse_track(t.content, movie_timescale, remaining_samples)?;
+                remaining_samples -= track.samples.len();
+                tracks.push(track);
             }
         }
     }
@@ -244,14 +305,22 @@ fn count(r: &mut Reader<'_>, entry_size: usize, kind: &[u8; 4]) -> Result<usize,
     Ok(n)
 }
 
-fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
+fn parse_track(
+    trak: &[u8],
+    movie_timescale: u32,
+    remaining_samples: usize,
+) -> Result<Track, Error> {
     // tkhd: track ID and visual size.
     let (version, mut r) = full_box(required(trak, b"tkhd")?)?;
     let skip_times = if version == 1 { 16 } else { 8 };
     r.bytes(skip_times)?;
     let id = r.u32()?;
     r.bytes(4)?; // reserved
-    r.bytes(if version == 1 { 8 } else { 4 })?; // duration
+    // All ones: indefinite.
+    let duration = match version {
+        1 => Some(r.u64()?).filter(|&d| d != u64::MAX),
+        _ => Some(r.u32()?).filter(|&d| d != u32::MAX).map(u64::from),
+    };
     r.bytes(8 + 2 + 2 + 2 + 2 + 36)?; // reserved, layer, group, volume, reserved, matrix
     let width = r.u32()? >> 16;
     let height = r.u32()? >> 16;
@@ -273,10 +342,13 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
     let (version, mut r) = full_box(required(mdia, b"mdhd")?)?;
     r.bytes(if version == 1 { 16 } else { 8 })?; // creation and modification times
     let timescale = r.u32()?;
-    let edits = match child(trak, b"edts")? {
+    let (edits, repeat_edits) = match child(trak, b"edts")? {
         Some(edts) => parse_edits(edts, movie_timescale, timescale)?,
-        None => Vec::new(),
+        None => (Vec::new(), false),
     };
+    let presented_duration = duration
+        .filter(|_| movie_timescale != 0)
+        .map(|d| movie_to_track_time(d, movie_timescale, timescale));
     let (_, mut r) = full_box(required(mdia, b"hdlr")?)?;
     r.bytes(4)?; // pre_defined
     let handler = r.fourcc()?;
@@ -313,11 +385,11 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
     let (_, mut r) = full_box(required(stbl, b"stsz")?)?;
     let uniform = r.u32()?;
     let sample_count = r.u32()? as usize;
-    if sample_count > MAX_SAMPLES {
+    if sample_count > remaining_samples {
         return Err(invalid(b"stsz", "too many samples"));
     }
-    let sizes: Vec<u32> = if uniform != 0 {
-        vec![uniform; sample_count]
+    let table_sizes: Vec<u32> = if uniform != 0 {
+        Vec::new()
     } else {
         if sample_count > r.remaining() / 4 {
             return Err(invalid(b"stsz", "more entries than data"));
@@ -352,7 +424,7 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
     }
 
     // Sample offsets: walk the chunks, each holding its run's number of samples.
-    let mut samples = Vec::with_capacity(sample_count);
+    let mut samples = Vec::with_capacity(sample_count.min(4096));
     'chunks: for (chunk, &chunk_offset) in offsets.iter().enumerate() {
         let number = chunk as u32 + 1;
         let per_chunk = runs
@@ -362,8 +434,13 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
             .map_or(0, |&(_, n)| n);
         let mut offset = chunk_offset;
         for _ in 0..per_chunk {
-            let Some(&size) = sizes.get(samples.len()) else {
+            if samples.len() == sample_count {
                 break 'chunks;
+            }
+            let size = if uniform != 0 {
+                uniform
+            } else {
+                table_sizes[samples.len()]
             };
             samples.push(Sample {
                 offset,
@@ -437,19 +514,28 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Result<Track, Error> {
         samples,
         references,
         edits,
+        repeat_edits,
+        presented_duration,
     })
 }
 
 /// The edit list of an `edts` box, with segment durations converted from the movie's
-/// timescale to the track's. Empty without an `elst` box or a movie timescale.
-fn parse_edits(edts: &[u8], movie_timescale: u32, timescale: u32) -> Result<Vec<Edit>, Error> {
+/// timescale to the track's, and its repeat flag. Empty without an `elst` box or a movie
+/// timescale.
+fn parse_edits(
+    edts: &[u8],
+    movie_timescale: u32,
+    timescale: u32,
+) -> Result<(Vec<Edit>, bool), Error> {
     let Some(elst) = child(edts, b"elst")? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     if movie_timescale == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
-    let (version, mut r) = full_box(elst)?;
+    let mut r = Reader::new(elst);
+    let version = r.u8()?;
+    let repeat = r.bytes(3)?[2] & 1 != 0;
     let n = count(&mut r, if version == 1 { 20 } else { 12 }, b"elst")?;
     let mut edits = Vec::with_capacity(n);
     for _ in 0..n {
@@ -460,14 +546,19 @@ fn parse_edits(edts: &[u8], movie_timescale: u32, timescale: u32) -> Result<Vec<
         };
         let rate = r.u16()?;
         r.bytes(2)?; // media_rate_fraction
-        let duration = u128::from(duration) * u128::from(timescale) / u128::from(movie_timescale);
         edits.push(Edit {
-            duration: u64::try_from(duration).unwrap_or(u64::MAX),
+            duration: movie_to_track_time(duration, movie_timescale, timescale),
             media_time,
             dwell: rate == 0,
         });
     }
-    Ok(edits)
+    Ok((edits, repeat))
+}
+
+/// A duration in the movie's timescale, in the track's.
+fn movie_to_track_time(duration: u64, movie_timescale: u32, timescale: u32) -> u64 {
+    let d = u128::from(duration) * u128::from(timescale) / u128::from(movie_timescale);
+    u64::try_from(d).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -496,6 +587,8 @@ mod tests {
                 .collect(),
             references: Vec::new(),
             edits: Vec::new(),
+            repeat_edits: false,
+            presented_duration: None,
         }
     }
 
@@ -535,7 +628,7 @@ mod tests {
         // Starting later skips samples; a segment past the media ends with it.
         assert_eq!(shown(vec![edit(1, 2)]), [(1, 1), (2, 1)]);
         assert_eq!(shown(vec![edit(2, 50)]), [(2, 1), (3, 1)]);
-        // An empty edit is a delay, ignored; edits selecting nothing show the media as it is.
+        // A leading empty edit is a delay; edits selecting nothing show the media as it is.
         assert_eq!(shown(vec![edit(-1, 5), edit(0, 4)]), all);
         assert_eq!(shown(vec![edit(-1, 5)]), all);
         assert_eq!(shown(vec![edit(10, 5)]), all);
@@ -543,5 +636,73 @@ mod tests {
         let mut hold = edit(2, 7);
         hold.dwell = true;
         assert_eq!(shown(vec![hold]), [(2, 7)]);
+        // A later empty edit keeps the previous frame on screen.
+        assert_eq!(
+            shown(vec![edit(0, 2), edit(-1, 3), edit(2, 2)]),
+            [(0, 1), (1, 4), (2, 1), (3, 1)]
+        );
+    }
+
+    #[test]
+    fn edit_lists_wait_and_repeat() {
+        let edit = |media_time, duration| Edit {
+            duration,
+            media_time,
+            dwell: false,
+        };
+        let repeated = |edits: Vec<Edit>, presented_duration| {
+            let mut t = track(&[0; 4]);
+            t.edits = edits;
+            t.repeat_edits = true;
+            t.presented_duration = presented_duration;
+            t
+        };
+        let mut t = track(&[0; 4]);
+        t.edits = vec![edit(-1, 2), edit(-1, 1), edit(0, 4)];
+        assert_eq!(t.start_delay(), 3);
+        assert_eq!(track(&[0; 4]).start_delay(), 0);
+        assert!(!t.repeats_forever());
+
+        // Played until the track's duration: twice and a half (Nokia C036, C037).
+        let t = repeated(vec![edit(0, 4)], Some(10));
+        let order: Vec<usize> = t.presentation().iter().map(|&(i, _)| i).collect();
+        assert_eq!(order, [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]);
+        // The start delay comes back between passes; the last frame is cut where the track ends.
+        let t = repeated(vec![edit(-1, 2), edit(0, 4)], Some(9));
+        assert_eq!(t.start_delay(), 2);
+        assert_eq!(t.presentation(), [(0, 1), (1, 1), (2, 1), (3, 3), (0, 1)]);
+        // Without the flag, the track's duration changes nothing.
+        let mut once = repeated(vec![edit(0, 4)], Some(10));
+        once.repeat_edits = false;
+        assert_eq!(once.presentation().len(), 4);
+
+        // An indefinite duration: one pass, and the caller loops it (Nokia C038).
+        let t = repeated(vec![edit(0, 4)], None);
+        assert!(t.repeats_forever());
+        assert_eq!(t.presentation().len(), 4);
+
+        // Repeated edits that show nothing end quickly and show the media as it is.
+        let t = repeated(vec![edit(10, 1)], Some(u64::MAX));
+        assert_eq!(t.presentation().len(), 4);
+        let t = repeated(vec![edit(-1, 1)], Some(u64::MAX));
+        assert_eq!(t.presentation().len(), 4);
+        // A huge repeat count stays bounded.
+        let t = repeated(vec![edit(0, 4)], Some(u64::MAX));
+        assert_eq!(t.presentation().len(), MAX_SAMPLES);
+    }
+
+    #[test]
+    fn uniform_stsz_oom_regression_is_rejected() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/regressions/container/27b98151ea2b6492545413707f2161b38f8f7b5f");
+        let bytes = std::fs::read(path).unwrap();
+        let err = parse_tracks(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidBox {
+                box_type: FourCC([b's', b't', b's', b'z']),
+                ..
+            }
+        ));
     }
 }
