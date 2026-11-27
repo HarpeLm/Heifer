@@ -13,8 +13,8 @@ use heifer_isobmff::boxes::ConstructionMethod;
 use heifer_isobmff::{HeifFile, ItemId};
 
 use crate::{
-    Error, Image, ImageInfo, MAX_DEPTH, Metadata, Options, decode_item_with,
-    metadata::item_metadata,
+    Error, Image, ImageInfo, MAX_DEPTH, Metadata, Options, PreviewOptions, decode_item_with,
+    metadata::item_metadata, preview::decode_preview_from_file, to_srgb_with_options,
 };
 
 /// Largest `meta` box accepted, which is read whole: real files keep it far below.
@@ -59,6 +59,31 @@ pub fn decode_reader_rgba8<R: Read + Seek>(
     let loaded = Loaded::read(reader, Need::PrimaryImage)?;
     let file = loaded.file()?;
     Ok(decode_item_with(&file, file.primary_id, 0, options)?)
+}
+
+/// Like [`decode_srgb_rgba8`](crate::decode_srgb_rgba8), reading only the container and primary
+/// image items from `reader` and converting the result to sRGB (honouring
+/// [`Options::fallback_to_coded_color`]).
+pub fn decode_reader_srgb_rgba8<R: Read + Seek>(
+    reader: R,
+    options: &Options,
+) -> Result<Image<u8>, ReadError> {
+    let loaded = Loaded::read(reader, Need::PrimaryImage)?;
+    let file = loaded.file()?;
+    let id = file.primary_id;
+    let image = decode_item_with(&file, id, 0, options)?;
+    Ok(to_srgb_with_options(&file, id, image, options)?)
+}
+
+/// Like [`decode_preview_rgba8`](crate::decode_preview_rgba8), reading only the container and
+/// primary image items from `reader`.
+pub fn decode_reader_preview_rgba8<R: Read + Seek>(
+    reader: R,
+    options: &PreviewOptions,
+) -> Result<Image<u8>, ReadError> {
+    let loaded = Loaded::read(reader, Need::PrimaryImage)?;
+    let file = loaded.file()?;
+    Ok(decode_preview_from_file(&file, file.primary_id, options)?)
 }
 
 /// Like [`read_metadata`](crate::read_metadata), reading only the container and the metadata
