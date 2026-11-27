@@ -1828,14 +1828,15 @@ impl Parser<'_, '_> {
                     if ts_ctx {
                         let idx = add.min(43);
                         let mut c = sig_models[idx].pack();
+                        let mut found = false;
                         for n in (1..=end).rev() {
                             if engine.decode_packed(&mut c) == 1 {
-                                infer_sb_dc = false;
+                                found = true;
                                 sig[n_sig] = n as u8;
                                 n_sig += 1;
                             }
                         }
-                        if infer_sb_dc || engine.decode_packed(&mut c) == 1 {
+                        if (infer_sb_dc && !found) || engine.decode_packed(&mut c) == 1 {
                             sig[n_sig] = 0;
                             n_sig += 1;
                         }
@@ -1843,14 +1844,16 @@ impl Parser<'_, '_> {
                     } else if log2_size >= 3 && prev_csbf == 3 {
                         let idx = (add + 2).min(43);
                         let mut c = sig_models[idx].pack();
+                        let mut found = false;
                         for n in (1..=end).rev() {
                             if engine.decode_packed(&mut c) == 1 {
-                                infer_sb_dc = false;
+                                found = true;
                                 sig[n_sig] = n as u8;
                                 n_sig += 1;
                             }
                         }
-                        let dc_sig = if infer_sb_dc {
+                        let infer_dc = infer_sb_dc && !found;
+                        let dc_sig = if infer_dc {
                             true
                         } else if sig_ctx.dc.is_none() {
                             engine.decode_packed(&mut c) == 1
@@ -1858,7 +1861,7 @@ impl Parser<'_, '_> {
                             false
                         };
                         sig_models[idx] = ContextModel::unpack(c);
-                        if !infer_sb_dc && let Some(dc_idx) = sig_ctx.dc {
+                        if !infer_dc && let Some(dc_idx) = sig_ctx.dc {
                             if engine.decode(&mut sig_models[dc_idx.min(43)]) == 1 {
                                 sig[n_sig] = 0;
                                 n_sig += 1;
@@ -1875,15 +1878,16 @@ impl Parser<'_, '_> {
                             sig_models[add + 2].pack(),
                             0,
                         ];
-                        for n in (1..=end).rev() {
-                            let ci = usize::from(table[n & 15]) & 3;
-                            if engine.decode_packed(&mut c[ci]) == 1 {
-                                infer_sb_dc = false;
-                                sig[n_sig] = n as u8;
+                        let mut found = false;
+                        for (idx_m1, &ci_raw) in table[1..=end].iter().enumerate().rev() {
+                            if engine.decode_packed(&mut c[usize::from(ci_raw) & 3]) == 1 {
+                                found = true;
+                                sig[n_sig] = (idx_m1 + 1) as u8;
                                 n_sig += 1;
                             }
                         }
-                        let dc_sig = if infer_sb_dc {
+                        let infer_dc = infer_sb_dc && !found;
+                        let dc_sig = if infer_dc {
                             true
                         } else if sig_ctx.dc.is_none() {
                             let ci0 = usize::from(table[0]) & 3;
@@ -1894,7 +1898,7 @@ impl Parser<'_, '_> {
                         sig_models[add] = ContextModel::unpack(c[0]);
                         sig_models[add + 1] = ContextModel::unpack(c[1]);
                         sig_models[add + 2] = ContextModel::unpack(c[2]);
-                        if !infer_sb_dc && let Some(dc_idx) = sig_ctx.dc {
+                        if !infer_dc && let Some(dc_idx) = sig_ctx.dc {
                             if engine.decode(&mut sig_models[dc_idx.min(43)]) == 1 {
                                 sig[n_sig] = 0;
                                 n_sig += 1;
@@ -1909,15 +1913,15 @@ impl Parser<'_, '_> {
                         for j in 0..9 {
                             c[j] = sig_models[add + j].pack();
                         }
-                        for n in (1..=end).rev() {
-                            let ci = usize::from(table[n & 15]) & 15;
-                            if engine.decode_packed(&mut c[ci]) == 1 {
-                                infer_sb_dc = false;
-                                sig[n_sig] = n as u8;
+                        let mut found = false;
+                        for (idx_m1, &ci_raw) in table[1..=end].iter().enumerate().rev() {
+                            if engine.decode_packed(&mut c[usize::from(ci_raw) & 15]) == 1 {
+                                found = true;
+                                sig[n_sig] = (idx_m1 + 1) as u8;
                                 n_sig += 1;
                             }
                         }
-                        if infer_sb_dc
+                        if (infer_sb_dc && !found)
                             || engine.decode_packed(&mut c[usize::from(table[0]) & 15]) == 1
                         {
                             sig[n_sig] = 0;
@@ -1944,7 +1948,18 @@ impl Parser<'_, '_> {
             let mut greater1_count = 0u32;
             let g1_base =
                 ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_set * 4 + if luma { 0 } else { 16 };
-            {
+            if n_sig == 1 {
+                let mut g1 = self.ctx.models[g1_base + 1].pack();
+                if self.engine.decode_packed(&mut g1) == 1 {
+                    greater1_mask = 1;
+                    greater1_ctx_state = 0;
+                    greater1_count = 1;
+                    first_g1 = Some(0);
+                } else {
+                    greater1_ctx_state = 2;
+                }
+                self.ctx.models[g1_base + 1] = ContextModel::unpack(g1);
+            } else {
                 let g1_models = &mut self.ctx.models[g1_base..g1_base + 4];
                 let mut g = [
                     g1_models[0].pack(),
@@ -2019,13 +2034,15 @@ impl Parser<'_, '_> {
                 } else {
                     0
                 };
+                let first_g1_idx = first_g1.unwrap_or(usize::MAX);
                 let mut first_remaining = true;
-                let mut sum_abs: i64 = 0;
+                let mut sum_parity: i32 = 0;
                 for k in 0..n_sig {
+                    let is_first_g1 = k == first_g1_idx;
                     let g1 = i32::from(k < 8 && (greater1_mask >> k) & 1 != 0);
-                    let base = 1 + g1 + i32::from(first_g1 == Some(k) && greater2);
+                    let base = 1 + g1 + i32::from(is_first_g1 && greater2);
                     let threshold = if k < 8 {
-                        if first_g1 == Some(k) { 3 } else { 2 }
+                        if is_first_g1 { 3 } else { 2 }
                     } else {
                         1
                     };
@@ -2061,8 +2078,8 @@ impl Parser<'_, '_> {
                         level = -level;
                     }
                     if sign_hidden {
-                        sum_abs += i64::from(abs);
-                        if k == n_sig - 1 && sum_abs % 2 == 1 {
+                        sum_parity ^= abs;
+                        if k == n_sig - 1 && (sum_parity & 1) != 0 {
                             level = -level;
                         }
                     }
@@ -2081,13 +2098,18 @@ impl Parser<'_, '_> {
     }
 
     /// `coeff_abs_level_remaining` (§9.3.3.11): Rice prefix/suffix, then Exp-Golomb escape.
+    #[inline(always)]
     fn coeff_abs_level_remaining(&mut self, rice: u32) -> Result<u32, Error> {
         let prefix = self.engine.decode_bypass_unary_capped(32);
         if prefix > 32 {
             return Err(Error::Invalid("coeff_abs_level_remaining prefix too long"));
         }
         if prefix <= 3 {
-            Ok((prefix << rice) + self.engine.decode_bypass_bits(rice))
+            if rice == 0 {
+                Ok(prefix)
+            } else {
+                Ok((prefix << rice) + self.engine.decode_bypass_bits(rice))
+            }
         } else {
             let n = prefix - 3 + rice;
             if n > 32 {
