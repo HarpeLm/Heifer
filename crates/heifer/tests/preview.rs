@@ -4,9 +4,11 @@
 use std::io::Cursor;
 use std::path::Path;
 
+#[cfg(feature = "encoder")]
+use heifer::{Error, ReadError};
 use heifer::{
-    Error, Image, Options, PreviewOptions, ReadError, decode_preview_rgba8,
-    decode_reader_preview_rgba8, decode_reader_srgb_rgba8, decode_rgba8, decode_srgb_rgba8,
+    Image, Options, PreviewOptions, decode_preview_rgba8, decode_reader_preview_rgba8,
+    decode_reader_srgb_rgba8, decode_rgba8, decode_srgb_rgba8,
 };
 
 fn fixture(name: &str) -> Option<Vec<u8>> {
