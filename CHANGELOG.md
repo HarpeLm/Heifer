@@ -9,6 +9,10 @@
   the new `FileKind::Avif` (`"avif"`, `"image/avif"`). Decoding AVIF is not supported yet and
   returns `Error::Unsupported`. Checked on all 172 files of the AOMediaCodec/av1-avif test set.
 - `heifer-isobmff`: new `Av1Config` (the `av1C` box) and `HeifFile::av1_config`.
+- New `heifer-av1-dec` crate (not published yet), the start of a safe-Rust AV1 decoder for AVIF:
+  it splits AV1 bitstreams into OBUs and parses sequence headers (profile, maximum size, bit
+  depth, colour configuration, enabled tools). Checked against the `av1C` box and image size of
+  all 238 AV1 items in the AOMediaCodec/av1-avif test set, and fuzzed by a new `av1` target.
 
 ## 0.9.0 — 2026-11-27
 
