@@ -13,6 +13,11 @@
   it splits AV1 bitstreams into OBUs and parses sequence headers (profile, maximum size, bit
   depth, colour configuration, enabled tools). Checked against the `av1C` box and image size of
   all 238 AV1 items in the AOMediaCodec/av1-avif test set, and fuzzed by a new `av1` target.
+  It also reads intra frame headers (frame size, superres, tiles, quantizer, segmentation,
+  deblocking, CDEF, loop restoration, film grain) and cuts tile groups into tiles: the 212
+  single-layer items of the test set parse to their `ispe` size, and multi-layer items stop at
+  their first inter frame. The symbol decoder and its CDF adaptation are in place, with the 96
+  default CDF tables generated from the specification source (`scripts/gen-av1-cdfs.py`).
 
 ## 0.9.0 — 2026-11-27
 
