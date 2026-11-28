@@ -1,0 +1,15 @@
+title: ""
+labels: []
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Idea
+      description: What heifer should do, and the use case behind it.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How you work around it today
+      description: Another library, a conversion step, nothing yet...

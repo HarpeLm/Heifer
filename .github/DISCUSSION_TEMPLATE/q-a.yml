@@ -1,0 +1,29 @@
+title: ""
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions about using heifer: decoding, encoding, the `image` crate integration, WASM,
+        migrating from libheif-rs ([migration guide](https://github.com/HarpeLm/Heifer/blob/main/docs/MIGRATION.md)).
+
+        A file that is refused or decodes wrongly is a bug: please open an issue instead.
+        Do not attach a private photo.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What you are trying to do, and what you tried.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: heifer version
+      placeholder: "0.9.0"
+  - type: textarea
+    id: code
+    attributes:
+      label: Code
+      description: A short snippet, if it helps.
+      render: rust

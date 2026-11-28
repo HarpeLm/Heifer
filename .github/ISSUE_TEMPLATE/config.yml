@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Ask a question
+    url: https://github.com/HarpeLm/Heifer/discussions/categories/q-a
+    about: Usage questions and help go to Discussions.
   - name: Report a security vulnerability
     url: https://github.com/HarpeLm/Heifer/security/advisories/new
     about: Report crashes, hangs, excessive memory use or memory-safety issues privately.
