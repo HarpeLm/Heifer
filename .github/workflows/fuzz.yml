@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [hevc, decode, parallel, container, cabac, encode, info, image_decoder]
+        target: [hevc, decode, parallel, container, cabac, encode, info, image_decoder, preview, gain_map]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
