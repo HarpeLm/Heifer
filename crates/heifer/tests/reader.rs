@@ -52,8 +52,68 @@ fn reader_and_slice_decode_identically() {
         let meta = heifer::read_metadata(&bytes).ok();
         let meta_reader = heifer::read_metadata_reader(Cursor::new(&bytes)).ok();
         assert_eq!(meta, meta_reader, "{name}");
+        let gm = heifer::read_gain_map(&bytes).ok();
+        let gm_reader =
+            heifer::read_gain_map_reader(Cursor::new(&bytes), &heifer::Options::default()).ok();
+        assert_eq!(gm, gm_reader, "{name}: gain map");
     }
     assert!(compared >= 1);
+}
+
+#[test]
+fn read_gain_map_reader_matches_slice_and_skips_primary_image_payload() {
+    let (w, h) = (128u32, 96u32);
+    let mut base_data = Vec::with_capacity((w * h * 4) as usize);
+    let mut hdr_data = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let v = ((x * 2 + y) % 200 + 20) as u16;
+            base_data.extend([v, v, v, 255]);
+            let linear = (f32::from(v) / 255.0).powf(2.2).max(0.01);
+            let boost = if x >= w / 2 { 4.0 } else { 1.0 };
+            hdr_data.extend([linear * boost; 3]);
+        }
+    }
+    let base = heifer::Image {
+        width: w,
+        height: h,
+        bit_depth: 8,
+        has_alpha: false,
+        data: base_data,
+    };
+    let hdr = heifer::HdrImage {
+        width: w,
+        height: h,
+        headroom: 4.0,
+        data: hdr_data,
+    };
+    let heic = heifer::encode_hdr(
+        &base,
+        &hdr,
+        &heifer::EncodeOptions::new()
+            .with_quality(80)
+            .with_speed(heifer::EncodeSpeed::Fast),
+    )
+    .unwrap();
+
+    let from_slice = heifer::read_gain_map(&heic)
+        .unwrap()
+        .expect("tmap gain map");
+    let mut reader = Failing {
+        inner: Cursor::new(&heic),
+        read: 0,
+        limit: usize::MAX,
+    };
+    let from_reader = heifer::read_gain_map_reader(&mut reader, &heifer::Options::default())
+        .unwrap()
+        .expect("tmap gain map from reader");
+    assert_eq!(from_slice, from_reader);
+    assert!(
+        reader.read < heic.len(),
+        "expected read_gain_map_reader to skip the primary image payload (read {} of {} bytes)",
+        reader.read,
+        heic.len()
+    );
 }
 
 /// A reader that fails after `limit` bytes.
