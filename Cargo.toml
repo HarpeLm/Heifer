@@ -23,6 +23,14 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# The codecs run conformance streams and real photos in their tests: unoptimized, those take
+# most of the suite's time. Optimizing them keeps overflow checks and debug assertions on.
+[profile.dev.package.heifer-hevc-dec]
+opt-level = 3
+
+[profile.dev.package.heifer-hevc-enc]
+opt-level = 3
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
