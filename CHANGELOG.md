@@ -6,8 +6,16 @@
 
 - AVIF files are described without decoding: `read_info` and `read_info_reader` give the size
   (after `clap`, `irot` and `imir`), bit depth and alpha of `av01` items and grids of them, and
-  the new `FileKind::Avif` (`"avif"`, `"image/avif"`). Decoding AVIF is not supported yet and
-  returns `Error::Unsupported`. Checked on all 172 files of the AOMediaCodec/av1-avif test set.
+  the new `FileKind::Avif` (`"avif"`, `"image/avif"`). Checked on all 172 files of the
+  AOMediaCodec/av1-avif test set.
+- AVIF files decode: `decode`, `decode_rgba8` and the other decode functions use the new AV1
+  decoder for `av01` items, with the YCbCr matrix and range of `colr` (or of the sequence
+  header), at 8, 10 and 12 bits in 4:0:0, 4:2:0, 4:2:2 and 4:4:4, grids, AV1 alpha planes, ICC
+  profiles and the `clap`, `irot` and `imir` transforms. `check_file_type` reports the `avif`
+  brand as supported, and the new `Error::Av1` reports corrupt AV1 data. Items with inter frames
+  (spatial layers) or intra block copy still return `Error::Unsupported`. 161 files of the
+  av1-avif test set decode to exactly dav1d's pictures put through the same conversion (an
+  opt-in test, `HEIFER_DAV1D`); the other 19 use those tools.
 - `heifer-isobmff`: new `Av1Config` (the `av1C` box) and `HeifFile::av1_config`.
 - New `heifer-av1-dec` crate (not published yet), the start of a safe-Rust AV1 decoder for AVIF:
   it splits AV1 bitstreams into OBUs and parses sequence headers (profile, maximum size, bit
@@ -28,6 +36,11 @@
   each filter, match aomdec sample for sample, and 204 of the 238 items of the av1-avif test set
   match dav1d; the other 34 use inter frames (spatial layers) or intra block copy, which are not
   supported yet.
+
+**Fixes**
+
+- Pictures with an odd width or height in 4:2:0 or 4:2:2 had their chroma read at the wrong
+  scale, which garbled the colours. HEVC photos are not affected: their coded size is even.
 
 ## 0.9.0 — 2026-11-27
 
