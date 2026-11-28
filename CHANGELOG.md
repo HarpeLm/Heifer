@@ -13,9 +13,9 @@
   header), at 8, 10 and 12 bits in 4:0:0, 4:2:0, 4:2:2 and 4:4:4, grids, AV1 alpha planes, ICC
   profiles and the `clap`, `irot` and `imir` transforms. `check_file_type` reports the `avif`
   brand as supported, and the new `Error::Av1` reports corrupt AV1 data. Items with inter frames
-  (spatial layers) or intra block copy still return `Error::Unsupported`. 161 files of the
-  av1-avif test set decode to exactly dav1d's pictures put through the same conversion (an
-  opt-in test, `HEIFER_DAV1D`); the other 19 use those tools.
+  (spatial layers) still return `Error::Unsupported`. 169 files of the av1-avif test set decode
+  to exactly dav1d's pictures put through the same conversion (an opt-in test, `HEIFER_DAV1D`);
+  the other 11 use inter frames.
 - `heifer-isobmff`: new `Av1Config` (the `av1C` box) and `HeifFile::av1_config`.
 - New `heifer-av1-dec` crate (not published yet), the start of a safe-Rust AV1 decoder for AVIF:
   it splits AV1 bitstreams into OBUs and parses sequence headers (profile, maximum size, bit
@@ -28,14 +28,14 @@
   default CDF tables generated from the specification source (`scripts/gen-av1-tables.py`, which
   also generates the other lookup tables). `decode_frame` now decodes intra frames: every intra
   prediction mode (directional with edge filtering, smooth, Paeth, filter intra, chroma from
-  luma, palette), all partitions, coefficients, quantizer and
-  segmentation deltas, and the DCT, ADST, identity and Walsh-Hadamard inverse transforms, at 8, 10
+  luma, palette), intra block copy (with its motion vector prediction and inter transform sizes
+  and types), all partitions, coefficients, quantizer and segmentation deltas, and the DCT, ADST, identity and Walsh-Hadamard inverse transforms, at 8, 10
   and 12 bits in 4:0:0, 4:2:0, 4:2:2 and 4:4:4, followed by the loop filters: deblocking (with
   loop filter deltas and sharpness), CDEF, and loop restoration (Wiener and self-guided). Film
-  grain is not applied. 34 small aomenc streams (`scripts/make-av1-streams.sh`), with and without
-  each filter, match aomdec sample for sample, and 204 of the 238 items of the av1-avif test set
-  match dav1d; the other 34 use inter frames (spatial layers) or intra block copy, which are not
-  supported yet.
+  grain is not applied. 45 small aomenc streams (`scripts/make-av1-streams.sh`), with and without
+  each filter and with intra block copy, match aomdec sample for sample, and 212 of the 238 items
+  of the av1-avif test set match dav1d; the other 26 use inter frames (spatial layers), which are
+  not supported yet.
 
 **Fixes**
 
