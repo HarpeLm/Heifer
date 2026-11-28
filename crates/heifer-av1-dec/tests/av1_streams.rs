@@ -217,3 +217,58 @@ fn filters_10() {
 fn filters_12() {
     check("filters_12");
 }
+
+#[test]
+fn intrabc() {
+    check("intrabc");
+}
+
+#[test]
+fn intrabc_tiled() {
+    check("intrabc_tiled");
+}
+
+#[test]
+fn intrabc_yuv444() {
+    check("intrabc_yuv444");
+}
+
+#[test]
+fn intrabc_yuv422() {
+    check("intrabc_yuv422");
+}
+
+#[test]
+fn intrabc_monochrome() {
+    check("intrabc_monochrome");
+}
+
+#[test]
+fn intrabc_10() {
+    check("intrabc_10");
+}
+
+#[test]
+fn intrabc_12() {
+    check("intrabc_12");
+}
+
+#[test]
+fn intrabc_sb128() {
+    check("intrabc_sb128");
+}
+
+#[test]
+fn intrabc_tile_columns() {
+    check("intrabc_tile_columns");
+}
+
+#[test]
+fn intrabc_lossless() {
+    check("intrabc_lossless");
+}
+
+#[test]
+fn intrabc_noise() {
+    check("intrabc_noise");
+}
