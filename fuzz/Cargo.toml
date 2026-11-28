@@ -73,3 +73,17 @@ path = "fuzz_targets/image_decoder.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "preview"
+path = "fuzz_targets/preview.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gain_map"
+path = "fuzz_targets/gain_map.rs"
+test = false
+doc = false
+bench = false
