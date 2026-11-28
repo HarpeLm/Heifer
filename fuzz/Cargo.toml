@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 heifer = { path = "../crates/heifer", features = ["image"] }
 heifer-isobmff = { path = "../crates/heifer-isobmff" }
 heifer-hevc-dec = { path = "../crates/heifer-hevc-dec" }
+heifer-av1-dec = { path = "../crates/heifer-av1-dec" }
 heifer-hevc-enc = { path = "../crates/heifer-hevc-enc" }
 image = { version = "0.25.8", default-features = false }
 
@@ -84,6 +85,13 @@ bench = false
 [[bin]]
 name = "gain_map"
 path = "fuzz_targets/gain_map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "av1"
+path = "fuzz_targets/av1.rs"
 test = false
 doc = false
 bench = false
