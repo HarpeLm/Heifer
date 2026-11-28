@@ -32,7 +32,9 @@ fn dav1d_frame(bin: &Path, file: &HeifFile<'_>, id: ItemId, dir: &Path) -> Frame
     let config = file.av1_config(id).unwrap().expect("av1C");
     let data = file.item_data(id).unwrap();
     let frames = heifer_av1_dec::frames(&data, &config.config_obus).unwrap();
-    let sequence = &frames[0].sequence;
+    // The last frame shown is the item's picture (its highest spatial layer).
+    let shown = frames.iter().rev().find(|f| f.header.show_frame).unwrap();
+    let sequence = &shown.sequence;
     // A temporal delimiter, then the sequence header of av1C, then the item.
     let mut obus = vec![0x12, 0x00];
     obus.extend_from_slice(&config.config_obus);
@@ -40,7 +42,15 @@ fn dav1d_frame(bin: &Path, file: &HeifFile<'_>, id: ItemId, dir: &Path) -> Frame
     let (input, output) = (dir.join("item.obu"), dir.join("item.yuv"));
     std::fs::write(&input, obus).unwrap();
     let status = Command::new(bin)
-        .args(["--filmgrain", "0", "--demuxer", "section5", "--quiet"])
+        .args([
+            "--filmgrain",
+            "0",
+            "--alllayers",
+            "0",
+            "--demuxer",
+            "section5",
+            "--quiet",
+        ])
         .arg("-i")
         .arg(&input)
         .arg("-o")
@@ -52,10 +62,7 @@ fn dav1d_frame(bin: &Path, file: &HeifFile<'_>, id: ItemId, dir: &Path) -> Frame
 
     let color = &sequence.color;
     let bd = color.bit_depth;
-    let (w, h) = (
-        frames[0].header.upscaled_width,
-        frames[0].header.frame_height,
-    );
+    let (w, h) = (shown.header.upscaled_width, shown.header.frame_height);
     let (sx, sy) = (
         u32::from(color.subsampling_x),
         u32::from(color.subsampling_y),
