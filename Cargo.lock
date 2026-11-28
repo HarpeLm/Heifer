@@ -118,6 +118,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "heifer-av1-dec"
+version = "0.9.0"
+dependencies = [
+ "heifer-isobmff",
+ "thiserror",
+]
+
+[[package]]
 name = "heifer-cli"
 version = "0.9.0"
 dependencies = [
