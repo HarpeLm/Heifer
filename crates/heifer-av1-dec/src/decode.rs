@@ -1,5 +1,5 @@
 //! Decoding of intra frames (AV1 §5.11, §6.10, §7.11–7.13): reads each tile's blocks, predicts
-//! them and adds their residuals. Loop filters are not applied yet.
+//! them, adds their residuals, then runs the loop filters (`filter`).
 
 use crate::Error;
 use crate::cdf_tables::Cdfs;
@@ -10,6 +10,8 @@ use crate::spec_tables::*;
 use crate::symbol::SymbolDecoder;
 use crate::tile::{CodedFrame, Tile};
 use crate::transform::{self, DCT_DCT, IDTX};
+
+mod filter;
 
 /// A decoded picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +62,7 @@ const TX_CLASS_2D: usize = 0;
 const TX_CLASS_HORIZ: usize = 1;
 const TX_CLASS_VERT: usize = 2;
 
-/// Decodes an intra frame, without loop filtering.
+/// Decodes an intra frame. Film grain is not applied.
 pub fn decode_frame(frame: &CodedFrame<'_>) -> Result<Picture, Error> {
     let (seq, fh) = (&frame.sequence, &frame.header);
     if fh.upscaled_width != fh.frame_width {
@@ -73,6 +75,7 @@ pub fn decode_frame(frame: &CodedFrame<'_>) -> Result<Picture, Error> {
     for tile in &frame.tiles {
         TileDecoder::new(&mut f, tile)?.decode()?;
     }
+    f.apply_filters();
     Ok(f.picture())
 }
 
@@ -103,6 +106,22 @@ struct FrameState<'h> {
     palette_colors: [Vec<[u16; 8]>; 2],
     /// `cdef_idx` per 64×64 block.
     cdef_idx: Vec<i8>,
+    /// `DeltaLFs`.
+    delta_lfs: Vec<[i8; 4]>,
+    /// `LoopfilterTxSizes` per plane and 4×4 unit of that plane, `mi_stride` units per row.
+    lf_tx_sizes: [Vec<u8>; 3],
+    /// Loop restoration units of each plane, row after row.
+    lr_units: [Vec<LrUnit>; 3],
+}
+
+/// `LrType`, `LrWiener`, `LrSgrSet` and `LrSgrXqd` of a loop restoration unit.
+#[derive(Debug, Clone, Copy, Default)]
+struct LrUnit {
+    /// `RESTORE_NONE` (0), `RESTORE_WIENER` (1) or `RESTORE_SGRPROJ` (2).
+    kind: u8,
+    wiener: [[i32; 3]; 2],
+    sgr_set: u8,
+    sgr_xqd: [i32; 2],
 }
 
 impl<'h> FrameState<'h> {
@@ -126,7 +145,7 @@ impl<'h> FrameState<'h> {
             })
             .collect();
         let units = mi_stride * rows;
-        Self {
+        let mut f = Self {
             seq,
             fh,
             sub_x,
@@ -147,7 +166,36 @@ impl<'h> FrameState<'h> {
             palette_sizes: [vec![0; units], vec![0; units]],
             palette_colors: [vec![[0; 8]; units], vec![[0; 8]; units]],
             cdef_idx: vec![-1; (mi_stride / 16) * (rows / 16)],
+            delta_lfs: vec![[0; 4]; units],
+            lf_tx_sizes: [vec![0; units], vec![0; units], vec![0; units]],
+            lr_units: Default::default(),
+        };
+        for plane in 0..num_planes {
+            if fh.restoration.types[plane] != RestorationType::None {
+                let (rows, cols) = f.lr_unit_counts(plane);
+                f.lr_units[plane] = vec![LrUnit::default(); rows * cols];
+            }
         }
+        f
+    }
+
+    fn sub(&self, plane: usize) -> (usize, usize) {
+        if plane > 0 {
+            (self.sub_x, self.sub_y)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// `unitRows` and `unitCols` of a plane (`count_units_in_frame()`).
+    fn lr_unit_counts(&self, plane: usize) -> (usize, usize) {
+        let (sx, sy) = self.sub(plane);
+        let unit = usize::from(self.fh.restoration.unit_size[plane]);
+        let count = |size: usize| ((size + (unit >> 1)) / unit).max(1);
+        (
+            count(round2(self.fh.frame_height as i32, sy as u32) as usize),
+            count(round2(self.fh.upscaled_width as i32, sx as u32) as usize),
+        )
     }
 
     fn mi(&self, row: usize, col: usize) -> usize {
@@ -479,7 +527,7 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
     }
 
-    /// `read_lr()`: loop restoration coefficients, read but not applied yet.
+    /// `read_lr()`: loop restoration coefficients.
     fn read_lr(&mut self, r: usize, c: usize, bsize: usize) -> Result<(), Error> {
         let fh = self.f.fh;
         if fh.allow_intrabc {
@@ -492,30 +540,24 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             if frame_type == RestorationType::None {
                 continue;
             }
-            let (sx, sy) = if plane > 0 {
-                (self.f.sub_x, self.f.sub_y)
-            } else {
-                (0, 0)
-            };
+            let (sx, sy) = self.f.sub(plane);
             let unit = usize::from(fh.restoration.unit_size[plane]);
-            let count = |size: usize| ((size + (unit >> 1)) / unit).max(1);
-            let unit_rows = count(round2(fh.frame_height as i32, sy as u32) as usize);
-            let unit_cols = count(round2(fh.upscaled_width as i32, sx as u32) as usize);
+            let (unit_rows, unit_cols) = self.f.lr_unit_counts(plane);
             let row_start = (r * (4 >> sy)).div_ceil(unit);
             let row_end = unit_rows.min(((r + h) * (4 >> sy)).div_ceil(unit));
             let col_start = (c * (4 >> sx)).div_ceil(unit);
             let col_end = unit_cols.min(((c + w) * (4 >> sx)).div_ceil(unit));
-            for _ in row_start..row_end {
-                for _ in col_start..col_end {
-                    self.read_lr_unit(plane, frame_type)?;
+            for unit_row in row_start..row_end {
+                for unit_col in col_start..col_end {
+                    let u = self.read_lr_unit(plane, frame_type)?;
+                    self.f.lr_units[plane][unit_row * unit_cols + unit_col] = u;
                 }
             }
         }
         Ok(())
     }
 
-    // shortcut: the unit's coefficients are dropped, keep them when loop restoration lands (M3).
-    fn read_lr_unit(&mut self, plane: usize, frame_type: RestorationType) -> Result<(), Error> {
+    fn read_lr_unit(&mut self, plane: usize, frame_type: RestorationType) -> Result<LrUnit, Error> {
         let kind = match frame_type {
             RestorationType::Wiener => {
                 if self.sym(|c| &mut c.use_wiener)? == 1 {
@@ -533,6 +575,10 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             }
             _ => self.sym(|c| &mut c.restoration_type)?,
         };
+        let mut unit = LrUnit {
+            kind: kind as u8,
+            ..LrUnit::default()
+        };
         if kind == 1 {
             const MIN: [i32; 3] = [-5, -23, -17];
             const MAX: [i32; 3] = [10, 8, 46];
@@ -542,12 +588,14 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                     let r = self.ref_lr_wiener[plane][pass][j];
                     let v = self.signed_subexp(MIN[j], MAX[j] + 1, K[j], r)?;
                     self.ref_lr_wiener[plane][pass][j] = v;
+                    unit.wiener[pass][j] = v;
                 }
             }
         } else if kind == 2 {
             const MIN: [i32; 2] = [-96, -32];
             const MAX: [i32; 2] = [31, 95];
             let set = self.lit(4)? as usize;
+            unit.sgr_set = set as u8;
             for i in 0..2 {
                 let v = if SGR_PARAMS[set][i * 2] != 0 {
                     self.signed_subexp(MIN[i], MAX[i] + 1, 4, self.ref_sgr_xqd[plane][i])?
@@ -557,9 +605,10 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                     0
                 };
                 self.ref_sgr_xqd[plane][i] = v;
+                unit.sgr_xqd[i] = v;
             }
         }
-        Ok(())
+        Ok(unit)
     }
 
     /// `decode_signed_subexp_with_ref_bool()`.
@@ -784,6 +833,7 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                 self.f.palette_sizes[1][i] = b.palette_size_uv as u8;
                 self.f.palette_colors[0][i] = b.palette_y;
                 self.f.palette_colors[1][i] = b.palette_u;
+                self.f.delta_lfs[i] = self.delta_lf.map(|d| d as i8);
             }
         }
         Ok(())
@@ -1300,11 +1350,7 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
     }
 
     fn plane_sub(&self, plane: usize) -> (usize, usize) {
-        if plane > 0 {
-            (self.f.sub_x, self.f.sub_y)
-        } else {
-            (0, 0)
-        }
+        self.f.sub(plane)
     }
 
     /// `get_plane_residual_size()`.
@@ -1492,6 +1538,11 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
         for row in &mut self.block_decoded[plane][sub_row + 1..sub_row + 1 + step_y] {
             row[sub_col + 1..sub_col + 1 + step_x].fill(true);
+        }
+        let stride = self.f.mi_stride;
+        for i in 0..step_y {
+            let start = ((row >> sy) + i) * stride + (col >> sx);
+            self.f.lf_tx_sizes[plane][start..start + step_x].fill(tx as u8);
         }
         Ok(())
     }
