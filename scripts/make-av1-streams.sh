@@ -46,6 +46,20 @@ picture small10 136x72 yuv420p10le
 picture small12 136x72 yuv420p12le
 # Without noise aomenc detects screen content, which turns on palettes.
 picture screen 264x200 yuv420p ""
+# Exact repeats, which intra block copy predicts: one 66×40 picture tiled 4×5.
+ffmpeg -loglevel error -y -f lavfi -i "testsrc2=s=66x40:d=1" -frames:v 1 "$tmp/tile.png"
+tiled() { # name format [filters]
+  ffmpeg -loglevel error -y -loop 1 -i "$tmp/tile.png" -vf "tile=4x5${3-},format=$2" -strict -1 \
+    -frames:v 1 "$tmp/$1.y4m"
+}
+tiled tiled yuv420p
+tiled tiled444 yuv444p
+tiled tiled422 yuv422p
+tiled tiled_gray gray
+tiled tiled10 yuv420p10le
+tiled tiled12 yuv420p12le
+# Noise leaves a residual under the copied blocks, so inter transform sizes and types get coded.
+tiled tiled_noise yuv420p ,noise=alls=6:allf=t
 # Smooth enough for 128×128 blocks and 64×64 transforms.
 ffmpeg -loglevel error -y -f lavfi -i "gradients=s=264x200:d=1:seed=3,format=yuv420p" \
   -frames:v 1 "$tmp/gradient.y4m"
@@ -90,3 +104,19 @@ stream filters_yuv444 small444 --cq-level=40 --profile=1
 stream filters_yuv422 small422 --cq-level=40 --profile=2
 stream filters_10 small10 --cq-level=40 --bit-depth=10 --input-bit-depth=10
 stream filters_12 small12 --cq-level=40 --profile=2 --bit-depth=12 --input-bit-depth=12
+
+# Intra block copy: aomenc only allows it for screen content, at --cpu-used 2 or below. Loop
+# filters are off in frames that allow it.
+ibc="--tune-content=screen --cpu-used=2"
+stream intrabc screen --cq-level=30 $ibc
+stream intrabc_tiled tiled --cq-level=30 $ibc
+stream intrabc_yuv444 tiled444 --cq-level=30 --profile=1 $ibc
+stream intrabc_yuv422 tiled422 --cq-level=30 --profile=2 $ibc
+stream intrabc_monochrome tiled_gray --cq-level=30 --monochrome $ibc
+stream intrabc_10 tiled10 --cq-level=30 --bit-depth=10 --input-bit-depth=10 $ibc
+stream intrabc_12 tiled12 --cq-level=30 --profile=2 --bit-depth=12 --input-bit-depth=12 $ibc
+# With 128×128 superblocks and several tiles, aomenc no longer allows it.
+stream intrabc_sb128 tiled --cq-level=40 --sb-size=128 $ibc
+stream intrabc_tile_columns tiled --cq-level=40 --tile-columns=1 $ibc
+stream intrabc_lossless tiled --lossless=1 $ibc
+stream intrabc_noise tiled_noise --cq-level=20 $ibc
