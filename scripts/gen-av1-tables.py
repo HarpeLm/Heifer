@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Generates crates/heifer-av1-dec/src/cdf_tables.rs from the AV1 specification text.
+"""Generates the AV1 lookup tables of crates/heifer-av1-dec from the specification text.
 
-The default CDF tables are copied from the Markdown source of the specification
-(github.com/AOMediaCodec/av1-spec, pinned below), with the shapes it declares.
+The tables are copied from the Markdown source of the specification
+(github.com/AOMediaCodec/av1-spec, pinned below), with the shapes it declares:
+  - src/cdf_tables.rs: the default CDF tables (every `Default_*_Cdf`);
+  - src/spec_tables.rs: the other constant tables the decoder uses (TABLES below).
 
-Usage: scripts/gen-av1-cdfs.py SPEC_DIR > crates/heifer-av1-dec/src/cdf_tables.rs
-where SPEC_DIR holds the Markdown files of that commit (the constants come from
-03.symbols.md and 07.bitstream.semantics.md, the tables from 10.additional.tables.md).
+Usage: scripts/gen-av1-tables.py SPEC_DIR CRATE_DIR
+where SPEC_DIR holds the Markdown files of that commit (constants come from 03.symbols.md and
+07.bitstream.semantics.md, tables from 06 to 10).
 """
 
 import math
@@ -16,43 +18,79 @@ import sys
 
 SPEC_COMMIT = "5e04f3f75e73a5898d7616c47c52f032144b8f80"
 
-spec = pathlib.Path(sys.argv[1])
-text = "\n".join(p.read_text() for p in sorted(spec.glob("*.md")))
+# Non-CDF tables used by the decoder.
+TABLES = """
+Partition_Subsize Num_4x4_Blocks_Wide Num_4x4_Blocks_High Mi_Width_Log2 Mi_Height_Log2
+Subsampled_Size Max_Tx_Size_Rect Max_Tx_Depth Split_Tx_Size Tx_Width Tx_Height Tx_Width_Log2
+Tx_Height_Log2 Tx_Size_Sqr Tx_Size_Sqr_Up Adjusted_Tx_Size Mode_To_Txfm Tx_Type_In_Set_Intra
+Tx_Type_In_Set_Inter Tx_Type_Intra_Inv_Set1 Tx_Type_Intra_Inv_Set2 Coeff_Base_Ctx_Offset
+Coeff_Base_Pos_Ctx_Offset Mag_Ref_Offset_With_Tx_Class Sig_Ref_Diff_Offset Intra_Mode_Context
+Filter_Intra_Mode_To_Intra_Dir Palette_Color_Context Palette_Color_Hash_Multipliers
+Dc_Qlookup Ac_Qlookup Dr_Intra_Derivative Intra_Filter_Taps Mode_To_Angle Intra_Edge_Kernel
+Sm_Weights_Tx_4x4 Sm_Weights_Tx_8x8 Sm_Weights_Tx_16x16 Sm_Weights_Tx_32x32 Sm_Weights_Tx_64x64
+Transform_Row_Shift Cos128_Lookup Sgr_Params
+Default_Scan_4x4 Default_Scan_4x8 Default_Scan_8x4 Default_Scan_8x8 Default_Scan_8x16
+Default_Scan_16x8 Default_Scan_16x16 Default_Scan_16x32 Default_Scan_32x16 Default_Scan_4x16
+Default_Scan_16x4 Default_Scan_8x32 Default_Scan_32x8 Default_Scan_32x32
+Mrow_Scan_4x4 Mrow_Scan_4x8 Mrow_Scan_8x4 Mrow_Scan_8x8 Mrow_Scan_8x16 Mrow_Scan_16x8
+Mrow_Scan_16x16 Mrow_Scan_4x16 Mrow_Scan_16x4
+Mcol_Scan_4x4 Mcol_Scan_4x8 Mcol_Scan_8x4 Mcol_Scan_8x8 Mcol_Scan_8x16 Mcol_Scan_16x8
+Mcol_Scan_16x16 Mcol_Scan_4x16 Mcol_Scan_16x4
+""".split()
 
-# Constants: "| `NAME` | value |" rows anywhere in the specification.
+spec, crate = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+text = "\n".join(p.read_text() for p in sorted(spec.glob("*.md")))
+text = re.sub(r"//[^\n]*", "", text)  # comments inside tables
+
+# Constants: "| `NAME` | value |" rows of the symbol lists, then "| value | NAME" rows of the
+# semantics tables (block sizes, transform sizes, prediction modes…).
 consts = {}
 for name, value in re.findall(r"^\|\s*`([A-Z0-9_]+)`\s*\|\s*(-?\d+)\s*\|", text, re.M):
+    consts.setdefault(name, int(value))
+for value, name in re.findall(r"^\|\s*(\d+)\s*\|\s*([A-Z][A-Z0-9_]*[A-Z0-9])\s*\|?\s*$", text, re.M):
     consts.setdefault(name, int(value))
 # Defined in the semantics of lr_type (a table of a different shape).
 consts["RESTORE_SWITCHABLE"] = 3
 
 
-def dim(expr):
-    expr = re.sub(r"[A-Z][A-Z0-9_]+", lambda m: str(consts[m.group(0)]), expr)
-    if not re.fullmatch(r"[\d\s+\-*()]+", expr):
-        raise ValueError(expr)
-    return int(eval(expr.strip()))  # digits and + - * ( ) only
+def evaluate(expr):
+    expr = re.sub(r"[A-Z][A-Z0-9_]+", lambda m: str(consts[m.group(0)]), expr).strip()
+    if not re.fullmatch(r"[\d+\-*()< ]+", expr):
+        raise ValueError(repr(expr))
+    return int(eval(expr))  # digits and + - * ( ) only
 
 
-tables = []
-pattern = re.compile(r"^(Default_\w+_Cdf)\s*((?:\[[^\]]*\]\s*)+)=\s*\{", re.M)
-for m in pattern.finditer(text):
-    name = m.group(1)
-    dims = [dim(d) for d in re.findall(r"\[([^\]]*)\]", m.group(2))]
-    # The body runs to the brace that closes the opening one.
-    depth, i = 1, m.end()
-    while depth:
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-    # Entries are numbers or small expressions such as "128 * 128".
-    values = [dim(v) for v in re.split(r"[{},]", text[m.end() : i - 1]) if v.strip()]
-    if len(values) != math.prod(dims):
-        raise ValueError(f"{name}: {len(values)} values for shape {dims}")
-    tables.append((name, dims, values))
+def parse(name_pattern):
+    tables = []
+    pattern = re.compile(rf"^({name_pattern})\s*((?:\[[^\]]*\]\s*)+)=\s*\{{", re.M)
+    for m in pattern.finditer(text):
+        name = m.group(1)
+        raw_dims = re.findall(r"\[([^\]]*)\]", m.group(2))
+        dims = [evaluate(d) for d in raw_dims]
+        # The body runs to the brace that closes the opening one.
+        depth, i = 1, m.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        try:
+            # Line breaks separate entries too: Split_Tx_Size lacks a comma after TX_32X32.
+            values = [evaluate(v) for v in re.split(r"[{},\n]", text[m.end() : i - 1]) if v.strip()]
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"{name}: {e}") from e
+        if len(values) != math.prod(dims):
+            raise ValueError(f"{name}: {len(values)} values for shape {dims}")
+        tables.append((name, dims, values, "COEFF_CDF_Q_CTXS" in raw_dims[0]))
+    return tables
 
 
-def rust_type(dims):
-    t = "u16"
+def element_type(values):
+    for t, lo, hi in (("u8", 0, 255), ("i8", -128, 127), ("u16", 0, 65535), ("i16", -32768, 32767)):
+        if lo <= min(values) and max(values) <= hi:
+            return t
+    return "i32"
+
+
+def rust_type(t, dims):
     for d in reversed(dims):
         t = f"[{t}; {d}]"
     return t
@@ -65,29 +103,58 @@ def rust_value(dims, values):
     return "[" + ", ".join(rust_value(dims[1:], values[k * step : (k + 1) * step]) for k in range(dims[0])) + "]"
 
 
-print(f"""//! Default CDF tables (AV1 §10.3), generated by `scripts/gen-av1-cdfs.py` from the
-//! specification source, AOMediaCodec/av1-spec commit {SPEC_COMMIT}. Do not edit.
-//!
-//! Each innermost array is one CDF: increasing values ending with 32768, then the adaptation
-//! counter, which starts at 0.
-
-#![allow(dead_code)] // shortcut: tables are used by the tile decoder (M2); remove then.
-""")
 def rust_name(name):
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper().replace("__", "_")
 
 
-for name, dims, values in tables:
-    print(f"/// `{name}`.")
-    print(f"pub(crate) static {rust_name(name)}: {rust_type(dims)} = {rust_value(dims, values)};")
-print()
-print("/// Every table as `(name, values, CDF length)`, for tests.")
-print("#[cfg(test)]")
-print(f"pub(crate) fn all() -> [(&'static str, &'static [u16], usize); {len(tables)}] {{")
-print("    [")
-for name, dims, _ in tables:
+def write(path, doc, tables):
+    out = [f"//! {doc}, generated by `scripts/gen-av1-tables.py` from the specification source,",
+           f"//! AOMediaCodec/av1-spec commit {SPEC_COMMIT}. Do not edit.", ""]
+    for name, dims, values in tables:
+        out.append(f"/// `{name}`.")
+        # Scans share one type so that they can be chosen at run time.
+        t = "u16" if "_Scan_" in name else element_type(values)
+        out.append(f"pub(crate) static {rust_name(name)}: {rust_type(t, dims)} = {rust_value(dims, values)};")
+    path.write_text("\n".join(out) + "\n")
+
+
+cdfs = parse(r"Default_\w+_Cdf")
+cdf_out = [f"//! Default CDF tables (AV1 §10.3), generated by `scripts/gen-av1-tables.py` from the",
+           f"//! specification source, AOMediaCodec/av1-spec commit {SPEC_COMMIT}. Do not edit.",
+           "//!", "//! Each innermost array is one CDF: increasing values ending with 32768, then the adaptation",
+           "//! counter, which starts at 0. [`Cdfs`] holds the working copy of every CDF of a tile.", ""]
+for name, dims, values, _ in cdfs:
+    cdf_out.append(f"/// `{name}`.")
+    cdf_out.append(f"pub(crate) static {rust_name(name)}: {rust_type('u16', dims)} = {rust_value(dims, values)};")
+
+
+def field(name):
+    return name[len("Default_") : -len("_Cdf")].lower()
+
+
+cdf_out += ["", "/// The CDFs of a tile (`init_non_coeff_cdfs()` and `init_coeff_cdfs()`).",
+            "#[derive(Clone)]", "pub(crate) struct Cdfs {"]
+for name, dims, _, coeff in cdfs:
+    cdf_out.append(f"    pub(crate) {field(name)}: {rust_type('u16', dims[1:] if coeff else dims)},")
+cdf_out += ["    /// `DeltaLFMultiCdf`: one copy of `Default_Delta_Lf_Cdf` per loop filter level.",
+            f"    pub(crate) delta_lf_multi: [{rust_type('u16', next(d for n, d, _, _ in cdfs if n == 'Default_Delta_Lf_Cdf'))}; 4],",
+            "}", "", "impl Cdfs {",
+            "    /// The default CDFs; the coefficient CDFs are those of quantizer context `q_ctx` (0 to 3).",
+            "    pub(crate) fn new(q_ctx: usize) -> Box<Self> {", "        Box::new(Self {"]
+for name, dims, _, coeff in cdfs:
+    cdf_out.append(f"            {field(name)}: {rust_name(name)}{'[q_ctx]' if coeff else ''},")
+cdf_out += ["            delta_lf_multi: [DEFAULT_DELTA_LF_CDF; 4],", "        })", "    }", "}"]
+cdf_out += ["", "/// Every table as `(name, values, CDF length)`, for tests.", "#[cfg(test)]",
+            f"pub(crate) fn all() -> [(&'static str, &'static [u16], usize); {len(cdfs)}] {{", "    ["]
+for name, dims, _, _ in cdfs:
     flat = rust_name(name) + ".as_flattened()" * (len(dims) - 1) if len(dims) > 1 else "&" + rust_name(name)
-    print(f'        ("{name}", {flat}, {dims[-1]}),')
-print("    ]")
-print("}")
-sys.stderr.write(f"{len(tables)} tables, {sum(len(v) for _, _, v in tables)} values\n")
+    cdf_out.append(f'        ("{name}", {flat}, {dims[-1]}),')
+cdf_out += ["    ]", "}"]
+(crate / "src/cdf_tables.rs").write_text("\n".join(cdf_out) + "\n")
+
+found = {t[0]: t[:3] for t in parse("|".join(TABLES))}
+missing = [n for n in TABLES if n not in found]
+if missing:
+    raise ValueError(f"tables not found: {missing}")
+write(crate / "src/spec_tables.rs", "Constant tables of the AV1 specification", [found[n] for n in TABLES])
+sys.stderr.write(f"{len(cdfs)} CDF tables, {len(TABLES)} other tables\n")
