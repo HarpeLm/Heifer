@@ -73,10 +73,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "heifer-av1-dec"
+version = "0.9.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "heifer-fuzz"
 version = "0.0.0"
 dependencies = [
  "heifer",
+ "heifer-av1-dec",
  "heifer-hevc-dec",
  "heifer-hevc-enc",
  "heifer-isobmff",
