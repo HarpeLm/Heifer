@@ -73,6 +73,21 @@ pub struct SequenceHeader {
     pub color: ColorConfig,
     /// `film_grain_params_present`.
     pub film_grain_params_present: bool,
+    /// Decoder model fields that change the frame header syntax.
+    pub(crate) timing: FrameTiming,
+}
+
+/// The sequence header fields that add `temporal_point_info()` and `buffer_removal_time` to frame
+/// headers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct FrameTiming {
+    /// `frame_presentation_time_length_minus_1 + 1` when frame headers carry a presentation time
+    /// (`decoder_model_info_present_flag && !equal_picture_interval`), else 0.
+    pub(crate) presentation_time_bits: u32,
+    /// `buffer_removal_time_length_minus_1 + 1` when the decoder model is present, else 0.
+    pub(crate) buffer_removal_time_bits: u32,
+    /// `decoder_model_present_for_this_op` of each operating point.
+    pub(crate) decoder_model_present: Vec<bool>,
 }
 
 /// `color_config()` (AV1 §5.5.2).
@@ -120,6 +135,7 @@ impl SequenceHeader {
             ));
         }
         let mut operating_point_idc = Vec::new();
+        let mut timing = FrameTiming::default();
         let (level_idx, tier);
         if reduced_still_picture_header {
             operating_point_idc.push(0);
@@ -129,19 +145,25 @@ impl SequenceHeader {
             let timing_info_present = r.flag()?;
             let mut decoder_model_info_present = false;
             let mut buffer_delay_length = 0;
+            let mut equal_picture_interval = false;
+            let mut presentation_time_bits = 0;
             if timing_info_present {
                 r.f(32)?; // num_units_in_display_tick
                 r.f(32)?; // time_scale
-                if r.flag()? {
+                equal_picture_interval = r.flag()?;
+                if equal_picture_interval {
                     r.uvlc()?; // num_ticks_per_picture_minus_1
                 }
                 decoder_model_info_present = r.flag()?;
                 if decoder_model_info_present {
                     buffer_delay_length = r.f(5)? + 1;
                     r.f(32)?; // num_units_in_decoding_tick
-                    r.f(5)?; // buffer_removal_time_length_minus_1
-                    r.f(5)?; // frame_presentation_time_length_minus_1
+                    timing.buffer_removal_time_bits = r.f(5)? + 1;
+                    presentation_time_bits = r.f(5)? + 1;
                 }
+            }
+            if decoder_model_info_present && !equal_picture_interval {
+                timing.presentation_time_bits = presentation_time_bits;
             }
             let initial_display_delay_present = r.flag()?;
             let count = r.f(5)? + 1;
@@ -151,7 +173,9 @@ impl SequenceHeader {
                 let level = r.f(5)? as u8;
                 let op_tier = if level > 7 { r.f(1)? as u8 } else { 0 };
                 first.get_or_insert((level, op_tier));
-                if decoder_model_info_present && r.flag()? {
+                let decoder_model_present = decoder_model_info_present && r.flag()?;
+                timing.decoder_model_present.push(decoder_model_present);
+                if decoder_model_present {
                     r.f(buffer_delay_length)?; // decoder_buffer_delay
                     r.f(buffer_delay_length)?; // encoder_buffer_delay
                     r.flag()?; // low_delay_mode_flag
@@ -218,6 +242,7 @@ impl SequenceHeader {
                 separate_uv_delta_q: false,
             },
             film_grain_params_present: false,
+            timing,
         };
         if !reduced_still_picture_header {
             h.enable_interintra_compound = r.flag()?;
@@ -314,27 +339,7 @@ fn color_config(r: &mut BitReader<'_>, profile: u8) -> Result<ColorConfig, Error
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Packs `(value, bits)` fields MSB first, padded with zeros.
-    fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut acc = 0u64;
-        let mut n = 0;
-        for &(v, bits) in fields {
-            for i in (0..bits).rev() {
-                acc = acc << 1 | u64::from(v >> i & 1);
-                n += 1;
-                if n == 8 {
-                    out.push(acc as u8);
-                    (acc, n) = (0, 0);
-                }
-            }
-        }
-        if n > 0 {
-            out.push((acc << (8 - n)) as u8);
-        }
-        out
-    }
+    use crate::bits::pack;
 
     #[test]
     fn reduced_still_picture_header() {
