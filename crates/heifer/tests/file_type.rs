@@ -20,6 +20,11 @@ fn hevc_image_brands_are_supported() {
 }
 
 #[test]
+fn avif_images_are_supported() {
+    assert_eq!(check_file_type(&ftyp(b"avif")), FileTypeResult::Supported);
+}
+
+#[test]
 fn generic_heif_brands_are_maybe() {
     // The codec is in the items, not in the major brand.
     assert_eq!(check_file_type(&ftyp(b"mif1")), FileTypeResult::MayBe);
@@ -29,8 +34,8 @@ fn generic_heif_brands_are_maybe() {
 
 #[test]
 fn codecs_heifer_does_not_decode_are_unsupported() {
-    // Other codecs, and multi-layer HEVC (scalable, multiview).
-    for brand in [b"avif", b"avis", b"jpeg", b"j2ki", b"heim", b"heis"] {
+    // Other codecs, AV1 sequences, and multi-layer HEVC (scalable, multiview).
+    for brand in [b"avis", b"jpeg", b"j2ki", b"heim", b"heis"] {
         assert_eq!(
             check_file_type(&ftyp(brand)),
             FileTypeResult::Unsupported,
