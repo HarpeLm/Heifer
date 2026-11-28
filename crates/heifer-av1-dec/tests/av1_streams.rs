@@ -137,3 +137,83 @@ fn yuv422() {
 fn bit_depth_10() {
     check("bit_depth_10");
 }
+
+#[test]
+fn deblock() {
+    check("deblock");
+}
+
+#[test]
+fn deblock_sharpness() {
+    check("deblock_sharpness");
+}
+
+#[test]
+fn deblock_tools() {
+    check("deblock_tools");
+}
+
+#[test]
+fn delta_lf() {
+    check("delta_lf");
+}
+
+#[test]
+fn cdef() {
+    check("cdef");
+}
+
+#[test]
+fn cdef_sb128() {
+    check("cdef_sb128");
+}
+
+#[test]
+fn restoration() {
+    check("restoration");
+}
+
+#[test]
+fn restoration_large() {
+    check("restoration_large");
+}
+
+#[test]
+fn filters() {
+    check("filters");
+}
+
+#[test]
+fn filters_tiles() {
+    check("filters_tiles");
+}
+
+#[test]
+fn filters_segmentation() {
+    check("filters_segmentation");
+}
+
+#[test]
+fn filters_monochrome() {
+    check("filters_monochrome");
+}
+
+#[test]
+fn filters_yuv444() {
+    check("filters_yuv444");
+}
+
+#[test]
+fn filters_yuv422() {
+    check("filters_yuv422");
+}
+
+#[test]
+fn filters_10() {
+    check("filters_10");
+}
+
+#[test]
+fn filters_12() {
+    check("filters_12");
+}
