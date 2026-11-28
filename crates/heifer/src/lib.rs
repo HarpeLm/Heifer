@@ -28,9 +28,11 @@
 //!
 //! | `libheif-rs` | `heifer` |
 //! |---|---|
-//! | `HeifContext::read_from_bytes` + `decode` | [`decode`] / [`decode_rgba8`] / [`decode_srgb`] |
-//! | `check_file_type` / `FileTypeResult` | [`check_file_type`] / [`FileTypeResult`] |
-//! | `metadata_block_ids` / `metadata` | [`read_metadata`] / [`read_iptc`] |
+//! | `HeifContext::read_from_bytes` + `decode` | [`decode`] / [`decode_rgba8`] / [`decode_srgb`] / [`decode_reader_srgb_rgba8`] |
+//! | `check_file_type` / `FileTypeResult` | [`check_file_type`] / [`FileTypeResult`] / [`read_info_reader`] |
+//! | `metadata_block_ids` / `metadata` | [`read_metadata`] / [`read_metadata_reader`] / [`read_iptc`] |
+//! | Bounded-memory thumbnails / previews | [`decode_preview_rgba8`] / [`decode_reader_preview_rgba8`] |
+//! | HDR gain maps (ISO 21496-1 & Apple) | [`read_gain_map`] / [`read_gain_map_reader`] / [`decode_hdr`] |
 //! | `HeifContext::new` + `encode_image` | `encode` / `encode_rgb8` / `encode_rgba8` |
 //! | Image sequences (`.heics`) | [`read_sequence`] / [`decode_sequence`] / `encode_sequence` |
 //! | `integration::image::register_all_decoding_hooks` | `image_crate::register_image_decoder_hooks` |
@@ -87,7 +89,8 @@ pub use metadata::{
 pub use preview::{PreviewOptions, decode_preview_rgba8};
 pub use reader::{
     ReadError, decode_reader, decode_reader_preview_rgba8, decode_reader_rgba8,
-    decode_reader_srgb_rgba8, decode_reader_with_options, read_info_reader, read_metadata_reader,
+    decode_reader_srgb_rgba8, decode_reader_with_options, read_gain_map_reader, read_info_reader,
+    read_metadata_reader,
 };
 pub use sequence::{
     FrameInfo, SequenceFrames, SequenceInfo, decode_sequence, decode_sequence_frame,
