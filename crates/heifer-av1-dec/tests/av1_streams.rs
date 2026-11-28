@@ -1,16 +1,49 @@
 //! Decodes the small AV1 streams of `tests/streams` and compares every sample with the picture
 //! aomdec made from the same stream (`scripts/make-av1-streams.sh`).
 
+use heifer_av1_dec::Picture;
 use std::path::Path;
 
-fn check(name: &str) {
+fn read(name: &str) -> (Vec<u8>, Vec<u8>) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/streams");
     let data = std::fs::read(dir.join(format!("{name}.obu"))).unwrap();
     let expected = std::fs::read(dir.join(format!("{name}.yuv"))).unwrap();
+    (data, expected)
+}
+
+/// A stream of one intra frame.
+fn check(name: &str) {
+    let (data, expected) = read(name);
     let frames = heifer_av1_dec::frames(&data, &[]).unwrap();
     assert_eq!(frames.len(), 1, "{name}");
     let picture = heifer_av1_dec::decode_frame(&frames[0]).unwrap();
     let mut offset = 0;
+    compare(name, &picture, &expected, &mut offset);
+    assert_eq!(offset, expected.len(), "{name}: size");
+}
+
+/// A stream of several frames, every shown one compared in order.
+fn check_sequence(name: &str) {
+    let (data, expected) = read(name);
+    let mut decoder = heifer_av1_dec::Decoder::new();
+    let (mut offset, mut shown) = (0, 0);
+    for frame in heifer_av1_dec::frames(&data, &[]).unwrap() {
+        if let Some(picture) = decoder.decode(&frame).unwrap() {
+            compare(
+                &format!("{name} frame {shown}"),
+                &picture,
+                &expected,
+                &mut offset,
+            );
+            shown += 1;
+        }
+    }
+    assert!(shown > 1, "{name}: {shown} frames shown");
+    assert_eq!(offset, expected.len(), "{name}: size");
+}
+
+/// Compares `picture` with aomdec's samples at `offset` of `expected`, and moves past them.
+fn compare(name: &str, picture: &Picture, expected: &[u8], offset: &mut usize) {
     for (p, plane) in picture.planes.iter().enumerate() {
         let sx = if p == 0 {
             0
@@ -19,18 +52,19 @@ fn check(name: &str) {
         };
         let width = ((picture.width + sx) >> sx) as usize;
         // aomdec writes 8-bit samples as bytes, deeper ones as 16-bit little endian.
+        let offset_now = *offset;
         let reference: Vec<u16> = if picture.bit_depth == 8 {
-            expected[offset..offset + plane.len()]
+            expected[offset_now..offset_now + plane.len()]
                 .iter()
                 .map(|&b| u16::from(b))
                 .collect()
         } else {
-            expected[offset..offset + 2 * plane.len()]
+            expected[offset_now..offset_now + 2 * plane.len()]
                 .chunks(2)
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect()
         };
-        offset += if picture.bit_depth == 8 {
+        *offset += if picture.bit_depth == 8 {
             plane.len()
         } else {
             2 * plane.len()
@@ -45,7 +79,6 @@ fn check(name: &str) {
             );
         }
     }
-    assert_eq!(offset, expected.len(), "{name}: size");
 }
 
 #[test]
@@ -271,4 +304,44 @@ fn intrabc_lossless() {
 #[test]
 fn intrabc_noise() {
     check("intrabc_noise");
+}
+
+#[test]
+fn inter() {
+    check_sequence("inter");
+}
+
+#[test]
+fn inter_no_lag() {
+    check_sequence("inter_no_lag");
+}
+
+#[test]
+fn inter_obmc() {
+    check_sequence("inter_obmc");
+}
+
+#[test]
+fn inter_wedge() {
+    check_sequence("inter_wedge");
+}
+
+#[test]
+fn inter_segmentation() {
+    check_sequence("inter_segmentation");
+}
+
+#[test]
+fn inter_resize() {
+    check_sequence("inter_resize");
+}
+
+#[test]
+fn inter_10() {
+    check_sequence("inter_10");
+}
+
+#[test]
+fn inter_yuv444() {
+    check_sequence("inter_yuv444");
 }
