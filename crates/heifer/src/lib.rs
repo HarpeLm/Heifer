@@ -44,6 +44,7 @@
 //! - `image`: enables [`image`](https://docs.rs/image) crate integration (`image_crate` module:
 //!   `HeifDecoder`, `HeifSequenceDecoder`, `HeifEncoder`, and `image::open` hooks).
 
+mod av1;
 pub mod color;
 pub mod depth;
 #[cfg(feature = "encoder")]
@@ -121,6 +122,9 @@ pub enum Error {
     /// An HEVC bitstream could not be decoded.
     #[error("HEVC: {0}")]
     Hevc(#[from] heifer_hevc_dec::Error),
+    /// An AV1 bitstream (AVIF) could not be decoded.
+    #[error("AV1: {0}")]
+    Av1(heifer_av1_dec::Error),
     /// An image could not be encoded.
     #[cfg(feature = "encoder")]
     #[error("HEVC encoding: {0}")]
@@ -221,7 +225,7 @@ pub enum FileTypeResult {
     Supported,
     /// Not a HEIF file.
     No,
-    /// A HEIF file whose codec `heifer` does not support (AV1/AVIF, JPEG, JPEG 2000, image
+    /// A HEIF file whose codec `heifer` does not support (JPEG, JPEG 2000, AV1 image
     /// sequences, …).
     Unsupported,
     /// Too few bytes to decide, or a generic HEIF brand (`mif1`/`mif2`) whose codec is not
@@ -234,14 +238,14 @@ pub enum FileTypeResult {
 ///
 /// The first 12 bytes are enough (box size, `ftyp`, major brand); any more are ignored. Only
 /// the major brand is read, as in `libheif`: HEVC images and image sequences (`heic`, `heix`,
-/// `hevc`, `hevx`) are [`FileTypeResult::Supported`], and a generic `mif1`/`mif2`/`msf1` file
-/// is [`FileTypeResult::MayBe`] even when it holds HEVC.
+/// `hevc`, `hevx`) and AV1 images (`avif`) are [`FileTypeResult::Supported`], and a generic
+/// `mif1`/`mif2`/`msf1` file is [`FileTypeResult::MayBe`] even when it holds HEVC.
 ///
 /// ```
 /// let heic = b"\0\0\0\x18ftypheic";
 /// assert_eq!(heifer::check_file_type(heic), heifer::FileTypeResult::Supported);
 /// assert_eq!(
-///     heifer::check_file_type(b"\0\0\0\x18ftypavif"),
+///     heifer::check_file_type(b"\0\0\0\x18ftypavis"),
 ///     heifer::FileTypeResult::Unsupported
 /// );
 /// assert_eq!(heifer::check_file_type(b"not a heif file"), heifer::FileTypeResult::No);
@@ -258,7 +262,7 @@ pub fn check_file_type(data: &[u8]) -> FileTypeResult {
     }
     match &data[8..12] {
         // HEVC images, and HEVC image sequences.
-        b"heic" | b"heix" | b"hevc" | b"hevx" => FileTypeResult::Supported,
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"avif" => FileTypeResult::Supported,
         // Generic images and sequences: the codec is not known from the brand.
         b"mif1" | b"mif2" | b"msf1" => FileTypeResult::MayBe,
         _ => FileTypeResult::Unsupported,
@@ -275,7 +279,7 @@ pub enum FileKind {
     Heif,
     /// Image sequence (`.heics` or MP4/HEIF file with a sequence track).
     Sequence,
-    /// AV1-coded still image (`avif` brand). Its info is read; decoding is not supported yet.
+    /// AV1-coded still image (`avif` brand).
     Avif,
 }
 
@@ -899,6 +903,9 @@ fn nclx(file: &HeifFile<'_>, id: ItemId) -> Result<Option<(u16, u16)>, Error> {
         if let Some(colour) = vui_colour(file, item)? {
             return Ok(Some(colour));
         }
+        if let Some(colour) = av1::colour(file, item)? {
+            return Ok(Some(colour));
+        }
         current = file
             .referenced_items(item, b"dimg")
             .first()
@@ -997,7 +1004,8 @@ fn decode_item_with<S: Sample>(
     }
     let item = file.item(id)?;
     let mut alpha_id = None;
-    if item.item_type.0 != *b"hvc1" {
+    // Coded images attach their alpha plane when decoded.
+    if !matches!(&item.item_type.0, b"hvc1" | b"av01") {
         for aux in file.referencing_items(id, b"auxl") {
             if is_alpha_item(file, aux)? {
                 alpha_id = Some(aux);
@@ -1008,6 +1016,7 @@ fn decode_item_with<S: Sample>(
     let mut fused_transforms = false;
     let mut image = match &item.item_type.0 {
         b"hvc1" => decode_hvc1(file, id, options)?,
+        b"av01" => decode_av01(file, id, options)?,
         b"unci" => uncompressed::decode(file, id, options)?,
         b"grid" => {
             if alpha_id.is_none() {
@@ -1162,6 +1171,50 @@ fn decode_hvc1<S: Sample>(
         // The alpha plane is the luma of the auxiliary image, with its own range.
         let range = color_params_view(file, aux, &alpha)?;
         attach_alpha_view(&mut image, &alpha, range.full_range)?;
+        break;
+    }
+    Ok(image)
+}
+
+/// Decodes an `av01` item (AVIF), with its alpha plane if any.
+fn decode_av01<S: Sample>(
+    file: &HeifFile<'_>,
+    id: ItemId,
+    options: &Options,
+) -> Result<Image<S>, Error> {
+    let frame = av1::decode_frame(file, id, options)?;
+    let view = DecodedFrameView::U16(&frame, frame.full_window());
+    // `ispe` is authoritative, within the decoded picture.
+    let (width, height) = match file.image_size(id)? {
+        Some((w, h)) => (w.min(view.width()), h.min(view.height())),
+        None => (view.width(), view.height()),
+    };
+    check_size(width, height, options.max_pixels())?;
+    let params = color_params_view(file, id, &view)?;
+    let mut image = frame_view_to_rgba_sized(&view, params, width, height);
+    for aux in file.referencing_items(id, b"auxl") {
+        if !is_alpha_item(file, aux)? {
+            continue;
+        }
+        match &file.item(aux)?.item_type.0 {
+            b"unci" => {
+                let alpha: Image<S> = uncompressed::decode(file, aux, options)?;
+                attach_alpha_image(&mut image, &alpha)?;
+            }
+            b"av01" => {
+                let alpha = av1::decode_frame(file, aux, options)?;
+                let view = DecodedFrameView::U16(&alpha, alpha.full_window());
+                // The alpha plane is the luma of the auxiliary image, with its own range.
+                let range = color_params_view(file, aux, &view)?;
+                attach_alpha_view(&mut image, &view, range.full_range)?;
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "alpha plane of type `{}` for an AV1 image",
+                    FourCC(*other)
+                )));
+            }
+        }
         break;
     }
     Ok(image)
