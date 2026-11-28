@@ -278,7 +278,11 @@ fn planes_to_rgba_into_with_scratch<'o, P: Copy + Into<i32>, S: Sample + 'o>(
     }
 
     let (cw, chh) = (crop.widths[1], crop.heights[1]);
-    let (sx, sy) = (crop.widths[0] / cw.max(1), crop.heights[0] / chh.max(1));
+    // Rounded up: an odd luma size has (size + 1) / 2 subsampled chroma samples.
+    let (sx, sy) = (
+        crop.widths[0].div_ceil(cw.max(1)),
+        crop.heights[0].div_ceil(chh.max(1)),
+    );
     let (kr, kb) = kr_kb(params.matrix);
     let kg = 1.0 - kr - kb;
 
@@ -487,6 +491,25 @@ mod tests {
         let params = ColorParams::from_frame(&padded);
         let image: Image<u8> = frame_to_rgba_sized(&padded, params, 2, 2);
         assert_eq!(image.data, [128, 128, 128, 255].repeat(4));
+    }
+
+    #[test]
+    fn odd_sizes_keep_chroma_subsampled() {
+        // 3×3 4:2:0 (2×2 chroma, as AV1 codes odd sizes): the right column and bottom row use
+        // the last chroma sample, not the samples of the next pixels.
+        let odd = Frame {
+            widths: [3, 2, 2],
+            heights: [3, 2, 2],
+            planes: [vec![128; 9], vec![128; 4], vec![128, 128, 128, 255]],
+            bit_depth: [8, 8],
+            chroma_format: 1,
+            full_range: true,
+            matrix_coeffs: 6,
+        };
+        let image: Image<u8> = frame_to_rgba_as(&odd, ColorParams::from_frame(&odd));
+        let red: Vec<u8> = image.data.chunks_exact(4).map(|px| px[0]).collect();
+        // Cr rises only in the bottom-right chroma sample; odd rows and columns interpolate.
+        assert_eq!(red, [128, 128, 128, 128, 173, 217, 128, 217, 255]);
     }
 
     #[test]
