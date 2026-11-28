@@ -1,5 +1,6 @@
-//! Decoding of intra frames (AV1 §5.11, §6.10, §7.11–7.13): reads each tile's blocks, predicts
-//! them, adds their residuals, then runs the loop filters (`filter`).
+//! Decoding of intra frames (AV1 §5.11, §6.10, §7.10–7.13): reads each tile's blocks, predicts
+//! them (intra prediction, palettes, or intra block copy from the frame itself), adds their
+//! residuals, then runs the loop filters (`filter`).
 
 use crate::Error;
 use crate::cdf_tables::Cdfs;
@@ -56,6 +57,18 @@ const TX_16X64: usize = 17;
 const TX_64X16: usize = 18;
 
 const UV_CFL_PRED: u8 = 13;
+/// `RefFrame[ 0 ]` of intra blocks, intra block copy included.
+const INTRA_FRAME: i8 = 0;
+/// `RefFrames` of a unit no block of this frame has written yet.
+const REF_UNWRITTEN: i8 = -2;
+const MAX_VARTX_DEPTH: usize = 2;
+const MAX_REF_MV_STACK_SIZE: usize = 8;
+const REF_CAT_LEVEL: u32 = 640;
+const MV_BORDER: i32 = 128;
+const INTRABC_DELAY_PIXELS: i32 = 256;
+const MV_INTRABC_CONTEXT: usize = 1;
+/// `InterpFilters` of intra block copy: `BILINEAR`.
+const BILINEAR: usize = 3;
 const SEG_LVL_ALT_Q: usize = 0;
 const SEG_LVL_SKIP: usize = 6;
 const TX_CLASS_2D: usize = 0;
@@ -100,6 +113,11 @@ struct FrameState<'h> {
     segment_ids: Vec<u8>,
     /// `InterTxSizes`.
     tx_sizes: Vec<u8>,
+    is_inters: Vec<bool>,
+    /// `RefFrames[ .. ][ 0 ]`; the second reference is always `NONE` in intra frames.
+    ref_frames: Vec<i8>,
+    /// `Mvs[ .. ][ 0 ]`, row then column, in 1/8 samples.
+    mvs: Vec<[i32; 2]>,
     tx_types: Vec<u8>,
     /// `PaletteSizes` and `PaletteColors` for Y and U.
     palette_sizes: [Vec<u8>; 2],
@@ -162,6 +180,9 @@ impl<'h> FrameState<'h> {
             skips: vec![false; units],
             segment_ids: vec![0; units],
             tx_sizes: vec![0; units],
+            is_inters: vec![false; units],
+            ref_frames: vec![REF_UNWRITTEN; units],
+            mvs: vec![[0; 2]; units],
             tx_types: vec![0; units],
             palette_sizes: [vec![0; units], vec![0; units]],
             palette_colors: [vec![[0; 8]; units], vec![[0; 8]; units]],
@@ -260,6 +281,10 @@ struct Block {
     palette_u: [u16; 8],
     palette_v: [u16; 8],
     tx_size: usize,
+    /// `use_intrabc` (the only inter blocks of intra frames).
+    is_inter: bool,
+    /// `Mv[ 0 ]`.
+    mv: [i32; 2],
     max_luma_w: usize,
     max_luma_h: usize,
 }
@@ -289,6 +314,32 @@ struct TileDecoder<'h, 'f> {
     quant: Vec<i32>,
     /// `ColorMapY` and `ColorMapUV`, 64 entries per row.
     color_maps: [Vec<u8>; 2],
+}
+
+/// `RefStackMv[ .. ][ 0 ]`, `WeightStack`, `NumMvFound` and `FoundMatch` of single prediction.
+#[derive(Default)]
+struct MvStack {
+    mvs: [[i32; 2]; MAX_REF_MV_STACK_SIZE],
+    weights: [u32; MAX_REF_MV_STACK_SIZE],
+    count: usize,
+    found_match: bool,
+}
+
+impl MvStack {
+    /// The sorting process (§7.10.2.11): a stable sort by decreasing weight.
+    fn sort(&mut self, start: usize, mut end: usize) {
+        while end > start {
+            let mut new_end = start;
+            for i in start + 1..end {
+                if self.weights[i - 1] < self.weights[i] {
+                    self.weights.swap(i - 1, i);
+                    self.mvs.swap(i - 1, i);
+                    new_end = i;
+                }
+            }
+            end = new_end;
+        }
+    }
 }
 
 /// `Wiener_Taps_Mid`, `Sgrproj_Xqd_Mid`.
@@ -806,26 +857,33 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         };
         self.intra_frame_mode_info()?;
         self.palette_tokens()?;
-        self.read_tx_size()?;
+        self.read_block_tx_size()?;
         let b = &self.b;
         for row in r..r + bh4 {
             for col in c..c + bw4 {
                 let i = self.f.mi(row, col);
-                self.f.tx_sizes[i] = b.tx_size as u8;
                 self.f.y_modes[i] = b.y_mode;
                 if has_chroma {
                     self.f.uv_modes[i] = b.uv_mode;
+                }
+                self.f.ref_frames[i] = INTRA_FRAME;
+                if b.is_inter {
+                    self.f.mvs[i] = b.mv;
                 }
             }
         }
         if b.skip {
             self.reset_block_context();
         }
+        if self.b.is_inter {
+            self.predict_intrabc();
+        }
         self.residual()?;
         let b = &self.b;
         for row in r..r + bh4 {
             for col in c..c + bw4 {
                 let i = self.f.mi(row, col);
+                self.f.is_inters[i] = b.is_inter;
                 self.f.skips[i] = b.skip;
                 self.f.mi_sizes[i] = size as u8;
                 self.f.segment_ids[i] = b.segment_id as u8;
@@ -889,7 +947,10 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         self.read_delta_lf()?;
         self.read_deltas = false;
         if self.f.fh.allow_intrabc && self.sym(|c| &mut c.intrabc)? == 1 {
-            return Err(Error::Unsupported("intra block copy"));
+            // An inter block predicted from the frame itself, with YMode and UVMode DC_PRED.
+            self.b.is_inter = true;
+            self.b.mv = self.intrabc_mv()?;
+            return Ok(());
         }
 
         let (row, col) = (self.b.row, self.b.col);
@@ -1312,8 +1373,121 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         Ok(())
     }
 
-    /// `read_block_tx_size()` for an intra block: `read_tx_size( 1 )`.
-    fn read_tx_size(&mut self) -> Result<(), Error> {
+    /// `read_block_tx_size()`: `TxSize`, and `InterTxSizes` over the block.
+    fn read_block_tx_size(&mut self) -> Result<(), Error> {
+        let b = &self.b;
+        let (size, row, col, bw4, bh4) = (b.size, b.row, b.col, b.bw4, b.bh4);
+        if self.f.fh.tx_mode == TxMode::Select
+            && size > BLOCK_4X4
+            && b.is_inter
+            && !b.skip
+            && !b.lossless
+        {
+            let max = usize::from(MAX_TX_SIZE_RECT[size]);
+            let (w4, h4) = (
+                usize::from(TX_WIDTH[max]) >> 2,
+                usize::from(TX_HEIGHT[max]) >> 2,
+            );
+            for r in (row..row + bh4).step_by(h4) {
+                for c in (col..col + bw4).step_by(w4) {
+                    self.read_var_tx_size(r, c, max, 0)?;
+                }
+            }
+            return Ok(());
+        }
+        let allow_select = !b.skip || !b.is_inter;
+        self.read_tx_size(allow_select)?;
+        let tx = self.b.tx_size as u8;
+        for r in row..row + self.b.bh4 {
+            let i = self.f.mi(r, col);
+            self.f.tx_sizes[i..i + self.b.bw4].fill(tx);
+        }
+        Ok(())
+    }
+
+    /// `read_var_tx_size()`: a transform size tree of an inter block.
+    fn read_var_tx_size(
+        &mut self,
+        row: usize,
+        col: usize,
+        tx: usize,
+        depth: usize,
+    ) -> Result<(), Error> {
+        if row >= self.f.mi_rows || col >= self.f.mi_cols {
+            return Ok(());
+        }
+        let split = if tx == TX_4X4 || depth == MAX_VARTX_DEPTH {
+            false
+        } else {
+            let above = self.above_tx_width(row, col) < usize::from(TX_WIDTH[tx]);
+            let left = self.left_tx_height(row, col) < usize::from(TX_HEIGHT[tx]);
+            let size = self.b.size;
+            let bw = 4 * usize::from(NUM_4X4_BLOCKS_WIDE[size]);
+            let bh = 4 * usize::from(NUM_4X4_BLOCKS_HIGH[size]);
+            // find_tx_size() of a square: TX_4X4 to TX_64X64 are 0 to 4.
+            let max_sq = (bw.max(bh).min(64).ilog2() - 2) as usize;
+            let ctx = usize::from(usize::from(TX_SIZE_SQR_UP[tx]) != max_sq) * 3
+                + (4 - max_sq) * 6
+                + usize::from(above)
+                + usize::from(left);
+            self.sym(|c| &mut c.txfm_split[ctx])? == 1
+        };
+        let (w4, h4) = (
+            usize::from(TX_WIDTH[tx]) >> 2,
+            usize::from(TX_HEIGHT[tx]) >> 2,
+        );
+        if split {
+            let sub = usize::from(SPLIT_TX_SIZE[tx]);
+            let (step_w, step_h) = (
+                usize::from(TX_WIDTH[sub]) >> 2,
+                usize::from(TX_HEIGHT[sub]) >> 2,
+            );
+            for i in (0..h4).step_by(step_h) {
+                for j in (0..w4).step_by(step_w) {
+                    self.read_var_tx_size(row + i, col + j, sub, depth + 1)?;
+                }
+            }
+        } else {
+            // Units past the frame edge are written too: the arrays cover whole superblocks.
+            for i in 0..h4 {
+                let start = self.f.mi(row + i, col);
+                self.f.tx_sizes[start..start + w4].fill(tx as u8);
+            }
+            self.b.tx_size = tx;
+        }
+        Ok(())
+    }
+
+    /// `get_above_tx_width()`.
+    fn above_tx_width(&self, row: usize, col: usize) -> usize {
+        if row == self.b.row {
+            if !self.b.avail_u {
+                return 64;
+            }
+            let i = self.f.mi(row - 1, col);
+            if self.f.skips[i] && self.f.is_inters[i] {
+                return 4 * usize::from(NUM_4X4_BLOCKS_WIDE[usize::from(self.f.mi_sizes[i])]);
+            }
+        }
+        usize::from(TX_WIDTH[usize::from(self.f.tx_sizes[self.f.mi(row - 1, col)])])
+    }
+
+    /// `get_left_tx_height()`.
+    fn left_tx_height(&self, row: usize, col: usize) -> usize {
+        if col == self.b.col {
+            if !self.b.avail_l {
+                return 64;
+            }
+            let i = self.f.mi(row, col - 1);
+            if self.f.skips[i] && self.f.is_inters[i] {
+                return 4 * usize::from(NUM_4X4_BLOCKS_HIGH[usize::from(self.f.mi_sizes[i])]);
+            }
+        }
+        usize::from(TX_HEIGHT[usize::from(self.f.tx_sizes[self.f.mi(row, col - 1)])])
+    }
+
+    /// `read_tx_size( allowSelect )`.
+    fn read_tx_size(&mut self, allow_select: bool) -> Result<(), Error> {
         let size = self.b.size;
         if self.b.lossless {
             self.b.tx_size = TX_4X4;
@@ -1322,15 +1496,26 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         let max_rect = usize::from(MAX_TX_SIZE_RECT[size]);
         let max_depth = MAX_TX_DEPTH[size];
         self.b.tx_size = max_rect;
-        if size > BLOCK_4X4 && self.f.fh.tx_mode == TxMode::Select {
+        if size > BLOCK_4X4 && allow_select && self.f.fh.tx_mode == TxMode::Select {
             let (row, col) = (self.b.row, self.b.col);
+            let block = |i: usize| self.f.mi_sizes[i] as usize;
             let above_w = if self.b.avail_u {
-                TX_WIDTH[usize::from(self.f.tx_sizes[self.f.mi(row - 1, col)])]
+                let i = self.f.mi(row - 1, col);
+                if self.f.is_inters[i] {
+                    4 * NUM_4X4_BLOCKS_WIDE[block(i)]
+                } else {
+                    self.above_tx_width(row, col) as u8
+                }
             } else {
                 0
             };
             let left_h = if self.b.avail_l {
-                TX_HEIGHT[usize::from(self.f.tx_sizes[self.f.mi(row, col - 1)])]
+                let i = self.f.mi(row, col - 1);
+                if self.f.is_inters[i] {
+                    4 * NUM_4X4_BLOCKS_HIGH[block(i)]
+                } else {
+                    self.left_tx_height(row, col) as u8
+                }
             } else {
                 0
             };
@@ -1402,6 +1587,12 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                     let num4x4_w = usize::from(NUM_4X4_BLOCKS_WIDE[plane_size]);
                     let num4x4_h = usize::from(NUM_4X4_BLOCKS_HIGH[plane_size]);
                     let (sx, sy) = self.plane_sub(plane);
+                    if self.b.is_inter && !self.b.lossless && plane == 0 {
+                        let x = (self.b.col + (chunk_x << 4)) * 4;
+                        let y = (self.b.row + (chunk_y << 4)) * 4;
+                        self.transform_tree(x, y, num4x4_w * 4, num4x4_h * 4)?;
+                        continue;
+                    }
                     let base_x = (self.b.col >> sx) * 4;
                     let base_y = (self.b.row >> sy) * 4;
                     for y in (0..num4x4_h).step_by(step_y) {
@@ -1420,6 +1611,283 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             }
         }
         Ok(())
+    }
+
+    /// `transform_tree()`: the luma transform blocks of an inter block, per `InterTxSizes`.
+    fn transform_tree(&mut self, x: usize, y: usize, w: usize, h: usize) -> Result<(), Error> {
+        if x >= self.f.mi_cols * 4 || y >= self.f.mi_rows * 4 {
+            return Ok(());
+        }
+        let luma = usize::from(self.f.tx_sizes[self.f.mi(y >> 2, x >> 2)]);
+        if w <= usize::from(TX_WIDTH[luma]) && h <= usize::from(TX_HEIGHT[luma]) {
+            // find_tx_size()
+            let tx = (0..TX_WIDTH.len())
+                .find(|&t| usize::from(TX_WIDTH[t]) == w && usize::from(TX_HEIGHT[t]) == h)
+                .ok_or(Error::Invalid("transform tree size"))?;
+            return self.transform_block(0, x, y, tx, 0, 0);
+        }
+        if w > h {
+            self.transform_tree(x, y, w / 2, h)?;
+            self.transform_tree(x + w / 2, y, w / 2, h)
+        } else if w < h {
+            self.transform_tree(x, y, w, h / 2)?;
+            self.transform_tree(x, y + h / 2, w, h / 2)
+        } else {
+            self.transform_tree(x, y, w / 2, h / 2)?;
+            self.transform_tree(x + w / 2, y, w / 2, h / 2)?;
+            self.transform_tree(x, y + h / 2, w / 2, h / 2)?;
+            self.transform_tree(x + w / 2, y + h / 2, w / 2, h / 2)
+        }
+    }
+
+    /// The prediction of an intra block copy block (`compute_prediction()`): every plane copies
+    /// the block's own motion vector, since all its neighbours are intra blocks.
+    fn predict_intrabc(&mut self) {
+        let b = &self.b;
+        let bd = self.f.bit_depth;
+        // Rounding variables of single prediction.
+        let rounds = if bd == 12 { [5, 9] } else { [3, 11] };
+        let max = (1 << bd) - 1;
+        for plane in 0..1 + 2 * usize::from(b.has_chroma) {
+            let plane_size = self.residual_size(b.size, plane);
+            let w = 4 * usize::from(NUM_4X4_BLOCKS_WIDE[plane_size]);
+            let h = 4 * usize::from(NUM_4X4_BLOCKS_HIGH[plane_size]);
+            let (sx, sy) = self.plane_sub(plane);
+            let (x, y) = ((b.col >> sx) * 4, (b.row >> sy) * 4);
+            // The motion vector scaling process with the current frame as reference: no
+            // scaling, positions in 1/1024 samples.
+            let pos = |base: usize, mv: i32, sub: usize| {
+                ((((base as i32) << 4) + ((2 * mv) >> sub)) << 6) + 32
+            };
+            // Clamped to the decoded area, which covers whole 4×4 units.
+            let last_x = (((self.f.mi_cols * 4) + sx) >> sx) as i32 - 1;
+            let last_y = (((self.f.mi_rows * 4) + sy) >> sy) as i32 - 1;
+            let pred = predict::block_inter(
+                &self.f.planes[plane],
+                last_x,
+                last_y,
+                pos(x, b.mv[1], sx),
+                pos(y, b.mv[0], sy),
+                1 << 10,
+                1 << 10,
+                w,
+                h,
+                [BILINEAR; 2],
+                rounds,
+            );
+            let out = &mut self.f.planes[plane];
+            for i in 0..h {
+                for j in 0..w {
+                    out.set(x + j, y + i, pred[i * w + j].clamp(0, max));
+                }
+            }
+        }
+    }
+
+    /// `find_mv_stack( 0 )` and `assign_mv( 0 )` of an intra block copy block: the motion
+    /// vector, predicted from the neighbouring intra block copy blocks.
+    fn intrabc_mv(&mut self) -> Result<[i32; 2], Error> {
+        let mut stack = MvStack::default();
+        let (bw4, bh4) = (self.b.bw4, self.b.bh4);
+        self.scan_row(&mut stack, -1);
+        let mut found_above = std::mem::take(&mut stack.found_match);
+        self.scan_col(&mut stack, -1);
+        let mut found_left = std::mem::take(&mut stack.found_match);
+        if bw4.max(bh4) <= 16 {
+            self.scan_point(&mut stack, -1, bw4 as isize);
+        }
+        found_above |= std::mem::take(&mut stack.found_match);
+        let num_nearest = stack.count;
+        for w in &mut stack.weights[..num_nearest] {
+            *w += REF_CAT_LEVEL;
+        }
+        // Intra frames have no temporal candidates (use_ref_frame_mvs is 0).
+        self.scan_point(&mut stack, -1, -1);
+        found_above |= std::mem::take(&mut stack.found_match);
+        self.scan_row(&mut stack, -3);
+        found_above |= std::mem::take(&mut stack.found_match);
+        self.scan_col(&mut stack, -3);
+        found_left |= std::mem::take(&mut stack.found_match);
+        if bh4 > 1 {
+            self.scan_row(&mut stack, -5);
+        }
+        found_above |= std::mem::take(&mut stack.found_match);
+        if bw4 > 1 {
+            self.scan_col(&mut stack, -5);
+        }
+        found_left |= std::mem::take(&mut stack.found_match);
+        // The matches only set contexts of inter frames' syntax elements.
+        let _ = (found_above, found_left);
+        stack.sort(0, num_nearest);
+        stack.sort(num_nearest, stack.count);
+        // The extra search finds nothing more (no neighbour uses another frame), and the global
+        // motion candidates of intra blocks are zero: the stack is zero-filled past its count.
+        // Context and clamping process.
+        let (bw, bh) = (4 * bw4 as i32, 4 * bh4 as i32);
+        for mv in &mut stack.mvs[..stack.count] {
+            mv[0] = self.clamp_mv_row(mv[0], MV_BORDER + bh * 8);
+            mv[1] = self.clamp_mv_col(mv[1], MV_BORDER + bw * 8);
+        }
+        // assign_mv( 0 ): NEWMV, from the first non-zero candidate or a default.
+        let mut pred = stack.mvs[0];
+        if pred == [0, 0] {
+            pred = stack.mvs[1];
+        }
+        if pred == [0, 0] {
+            let sb4 = usize::from(NUM_4X4_BLOCKS_HIGH[self.sb_size()]) as i32;
+            pred = if (self.b.row as i32) - sb4 < self.row_start as i32 {
+                [0, -(sb4 * 4 + INTRABC_DELAY_PIXELS) * 8]
+            } else {
+                [-(sb4 * 4 * 8), 0]
+            };
+        }
+        let diff = self.read_mv(MV_INTRABC_CONTEXT)?;
+        Ok([pred[0] + diff[0], pred[1] + diff[1]])
+    }
+
+    /// The scan row process (§7.10.2.2) of single prediction from the current frame.
+    fn scan_row(&self, stack: &mut MvStack, delta_row: isize) {
+        let (row, col, bw4) = (self.b.row as isize, self.b.col as isize, self.b.bw4);
+        let end4 = bw4.min(self.f.mi_cols - self.b.col).min(16);
+        let (mut delta_row, mut delta_col) = (delta_row, 0);
+        let use_step16 = bw4 >= 16;
+        if delta_row.abs() > 1 {
+            delta_row += row & 1;
+            delta_col = 1 - (col & 1);
+        }
+        let mut i = 0;
+        while i < end4 {
+            let (r, c) = (row + delta_row, col + delta_col + i as isize);
+            if !self.is_inside(r, c) {
+                break;
+            }
+            let cand = self.f.mi(r as usize, c as usize);
+            let mut len = bw4.min(usize::from(
+                NUM_4X4_BLOCKS_WIDE[usize::from(self.f.mi_sizes[cand])],
+            ));
+            if delta_row.abs() > 1 {
+                len = len.max(2);
+            }
+            if use_step16 {
+                len = len.max(4);
+            }
+            self.add_ref_mv_candidate(stack, cand, 2 * len as u32);
+            i += len;
+        }
+    }
+
+    /// The scan col process (§7.10.2.3).
+    fn scan_col(&self, stack: &mut MvStack, delta_col: isize) {
+        let (row, col, bh4) = (self.b.row as isize, self.b.col as isize, self.b.bh4);
+        let end4 = bh4.min(self.f.mi_rows - self.b.row).min(16);
+        let (mut delta_row, mut delta_col) = (0, delta_col);
+        let use_step16 = bh4 >= 16;
+        if delta_col.abs() > 1 {
+            delta_row = 1 - (row & 1);
+            delta_col += col & 1;
+        }
+        let mut i = 0;
+        while i < end4 {
+            let (r, c) = (row + delta_row + i as isize, col + delta_col);
+            if !self.is_inside(r, c) {
+                break;
+            }
+            let cand = self.f.mi(r as usize, c as usize);
+            let mut len = bh4.min(usize::from(
+                NUM_4X4_BLOCKS_HIGH[usize::from(self.f.mi_sizes[cand])],
+            ));
+            if delta_col.abs() > 1 {
+                len = len.max(2);
+            }
+            if use_step16 {
+                len = len.max(4);
+            }
+            self.add_ref_mv_candidate(stack, cand, 2 * len as u32);
+            i += len;
+        }
+    }
+
+    /// The scan point process (§7.10.2.4): only where a block of this frame was decoded.
+    fn scan_point(&self, stack: &mut MvStack, delta_row: isize, delta_col: isize) {
+        let (r, c) = (
+            self.b.row as isize + delta_row,
+            self.b.col as isize + delta_col,
+        );
+        if self.is_inside(r, c) {
+            let cand = self.f.mi(r as usize, c as usize);
+            if self.f.ref_frames[cand] != REF_UNWRITTEN {
+                self.add_ref_mv_candidate(stack, cand, 4);
+            }
+        }
+    }
+
+    /// The add reference motion vector and search stack processes (§7.10.2.7–8) for
+    /// `RefFrame[ 0 ]` equal to `INTRA_FRAME`: the candidates are intra block copy blocks.
+    fn add_ref_mv_candidate(&self, stack: &mut MvStack, cand: usize, weight: u32) {
+        if !self.f.is_inters[cand] || self.f.ref_frames[cand] != INTRA_FRAME {
+            return;
+        }
+        // Lower precision process: intra frames force integer motion vectors.
+        let mv = self.f.mvs[cand].map(|v| {
+            let a = (v.abs() + 3) >> 3 << 3;
+            if v > 0 { a } else { -a }
+        });
+        stack.found_match = true;
+        if let Some(i) = stack.mvs[..stack.count].iter().position(|&m| m == mv) {
+            stack.weights[i] += weight;
+        } else if stack.count < MAX_REF_MV_STACK_SIZE {
+            stack.mvs[stack.count] = mv;
+            stack.weights[stack.count] = weight;
+            stack.count += 1;
+        }
+    }
+
+    /// `clamp_mv_row()`.
+    fn clamp_mv_row(&self, mv: i32, border: i32) -> i32 {
+        let (row, bh4) = (self.b.row as i32, self.b.bh4 as i32);
+        let to_top = -(row * 4 * 8);
+        let to_bottom = (self.f.mi_rows as i32 - bh4 - row) * 4 * 8;
+        mv.clamp(to_top - border, to_bottom + border)
+    }
+
+    /// `clamp_mv_col()`.
+    fn clamp_mv_col(&self, mv: i32, border: i32) -> i32 {
+        let (col, bw4) = (self.b.col as i32, self.b.bw4 as i32);
+        let to_left = -(col * 4 * 8);
+        let to_right = (self.f.mi_cols as i32 - bw4 - col) * 4 * 8;
+        mv.clamp(to_left - border, to_right + border)
+    }
+
+    /// `read_mv()`: the difference to the predicted motion vector, with integer precision
+    /// (`force_integer_mv`, and no `allow_high_precision_mv`, in intra frames).
+    fn read_mv(&mut self, ctx: usize) -> Result<[i32; 2], Error> {
+        let joint = self.sym(|c| &mut c.mv_joint[ctx])?;
+        let mut diff = [0; 2];
+        // MV_JOINT_HZVNZ (2) and MV_JOINT_HNZVNZ (3) code a row; MV_JOINT_HNZVZ (1) and 3 a column.
+        if joint == 2 || joint == 3 {
+            diff[0] = self.read_mv_component(ctx, 0)?;
+        }
+        if joint == 1 || joint == 3 {
+            diff[1] = self.read_mv_component(ctx, 1)?;
+        }
+        Ok(diff)
+    }
+
+    fn read_mv_component(&mut self, ctx: usize, comp: usize) -> Result<i32, Error> {
+        let sign = self.sym(|c| &mut c.mv_sign[ctx][comp])? == 1;
+        let class = self.sym(|c| &mut c.mv_class[ctx][comp])?;
+        // mv_fr is 3 and mv_hp 1: whole samples.
+        let mag = if class == 0 {
+            let bit = self.sym(|c| &mut c.mv_class0_bit[ctx][comp])? as i32;
+            ((bit << 3) | (3 << 1) | 1) + 1
+        } else {
+            let mut d = 0;
+            for i in 0..class {
+                d |= (self.sym(|c| &mut c.mv_bit[ctx][comp][i])? as i32) << i;
+            }
+            (2 << (class + 2)) + ((d << 3) | (3 << 1) | 1) + 1
+        };
+        Ok(if sign { -mag } else { mag })
     }
 
     fn filter_type(&self, plane: usize) -> bool {
@@ -1503,7 +1971,9 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         } else {
             b.palette_size_uv
         };
-        if palette > 0 {
+        if b.is_inter {
+            // Predicted with the whole block, before its residual.
+        } else if palette > 0 {
             // The palette prediction process.
             let colors = match plane {
                 0 => &b.palette_y,
@@ -1659,10 +2129,20 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
     }
 
-    /// `get_tx_set()` for an intra block.
+    /// `get_tx_set()`.
     fn tx_set(&self, tx: usize) -> usize {
         let (sqr, sqr_up) = (TX_SIZE_SQR[tx], TX_SIZE_SQR_UP[tx]);
-        if sqr_up >= 3 {
+        if sqr_up > 3 {
+            0
+        } else if self.b.is_inter {
+            if self.f.fh.reduced_tx_set || sqr_up == 3 {
+                3
+            } else if sqr == 2 {
+                2
+            } else {
+                1
+            }
+        } else if sqr_up == 3 {
             0
         } else if self.f.fh.reduced_tx_set || sqr == 2 {
             2
@@ -1700,7 +2180,14 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         } else {
             i32::from(self.f.fh.quantization.base_q_idx)
         };
-        let tx_type = if set > 0 && q > 0 {
+        let tx_type = if set > 0 && q > 0 && self.b.is_inter {
+            let sqr = usize::from(TX_SIZE_SQR[tx]);
+            match set {
+                1 => TX_TYPE_INTER_INV_SET1[self.sym(|c| &mut c.inter_tx_type_set1[sqr])?],
+                2 => TX_TYPE_INTER_INV_SET2[self.sym(|c| &mut c.inter_tx_type_set2)?],
+                _ => TX_TYPE_INTER_INV_SET3[self.sym(|c| &mut c.inter_tx_type_set3[sqr])?],
+            }
+        } else if set > 0 && q > 0 {
             let dir = match self.b.filter_intra_mode {
                 Some(m) => FILTER_INTRA_MODE_TO_INTRA_DIR[usize::from(m)],
                 None => self.b.y_mode,
@@ -1736,6 +2223,17 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
         if plane == 0 {
             return self.f.tx_types[self.f.mi(y4, x4)];
+        }
+        if self.b.is_inter {
+            // The luma transform type at the same place.
+            let x = self.b.col.max(x4 << self.f.sub_x);
+            let y = self.b.row.max(y4 << self.f.sub_y);
+            let tx_type = self.f.tx_types[self.f.mi(y, x)];
+            return if TX_TYPE_IN_SET_INTER[self.tx_set(tx)][usize::from(tx_type)] == 1 {
+                tx_type
+            } else {
+                DCT_DCT
+            };
         }
         let tx_type = MODE_TO_TXFM[usize::from(self.b.uv_mode)];
         if TX_TYPE_IN_SET_INTRA[self.tx_set(tx)][usize::from(tx_type)] == 1 {
