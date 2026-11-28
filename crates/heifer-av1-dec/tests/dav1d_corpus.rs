@@ -1,8 +1,7 @@
 //! Decodes every AV1 item of real AVIF files and compares the pictures with dav1d's.
 //!
 //! Opt-in: set `HEIFER_DAV1D` to a dav1d binary. Uses the fixtures of
-//! `scripts/fetch-fixtures.sh` and the `.avif` files of `HEIFER_AVIF_DIR`. Loop filters are not
-//! decoded yet, so dav1d runs with `--inloopfilters none`, and film grain is left out.
+//! `scripts/fetch-fixtures.sh` and the `.avif` files of `HEIFER_AVIF_DIR`. Film grain is left out.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,15 +27,7 @@ fn dav1d(dav1d: &Path, obus: &[u8], dir: &Path) -> Vec<u8> {
     let (input, output) = (dir.join("item.obu"), dir.join("item.yuv"));
     std::fs::write(&input, obus).unwrap();
     let status = Command::new(dav1d)
-        .args([
-            "--inloopfilters",
-            "none",
-            "--filmgrain",
-            "0",
-            "--demuxer",
-            "section5",
-            "--quiet",
-        ])
+        .args(["--filmgrain", "0", "--demuxer", "section5", "--quiet"])
         .arg("-i")
         .arg(&input)
         .arg("-o")
