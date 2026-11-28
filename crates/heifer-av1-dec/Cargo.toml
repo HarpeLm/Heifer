@@ -1,0 +1,22 @@
+[package]
+name = "heifer-av1-dec"
+description = "Pure-Rust AV1 decoder for AVIF still images (work in progress) — no C/dav1d dependency, no unsafe code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["av1", "avif", "decoder", "image"]
+categories = ["multimedia::images", "parser-implementations"]
+# Not published until it decodes pictures.
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+heifer-isobmff.workspace = true
+
+[lints]
+workspace = true
