@@ -1,9 +1,11 @@
 //! Intra prediction (AV1 §7.11.2): predicts a transform block from the reconstructed samples
-//! above and to its left.
+//! above and to its left. Also the block inter prediction of §7.11.3.4, which intra block copy
+//! uses on the frame being decoded.
 
 use crate::spec_tables::{
     DR_INTRA_DERIVATIVE, INTRA_EDGE_KERNEL, INTRA_FILTER_TAPS, MODE_TO_ANGLE, SM_WEIGHTS_TX_4X4,
     SM_WEIGHTS_TX_8X8, SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32, SM_WEIGHTS_TX_64X64,
+    SUBPEL_FILTERS,
 };
 
 pub(crate) const DC_PRED: u8 = 0;
@@ -404,4 +406,62 @@ fn directional(
             pred[i * w..(i + 1) * w].fill(left[OFF + i]);
         }
     }
+}
+
+/// The block inter prediction process (§7.11.3.4): a `w`×`h` block of `src` at `x`, `y` (in
+/// 1/1024 samples, `step_x`/`step_y` apart), filtered horizontally then vertically with the
+/// `Subpel_Filters` sets `filters` (`[vertical, horizontal]`, as `InterpFilters`) and rounded by
+/// `rounds` (`InterRound0`, `InterRound1`). Positions are clamped to `last_x`, `last_y`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_inter(
+    src: &Plane,
+    last_x: i32,
+    last_y: i32,
+    x: i32,
+    y: i32,
+    step_x: i32,
+    step_y: i32,
+    w: usize,
+    h: usize,
+    filters: [usize; 2],
+    rounds: [u32; 2],
+) -> Vec<i32> {
+    // 4-tap variants for small blocks: EIGHTTAP and EIGHTTAP_SHARP use set 4, EIGHTTAP_SMOOTH 5.
+    let narrow = |filter: usize, size: usize| match (filter, size <= 4) {
+        (0 | 2, true) => 4,
+        (1, true) => 5,
+        _ => filter,
+    };
+    let (fh, fv) = (narrow(filters[1], w), narrow(filters[0], h));
+    let round2 = |v: i32, n: u32| (v + (1 << (n - 1))) >> n;
+    let inter_h = ((((h as i32 - 1) * step_y + (1 << 10) - 1) >> 10) + 8) as usize;
+    let mut intermediate = vec![0i32; inter_h * w];
+    for r in 0..inter_h {
+        let row = ((y >> 10) + r as i32 - 3).clamp(0, last_y) as usize;
+        let samples = &src.data[row * src.stride..];
+        for c in 0..w {
+            let p = x + step_x * c as i32;
+            let taps = &SUBPEL_FILTERS[fh][((p >> 6) & 15) as usize];
+            let s: i32 = (0..8)
+                .map(|t| {
+                    let col = ((p >> 10) + t as i32 - 3).clamp(0, last_x) as usize;
+                    i32::from(taps[t]) * i32::from(samples[col])
+                })
+                .sum();
+            intermediate[r * w + c] = round2(s, rounds[0]);
+        }
+    }
+    let mut pred = vec![0i32; w * h];
+    for r in 0..h {
+        let p = (y & 1023) + step_y * r as i32;
+        let taps = &SUBPEL_FILTERS[fv][((p >> 6) & 15) as usize];
+        let base = (p >> 10) as usize;
+        for c in 0..w {
+            let s: i32 = (0..8)
+                .map(|t| i32::from(taps[t]) * intermediate[(base + t) * w + c])
+                .sum();
+            pred[r * w + c] = round2(s, rounds[1]);
+        }
+    }
+    pred
 }
