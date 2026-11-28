@@ -19,6 +19,7 @@ pub(crate) fn is_directional(mode: u8) -> bool {
 }
 
 /// One plane of the frame being decoded.
+#[derive(Clone)]
 pub(crate) struct Plane {
     pub(crate) data: Vec<u16>,
     pub(crate) stride: usize,
