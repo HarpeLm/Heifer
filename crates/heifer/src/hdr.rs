@@ -213,11 +213,17 @@ pub fn read_gain_map_with_options(
     bytes: &[u8],
     options: &Options,
 ) -> Result<Option<GainMap>, Error> {
-    let file = HeifFile::parse(bytes)?;
-    if let Some(map) = iso21496::read_gain_map(&file, options)? {
+    read_gain_map_from_file(&HeifFile::parse(bytes)?, options)
+}
+
+pub(crate) fn read_gain_map_from_file(
+    file: &HeifFile<'_>,
+    options: &Options,
+) -> Result<Option<GainMap>, Error> {
+    if let Some(map) = iso21496::read_gain_map(file, options)? {
         return Ok(Some(map));
     }
-    gain_map(&file, options)
+    gain_map(file, options)
 }
 
 /// Decodes an ISO 21496-1 or Apple gain-mapped image, or an image with a PQ or HLG transfer, in
