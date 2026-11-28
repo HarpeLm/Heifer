@@ -346,11 +346,17 @@ fn read_info_describes_avif_files() {
             read_info_reader(Cursor::new(&bytes)).unwrap(),
             "{name}"
         );
-        // Decoding is not supported yet, and says so instead of failing in another way.
-        assert!(
-            matches!(heifer::decode(&bytes), Err(heifer::Error::Unsupported(_))),
-            "{name}: {:?}",
-            heifer::decode(&bytes).err()
-        );
+        // Decoding agrees with the info; intra block copy is not supported yet, and says so.
+        match heifer::decode(&bytes) {
+            Ok(image) => assert_eq!(
+                (image.width, image.height, image.bit_depth, image.has_alpha),
+                (size.0, size.1, bit_depth, alpha),
+                "{name}"
+            ),
+            Err(heifer::Error::Unsupported(why)) => {
+                assert!(why.contains("intra block copy"), "{name}: {why}")
+            }
+            Err(e) => panic!("{name}: {e}"),
+        }
     }
 }
