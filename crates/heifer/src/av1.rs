@@ -26,17 +26,22 @@ pub(crate) fn decode_frame(
         .ok_or(heifer_isobmff::Error::MissingBox(FourCC(*b"av1C")))?;
     let data = file.item_data(id)?;
     let frames = heifer_av1_dec::frames(&data, &config.config_obus)?;
-    // An AVIF image item holds one frame; more mean layers or inter frames.
-    let [frame] = &frames[..] else {
-        return Err(Error::Unsupported("AV1 item with several frames".into()));
-    };
-    // Before decoding, so that a huge frame size allocates nothing.
-    check_size(
-        frame.header.upscaled_width,
-        frame.header.frame_height,
-        options.max_pixels(),
-    )?;
-    let picture = heifer_av1_dec::decode_frame(frame)?;
+    // An AVIF image item is one temporal unit: layered images hold several frames, and the
+    // picture is the last one shown (the highest spatial layer).
+    let mut decoder = heifer_av1_dec::Decoder::new();
+    let mut shown = None;
+    for frame in &frames {
+        // Before decoding, so that a huge frame size allocates nothing.
+        check_size(
+            frame.header.upscaled_width,
+            frame.header.frame_height,
+            options.max_pixels(),
+        )?;
+        if let Some(picture) = decoder.decode(frame)? {
+            shown = Some((picture, frame));
+        }
+    }
+    let (picture, frame) = shown.ok_or(heifer_av1_dec::Error::Invalid("no frame shown"))?;
     let color = &frame.sequence.color;
     let chroma_format = match (
         picture.planes.len(),
