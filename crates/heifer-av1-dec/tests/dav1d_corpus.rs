@@ -27,7 +27,15 @@ fn dav1d(dav1d: &Path, obus: &[u8], dir: &Path) -> Vec<u8> {
     let (input, output) = (dir.join("item.obu"), dir.join("item.yuv"));
     std::fs::write(&input, obus).unwrap();
     let status = Command::new(dav1d)
-        .args(["--filmgrain", "0", "--demuxer", "section5", "--quiet"])
+        .args([
+            "--filmgrain",
+            "0",
+            "--alllayers",
+            "0",
+            "--demuxer",
+            "section5",
+            "--quiet",
+        ])
         .arg("-i")
         .arg(&input)
         .arg("-o")
@@ -55,13 +63,15 @@ fn pixels_match_dav1d() {
             let what = format!("{name} item {}", item.id);
             let config = file.av1_config(item.id).unwrap().expect("av1C");
             let data = file.item_data(item.id).unwrap();
-            let picture =
-                heifer_av1_dec::frames(&data, &config.config_obus).and_then(|frames| match frames
-                    .as_slice()
-                {
-                    [frame] => heifer_av1_dec::decode_frame(frame),
-                    _ => Err(heifer_av1_dec::Error::Unsupported("several frames")),
-                });
+            // The last frame shown is the item's picture (its highest spatial layer).
+            let picture = heifer_av1_dec::frames(&data, &config.config_obus).and_then(|frames| {
+                let mut decoder = heifer_av1_dec::Decoder::new();
+                let mut shown = None;
+                for frame in &frames {
+                    shown = decoder.decode(frame)?.or(shown);
+                }
+                shown.ok_or(heifer_av1_dec::Error::Invalid("no frame shown"))
+            });
             let picture = match picture {
                 Err(heifer_av1_dec::Error::Unsupported(why)) => {
                     unsupported.push(format!("{what}: {why}"));
