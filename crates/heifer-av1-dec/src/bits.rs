@@ -41,6 +41,53 @@ impl<'a> BitReader<'a> {
         self.bit()
     }
 
+    /// `su(n)` (§4.10.6): an `n`-bit two's complement value.
+    pub(crate) fn su(&mut self, n: u32) -> Result<i32, Error> {
+        let value = self.f(n)? as i64;
+        let sign = 1i64 << (n - 1);
+        Ok((if value & sign != 0 {
+            value - 2 * sign
+        } else {
+            value
+        }) as i32)
+    }
+
+    /// `ns(n)` (§4.10.7): a value below `n`, `n >= 1`, with a short code for small values.
+    pub(crate) fn ns(&mut self, n: u32) -> Result<u32, Error> {
+        debug_assert!(n >= 1);
+        let w = 32 - n.leading_zeros();
+        let m = (1u32 << w) - n;
+        let v = self.f(w - 1)?;
+        if v < m {
+            return Ok(v);
+        }
+        Ok((v << 1) - m + u32::from(self.bit()?))
+    }
+
+    /// `trailing_bits()` (§5.3.4): a one bit, then zero bits to the end of the data.
+    pub(crate) fn trailing_bits(&mut self) -> Result<(), Error> {
+        if !self.bit()? {
+            return Err(Error::Invalid("trailing bits do not start with a one"));
+        }
+        self.zero_padding(self.data.len() * 8)
+    }
+
+    /// Checks that the bits up to `end` (a bit position) are zero, and skips them.
+    fn zero_padding(&mut self, end: usize) -> Result<(), Error> {
+        while self.pos < end {
+            if self.bit()? {
+                return Err(Error::Invalid("padding bits are not zero"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `byte_alignment()`: skips to the next byte boundary. Returns the bytes read so far.
+    pub(crate) fn byte_align(&mut self) -> Result<usize, Error> {
+        self.zero_padding(self.pos.div_ceil(8) * 8)?;
+        Ok(self.pos / 8)
+    }
+
     /// `uvlc()` (§4.10.3): a variable-length unsigned code, saturating at 2³² − 1.
     pub(crate) fn uvlc(&mut self) -> Result<u32, Error> {
         let mut leading_zeros = 0u32;
@@ -73,6 +120,28 @@ pub(crate) fn leb128(data: &[u8]) -> Result<(u64, usize), Error> {
 }
 
 #[cfg(test)]
+/// Packs `(value, bits)` fields MSB first, padded with zeros.
+pub(crate) fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut acc = 0u64;
+    let mut n = 0;
+    for &(v, bits) in fields {
+        for i in (0..bits).rev() {
+            acc = acc << 1 | u64::from(v >> i & 1);
+            n += 1;
+            if n == 8 {
+                out.push(acc as u8);
+                (acc, n) = (0, 0);
+            }
+        }
+    }
+    if n > 0 {
+        out.push((acc << (8 - n)) as u8);
+    }
+    out
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -87,6 +156,33 @@ mod tests {
             BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF]).f(32).unwrap(),
             0xDEAD_BEEF
         );
+    }
+
+    #[test]
+    fn signed_and_non_symmetric_codes() {
+        let mut r = BitReader::new(&[0b1111_0001, 0b1000_0000]);
+        assert_eq!(r.su(4).unwrap(), -1);
+        assert_eq!(r.su(4).unwrap(), 1);
+        // ns(5): w = 3, m = 3. "10" → 2 and "00" → 0 are below m; "110" and "111" read one more
+        // bit: (3 << 1) - 3 + bit.
+        let mut r = BitReader::new(&[0b1000_1101, 0b1100_0000]);
+        assert_eq!(r.ns(5).unwrap(), 2);
+        assert_eq!(r.ns(5).unwrap(), 0);
+        assert_eq!(r.ns(5).unwrap(), 3);
+        assert_eq!(r.ns(5).unwrap(), 4);
+        // ns(1) reads nothing.
+        assert_eq!(r.ns(1).unwrap(), 0);
+        // 10 bits read: alignment ends at byte 2.
+        assert_eq!(r.byte_align(), Ok(2));
+        assert_eq!(BitReader::new(&[0x01]).byte_align(), Ok(0));
+        let mut r = BitReader::new(&[0b1010_0000]);
+        r.f(1).unwrap();
+        assert!(r.byte_align().is_err());
+        let mut r = BitReader::new(&[0b0100_0000]);
+        r.f(1).unwrap();
+        assert!(r.clone().trailing_bits().is_ok());
+        r.f(1).unwrap();
+        assert!(r.trailing_bits().is_err());
     }
 
     #[test]
