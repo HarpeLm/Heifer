@@ -37,6 +37,10 @@ Mrow_Scan_4x4 Mrow_Scan_4x8 Mrow_Scan_8x4 Mrow_Scan_8x8 Mrow_Scan_8x16 Mrow_Scan
 Mrow_Scan_16x16 Mrow_Scan_4x16 Mrow_Scan_16x4
 Mcol_Scan_4x4 Mcol_Scan_4x8 Mcol_Scan_8x4 Mcol_Scan_8x8 Mcol_Scan_8x16 Mcol_Scan_16x8
 Mcol_Scan_16x16 Mcol_Scan_4x16 Mcol_Scan_16x4
+Size_Group Compound_Mode_Ctx_Map Wedge_Bits Warped_Filters Div_Lut Wedge_Codebook
+Wedge_Master_Oblique_Even Wedge_Master_Oblique_Odd Wedge_Master_Vertical
+Obmc_Mask_2 Obmc_Mask_4 Obmc_Mask_8 Obmc_Mask_16 Obmc_Mask_32 Ii_Weights_1d
+Quant_Dist_Weight Quant_Dist_Lookup Div_Mult
 """.split()
 
 spec, crate = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
@@ -50,8 +54,13 @@ for name, value in re.findall(r"^\|\s*`([A-Z0-9_]+)`\s*\|\s*(-?\d+)\s*\|", text,
     consts.setdefault(name, int(value))
 for value, name in re.findall(r"^\|\s*(\d+)\s*\|\s*([A-Z][A-Z0-9_]*[A-Z0-9])\s*\|?\s*$", text, re.M):
     consts.setdefault(name, int(value))
+# "| NAME | value" rows without backquotes (the wedge directions).
+for name, value in re.findall(r"^\|\s*([A-Z][A-Z0-9_]*[A-Z0-9])\s*\|\s*(\d+)\s*$", text, re.M):
+    consts.setdefault(name, int(value))
 # Defined in the semantics of lr_type (a table of a different shape).
 consts["RESTORE_SWITCHABLE"] = 3
+# Written as `1\<\<6` in the symbol list.
+consts["WARPEDPIXEL_PREC_SHIFTS"] = 1 << 6
 
 
 def evaluate(expr):
@@ -159,7 +168,15 @@ cdf_out += ["    /// `DeltaLFMultiCdf`: one copy of `Default_Delta_Lf_Cdf` per l
             "    pub(crate) fn new(q_ctx: usize) -> Box<Self> {", "        Box::new(Self {"]
 for name, dims, _, coeff in cdfs:
     cdf_out.append(f"            {field(name)}: {init(name, coeff)},")
-cdf_out += ["            delta_lf_multi: [DEFAULT_DELTA_LF_CDF; 4],", "        })", "    }", "}"]
+cdf_out += ["            delta_lf_multi: [DEFAULT_DELTA_LF_CDF; 4],", "        })", "    }", "",
+            "    /// Sets every adaptation counter to 0, as `load_cdfs()` does.",
+            "    pub(crate) fn clear_counters(&mut self) {", "        let all: [(&mut [u16], usize); %d] = [" % (len(cdfs) + 1)]
+for name, dims, _, coeff in cdfs + [("Default_Delta_Lf_Multi_Cdf", [4] + next(d for n, d, _, _ in cdfs if n == 'Default_Delta_Lf_Cdf'), None, False)]:
+    depth = len(MV_COPIES.get(name, []) + (dims[1:] if coeff else dims))
+    flat = f"self.{field(name)}" + (".as_flattened_mut()" * (depth - 1) if depth > 1 else "[..]")
+    cdf_out.append(f"            ({'&mut ' if depth == 1 else ''}{flat}, {dims[-1]}),")
+cdf_out += ["        ];", "        for (cdfs, n) in all {", "            for cdf in cdfs.chunks_exact_mut(n) {",
+            "                cdf[n - 1] = 0;", "            }", "        }", "    }", "}"]
 cdf_out += ["", "/// Every table as `(name, values, CDF length)`, for tests.", "#[cfg(test)]",
             f"pub(crate) fn all() -> [(&'static str, &'static [u16], usize); {len(cdfs)}] {{", "    ["]
 for name, dims, _, _ in cdfs:
