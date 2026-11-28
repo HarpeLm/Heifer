@@ -5,7 +5,7 @@
 
 use crate::Error;
 use crate::bits::BitReader;
-use crate::frame::FrameHeader;
+use crate::frame::{FrameHeader, RefHeaders};
 use crate::obu::{ObuType, obus};
 use crate::sequence::SequenceHeader;
 
@@ -51,6 +51,7 @@ pub fn frames<'a>(data: &'a [u8], config_obus: &[u8]) -> Result<Vec<CodedFrame<'
     }
     let mut done = Vec::new();
     let mut current: Option<CodedFrame<'a>> = None;
+    let mut refs = RefHeaders::default();
     for obu in obus(data) {
         let obu = obu?;
         if obu.obu_type == ObuType::SequenceHeader {
@@ -91,14 +92,20 @@ pub fn frames<'a>(data: &'a [u8], config_obus: &[u8]) -> Result<Vec<CodedFrame<'
             }
             (Some(_), _) => obu.payload,
             (None, obu_type) => {
-                let (header, size) = FrameHeader::parse(&obu, seq)?;
-                current = Some(CodedFrame {
+                let (header, size) = FrameHeader::parse_with_refs(&obu, seq, &refs)?;
+                let frame = CodedFrame {
                     sequence: seq.clone(),
                     header,
                     temporal_id: obu.temporal_id,
                     spatial_id: obu.spatial_id,
                     tiles: Vec::new(),
-                });
+                };
+                if frame.header.show_existing_frame.is_some() {
+                    update_refs(&mut refs, &frame.header);
+                    done.push(frame);
+                    continue;
+                }
+                current = Some(frame);
                 if obu_type == ObuType::FrameHeader {
                     continue;
                 }
@@ -107,6 +114,7 @@ pub fn frames<'a>(data: &'a [u8], config_obus: &[u8]) -> Result<Vec<CodedFrame<'
         };
         let frame = current.as_mut().expect("a frame is in progress");
         if read_tile_group(tile_data, &frame.header, &mut frame.tiles)? {
+            update_refs(&mut refs, &frame.header);
             done.extend(current.take());
         }
     }
@@ -117,6 +125,17 @@ pub fn frames<'a>(data: &'a [u8], config_obus: &[u8]) -> Result<Vec<CodedFrame<'
         return Err(Error::Invalid("no frame"));
     }
     Ok(done)
+}
+
+/// The header part of the reference frame update process (§7.20).
+fn update_refs(refs: &mut RefHeaders, header: &FrameHeader) {
+    for (i, slot) in refs.iter_mut().enumerate() {
+        if header.refresh_frame_flags >> i & 1 == 1 {
+            let mut saved = header.clone();
+            saved.show_existing_frame = None;
+            *slot = Some(saved);
+        }
+    }
 }
 
 /// `tile_group_obu()`: appends the group's tiles to `tiles`; returns whether it ends the frame.
