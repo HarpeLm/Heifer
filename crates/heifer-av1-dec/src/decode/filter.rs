@@ -25,6 +25,10 @@ const CDEF_DIRECTIONS: [[[isize; 2]; 2]; 8] = [
 ];
 const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 const CDEF_SEC_TAPS: [[i32; 2]; 2] = [[2, 1], [2, 1]];
+/// What the CDEF filter finds where cdef_get_at() has no sample.
+const UNAVAILABLE: i32 = i32::MAX;
+/// Side of the padded block CDEF filters: 8 samples and 2 on each side.
+const CDEF_BUF: usize = 12;
 const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
 
 const SGRPROJ_RST_BITS: u32 = 4;
@@ -238,42 +242,65 @@ impl FrameState<'_> {
         damping: u32,
         dir: usize,
     ) {
+        if pri == 0 && sec == 0 {
+            // Every tap is 0, so the samples stay as they are.
+            return;
+        }
         let coeff_shift = self.bit_depth - 8;
         let (sx, sy) = self.sub(plane);
         let (x0, y0) = ((c * 4) >> sx, (r * 4) >> sy);
         let (w, h) = (8 >> sx, 8 >> sy);
-        let (mi_rows, mi_cols) = (self.mi_rows as isize, self.mi_cols as isize);
+        let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
         let s = &src[plane];
-        // cdef_get_at(): None outside the frame's 4×4 units.
-        let at = |y: isize, x: isize| {
-            let (cr, cc) = ((y << sy) >> 2, (x << sx) >> 2);
-            (cr >= 0 && cr < mi_rows && cc >= 0 && cc < mi_cols)
-                .then(|| i32::from(s.data[y as usize * s.stride + x as usize]))
-        };
-        let taps = ((pri >> coeff_shift) & 1) as usize;
-        let mut out = [[0u16; 8]; 8];
-        for (i, out_row) in out.iter_mut().enumerate().take(h) {
-            for (j, out) in out_row.iter_mut().enumerate().take(w) {
-                let (y, x) = ((y0 + i) as isize, (x0 + j) as isize);
-                let v = i32::from(s.data[(y0 + i) * s.stride + x0 + j]);
-                let (mut sum, mut max, mut min) = (0, v, v);
-                for k in 0..2 {
-                    for sign in [-1, 1] {
-                        let mut tap = |d: usize, strength: i32, weight: i32| {
-                            let [oy, ox] = CDEF_DIRECTIONS[d][k];
-                            if let Some(p) = at(y + sign * oy, x + sign * ox) {
-                                sum += weight * constrain(p - v, strength, damping);
-                                max = max.max(p);
-                                min = min.min(p);
-                            }
-                        };
-                        tap(dir, pri, CDEF_PRI_TAPS[taps][k]);
-                        tap((dir + 6) & 7, sec, CDEF_SEC_TAPS[taps][k]);
-                        tap((dir + 2) & 7, sec, CDEF_SEC_TAPS[taps][k]);
-                    }
-                }
-                *out = (v + ((8 + sum - i32::from(sum < 0)) >> 4)).clamp(min, max) as u16;
+        // The block and the 2 samples around it that the taps reach, UNAVAILABLE where
+        // cdef_get_at() finds no sample (outside the frame's 4×4 units).
+        let mut buf = [UNAVAILABLE; CDEF_BUF * CDEF_BUF];
+        // The available samples form a rectangle: plane coordinates inside the frame's 4×4 units.
+        let (max_y, max_x) = ((mi_rows * 4) >> sy, (mi_cols * 4) >> sx);
+        let (x_lo, x_hi) = (x0.max(2) - 2, (x0 + w + 2).min(max_x));
+        for i in 0..h + 4 {
+            let y = y0 + i;
+            if y < 2 || y - 2 >= max_y {
+                continue;
             }
+            let row = &s.data[(y - 2) * s.stride..];
+            let dst = &mut buf[i * CDEF_BUF + x_lo + 2 - x0..][..x_hi - x_lo];
+            for (d, &v) in dst.iter_mut().zip(&row[x_lo..x_hi]) {
+                *d = i32::from(v);
+            }
+        }
+        let taps = ((pri >> coeff_shift) & 1) as usize;
+        let adj = |strength: i32| {
+            if strength == 0 {
+                0
+            } else {
+                damping.saturating_sub(strength.ilog2())
+            }
+        };
+        let (pri_adj, sec_adj) = (adj(pri), adj(sec));
+        let offset = |d: usize, k: usize| {
+            let [oy, ox] = CDEF_DIRECTIONS[d][k];
+            oy * CDEF_BUF as isize + ox
+        };
+        // The 12 taps: offset, strength, dampingAdj and weight.
+        let mut taps_list = [(0isize, 0i32, 0u32, 0i32); 12];
+        let mut n = 0;
+        for k in 0..2 {
+            for sign in [-1, 1] {
+                for (d, strength, adj, weight) in [
+                    (dir, pri, pri_adj, CDEF_PRI_TAPS[taps][k]),
+                    ((dir + 6) & 7, sec, sec_adj, CDEF_SEC_TAPS[taps][k]),
+                    ((dir + 2) & 7, sec, sec_adj, CDEF_SEC_TAPS[taps][k]),
+                ] {
+                    taps_list[n] = (sign * offset(d, k), strength, adj, weight);
+                    n += 1;
+                }
+            }
+        }
+        let mut out = [[0u16; 8]; 8];
+        match w {
+            8 => cdef_rows::<8>(&buf, h, &taps_list, &mut out),
+            _ => cdef_rows::<4>(&buf, h, &taps_list, &mut out),
         }
         let d = &mut self.planes[plane];
         for (i, row) in out.iter().enumerate().take(h) {
@@ -283,49 +310,60 @@ impl FrameState<'_> {
 
     // §7.17: loop restoration, from the CDEF output into `planes`.
 
+    /// The loop restoration process, run on regions that share a stripe and a restoration unit
+    /// rather than on 4×4 blocks, which gives the same output.
     fn restore(&mut self, deblocked: &[Plane], cdef: &[Plane]) {
         for plane in 0..self.num_planes {
             if self.fh.restoration.types[plane] == RestorationType::None {
                 continue;
             }
-            for y in (0..self.fh.frame_height as usize).step_by(4) {
-                for x in (0..self.fh.upscaled_width as usize).step_by(4) {
-                    self.restore_block(plane, y >> 2, x >> 2, &deblocked[plane], &cdef[plane]);
+            let (sx, sy) = self.sub(plane);
+            let unit_size = usize::from(self.fh.restoration.unit_size[plane]);
+            let (unit_rows, unit_cols) = self.lr_unit_counts(plane);
+            let end_x = round2(self.fh.upscaled_width as i32, sx as u32) as usize - 1;
+            let end_y = round2(self.fh.frame_height as i32, sy as u32) as usize - 1;
+            for stripe_num in 0.. {
+                let stripe_start = (-8 + stripe_num as isize * 64) >> sy;
+                if stripe_start > end_y as isize {
+                    break;
+                }
+                let src = Source {
+                    cur: &deblocked[plane],
+                    cdef: &cdef[plane],
+                    end_x: end_x as isize,
+                    end_y: end_y as isize,
+                    stripe_start,
+                    stripe_end: stripe_start + (64 >> sy) - 1,
+                };
+                let y = stripe_start.max(0) as usize;
+                let h = (src.stripe_end as usize).min(end_y) + 1 - y;
+                // unitRow of every 4×4 block of the stripe.
+                let unit_row = (unit_rows - 1).min(((stripe_num * 64) >> sy) / unit_size);
+                for unit_col in 0..unit_cols {
+                    let x = unit_col * unit_size;
+                    let last = if unit_col + 1 == unit_cols {
+                        end_x
+                    } else {
+                        x + unit_size - 1
+                    };
+                    let region = Region {
+                        x,
+                        y,
+                        w: last + 1 - x,
+                        h,
+                    };
+                    let unit = self.lr_units[plane][unit_row * unit_cols + unit_col];
+                    let out = match unit.kind {
+                        1 => wiener(&src, &unit, &region, self.bit_depth),
+                        2 => self_guided(&src, &unit, &region, self.bit_depth),
+                        _ => continue,
+                    };
+                    let d = &mut self.planes[plane];
+                    for (i, row) in out.chunks(region.w).enumerate() {
+                        d.data[(y + i) * d.stride + x..][..region.w].copy_from_slice(row);
+                    }
                 }
             }
-        }
-    }
-
-    /// The loop restore block process (§7.17.1).
-    fn restore_block(&mut self, plane: usize, row: usize, col: usize, cur: &Plane, cdef: &Plane) {
-        let (sx, sy) = self.sub(plane);
-        let stripe_num = (row * 4 + 8) / 64;
-        let stripe_start = (-8 + stripe_num as isize * 64) >> sy;
-        let unit_size = usize::from(self.fh.restoration.unit_size[plane]);
-        let (unit_rows, unit_cols) = self.lr_unit_counts(plane);
-        let unit_row = (unit_rows - 1).min(((row * 4 + 8) >> sy) / unit_size);
-        let unit_col = (unit_cols - 1).min(((col * 4) >> sx) / unit_size);
-        let src = Source {
-            cur,
-            cdef,
-            end_x: round2(self.fh.upscaled_width as i32, sx as u32) as isize - 1,
-            end_y: round2(self.fh.frame_height as i32, sy as u32) as isize - 1,
-            stripe_start,
-            stripe_end: stripe_start + (64 >> sy) - 1,
-        };
-        let (x, y) = ((col * 4) >> sx, (row * 4) >> sy);
-        let w = (4 >> sx).min(src.end_x as usize + 1 - x);
-        let h = (4 >> sy).min(src.end_y as usize + 1 - y);
-        let unit = self.lr_units[plane][unit_row * unit_cols + unit_col];
-        let block = Block { x, y, w, h };
-        let out = match unit.kind {
-            1 => wiener(&src, &unit, &block, self.bit_depth),
-            2 => self_guided(&src, &unit, &block, self.bit_depth),
-            _ => return,
-        };
-        let d = &mut self.planes[plane];
-        for (i, row) in out.iter().enumerate().take(h) {
-            d.data[(y + i) * d.stride + x..][..w].copy_from_slice(&row[..w]);
         }
     }
 }
@@ -425,14 +463,49 @@ fn filter_samples(
     }
 }
 
+/// Filters the `h` rows of `W` samples of a padded CDEF block, whole rows at a time so that
+/// the loops vectorize. `taps` holds each tap's offset, strength, dampingAdj and weight.
+fn cdef_rows<const W: usize>(
+    buf: &[i32; CDEF_BUF * CDEF_BUF],
+    h: usize,
+    taps: &[(isize, i32, u32, i32); 12],
+    out: &mut [[u16; 8]; 8],
+) {
+    for (i, out_row) in out.iter_mut().enumerate().take(h) {
+        let base = (i + 2) * CDEF_BUF + 2;
+        let v: [i32; W] = buf[base..base + W].try_into().unwrap();
+        let (mut sum, mut max, mut min) = ([0i32; W], v, v);
+        for &(off, strength, adj, weight) in taps {
+            let start = (base as isize + off) as usize;
+            let p: &[i32; W] = buf[start..start + W].try_into().unwrap();
+            for j in 0..W {
+                // All ones where the sample is available.
+                let mask = -i32::from(p[j] != UNAVAILABLE);
+                // constrain(), branch-free so that the loop vectorizes; 0 when the strength
+                // is 0. No overflow: samples are positive and UNAVAILABLE is the largest i32.
+                let d = p[j] - v[j];
+                let c = (strength - (d.abs() >> adj)).max(0).min(d.abs());
+                let sign = d >> 31;
+                sum[j] += (weight * ((c ^ sign) - sign)) & mask;
+                max[j] = max[j].max(p[j] & mask);
+                min[j] = min[j].min(p[j]);
+            }
+        }
+        for j in 0..W {
+            let s = sum[j];
+            out_row[j] = (v[j] + ((8 + s - i32::from(s < 0)) >> 4)).clamp(min[j], max[j]) as u16;
+        }
+    }
+}
+
 /// The CDEF direction process (§7.15.2): `yDir` and `var`.
 fn cdef_direction(p: &Plane, r: usize, c: usize, coeff_shift: u32) -> (usize, i64) {
     let mut cost = [0i64; 8];
-    let mut partial = [[0i64; 15]; 8];
+    let mut partial = [[0i32; 15]; 8];
     let (x0, y0) = (c * 4, r * 4);
     for i in 0..8 {
         for j in 0..8 {
-            let x = i64::from(p.data[(y0 + i) * p.stride + x0 + j] >> coeff_shift) - 128;
+            let x = i32::from(p.data[(y0 + i) * p.stride + x0 + j] >> coeff_shift) - 128;
             partial[0][i + j] += x;
             partial[1][i + j / 2] += x;
             partial[2][i] += x;
@@ -443,6 +516,7 @@ fn cdef_direction(p: &Plane, r: usize, c: usize, coeff_shift: u32) -> (usize, i6
             partial[7][i / 2 + j] += x;
         }
     }
+    let partial = partial.map(|r| r.map(i64::from));
     for i in 0..8 {
         cost[2] += partial[2][i] * partial[2][i];
         cost[6] += partial[6][i] * partial[6][i];
@@ -477,15 +551,6 @@ fn cdef_direction(p: &Plane, r: usize, c: usize, coeff_shift: u32) -> (usize, i6
     (y_dir, (best_cost - cost[(y_dir + 4) & 7]) >> 10)
 }
 
-fn constrain(diff: i32, threshold: i32, damping: u32) -> i32 {
-    if threshold == 0 {
-        return 0;
-    }
-    let adj = damping.saturating_sub(threshold.ilog2());
-    let v = (threshold - (diff.abs() >> adj)).clamp(0, diff.abs());
-    if diff < 0 { -v } else { v }
-}
-
 /// What the get source sample process (§7.17.6) reads from.
 struct Source<'a> {
     cur: &'a Plane,
@@ -497,8 +562,8 @@ struct Source<'a> {
 }
 
 impl Source<'_> {
-    fn at(&self, x: isize, y: isize) -> i32 {
-        let x = x.clamp(0, self.end_x) as usize;
+    /// The row of samples that get_source_sample() reads for `y`.
+    fn row(&self, y: isize) -> &[u16] {
         let y = y.clamp(0, self.end_y);
         let (p, y) = if y < self.stripe_start {
             (self.cur, y.max(self.stripe_start - 2))
@@ -507,20 +572,28 @@ impl Source<'_> {
         } else {
             (self.cdef, y)
         };
-        i32::from(p.data[y as usize * p.stride + x])
+        &p.data[y as usize * p.stride..][..=self.end_x as usize]
+    }
+
+    /// Samples `x - pad .. x + w + pad` of `row`, the columns clamped to the plane.
+    fn padded(&self, row: &[u16], x: usize, w: usize, pad: usize) -> impl Iterator<Item = i32> {
+        (0..w + 2 * pad).map(move |i| {
+            let x = (x + i).saturating_sub(pad).min(self.end_x as usize);
+            i32::from(row[x])
+        })
     }
 }
 
-/// A block of at most 4×4 samples of one plane.
-struct Block {
+/// The samples of a plane that one restoration unit filters within one stripe.
+struct Region {
     x: usize,
     y: usize,
     w: usize,
     h: usize,
 }
 
-/// The Wiener filter process (§7.17.4).
-fn wiener(src: &Source<'_>, unit: &LrUnit, b: &Block, bit_depth: u32) -> [[u16; 4]; 4] {
+/// The Wiener filter process (§7.17.4), on a region; the output rows one after the other.
+fn wiener(src: &Source<'_>, unit: &LrUnit, b: &Region, bit_depth: u32) -> Vec<u16> {
     // The rounding variables with isCompound equal to 0.
     let (round0, round1) = if bit_depth == 12 { (5, 9) } else { (3, 11) };
     let coefficients = |c: [i32; 3]| {
@@ -536,84 +609,107 @@ fn wiener(src: &Source<'_>, unit: &LrUnit, b: &Block, bit_depth: u32) -> [[u16; 
     let (vfilter, hfilter) = (coefficients(unit.wiener[0]), coefficients(unit.wiener[1]));
     let offset = 1 << (bit_depth + FILTER_BITS - round0 - 1);
     let limit = (1 << (bit_depth + 1 + FILTER_BITS - round0)) - 1;
-    let (x, y) = (b.x as isize, b.y as isize);
-    let mut inter = [[0i32; 4]; 10];
-    for (r, row) in inter.iter_mut().enumerate().take(b.h + 6) {
-        for (c, v) in row.iter_mut().enumerate().take(b.w) {
-            let s: i32 = (0..7)
-                .map(|t| hfilter[t] * src.at(x + (c + t) as isize - 3, y + r as isize - 3))
-                .sum();
+    let mut inter = vec![0i32; (b.h + 6) * b.w];
+    let mut row = Vec::with_capacity(b.w + 6);
+    for (r, out) in inter.chunks_mut(b.w).enumerate() {
+        row.clear();
+        row.extend(src.padded(src.row((b.y + r) as isize - 3), b.x, b.w, 3));
+        for (c, v) in out.iter_mut().enumerate() {
+            let s: i32 = hfilter.iter().zip(&row[c..c + 7]).map(|(f, x)| f * x).sum();
             *v = round2(s, round0).clamp(-offset, limit - offset);
         }
     }
     let max = (1 << bit_depth) - 1;
-    let mut out = [[0u16; 4]; 4];
-    for r in 0..b.h {
-        for c in 0..b.w {
-            let s: i32 = (0..7).map(|t| vfilter[t] * inter[r + t][c]).sum();
-            out[r][c] = round2(s, round1).clamp(0, max) as u16;
+    let mut out = vec![0u16; b.h * b.w];
+    for (r, out) in out.chunks_mut(b.w).enumerate() {
+        for (c, v) in out.iter_mut().enumerate() {
+            let s: i32 = (0..7).map(|t| vfilter[t] * inter[(r + t) * b.w + c]).sum();
+            *v = round2(s, round1).clamp(0, max) as u16;
         }
     }
     out
 }
 
-/// The self guided filter process (§7.17.2).
-fn self_guided(src: &Source<'_>, unit: &LrUnit, b: &Block, bit_depth: u32) -> [[u16; 4]; 4] {
+/// Rows and columns of source samples around a region that the box filters read: one for A
+/// and B, and up to two for the box.
+const SGR_PAD: usize = 3;
+
+/// The self guided filter process (§7.17.2), on a region.
+fn self_guided(src: &Source<'_>, unit: &LrUnit, b: &Region, bit_depth: u32) -> Vec<u16> {
+    // Integral images of the source samples and of their squares, SGR_PAD around the region.
+    let (gw, gh) = (b.w + 2 * SGR_PAD, b.h + 2 * SGR_PAD);
+    let mut sum = vec![0i64; (gw + 1) * (gh + 1)];
+    let mut sq = vec![0i64; (gw + 1) * (gh + 1)];
+    for gy in 0..gh {
+        let row = src.row((b.y + gy) as isize - SGR_PAD as isize);
+        let (mut s, mut q) = (0i64, 0i64);
+        for (gx, c) in src.padded(row, b.x, b.w, SGR_PAD).enumerate() {
+            let c = i64::from(c);
+            s += c;
+            q += c * c;
+            let i = (gy + 1) * (gw + 1) + gx + 1;
+            sum[i] = sum[i - gw - 1] + s;
+            sq[i] = sq[i - gw - 1] + q;
+        }
+    }
     let set = usize::from(unit.sgr_set);
-    let flt0 = box_filter(src, b, set, 0, bit_depth);
-    let flt1 = box_filter(src, b, set, 1, bit_depth);
+    let flt0 = box_filter(src, b, set, 0, bit_depth, &sum, &sq);
+    let flt1 = box_filter(src, b, set, 1, bit_depth, &sum, &sq);
     let [w0, w1] = unit.sgr_xqd.map(i64::from);
     let w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1;
-    let (r0, r1) = (SGR_PARAMS[set][0], SGR_PARAMS[set][2]);
     let max = (1 << bit_depth) - 1;
-    let mut out = [[0u16; 4]; 4];
+    let mut out = vec![0u16; b.h * b.w];
     for i in 0..b.h {
-        for j in 0..b.w {
-            let u =
-                i64::from(src.cdef.data[(b.y + i) * src.cdef.stride + b.x + j]) << SGRPROJ_RST_BITS;
+        let row = &src.cdef.data[(b.y + i) * src.cdef.stride + b.x..][..b.w];
+        for (j, &sample) in row.iter().enumerate() {
+            let u = i64::from(sample) << SGRPROJ_RST_BITS;
+            let k = i * b.w + j;
             let mut v = w1 * u;
-            v += w0 * if r0 != 0 { flt0[i][j] } else { u };
-            v += w2 * if r1 != 0 { flt1[i][j] } else { u };
-            out[i][j] = round2_64(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS).clamp(0, max) as u16;
+            v += w0 * flt0.as_ref().map_or(u, |f| f[k]);
+            v += w2 * flt1.as_ref().map_or(u, |f| f[k]);
+            out[k] = round2_64(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS).clamp(0, max) as u16;
         }
     }
     out
 }
 
-/// The box filter process (§7.17.3); zeros when the pass is unused.
+/// The box filter process (§7.17.3); None when the pass is unused. `sum` and `sq` are the
+/// integral images of `self_guided()`.
 fn box_filter(
     src: &Source<'_>,
-    b: &Block,
+    b: &Region,
     set: usize,
     pass: usize,
     bit_depth: u32,
-) -> [[i64; 4]; 4] {
-    let mut f = [[0i64; 4]; 4];
-    let r = isize::from(SGR_PARAMS[set][pass * 2]);
+    sum: &[i64],
+    sq: &[i64],
+) -> Option<Vec<i64>> {
+    let r = usize::from(SGR_PARAMS[set][pass * 2]);
     if r == 0 {
-        return f;
+        return None;
     }
     let eps = i64::from(SGR_PARAMS[set][pass * 2 + 1]);
     let n = ((2 * r + 1) * (2 * r + 1)) as i64;
     let n2e = n * n * eps;
     let s = ((1 << SGRPROJ_MTABLE_BITS) + n2e / 2) / n2e;
     let one_over_n = ((1 << SGRPROJ_RECIP_BITS) + n / 2) / n;
+    let gw = b.w + 2 * SGR_PAD + 1;
+    // Sum over the box of side 2r + 1 whose top left source sample is (gy, gx).
+    let boxed = |t: &[i64], gy: usize, gx: usize| {
+        let d = 2 * r + 1;
+        t[(gy + d) * gw + gx + d] - t[gy * gw + gx + d] - t[(gy + d) * gw + gx] + t[gy * gw + gx]
+    };
     // A and B, with one extra sample on each side.
-    let mut aa = [[0i64; 6]; 6];
-    let mut bb = [[0i64; 6]; 6];
-    let (x, y) = (b.x as isize, b.y as isize);
-    for i in 0..b.h + 2 {
-        for j in 0..b.w + 2 {
-            let (mut a, mut sum) = (0i64, 0i64);
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let c = i64::from(src.at(x + j as isize - 1 + dx, y + i as isize - 1 + dy));
-                    a += c * c;
-                    sum += c;
-                }
-            }
+    let (aw, ah) = (b.w + 2, b.h + 2);
+    let mut aa = vec![0i64; aw * ah];
+    let mut bb = vec![0i64; aw * ah];
+    for i in 0..ah {
+        for j in 0..aw {
+            // A[i - 1][j - 1] is centred on source sample (i + SGR_PAD - 1, j + SGR_PAD - 1).
+            let (gy, gx) = (i + SGR_PAD - 1 - r, j + SGR_PAD - 1 - r);
+            let (a, total) = (boxed(sq, gy, gx), boxed(sum, gy, gx));
             let a = round2_64(a, 2 * (bit_depth - 8));
-            let d = round2_64(sum, bit_depth - 8);
+            let d = round2_64(total, bit_depth - 8);
             let p = (a * n - d * d).max(0);
             let z = round2_64(p * s, SGRPROJ_MTABLE_BITS);
             let a2 = if z >= 255 {
@@ -623,15 +719,17 @@ fn box_filter(
             } else {
                 ((z << SGRPROJ_SGR_BITS) + z / 2) / (z + 1)
             };
-            let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) * sum * one_over_n;
-            aa[i][j] = a2;
-            bb[i][j] = round2_64(b2, SGRPROJ_RECIP_BITS);
+            let b2 = ((1 << SGRPROJ_SGR_BITS) - a2) * total * one_over_n;
+            aa[i * aw + j] = a2;
+            bb[i * aw + j] = round2_64(b2, SGRPROJ_RECIP_BITS);
         }
     }
+    let mut f = vec![0i64; b.w * b.h];
     for i in 0..b.h {
         let shift = if pass == 0 && i & 1 == 1 { 4 } else { 5 };
+        let row = &src.cdef.data[(b.y + i) * src.cdef.stride + b.x..][..b.w];
         for j in 0..b.w {
-            let (mut a, mut sum) = (0i64, 0i64);
+            let (mut a, mut total) = (0i64, 0i64);
             for dy in 0..3 {
                 for dx in 0..3 {
                     let weight = if pass == 0 {
@@ -646,13 +744,14 @@ fn box_filter(
                     } else {
                         3
                     };
-                    a += weight * aa[i + dy][j + dx];
-                    sum += weight * bb[i + dy][j + dx];
+                    let k = (i + dy) * aw + j + dx;
+                    a += weight * aa[k];
+                    total += weight * bb[k];
                 }
             }
-            let v = a * i64::from(src.cdef.data[(b.y + i) * src.cdef.stride + b.x + j]) + sum;
-            f[i][j] = round2_64(v, SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS);
+            let v = a * i64::from(row[j]) + total;
+            f[i * b.w + j] = round2_64(v, SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS);
         }
     }
-    f
+    Some(f)
 }
