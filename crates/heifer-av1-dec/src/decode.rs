@@ -1,10 +1,13 @@
-//! Decoding of intra frames (AV1 §5.11, §6.10, §7.10–7.13): reads each tile's blocks, predicts
-//! them (intra prediction, palettes, or intra block copy from the frame itself), adds their
-//! residuals, then runs the loop filters (`filter`).
+//! Decoding of frames (AV1 §5.11, §6.10, §7.9–7.13, §7.19–7.20): reads each tile's blocks,
+//! predicts them (intra prediction, palettes, intra block copy, or inter prediction from the
+//! reference frames, in `inter` and `mc`), adds their residuals, then runs the loop filters
+//! (`filter`).
+
+use std::sync::Arc;
 
 use crate::Error;
 use crate::cdf_tables::Cdfs;
-use crate::frame::{FrameHeader, RestorationType, TxMode};
+use crate::frame::{FrameHeader, RestorationType, TxMode, relative_dist};
 use crate::predict::{self, DC_PRED, IntraBlock, Plane, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED};
 use crate::sequence::SequenceHeader;
 use crate::spec_tables::*;
@@ -13,6 +16,10 @@ use crate::tile::{CodedFrame, Tile};
 use crate::transform::{self, DCT_DCT, IDTX};
 
 mod filter;
+mod inter;
+mod mc;
+
+use inter::{INVALID_MV, MvStack, NONE};
 
 /// A decoded picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +41,7 @@ pub struct Picture {
 
 const BLOCK_4X4: usize = 0;
 const BLOCK_8X8: usize = 3;
+const BLOCK_32X32: usize = 9;
 const BLOCK_64X64: usize = 12;
 const BLOCK_128X128: usize = 15;
 const BLOCK_INVALID: u8 = 22;
@@ -68,15 +76,84 @@ const MV_BORDER: i32 = 128;
 const INTRABC_DELAY_PIXELS: i32 = 256;
 const MV_INTRABC_CONTEXT: usize = 1;
 /// `InterpFilters` of intra block copy: `BILINEAR`.
-const BILINEAR: usize = 3;
+const BILINEAR: u8 = 3;
+const SWITCHABLE: u8 = 4;
 const SEG_LVL_ALT_Q: usize = 0;
 const SEG_LVL_SKIP: usize = 6;
 const TX_CLASS_2D: usize = 0;
 const TX_CLASS_HORIZ: usize = 1;
 const TX_CLASS_VERT: usize = 2;
 
-/// Decodes an intra frame. Film grain is not applied.
+/// Decodes an intra frame on its own. Film grain is not applied. Frames that refer to others go
+/// through a [`Decoder`].
 pub fn decode_frame(frame: &CodedFrame<'_>) -> Result<Picture, Error> {
+    if !frame.header.is_intra() || frame.header.show_existing_frame.is_some() {
+        return Err(Error::Unsupported("inter frames"));
+    }
+    Ok(decode_coded(frame, &Default::default())?.picture)
+}
+
+/// Decodes the frames of a stream in order, keeping the eight reference slots (§7.20).
+#[derive(Default)]
+pub struct Decoder {
+    slots: [Option<Arc<RefFrame>>; 8],
+}
+
+impl Decoder {
+    /// A decoder with empty reference slots.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decodes `frame`, one of the frames of [`frames`](crate::frames) in order, and returns its
+    /// picture when the frame is shown. Film grain is not applied.
+    pub fn decode(&mut self, frame: &CodedFrame<'_>) -> Result<Option<Picture>, Error> {
+        let fh = &frame.header;
+        let current = match fh.show_existing_frame {
+            Some(idx) => self.slots[usize::from(idx)]
+                .clone()
+                .ok_or(Error::Invalid("shows an empty reference slot"))?,
+            None => Arc::new(decode_coded(frame, &self.slots)?),
+        };
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if fh.refresh_frame_flags >> i & 1 == 1 {
+                *slot = Some(current.clone());
+            }
+        }
+        Ok(fh.show_frame.then(|| current.picture.clone()))
+    }
+}
+
+/// What a decoded frame leaves in a reference slot.
+struct RefFrame {
+    /// `LrFrame`.
+    picture: Picture,
+    /// `RefUpscaledWidth`, `RefFrameHeight`, `RefMiRows` and `RefMiCols`.
+    upscaled_width: u32,
+    frame_height: u32,
+    mi_rows: usize,
+    mi_cols: usize,
+    /// `RefFrameType` is `KEY_FRAME` or `INTRA_ONLY_FRAME`.
+    intra: bool,
+    /// `SavedOrderHints`.
+    order_hints: [u32; 8],
+    /// The CDFs at the end of the frame (`save_cdfs()`).
+    cdfs: Box<Cdfs>,
+    /// Row stride of the per-unit arrays.
+    mi_stride: usize,
+    /// `SavedRefFrames`: `MfRefFrames`, `NONE` (-1) where no motion vector is kept.
+    mf_ref_frames: Vec<i8>,
+    /// `SavedMvs`.
+    mf_mvs: Vec<[i32; 2]>,
+    /// `SavedSegmentIds`.
+    segment_ids: Vec<u8>,
+}
+
+/// Decodes a frame (not a shown existing one), given the reference slots.
+fn decode_coded(
+    frame: &CodedFrame<'_>,
+    slots: &[Option<Arc<RefFrame>>; 8],
+) -> Result<RefFrame, Error> {
     let (seq, fh) = (&frame.sequence, &frame.header);
     if fh.upscaled_width != fh.frame_width {
         return Err(Error::Unsupported("superres"));
@@ -84,12 +161,57 @@ pub fn decode_frame(frame: &CodedFrame<'_>) -> Result<Picture, Error> {
     if fh.quantization.qmatrix.is_some() {
         return Err(Error::Unsupported("quantizer matrices"));
     }
-    let mut f = FrameState::new(seq, fh);
-    for tile in &frame.tiles {
-        TileDecoder::new(&mut f, tile)?.decode()?;
+    let cdfs = match fh.primary_ref_frame {
+        Some(p) => {
+            // load_cdfs()
+            let slot = &slots[usize::from(fh.ref_frame_idx[usize::from(p)])];
+            let mut cdfs = slot
+                .as_ref()
+                .ok_or(Error::Invalid("reference to an empty slot"))?
+                .cdfs
+                .clone();
+            cdfs.clear_counters();
+            cdfs
+        }
+        None => Cdfs::new(match fh.quantization.base_q_idx {
+            0..=20 => 0,
+            21..=60 => 1,
+            61..=120 => 2,
+            _ => 3,
+        }),
+    };
+    let mut f = FrameState::new(seq, fh, cdfs);
+    if !fh.is_intra() {
+        for (i, &idx) in fh.ref_frame_idx.iter().enumerate() {
+            let slot = slots[usize::from(idx)].clone();
+            f.refs[i + 1] = Some(slot.ok_or(Error::Invalid("reference to an empty slot"))?);
+        }
+    }
+    if let Some(p) = fh.primary_ref_frame {
+        // load_previous_segment_ids()
+        let prev = f.refs[usize::from(p) + 1].clone();
+        if let Some(prev) = prev
+            .filter(|r| fh.segmentation.enabled && r.mi_rows == f.mi_rows && r.mi_cols == f.mi_cols)
+        {
+            f.prev_segment_ids = prev.segment_ids.clone();
+        }
+    }
+    if fh.use_ref_frame_mvs {
+        f.motion_field_estimation();
+    }
+    let mut saved = None;
+    for (num, tile) in frame.tiles.iter().enumerate() {
+        let cdfs = TileDecoder::new(&mut f, tile)?.decode()?;
+        // The exit process for the symbol decoder keeps one tile's CDFs.
+        if num == fh.tile_info.context_update_tile_id as usize && !fh.disable_frame_end_update_cdf {
+            saved = Some(cdfs);
+        }
+    }
+    if let Some(cdfs) = saved {
+        f.cdfs = cdfs; // frame_end_update_cdf()
     }
     f.apply_filters();
-    Ok(f.picture())
+    Ok(f.into_ref_frame())
 }
 
 /// State shared by the tiles of a frame: the reconstructed planes and what blocks leave behind
@@ -97,6 +219,8 @@ pub fn decode_frame(frame: &CodedFrame<'_>) -> Result<Picture, Error> {
 struct FrameState<'h> {
     seq: &'h SequenceHeader,
     fh: &'h FrameHeader,
+    /// The CDFs every tile starts from, then those kept at the end of the frame.
+    cdfs: Box<Cdfs>,
     sub_x: usize,
     sub_y: usize,
     num_planes: usize,
@@ -114,10 +238,20 @@ struct FrameState<'h> {
     /// `InterTxSizes`.
     tx_sizes: Vec<u8>,
     is_inters: Vec<bool>,
-    /// `RefFrames[ .. ][ 0 ]`; the second reference is always `NONE` in intra frames.
-    ref_frames: Vec<i8>,
-    /// `Mvs[ .. ][ 0 ]`, row then column, in 1/8 samples.
-    mvs: Vec<[i32; 2]>,
+    skip_modes: Vec<bool>,
+    /// `RefFrames`: `REF_UNWRITTEN` until the unit is decoded.
+    ref_frames: Vec<[i8; 2]>,
+    /// `Mvs`, row then column, in 1/8 samples.
+    mvs: Vec<[[i32; 2]; 2]>,
+    interp_filters: Vec<[u8; 2]>,
+    comp_group_idxs: Vec<u8>,
+    compound_idxs: Vec<u8>,
+    /// The reference frames, indexed by `LAST_FRAME`…`ALTREF_FRAME`.
+    refs: [Option<Arc<RefFrame>>; 8],
+    /// `PrevSegmentIds`: empty when they are all 0.
+    prev_segment_ids: Vec<u8>,
+    /// `MotionFieldMvs` per reference frame, `mi_cols >> 1` entries per row.
+    motion_field: Vec<Vec<[i32; 2]>>,
     tx_types: Vec<u8>,
     /// `PaletteSizes` and `PaletteColors` for Y and U.
     palette_sizes: [Vec<u8>; 2],
@@ -143,7 +277,7 @@ struct LrUnit {
 }
 
 impl<'h> FrameState<'h> {
-    fn new(seq: &'h SequenceHeader, fh: &'h FrameHeader) -> Self {
+    fn new(seq: &'h SequenceHeader, fh: &'h FrameHeader, cdfs: Box<Cdfs>) -> Self {
         let (mi_rows, mi_cols) = (fh.mi_rows as usize, fh.mi_cols as usize);
         let mi_stride = mi_cols.next_multiple_of(32);
         let rows = mi_rows.next_multiple_of(32);
@@ -166,6 +300,7 @@ impl<'h> FrameState<'h> {
         let mut f = Self {
             seq,
             fh,
+            cdfs,
             sub_x,
             sub_y,
             num_planes,
@@ -181,8 +316,15 @@ impl<'h> FrameState<'h> {
             segment_ids: vec![0; units],
             tx_sizes: vec![0; units],
             is_inters: vec![false; units],
-            ref_frames: vec![REF_UNWRITTEN; units],
-            mvs: vec![[0; 2]; units],
+            skip_modes: vec![false; units],
+            ref_frames: vec![[REF_UNWRITTEN, NONE]; units],
+            mvs: vec![[[0; 2]; 2]; units],
+            interp_filters: vec![[0; 2]; units],
+            comp_group_idxs: vec![0; units],
+            compound_idxs: vec![0; units],
+            refs: Default::default(),
+            prev_segment_ids: Vec::new(),
+            motion_field: Vec::new(),
             tx_types: vec![0; units],
             palette_sizes: [vec![0; units], vec![0; units]],
             palette_colors: [vec![[0; 8]; units], vec![[0; 8]; units]],
@@ -221,6 +363,135 @@ impl<'h> FrameState<'h> {
 
     fn mi(&self, row: usize, col: usize) -> usize {
         row * self.mi_stride + col
+    }
+
+    /// The motion field motion vector storage process (§7.19) and the frame state that the
+    /// reference frame update process (§7.20) keeps.
+    fn into_ref_frame(mut self) -> RefFrame {
+        let fh = self.fh;
+        let units = self.ref_frames.len();
+        let (mut mf_ref_frames, mut mf_mvs) = (vec![NONE; units], vec![[0; 2]; units]);
+        for (i, refs) in self.ref_frames.iter().enumerate() {
+            for list in 0..2 {
+                let r = refs[list];
+                if r > INTRA_FRAME
+                    && relative_dist(self.seq, fh.order_hints[r as usize], fh.order_hint) < 0
+                {
+                    let mv = self.mvs[i][list];
+                    // REFMVS_LIMIT
+                    if mv[0].abs() < 1 << 12 && mv[1].abs() < 1 << 12 {
+                        mf_ref_frames[i] = r;
+                        mf_mvs[i] = mv;
+                    }
+                }
+            }
+        }
+        let seg = &fh.segmentation;
+        if seg.enabled && !seg.update_map {
+            self.segment_ids = if self.prev_segment_ids.is_empty() {
+                vec![0; units]
+            } else {
+                std::mem::take(&mut self.prev_segment_ids)
+            };
+        }
+        let mut order_hints = fh.order_hints;
+        order_hints[0] = fh.order_hint;
+        RefFrame {
+            upscaled_width: fh.upscaled_width,
+            frame_height: fh.frame_height,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            intra: fh.is_intra(),
+            order_hints,
+            cdfs: self.cdfs.clone(),
+            mi_stride: self.mi_stride,
+            mf_ref_frames,
+            mf_mvs,
+            segment_ids: std::mem::take(&mut self.segment_ids),
+            picture: self.picture(),
+        }
+    }
+
+    /// The motion field estimation process (§7.9).
+    fn motion_field_estimation(&mut self) {
+        let (w8, h8) = (self.mi_cols >> 1, self.mi_rows >> 1);
+        self.motion_field = vec![vec![[INVALID_MV; 2]; w8 * h8]; 8];
+        let hints = self.fh.order_hints;
+        let dist = |a: u32| relative_dist(self.seq, a, self.fh.order_hint);
+        let last_alt = self.refs[1].as_ref().map_or(0, |r| r.order_hints[7]);
+        if last_alt != hints[4] {
+            self.project(1, -1);
+        }
+        let mut stamp = 1; // MFMV_STACK_SIZE - 2
+        for src in [5, 6, 7] {
+            if dist(hints[src]) > 0 && (src < 7 || stamp >= 0) && self.project(src, 1) {
+                stamp -= 1;
+            }
+        }
+        if stamp >= 0 {
+            self.project(2, -1);
+        }
+    }
+
+    /// The projection process (§7.9.2).
+    fn project(&mut self, src: usize, dst_sign: i32) -> bool {
+        let Some(rf) = self.refs[src].clone() else {
+            return false;
+        };
+        if rf.mi_rows != self.mi_rows || rf.mi_cols != self.mi_cols || rf.intra {
+            return false;
+        }
+        let (w8, h8) = (self.mi_cols >> 1, self.mi_rows >> 1);
+        let seq = self.seq;
+        let hints = self.fh.order_hints;
+        let cur = self.fh.order_hint;
+        // get_mv_projection()
+        let projection = |mv: [i32; 2], num: i32, den: i32| {
+            let num = num.clamp(-31, 31);
+            let mult = i32::from(DIV_MULT[den.min(31) as usize]);
+            mv.map(|v| round2_signed(v * num * mult, 14).clamp(-(1 << 14) + 1, (1 << 14) - 1))
+        };
+        let project = |v8: usize, delta: i32, max8: usize, max_off8: isize| {
+            let base8 = ((v8 >> 3) << 3) as isize;
+            let offset8 = if delta >= 0 {
+                delta >> 6
+            } else {
+                -((-delta) >> 6)
+            };
+            let v8 = v8 as isize + (dst_sign * offset8) as isize;
+            let valid = v8 >= 0
+                && v8 < max8 as isize
+                && v8 >= base8 - max_off8
+                && v8 < base8 + 8 + max_off8;
+            valid.then_some(v8 as usize)
+        };
+        for y8 in 0..h8 {
+            for x8 in 0..w8 {
+                let i = (2 * y8 + 1) * rf.mi_stride + 2 * x8 + 1;
+                let src_ref = rf.mf_ref_frames[i];
+                if src_ref <= INTRA_FRAME {
+                    continue;
+                }
+                let ref_to_cur = relative_dist(seq, hints[src], cur);
+                let ref_offset = relative_dist(seq, hints[src], rf.order_hints[src_ref as usize]);
+                if ref_to_cur.abs() > 31 || ref_offset.abs() > 31 || ref_offset <= 0 {
+                    continue;
+                }
+                let mv = rf.mf_mvs[i];
+                let proj = projection(mv, ref_to_cur * dst_sign, ref_offset);
+                // MAX_OFFSET_HEIGHT and MAX_OFFSET_WIDTH.
+                let (Some(py), Some(px)) =
+                    (project(y8, proj[0], h8, 0), project(x8, proj[1], w8, 8))
+                else {
+                    continue;
+                };
+                for dst in 1..8 {
+                    let ref_to_dst = relative_dist(seq, cur, hints[dst]);
+                    self.motion_field[dst][py * w8 + px] = projection(mv, ref_to_dst, ref_offset);
+                }
+            }
+        }
+        true
     }
 
     fn picture(self) -> Picture {
@@ -281,10 +552,34 @@ struct Block {
     palette_u: [u16; 8],
     palette_v: [u16; 8],
     tx_size: usize,
-    /// `use_intrabc` (the only inter blocks of intra frames).
     is_inter: bool,
-    /// `Mv[ 0 ]`.
-    mv: [i32; 2],
+    /// `RefFrame`.
+    ref_frame: [i8; 2],
+    /// `Mv`.
+    mv: [[i32; 2]; 2],
+    /// `LeftRefFrame` and `AboveRefFrame`.
+    left_ref: [i8; 2],
+    above_ref: [i8; 2],
+    skip_mode: bool,
+    stack: MvStack,
+    ref_mv_idx: usize,
+    interp_filter: [u8; 2],
+    motion_mode: u8,
+    interintra: bool,
+    interintra_mode: u8,
+    wedge_interintra: bool,
+    wedge_index: usize,
+    wedge_sign: usize,
+    mask_type: bool,
+    compound_type: u8,
+    comp_group_idx: u8,
+    compound_idx: u8,
+    /// `NumSamples`, `NumSamplesScanned` and `CandList` of the find warp samples process.
+    num_samples: usize,
+    num_samples_scanned: usize,
+    cand_list: [[i32; 4]; 8],
+    /// `LocalWarpParams` when `LocalValid`.
+    local_warp: Option<[i32; 6]>,
     max_luma_w: usize,
     max_luma_h: usize,
 }
@@ -314,32 +609,12 @@ struct TileDecoder<'h, 'f> {
     quant: Vec<i32>,
     /// `ColorMapY` and `ColorMapUV`, 64 entries per row.
     color_maps: [Vec<u8>; 2],
-}
-
-/// `RefStackMv[ .. ][ 0 ]`, `WeightStack`, `NumMvFound` and `FoundMatch` of single prediction.
-#[derive(Default)]
-struct MvStack {
-    mvs: [[i32; 2]; MAX_REF_MV_STACK_SIZE],
-    weights: [u32; MAX_REF_MV_STACK_SIZE],
-    count: usize,
-    found_match: bool,
-}
-
-impl MvStack {
-    /// The sorting process (§7.10.2.11): a stable sort by decreasing weight.
-    fn sort(&mut self, start: usize, mut end: usize) {
-        while end > start {
-            let mut new_end = start;
-            for i in start + 1..end {
-                if self.weights[i - 1] < self.weights[i] {
-                    self.weights.swap(i - 1, i);
-                    self.mvs.swap(i - 1, i);
-                    new_end = i;
-                }
-            }
-            end = new_end;
-        }
-    }
+    /// `AboveSegPredContext` and `LeftSegPredContext`.
+    above_seg_pred: Vec<u8>,
+    left_seg_pred: Vec<u8>,
+    /// `Mask` of compound and inter-intra prediction, `mask_w` entries per row.
+    mask: Vec<u8>,
+    mask_w: usize,
 }
 
 /// `Wiener_Taps_Mid`, `Sgrproj_Xqd_Mid`.
@@ -469,17 +744,11 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         let info = &f.fh.tile_info;
         let (row, col) = (tile.row as usize, tile.col as usize);
         let q = f.fh.quantization.base_q_idx;
-        let q_ctx = match q {
-            0..=20 => 0,
-            21..=60 => 1,
-            61..=120 => 2,
-            _ => 3,
-        };
         let above = f.mi_stride + 32;
         let left = f.mi_rows.next_multiple_of(32) + 32;
         Ok(Self {
             sd: SymbolDecoder::new(tile.data, f.fh.disable_cdf_update)?,
-            cdf: Cdfs::new(q_ctx),
+            cdf: f.cdfs.clone(),
             row_start: info.mi_row_starts[row] as usize,
             row_end: info.mi_row_starts[row + 1] as usize,
             col_start: info.mi_col_starts[col] as usize,
@@ -497,6 +766,10 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             b: Block::default(),
             quant: vec![0; 1024],
             color_maps: [vec![0; 64 * 64], vec![0; 64 * 64]],
+            above_seg_pred: vec![0; above],
+            left_seg_pred: vec![0; left],
+            mask: Vec::new(),
+            mask_w: 0,
             f,
         })
     }
@@ -524,8 +797,8 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
     }
 
-    /// `decode_tile()`.
-    fn decode(mut self) -> Result<(), Error> {
+    /// `decode_tile()`; returns the tile's final CDFs.
+    fn decode(mut self) -> Result<Box<Cdfs>, Error> {
         let sb_size = self.sb_size();
         let sb4 = usize::from(NUM_4X4_BLOCKS_WIDE[sb_size]);
         for r in (self.row_start..self.row_end).step_by(sb4) {
@@ -533,6 +806,7 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                 self.left_level[p].fill(0);
                 self.left_dc[p].fill(0);
             }
+            self.left_seg_pred.fill(0);
             for c in (self.col_start..self.col_end).step_by(sb4) {
                 self.read_deltas = self.f.fh.delta_q_present;
                 self.clear_cdef(r, c);
@@ -541,7 +815,8 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
                 self.decode_partition(r, c, sb_size)?;
             }
         }
-        self.sd.finish()
+        self.sd.finish()?;
+        Ok(self.cdf)
     }
 
     fn clear_cdef(&mut self, r: usize, c: usize) {
@@ -855,7 +1130,12 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             avail_l_chroma,
             ..Block::default()
         };
-        self.intra_frame_mode_info()?;
+        let intra_frame = self.f.fh.is_intra();
+        if intra_frame {
+            self.intra_frame_mode_info()?;
+        } else {
+            self.inter_frame_mode_info()?;
+        }
         self.palette_tokens()?;
         self.read_block_tx_size()?;
         let b = &self.b;
@@ -863,11 +1143,14 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             for col in c..c + bw4 {
                 let i = self.f.mi(row, col);
                 self.f.y_modes[i] = b.y_mode;
-                if has_chroma {
+                if b.ref_frame[0] == INTRA_FRAME && has_chroma {
                     self.f.uv_modes[i] = b.uv_mode;
                 }
-                self.f.ref_frames[i] = INTRA_FRAME;
+                self.f.ref_frames[i] = b.ref_frame;
                 if b.is_inter {
+                    self.f.comp_group_idxs[i] = b.comp_group_idx;
+                    self.f.compound_idxs[i] = b.compound_idx;
+                    self.f.interp_filters[i] = b.interp_filter;
                     self.f.mvs[i] = b.mv;
                 }
             }
@@ -876,7 +1159,11 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             self.reset_block_context();
         }
         if self.b.is_inter {
-            self.predict_intrabc();
+            if intra_frame {
+                self.predict_intrabc();
+            } else {
+                self.predict_inter_block()?;
+            }
         }
         self.residual()?;
         let b = &self.b;
@@ -884,6 +1171,7 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             for col in c..c + bw4 {
                 let i = self.f.mi(row, col);
                 self.f.is_inters[i] = b.is_inter;
+                self.f.skip_modes[i] = b.skip_mode;
                 self.f.skips[i] = b.skip;
                 self.f.mi_sizes[i] = size as u8;
                 self.f.segment_ids[i] = b.segment_id as u8;
@@ -922,23 +1210,12 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
     }
 
     fn intra_frame_mode_info(&mut self) -> Result<(), Error> {
+        self.b.ref_frame = [INTRA_FRAME, NONE];
         let pre_skip = self.f.fh.segmentation.seg_id_pre_skip;
         if pre_skip {
             self.intra_segment_id()?;
         }
-        // read_skip()
-        self.b.skip = if pre_skip && self.seg_feature_active(self.b.segment_id, SEG_LVL_SKIP) {
-            true
-        } else {
-            let mut ctx = 0;
-            if self.b.avail_u {
-                ctx += usize::from(self.f.skips[self.f.mi(self.b.row - 1, self.b.col)]);
-            }
-            if self.b.avail_l {
-                ctx += usize::from(self.f.skips[self.f.mi(self.b.row, self.b.col - 1)]);
-            }
-            self.sym(|c| &mut c.skip[ctx])? == 1
-        };
+        self.read_skip()?;
         if !pre_skip {
             self.intra_segment_id()?;
         }
@@ -949,7 +1226,8 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         if self.f.fh.allow_intrabc && self.sym(|c| &mut c.intrabc)? == 1 {
             // An inter block predicted from the frame itself, with YMode and UVMode DC_PRED.
             self.b.is_inter = true;
-            self.b.mv = self.intrabc_mv()?;
+            self.b.interp_filter = [BILINEAR; 2];
+            self.b.mv[0] = self.intrabc_mv()?;
             return Ok(());
         }
 
@@ -966,7 +1244,31 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         };
         let above = usize::from(INTRA_MODE_CONTEXT[usize::from(above)]);
         let left = usize::from(INTRA_MODE_CONTEXT[usize::from(left)]);
-        self.b.y_mode = self.sym(|c| &mut c.intra_frame_y_mode[above][left])? as u8;
+        let y_mode = self.sym(|c| &mut c.intra_frame_y_mode[above][left])? as u8;
+        self.intra_modes(y_mode)
+    }
+
+    /// `read_skip()`.
+    fn read_skip(&mut self) -> Result<(), Error> {
+        let pre_skip = self.f.fh.segmentation.seg_id_pre_skip;
+        self.b.skip = if pre_skip && self.seg_feature_active(self.b.segment_id, SEG_LVL_SKIP) {
+            true
+        } else {
+            let mut ctx = 0;
+            if self.b.avail_u {
+                ctx += usize::from(self.f.skips[self.f.mi(self.b.row - 1, self.b.col)]);
+            }
+            if self.b.avail_l {
+                ctx += usize::from(self.f.skips[self.f.mi(self.b.row, self.b.col - 1)]);
+            }
+            self.sym(|c| &mut c.skip[ctx])? == 1
+        };
+        Ok(())
+    }
+
+    /// The modes of an intra block after `y_mode`: angles, chroma mode, palette and filter.
+    fn intra_modes(&mut self, y_mode: u8) -> Result<(), Error> {
+        self.b.y_mode = y_mode;
         self.b.angle_delta_y = self.angle_info(self.b.y_mode)?;
         let size = self.b.size;
         let bw = 4 * usize::from(NUM_4X4_BLOCKS_WIDE[size]);
@@ -1251,8 +1553,17 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
     }
 
     fn intra_segment_id(&mut self) -> Result<(), Error> {
+        if self.f.fh.segmentation.enabled {
+            self.read_segment_id()?;
+        }
+        self.b.lossless = self.f.fh.lossless[self.b.segment_id];
+        Ok(())
+    }
+
+    /// `read_segment_id()`.
+    fn read_segment_id(&mut self) -> Result<(), Error> {
         let seg = &self.f.fh.segmentation;
-        if seg.enabled {
+        {
             let last = i32::from(seg.last_active_seg_id);
             let (row, col) = (self.b.row, self.b.col);
             let get = |s: &Self, r: usize, c: usize| i32::from(s.f.segment_ids[s.f.mi(r, c)]);
@@ -1298,7 +1609,6 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             }
             self.b.segment_id = id as usize;
         }
-        self.b.lossless = self.f.fh.lossless[self.b.segment_id];
         Ok(())
     }
 
@@ -1662,17 +1972,19 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
             // Clamped to the decoded area, which covers whole 4×4 units.
             let last_x = (((self.f.mi_cols * 4) + sx) >> sx) as i32 - 1;
             let last_y = (((self.f.mi_rows * 4) + sy) >> sy) as i32 - 1;
+            let src = &self.f.planes[plane];
             let pred = predict::block_inter(
-                &self.f.planes[plane],
+                &src.data,
+                src.stride,
                 last_x,
                 last_y,
-                pos(x, b.mv[1], sx),
-                pos(y, b.mv[0], sy),
+                pos(x, b.mv[0][1], sx),
+                pos(y, b.mv[0][0], sy),
                 1 << 10,
                 1 << 10,
                 w,
                 h,
-                [BILINEAR; 2],
+                [usize::from(BILINEAR); 2],
                 rounds,
             );
             let out = &mut self.f.planes[plane];
@@ -1684,222 +1996,16 @@ impl<'h, 'f> TileDecoder<'h, 'f> {
         }
     }
 
-    /// `find_mv_stack( 0 )` and `assign_mv( 0 )` of an intra block copy block: the motion
-    /// vector, predicted from the neighbouring intra block copy blocks.
-    fn intrabc_mv(&mut self) -> Result<[i32; 2], Error> {
-        let mut stack = MvStack::default();
-        let (bw4, bh4) = (self.b.bw4, self.b.bh4);
-        self.scan_row(&mut stack, -1);
-        let mut found_above = std::mem::take(&mut stack.found_match);
-        self.scan_col(&mut stack, -1);
-        let mut found_left = std::mem::take(&mut stack.found_match);
-        if bw4.max(bh4) <= 16 {
-            self.scan_point(&mut stack, -1, bw4 as isize);
-        }
-        found_above |= std::mem::take(&mut stack.found_match);
-        let num_nearest = stack.count;
-        for w in &mut stack.weights[..num_nearest] {
-            *w += REF_CAT_LEVEL;
-        }
-        // Intra frames have no temporal candidates (use_ref_frame_mvs is 0).
-        self.scan_point(&mut stack, -1, -1);
-        found_above |= std::mem::take(&mut stack.found_match);
-        self.scan_row(&mut stack, -3);
-        found_above |= std::mem::take(&mut stack.found_match);
-        self.scan_col(&mut stack, -3);
-        found_left |= std::mem::take(&mut stack.found_match);
-        if bh4 > 1 {
-            self.scan_row(&mut stack, -5);
-        }
-        found_above |= std::mem::take(&mut stack.found_match);
-        if bw4 > 1 {
-            self.scan_col(&mut stack, -5);
-        }
-        found_left |= std::mem::take(&mut stack.found_match);
-        // The matches only set contexts of inter frames' syntax elements.
-        let _ = (found_above, found_left);
-        stack.sort(0, num_nearest);
-        stack.sort(num_nearest, stack.count);
-        // The extra search finds nothing more (no neighbour uses another frame), and the global
-        // motion candidates of intra blocks are zero: the stack is zero-filled past its count.
-        // Context and clamping process.
-        let (bw, bh) = (4 * bw4 as i32, 4 * bh4 as i32);
-        for mv in &mut stack.mvs[..stack.count] {
-            mv[0] = self.clamp_mv_row(mv[0], MV_BORDER + bh * 8);
-            mv[1] = self.clamp_mv_col(mv[1], MV_BORDER + bw * 8);
-        }
-        // assign_mv( 0 ): NEWMV, from the first non-zero candidate or a default.
-        let mut pred = stack.mvs[0];
-        if pred == [0, 0] {
-            pred = stack.mvs[1];
-        }
-        if pred == [0, 0] {
-            let sb4 = usize::from(NUM_4X4_BLOCKS_HIGH[self.sb_size()]) as i32;
-            pred = if (self.b.row as i32) - sb4 < self.row_start as i32 {
-                [0, -(sb4 * 4 + INTRABC_DELAY_PIXELS) * 8]
-            } else {
-                [-(sb4 * 4 * 8), 0]
-            };
-        }
-        let diff = self.read_mv(MV_INTRABC_CONTEXT)?;
-        Ok([pred[0] + diff[0], pred[1] + diff[1]])
-    }
-
-    /// The scan row process (§7.10.2.2) of single prediction from the current frame.
-    fn scan_row(&self, stack: &mut MvStack, delta_row: isize) {
-        let (row, col, bw4) = (self.b.row as isize, self.b.col as isize, self.b.bw4);
-        let end4 = bw4.min(self.f.mi_cols - self.b.col).min(16);
-        let (mut delta_row, mut delta_col) = (delta_row, 0);
-        let use_step16 = bw4 >= 16;
-        if delta_row.abs() > 1 {
-            delta_row += row & 1;
-            delta_col = 1 - (col & 1);
-        }
-        let mut i = 0;
-        while i < end4 {
-            let (r, c) = (row + delta_row, col + delta_col + i as isize);
-            if !self.is_inside(r, c) {
-                break;
-            }
-            let cand = self.f.mi(r as usize, c as usize);
-            let mut len = bw4.min(usize::from(
-                NUM_4X4_BLOCKS_WIDE[usize::from(self.f.mi_sizes[cand])],
-            ));
-            if delta_row.abs() > 1 {
-                len = len.max(2);
-            }
-            if use_step16 {
-                len = len.max(4);
-            }
-            self.add_ref_mv_candidate(stack, cand, 2 * len as u32);
-            i += len;
-        }
-    }
-
-    /// The scan col process (§7.10.2.3).
-    fn scan_col(&self, stack: &mut MvStack, delta_col: isize) {
-        let (row, col, bh4) = (self.b.row as isize, self.b.col as isize, self.b.bh4);
-        let end4 = bh4.min(self.f.mi_rows - self.b.row).min(16);
-        let (mut delta_row, mut delta_col) = (0, delta_col);
-        let use_step16 = bh4 >= 16;
-        if delta_col.abs() > 1 {
-            delta_row = 1 - (row & 1);
-            delta_col += col & 1;
-        }
-        let mut i = 0;
-        while i < end4 {
-            let (r, c) = (row + delta_row + i as isize, col + delta_col);
-            if !self.is_inside(r, c) {
-                break;
-            }
-            let cand = self.f.mi(r as usize, c as usize);
-            let mut len = bh4.min(usize::from(
-                NUM_4X4_BLOCKS_HIGH[usize::from(self.f.mi_sizes[cand])],
-            ));
-            if delta_col.abs() > 1 {
-                len = len.max(2);
-            }
-            if use_step16 {
-                len = len.max(4);
-            }
-            self.add_ref_mv_candidate(stack, cand, 2 * len as u32);
-            i += len;
-        }
-    }
-
-    /// The scan point process (§7.10.2.4): only where a block of this frame was decoded.
-    fn scan_point(&self, stack: &mut MvStack, delta_row: isize, delta_col: isize) {
-        let (r, c) = (
-            self.b.row as isize + delta_row,
-            self.b.col as isize + delta_col,
-        );
-        if self.is_inside(r, c) {
-            let cand = self.f.mi(r as usize, c as usize);
-            if self.f.ref_frames[cand] != REF_UNWRITTEN {
-                self.add_ref_mv_candidate(stack, cand, 4);
-            }
-        }
-    }
-
-    /// The add reference motion vector and search stack processes (§7.10.2.7–8) for
-    /// `RefFrame[ 0 ]` equal to `INTRA_FRAME`: the candidates are intra block copy blocks.
-    fn add_ref_mv_candidate(&self, stack: &mut MvStack, cand: usize, weight: u32) {
-        if !self.f.is_inters[cand] || self.f.ref_frames[cand] != INTRA_FRAME {
-            return;
-        }
-        // Lower precision process: intra frames force integer motion vectors.
-        let mv = self.f.mvs[cand].map(|v| {
-            let a = (v.abs() + 3) >> 3 << 3;
-            if v > 0 { a } else { -a }
-        });
-        stack.found_match = true;
-        if let Some(i) = stack.mvs[..stack.count].iter().position(|&m| m == mv) {
-            stack.weights[i] += weight;
-        } else if stack.count < MAX_REF_MV_STACK_SIZE {
-            stack.mvs[stack.count] = mv;
-            stack.weights[stack.count] = weight;
-            stack.count += 1;
-        }
-    }
-
-    /// `clamp_mv_row()`.
-    fn clamp_mv_row(&self, mv: i32, border: i32) -> i32 {
-        let (row, bh4) = (self.b.row as i32, self.b.bh4 as i32);
-        let to_top = -(row * 4 * 8);
-        let to_bottom = (self.f.mi_rows as i32 - bh4 - row) * 4 * 8;
-        mv.clamp(to_top - border, to_bottom + border)
-    }
-
-    /// `clamp_mv_col()`.
-    fn clamp_mv_col(&self, mv: i32, border: i32) -> i32 {
-        let (col, bw4) = (self.b.col as i32, self.b.bw4 as i32);
-        let to_left = -(col * 4 * 8);
-        let to_right = (self.f.mi_cols as i32 - bw4 - col) * 4 * 8;
-        mv.clamp(to_left - border, to_right + border)
-    }
-
-    /// `read_mv()`: the difference to the predicted motion vector, with integer precision
-    /// (`force_integer_mv`, and no `allow_high_precision_mv`, in intra frames).
-    fn read_mv(&mut self, ctx: usize) -> Result<[i32; 2], Error> {
-        let joint = self.sym(|c| &mut c.mv_joint[ctx])?;
-        let mut diff = [0; 2];
-        // MV_JOINT_HZVNZ (2) and MV_JOINT_HNZVNZ (3) code a row; MV_JOINT_HNZVZ (1) and 3 a column.
-        if joint == 2 || joint == 3 {
-            diff[0] = self.read_mv_component(ctx, 0)?;
-        }
-        if joint == 1 || joint == 3 {
-            diff[1] = self.read_mv_component(ctx, 1)?;
-        }
-        Ok(diff)
-    }
-
-    fn read_mv_component(&mut self, ctx: usize, comp: usize) -> Result<i32, Error> {
-        let sign = self.sym(|c| &mut c.mv_sign[ctx][comp])? == 1;
-        let class = self.sym(|c| &mut c.mv_class[ctx][comp])?;
-        // mv_fr is 3 and mv_hp 1: whole samples.
-        let mag = if class == 0 {
-            let bit = self.sym(|c| &mut c.mv_class0_bit[ctx][comp])? as i32;
-            ((bit << 3) | (3 << 1) | 1) + 1
-        } else {
-            let mut d = 0;
-            for i in 0..class {
-                d |= (self.sym(|c| &mut c.mv_bit[ctx][comp][i])? as i32) << i;
-            }
-            (2 << (class + 2)) + ((d << 3) | (3 << 1) | 1) + 1
-        };
-        Ok(if sign { -mag } else { mag })
-    }
-
     fn filter_type(&self, plane: usize) -> bool {
         let b = &self.b;
         let (sx, sy) = (self.f.sub_x == 1, self.f.sub_y == 1);
         let smooth = |r: usize, c: usize| {
             let i = self.f.mi(r, c);
-            is_smooth(if plane == 0 {
-                self.f.y_modes[i]
+            if plane == 0 {
+                is_smooth(self.f.y_modes[i])
             } else {
-                self.f.uv_modes[i]
-            })
+                self.f.ref_frames[i][0] <= INTRA_FRAME && is_smooth(self.f.uv_modes[i])
+            }
         };
         let mut above = false;
         if if plane == 0 {
