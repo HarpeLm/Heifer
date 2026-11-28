@@ -16,6 +16,7 @@ categories = ["multimedia::images", "multimedia::encoding", "parser-implementati
 thiserror.workspace = true
 heifer-isobmff.workspace = true
 heifer-hevc-dec.workspace = true
+heifer-av1-dec.workspace = true
 heifer-hevc-enc = { workspace = true, optional = true }
 image = { version = "0.25.8", default-features = false, optional = true }
 
