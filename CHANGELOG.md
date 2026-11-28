@@ -12,10 +12,10 @@
   decoder for `av01` items, with the YCbCr matrix and range of `colr` (or of the sequence
   header), at 8, 10 and 12 bits in 4:0:0, 4:2:0, 4:2:2 and 4:4:4, grids, AV1 alpha planes, ICC
   profiles and the `clap`, `irot` and `imir` transforms. `check_file_type` reports the `avif`
-  brand as supported, and the new `Error::Av1` reports corrupt AV1 data. Items with inter frames
-  (spatial layers) still return `Error::Unsupported`. 169 files of the av1-avif test set decode
-  to exactly dav1d's pictures put through the same conversion (an opt-in test, `HEIFER_DAV1D`);
-  the other 11 use inter frames.
+  brand as supported, and the new `Error::Av1` reports corrupt AV1 data. Layered items (several
+  frames, spatial layers) decode to their last shown frame, the highest layer, as dav1d does.
+  All 180 files of the av1-avif test set decode to exactly dav1d's pictures put through the same
+  conversion (an opt-in test, `HEIFER_DAV1D`).
 - `heifer-isobmff`: new `Av1Config` (the `av1C` box) and `HeifFile::av1_config`.
 - New `heifer-av1-dec` crate (not published yet), the start of a safe-Rust AV1 decoder for AVIF:
   it splits AV1 bitstreams into OBUs and parses sequence headers (profile, maximum size, bit
@@ -33,9 +33,14 @@
   and 12 bits in 4:0:0, 4:2:0, 4:2:2 and 4:4:4, followed by the loop filters: deblocking (with
   loop filter deltas and sharpness), CDEF, and loop restoration (Wiener and self-guided). Film
   grain is not applied. 45 small aomenc streams (`scripts/make-av1-streams.sh`), with and without
-  each filter and with intra block copy, match aomdec sample for sample, and 212 of the 238 items
-  of the av1-avif test set match dav1d; the other 26 use inter frames (spatial layers), which are
-  not supported yet.
+  each filter and with intra block copy, match aomdec sample for sample. The new `Decoder` decodes
+  the frames of a stream in order with the eight reference slots: inter frames (motion vector
+  prediction with spatial and temporal candidates, motion field projection, single and compound
+  references, the 8-tap, smooth, sharp and bilinear interpolation filters, scaled references,
+  global and local warped motion, OBMC, wedge, difference-weighted and distance-weighted compound,
+  inter-intra prediction and skip mode), hidden frames and `show_existing_frame`. 8 more aomenc
+  streams of 8 inter frames match aomdec on every shown frame, and all 238 items of the av1-avif
+  test set match dav1d.
 
 **Fixes**
 
