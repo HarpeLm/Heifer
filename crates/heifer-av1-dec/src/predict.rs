@@ -414,7 +414,8 @@ fn directional(
 /// `rounds` (`InterRound0`, `InterRound1`). Positions are clamped to `last_x`, `last_y`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_inter(
-    src: &Plane,
+    src: &[u16],
+    stride: usize,
     last_x: i32,
     last_y: i32,
     x: i32,
@@ -438,7 +439,7 @@ pub(crate) fn block_inter(
     let mut intermediate = vec![0i32; inter_h * w];
     for r in 0..inter_h {
         let row = ((y >> 10) + r as i32 - 3).clamp(0, last_y) as usize;
-        let samples = &src.data[row * src.stride..];
+        let samples = &src[row * stride..];
         for c in 0..w {
             let p = x + step_x * c as i32;
             let taps = &SUBPEL_FILTERS[fh][((p >> 6) & 15) as usize];
