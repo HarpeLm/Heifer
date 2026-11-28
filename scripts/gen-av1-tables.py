@@ -29,6 +29,7 @@ Filter_Intra_Mode_To_Intra_Dir Palette_Color_Context Palette_Color_Hash_Multipli
 Dc_Qlookup Ac_Qlookup Dr_Intra_Derivative Intra_Filter_Taps Mode_To_Angle Intra_Edge_Kernel
 Sm_Weights_Tx_4x4 Sm_Weights_Tx_8x8 Sm_Weights_Tx_16x16 Sm_Weights_Tx_32x32 Sm_Weights_Tx_64x64
 Transform_Row_Shift Cos128_Lookup Sgr_Params
+Tx_Type_Inter_Inv_Set1 Tx_Type_Inter_Inv_Set2 Tx_Type_Inter_Inv_Set3 Subpel_Filters
 Default_Scan_4x4 Default_Scan_4x8 Default_Scan_8x4 Default_Scan_8x8 Default_Scan_8x16
 Default_Scan_16x8 Default_Scan_16x16 Default_Scan_16x32 Default_Scan_32x16 Default_Scan_4x16
 Default_Scan_16x4 Default_Scan_8x32 Default_Scan_32x8 Default_Scan_32x32
@@ -62,7 +63,7 @@ def evaluate(expr):
 
 def parse(name_pattern):
     tables = []
-    pattern = re.compile(rf"^({name_pattern})\s*((?:\[[^\]]*\]\s*)+)=\s*\{{", re.M)
+    pattern = re.compile(rf"^[ \t]*({name_pattern})\s*((?:\[[^\]]*\]\s*)+)=\s*\{{", re.M)
     for m in pattern.finditer(text):
         name = m.group(1)
         raw_dims = re.findall(r"\[([^\]]*)\]", m.group(2))
@@ -132,17 +133,32 @@ def field(name):
     return name[len("Default_") : -len("_Cdf")].lower()
 
 
+# MV CDFs have one copy per MvCtx (MV_CONTEXTS = 2), and per component when the default table
+# has no component dimension (§6.8.2, the semantics of disable_cdf_update).
+MV_COPIES = {"Default_Mv_Joint_Cdf": [2], "Default_Mv_Class_Cdf": [2], "Default_Mv_Fr_Cdf": [2],
+             "Default_Mv_Class0_Fr_Cdf": [2], "Default_Mv_Class0_Bit_Cdf": [2, 2],
+             "Default_Mv_Class0_Hp_Cdf": [2, 2], "Default_Mv_Sign_Cdf": [2, 2],
+             "Default_Mv_Bit_Cdf": [2, 2], "Default_Mv_Hp_Cdf": [2, 2]}
+
+
+def init(name, coeff):
+    value = rust_name(name) + ("[q_ctx]" if coeff else "")
+    for n in reversed(MV_COPIES.get(name, [])):
+        value = f"[{value}; {n}]"
+    return value
+
+
 cdf_out += ["", "/// The CDFs of a tile (`init_non_coeff_cdfs()` and `init_coeff_cdfs()`).",
             "#[derive(Clone)]", "pub(crate) struct Cdfs {"]
 for name, dims, _, coeff in cdfs:
-    cdf_out.append(f"    pub(crate) {field(name)}: {rust_type('u16', dims[1:] if coeff else dims)},")
+    cdf_out.append(f"    pub(crate) {field(name)}: {rust_type('u16', MV_COPIES.get(name, []) + (dims[1:] if coeff else dims))},")
 cdf_out += ["    /// `DeltaLFMultiCdf`: one copy of `Default_Delta_Lf_Cdf` per loop filter level.",
             f"    pub(crate) delta_lf_multi: [{rust_type('u16', next(d for n, d, _, _ in cdfs if n == 'Default_Delta_Lf_Cdf'))}; 4],",
             "}", "", "impl Cdfs {",
             "    /// The default CDFs; the coefficient CDFs are those of quantizer context `q_ctx` (0 to 3).",
             "    pub(crate) fn new(q_ctx: usize) -> Box<Self> {", "        Box::new(Self {"]
 for name, dims, _, coeff in cdfs:
-    cdf_out.append(f"            {field(name)}: {rust_name(name)}{'[q_ctx]' if coeff else ''},")
+    cdf_out.append(f"            {field(name)}: {init(name, coeff)},")
 cdf_out += ["            delta_lf_multi: [DEFAULT_DELTA_LF_CDF; 4],", "        })", "    }", "}"]
 cdf_out += ["", "/// Every table as `(name, values, CDF length)`, for tests.", "#[cfg(test)]",
             f"pub(crate) fn all() -> [(&'static str, &'static [u16], usize); {len(cdfs)}] {{", "    ["]
