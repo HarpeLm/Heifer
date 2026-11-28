@@ -43,6 +43,7 @@ picture gray 136x72 gray
 picture small444 136x72 yuv444p
 picture small422 136x72 yuv422p
 picture small10 136x72 yuv420p10le
+picture small12 136x72 yuv420p12le
 # Without noise aomenc detects screen content, which turns on palettes.
 picture screen 264x200 yuv420p ""
 # Smooth enough for 128×128 blocks and 64×64 transforms.
@@ -69,3 +70,23 @@ stream monochrome gray --cq-level=30 --monochrome $nofilters
 stream yuv444 small444 --cq-level=30 --profile=1 $nofilters
 stream yuv422 small422 --cq-level=30 --profile=2 $nofilters
 stream bit_depth_10 small10 --cq-level=30 --bit-depth=10 --input-bit-depth=10 $nofilters
+
+# With loop filters: one filter at a time, then all of them with other tools.
+nolr="--enable-restoration=0"
+stream deblock small --cq-level=45 --enable-cdef=0 $nolr $basic
+# aomenc only sets loop_filter_sharpness in all intra mode.
+stream deblock_sharpness small --cq-level=45 --allintra --sharpness=6 --enable-cdef=0 $nolr $basic
+stream deblock_tools large --cq-level=40 --enable-cdef=0 $nolr
+stream delta_lf screen --cq-level=40 --deltaq-mode=3 --delta-lf-mode=1 --enable-cdef=0 $nolr
+stream cdef small --cq-level=45 --loopfilter-control=0 $nolr $basic
+stream cdef_sb128 large --cq-level=40 --sb-size=128 --loopfilter-control=0 $nolr
+stream restoration small --cq-level=45 --loopfilter-control=0 --enable-cdef=0 $basic
+stream restoration_large large --cq-level=35 --loopfilter-control=0 --enable-cdef=0
+stream filters large --cq-level=40
+stream filters_tiles large --cq-level=50 --sb-size=128 --tile-columns=1 --tile-rows=1
+stream filters_segmentation large --cq-level=40 --aq-mode=1
+stream filters_monochrome gray --cq-level=40 --monochrome
+stream filters_yuv444 small444 --cq-level=40 --profile=1
+stream filters_yuv422 small422 --cq-level=40 --profile=2
+stream filters_10 small10 --cq-level=40 --bit-depth=10 --input-bit-depth=10
+stream filters_12 small12 --cq-level=40 --profile=2 --bit-depth=12 --input-bit-depth=12
