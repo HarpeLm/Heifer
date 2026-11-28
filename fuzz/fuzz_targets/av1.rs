@@ -1,6 +1,7 @@
-//! AV1 OBUs, headers and tiles on arbitrary bytes, raw and inside AVIF items: must never panic.
+//! AV1 OBUs, headers, tiles and intra decoding on arbitrary bytes, raw and inside AVIF items:
+//! must never panic.
 #![no_main]
-use heifer_av1_dec::{ObuType, SequenceHeader, SymbolDecoder, frames, obus};
+use heifer_av1_dec::{ObuType, SequenceHeader, SymbolDecoder, decode_frame, frames, obus};
 use libfuzzer_sys::fuzz_target;
 
 fn read(data: &[u8], config_obus: &[u8]) {
@@ -20,6 +21,10 @@ fn read(data: &[u8], config_obus: &[u8]) {
                 }
                 let _ = symbols.finish();
             }
+        }
+        // Keeps the planes small: the size limit is the caller's job.
+        if frame.header.frame_width * frame.header.frame_height <= 1 << 20 {
+            let _ = decode_frame(&frame);
         }
     }
 }
