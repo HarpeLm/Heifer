@@ -110,6 +110,7 @@ dependencies = [
 name = "heifer"
 version = "0.9.0"
 dependencies = [
+ "heifer-av1-dec",
  "heifer-hevc-dec",
  "heifer-hevc-enc",
  "heifer-isobmff",
