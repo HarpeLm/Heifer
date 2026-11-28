@@ -13,6 +13,7 @@ homepage = "https://harpelm.github.io/Heifer/"
 [workspace.dependencies]
 heifer-isobmff = { path = "crates/heifer-isobmff", version = "0.9.0" }
 heifer-hevc-dec = { path = "crates/heifer-hevc-dec", version = "0.9.0" }
+heifer-av1-dec = { path = "crates/heifer-av1-dec", version = "0.9.0" }
 heifer-hevc-enc = { path = "crates/heifer-hevc-enc", version = "0.9.0" }
 thiserror = "2"
 
@@ -29,6 +30,9 @@ all = { level = "warn", priority = -1 }
 opt-level = 3
 
 [profile.dev.package.heifer-hevc-enc]
+opt-level = 3
+
+[profile.dev.package.heifer-av1-dec]
 opt-level = 3
 
 # The profile that 'dist' will build with
