@@ -120,3 +120,36 @@ stream intrabc_sb128 tiled --cq-level=40 --sb-size=128 $ibc
 stream intrabc_tile_columns tiled --cq-level=40 --tile-columns=1 $ibc
 stream intrabc_lossless tiled --lossless=1 $ibc
 stream intrabc_noise tiled_noise --cq-level=20 $ibc
+
+# Inter frames: eight frames of a turning picture. The reference .yuv holds every shown frame in
+# order; the decoder must match all of them.
+clip() { # name format
+  ffmpeg -loglevel error -y -f lavfi \
+    -i "testsrc2=s=136x72:r=8:d=1,rotate=a=t/4:c=black,noise=alls=8:allf=t,format=$2" -strict -1 \
+    -frames:v 8 "$tmp/$1.y4m"
+}
+sequence() { # name clip options…
+  local name=$1 src=$2
+  shift 2
+  # shellcheck disable=SC2068
+  aomenc --limit=8 --end-usage=q --cpu-used=4 --obu $@ -o "$out/$name.obu" "$tmp/$src.y4m" \
+    >/dev/null 2>&1
+  aomdec --rawvideo -o "$out/$name.yuv" "$out/$name.obu"
+}
+clip clip yuv420p
+clip clip10 yuv420p10le
+clip clip444 yuv444p
+# Hidden frames shown later (show_existing_frame), compound references, skip mode, warped motion.
+sequence inter clip --cq-level=30
+sequence inter_no_lag clip --cq-level=30 --lag-in-frames=0
+sequence inter_obmc clip --cq-level=20 --cpu-used=1 --enable-warped-motion=0 \
+  --enable-global-motion=0 --enable-dist-wtd-comp=1 --enable-interintra-comp=1 --enable-obmc=1 \
+  --enable-dual-filter=1
+sequence inter_wedge clip --cq-level=40 --cpu-used=0 --enable-diff-wtd-comp=0 \
+  --enable-dist-wtd-comp=1 --enable-smooth-interintra=1 --enable-interintra-wedge=1 \
+  --enable-interinter-wedge=1
+sequence inter_segmentation clip --cq-level=30 --aq-mode=1
+# Frames of random sizes, predicted from scaled references.
+sequence inter_resize clip --cq-level=30 --resize-mode=2
+sequence inter_10 clip10 --cq-level=30 --bit-depth=10 --input-bit-depth=10
+sequence inter_yuv444 clip444 --cq-level=30 --profile=1
