@@ -1,10 +1,13 @@
 //! The loop filters run once all tiles are decoded (AV1 §7.14, §7.15, §7.17): deblocking, CDEF,
 //! then loop restoration. Superres is rejected earlier, so the upscaling step is the identity.
 
-use super::{FrameState, LrUnit, round2};
+use super::inter::{GLOBAL_GLOBALMV, GLOBALMV, NEARESTMV};
+use super::{FrameState, INTRA_FRAME, LrUnit, round2};
 use crate::frame::RestorationType;
 use crate::predict::Plane;
-use crate::spec_tables::{SGR_PARAMS, TX_HEIGHT, TX_WIDTH};
+use crate::spec_tables::{
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, SGR_PARAMS, SUBSAMPLED_SIZE, TX_HEIGHT, TX_WIDTH,
+};
 
 const SEG_LVL_ALT_LF_Y_V: usize = 1;
 const MAX_LOOP_FILTER: i32 = 63;
@@ -110,6 +113,19 @@ impl FrameState<'_> {
         if pos % usize::from(tx_len) != 0 {
             return;
         }
+        // Inside a skipped inter block, only prediction block edges are filtered.
+        let mi = self.mi(row, col);
+        if self.skips[mi] && self.ref_frames[mi][0] > INTRA_FRAME {
+            let size = usize::from(SUBSAMPLED_SIZE[usize::from(self.mi_sizes[mi])][sx][sy]);
+            let block_len = if pass == 0 {
+                4 * usize::from(NUM_4X4_BLOCKS_WIDE[size])
+            } else {
+                4 * usize::from(NUM_4X4_BLOCKS_HIGH[size])
+            };
+            if pos % block_len != 0 {
+                return;
+            }
+        }
         let base = usize::from(tx_len.min(prev_tx_len));
         let filter_size = base.min(if plane == 0 { 16 } else { 8 });
         let mut lvl = self.filter_level(row, col, plane, pass);
@@ -168,9 +184,17 @@ impl FrameState<'_> {
             lvl = (lvl + data).clamp(0, MAX_LOOP_FILTER);
         }
         if lf.delta_enabled {
-            // INTRA_FRAME: the mode deltas only apply to inter blocks.
             let n_shift = lvl >> 5;
-            lvl = (lvl + (i32::from(lf.ref_deltas[0]) << n_shift)).clamp(0, MAX_LOOP_FILTER);
+            let r = self.ref_frames[mi][0].max(INTRA_FRAME) as usize;
+            lvl += i32::from(lf.ref_deltas[r]) << n_shift;
+            if r > 0 {
+                // modeType: 1 for the inter modes other than GLOBALMV and GLOBAL_GLOBALMV.
+                let mode = self.y_modes[mi];
+                let mode_type =
+                    usize::from(mode >= NEARESTMV && mode != GLOBALMV && mode != GLOBAL_GLOBALMV);
+                lvl += i32::from(lf.mode_deltas[mode_type]) << n_shift;
+            }
+            lvl = lvl.clamp(0, MAX_LOOP_FILTER);
         }
         lvl
     }
