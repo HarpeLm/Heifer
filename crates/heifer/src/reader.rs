@@ -9,12 +9,13 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use heifer_isobmff::boxes::ConstructionMethod;
+use heifer_isobmff::boxes::{ConstructionMethod, Property};
 use heifer_isobmff::{HeifFile, ItemId};
 
 use crate::{
-    Error, Image, ImageInfo, MAX_DEPTH, Metadata, Options, PreviewOptions, decode_item_with,
-    metadata::item_metadata, preview::decode_preview_from_file, to_srgb_with_options,
+    APPLE_GAIN_MAP, Error, GainMap, Image, ImageInfo, MAX_DEPTH, Metadata, Options, PreviewOptions,
+    decode_item_with, hdr::read_gain_map_from_file, metadata::item_metadata,
+    preview::decode_preview_from_file, to_srgb_with_options,
 };
 
 /// Largest `meta` box accepted, which is read whole: real files keep it far below.
@@ -94,6 +95,18 @@ pub fn read_metadata_reader<R: Read + Seek>(reader: R) -> Result<Metadata, ReadE
     Ok(item_metadata(&file, file.primary_id)?)
 }
 
+/// Like [`read_gain_map_with_options`](crate::read_gain_map_with_options), reading only the
+/// container, HDR gain map item (`tmap` or Apple `hdrgainmap`), and its metadata from `reader`,
+/// without reading the primary image bitstream.
+pub fn read_gain_map_reader<R: Read + Seek>(
+    reader: R,
+    options: &Options,
+) -> Result<Option<GainMap>, ReadError> {
+    let loaded = Loaded::read(reader, Need::GainMap)?;
+    let file = loaded.file()?;
+    Ok(read_gain_map_from_file(&file, options)?)
+}
+
 /// Like [`read_info`](crate::read_info), reading only the container headers and small
 /// derived-item descriptors from `reader`, without reading image bitstreams or thumbnails.
 pub fn read_info_reader<R: Read + Seek>(reader: R) -> Result<ImageInfo, ReadError> {
@@ -156,6 +169,8 @@ enum Need {
     Metadata,
     /// Small derived-item descriptors (`grid`, `iovl`) needed for container info only.
     Info,
+    /// The HDR gain map item (`tmap` or Apple `hdrgainmap`) and its metadata only.
+    GainMap,
 }
 
 /// The `ftyp` and `meta` boxes, followed by an `mdat` box holding the needed item data, and
@@ -319,6 +334,9 @@ fn wanted_items(file: &HeifFile<'_>, need: Need) -> Vec<ItemId> {
     if need == Need::Info {
         return wanted_info_items(file);
     }
+    if need == Need::GainMap {
+        return wanted_gain_map_items(file);
+    }
     let primary = file.primary_id;
     let mut wanted = file.referencing_items(primary, b"cdsc");
     // A grid's metadata can describe its first tile instead.
@@ -402,6 +420,69 @@ fn add_iloc_dependencies(file: &HeifFile<'_>, root: ItemId, wanted: &mut Vec<Ite
         wanted.push(id);
         for &dep in file.referenced_items(id, b"iloc") {
             stack.push((dep, depth + 1));
+        }
+    }
+}
+
+/// Items needed for `read_gain_map_reader`: the ISO 21496-1 `tmap` item and its gain-map image
+/// (without the primary base image), or the Apple `hdrgainmap` auxiliary item plus its XMP and
+/// the primary image's EXIF metadata.
+fn wanted_gain_map_items(file: &HeifFile<'_>) -> Vec<ItemId> {
+    let mut wanted = Vec::new();
+    let primary = file.primary_id;
+
+    // ISO 21496-1 `tmap` item (preferred when present).
+    let tone_map = file
+        .items
+        .iter()
+        .filter(|item| item.item_type.0 == *b"tmap")
+        .find(|item| file.referenced_items(item.id, b"dimg").first() == Some(&primary))
+        .or_else(|| file.items.iter().find(|item| item.item_type.0 == *b"tmap"));
+    if let Some(tone_map) = tone_map {
+        add_iloc_dependencies(file, tone_map.id, &mut wanted);
+        if let [_, map] = file.referenced_items(tone_map.id, b"dimg") {
+            add_image_item_tree(file, *map, &mut wanted);
+        }
+    }
+
+    // Apple `urn:com:apple:photo:2020:aux:hdrgainmap` auxiliary item + its XMP + primary EXIF.
+    for aux in file.referencing_items(primary, b"auxl") {
+        let is_gain_map = file.item_properties(aux).ok().is_some_and(|mut props| {
+            props.any(|p| matches!(p, Property::AuxiliaryType(t) if t == APPLE_GAIN_MAP))
+        });
+        if is_gain_map {
+            add_image_item_tree(file, aux, &mut wanted);
+            wanted.extend(file.referencing_items(aux, b"cdsc"));
+            wanted.extend(file.referencing_items(primary, b"cdsc"));
+            for &tile in file.referenced_items(primary, b"dimg") {
+                wanted.extend(file.referencing_items(tile, b"cdsc"));
+            }
+            break;
+        }
+    }
+
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted
+}
+
+fn add_image_item_tree(file: &HeifFile<'_>, root: ItemId, wanted: &mut Vec<ItemId>) {
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        if wanted.contains(&id) {
+            continue;
+        }
+        wanted.push(id);
+        for next in file
+            .referenced_items(id, b"dimg")
+            .iter()
+            .chain(file.referenced_items(id, b"iloc"))
+            .chain(file.referenced_items(id, b"pred"))
+            .copied()
+        {
+            if !wanted.contains(&next) && !pending.contains(&next) {
+                pending.push(next);
+            }
         }
     }
 }
