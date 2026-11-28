@@ -34,14 +34,14 @@ echo "Building fuzz targets..."
 cargo +nightly fuzz build -O -s none
 
 # Seed corpora (existing corpora are kept and grow across runs).
-mkdir -p corpus/{decode,container,parallel,hevc,cabac,encode,info,image_decoder,preview,gain_map} logs artifacts
+mkdir -p corpus/{decode,container,parallel,hevc,cabac,encode,info,image_decoder,preview,gain_map,av1} logs artifacts
 seed() { [ -e "$2" ] && find "$2" -type f -size -400k -exec cp -n {} "corpus/$1/" \; 2>/dev/null || true; }
 for t in decode container parallel info image_decoder preview gain_map; do
   seed "$t" "$ROOT/tests/fixtures"
   seed "$t" "$ROOT/fuzz/seeds/libheif"
 done
 # Every input that ever crashed a target, reduced to the smallest set that keeps its coverage.
-for t in decode container parallel hevc cabac encode info image_decoder preview gain_map; do
+for t in decode container parallel hevc cabac encode info image_decoder preview gain_map av1; do
   seed "$t" "$ROOT/fuzz/regressions/$t"
 done
 [ -d "$ROOT/tests/conformance" ] && find "$ROOT/tests/conformance" \( -name '*.bit' -o -name '*.bin' \) -size -100k \
@@ -59,6 +59,7 @@ seed hevc "$ROOT/crates/heifer-hevc-dec/tests/data"
 for t in decode container parallel info image_decoder preview gain_map; do
   seed "$t" "$ROOT/crates/heifer/tests/data"
 done
+seed av1 "$ROOT/tests/fixtures/avif"
 [ -n "$(ls corpus/cabac)" ] || printf '\x1a\x00\x01\x02' > corpus/cabac/seed
 [ -n "$(ls corpus/encode)" ] || printf '\x10\x0c\x16\x00\x40\x80\xc0\xff\x20' > corpus/encode/seed
 
@@ -73,7 +74,7 @@ run() {
     -max_total_time="$seconds" -rss_limit_mb=2048 -timeout=20 \
     -artifact_prefix="artifacts/$target/" "$@" > "logs/$target.log" 2>&1 &
 }
-mkdir -p artifacts/{decode,container,parallel,hevc,cabac,encode,info,image_decoder,preview,gain_map}
+mkdir -p artifacts/{decode,container,parallel,hevc,cabac,encode,info,image_decoder,preview,gain_map,av1}
 run hevc          "$(share 4)" -dict=dicts/hevc.dict -max_len=200000
 run decode        "$(share 3)" -dict=dicts/heif.dict -max_len=400000
 run parallel      "$(share 1)" -dict=dicts/heif.dict -max_len=400000
@@ -82,6 +83,7 @@ run info          "$(share 1)" -dict=dicts/heif.dict -max_len=400000
 run image_decoder "$(share 1)" -dict=dicts/heif.dict -max_len=400000
 run preview       "$(share 1)" -dict=dicts/heif.dict -max_len=400000
 run gain_map      "$(share 1)" -dict=dicts/heif.dict -max_len=400000
+run av1           "$(share 1)" -max_len=400000
 run cabac         "$(share 1)" -max_len=8192
 run encode        "$(share 1)" -max_len=8192
 
@@ -91,7 +93,7 @@ wait
 
 echo
 echo "Done. Corpus sizes:"
-for t in hevc decode parallel container cabac encode info image_decoder preview gain_map; do
+for t in hevc decode parallel container cabac encode info image_decoder preview gain_map av1; do
   printf "  %-10s %6s inputs\n" "$t" "$(ls "corpus/$t" | wc -l | tr -d ' ')"
 done
 crashes=$(find artifacts -type f | wc -l | tr -d ' ')
