@@ -80,3 +80,47 @@ fn sequence_headers_match_the_container() {
     eprintln!("{} files, {items} AV1 items", files.len());
     assert!(items > 0);
 }
+
+#[test]
+fn frames_and_tiles_match_the_container() {
+    let files = avif_files();
+    if files.is_empty() {
+        eprintln!("skipping: run scripts/fetch-fixtures.sh");
+        return;
+    }
+    let (mut items, mut tiles, mut layered) = (0, 0, 0);
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let bytes = std::fs::read(path).unwrap();
+        let file = HeifFile::parse(&bytes).unwrap();
+        for item in file.items.iter().filter(|i| i.item_type.0 == *b"av01") {
+            let what = format!("{name} item {}", item.id);
+            let config = file.av1_config(item.id).unwrap().expect("av1C");
+            let data = file.item_data(item.id).unwrap();
+            let frames = match heifer_av1_dec::frames(&data, &config.config_obus) {
+                Err(heifer_av1_dec::Error::Unsupported("inter frames")) => {
+                    // Spatial layers above the first one predict from it.
+                    layered += 1;
+                    continue;
+                }
+                r => r.unwrap_or_else(|e| panic!("{what}: {e}")),
+            };
+            let last = frames.last().unwrap();
+            let h = &last.header;
+            if frames.len() == 1 {
+                if let Some(size) = file.image_size(item.id).unwrap() {
+                    assert_eq!(size, (h.upscaled_width, h.frame_height), "{what}");
+                }
+            }
+            for frame in &frames {
+                let info = &frame.header.tile_info;
+                assert_eq!(frame.tiles.len() as u32, info.cols * info.rows, "{what}");
+                assert!(frame.tiles.iter().all(|t| !t.data.is_empty()), "{what}");
+                tiles += frame.tiles.len();
+            }
+            items += 1;
+        }
+    }
+    eprintln!("{items} AV1 items, {tiles} tiles, {layered} layered items skipped");
+    assert!(items > 0);
+}
