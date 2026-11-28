@@ -2,6 +2,8 @@
 
 <img src="docs/images/banner.webp" alt="Heifer: HEIF/HEIC decoder and encoder in pure Rust" width="100%">
 
+<h1>Heifer — Pure-Rust HEIC/HEIF Decoder &amp; Encoder</h1>
+
 **Pure-Rust HEIC/HEIF (and `.heics`) decoder & encoder.**<br>
 `#![forbid(unsafe_code)]` · zero C/`libheif` dependency · WASM-ready · `image` crate support.
 
