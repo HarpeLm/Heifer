@@ -1,7 +1,7 @@
-//! Frame header (AV1 §5.9 and §6.8), for intra frames.
+//! Frame header (AV1 §5.9 and §6.8).
 //!
-//! A still image is one key frame (or, rarely, an intra-only frame). Inter frames need reference
-//! frames and are rejected with [`Error::Unsupported`].
+//! A still image is one key frame (or, rarely, an intra-only frame). Layered images add inter
+//! frames, whose headers depend on the headers saved in the eight reference slots.
 
 use crate::Error;
 use crate::bits::BitReader;
@@ -26,8 +26,11 @@ pub enum FrameType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FrameHeader {
-    /// `frame_type`: [`FrameType::Key`] or [`FrameType::IntraOnly`].
+    /// `frame_type`.
     pub frame_type: FrameType,
+    /// `frame_to_show_map_idx` when the header only shows a saved frame (`show_existing_frame`):
+    /// the other fields are then those of that frame.
+    pub show_existing_frame: Option<u8>,
     /// `show_frame`.
     pub show_frame: bool,
     /// `showable_frame`.
@@ -98,6 +101,34 @@ pub struct FrameHeader {
     pub reduced_tx_set: bool,
     /// Film grain parameters, when grain is applied to this frame.
     pub film_grain: Option<FilmGrain>,
+    /// `force_integer_mv`.
+    pub force_integer_mv: bool,
+    /// `primary_ref_frame`, `None` for `PRIMARY_REF_NONE`.
+    pub primary_ref_frame: Option<u8>,
+    /// `ref_frame_idx`: the slots of `LAST_FRAME` to `ALTREF_FRAME`.
+    pub ref_frame_idx: [u8; 7],
+    /// `OrderHints`, indexed by reference frame (`LAST_FRAME` = 1 to `ALTREF_FRAME` = 7).
+    pub order_hints: [u32; 8],
+    /// `RefFrameSignBias`, indexed like `order_hints`.
+    pub ref_frame_sign_bias: [bool; 8],
+    /// `allow_high_precision_mv`.
+    pub allow_high_precision_mv: bool,
+    /// `interpolation_filter`: `EIGHTTAP` 0, `SMOOTH` 1, `SHARP` 2, `BILINEAR` 3, `SWITCHABLE` 4.
+    pub interpolation_filter: u8,
+    /// `is_motion_mode_switchable`.
+    pub is_motion_mode_switchable: bool,
+    /// `use_ref_frame_mvs`.
+    pub use_ref_frame_mvs: bool,
+    /// `reference_select`.
+    pub reference_select: bool,
+    /// `SkipModeFrame`, when `skip_mode_present`.
+    pub skip_mode_frames: Option<[u8; 2]>,
+    /// `allow_warped_motion`.
+    pub allow_warped_motion: bool,
+    /// `GmType` per reference frame: `IDENTITY` 0, `TRANSLATION` 1, `ROTZOOM` 2, `AFFINE` 3.
+    pub gm_types: [u8; 8],
+    /// `gm_params` per reference frame.
+    pub gm_params: [[i32; 6]; 8],
 }
 
 /// `MAX_SEGMENTS`.
@@ -161,6 +192,10 @@ pub struct Segmentation {
     pub seg_id_pre_skip: bool,
     /// `LastActiveSegId`.
     pub last_active_seg_id: u8,
+    /// `segmentation_update_map`.
+    pub update_map: bool,
+    /// `segmentation_temporal_update`.
+    pub temporal_update: bool,
 }
 
 /// `loop_filter_params()` (§5.9.11).
@@ -284,21 +319,91 @@ const SEGMENTATION_FEATURE_MAX: [i16; SEG_LVL_MAX] = [255, 63, 63, 63, 63, 7, 0,
 const SEG_LVL_REF_FRAME: usize = 5;
 /// Defaults of `loop_filter_ref_deltas` (`setup_past_independence()`).
 const DEFAULT_REF_DELTAS: [i8; 8] = [1, 0, 0, 0, -1, 0, -1, -1];
+const PRIMARY_REF_NONE: u32 = 7;
+const SWITCHABLE: u8 = 4;
+const WARPEDMODEL_PREC_BITS: u32 = 16;
+/// `gm_params` of the identity model (`IDENTITY`).
+pub(crate) const DEFAULT_GM_PARAMS: [i32; 6] = [
+    0,
+    0,
+    1 << WARPEDMODEL_PREC_BITS,
+    0,
+    0,
+    1 << WARPEDMODEL_PREC_BITS,
+];
+const TRANSLATION: u8 = 1;
+const ROTZOOM: u8 = 2;
+const AFFINE: u8 = 3;
+
+/// The headers saved in the eight reference slots (`RefValid` is `Some`).
+pub(crate) type RefHeaders = [Option<FrameHeader>; 8];
+
+/// `get_relative_dist()`.
+pub(crate) fn relative_dist(seq: &SequenceHeader, a: u32, b: u32) -> i32 {
+    if !seq.enable_order_hint {
+        return 0;
+    }
+    let diff = a as i32 - b as i32;
+    let m = 1 << (seq.order_hint_bits - 1);
+    (diff & (m - 1)) - (diff & m)
+}
 
 impl FrameHeader {
-    /// Parses the frame header at the start of a frame header or frame OBU.
+    /// Parses the frame header at the start of a frame header or frame OBU, with empty reference
+    /// slots: right for key frames, while inter frames fail.
     ///
     /// Returns the header and the number of bytes it takes, up to the byte alignment: in a frame
     /// OBU, the tile group starts there.
     pub fn parse(obu: &Obu<'_>, seq: &SequenceHeader) -> Result<(Self, usize), Error> {
+        Self::parse_with_refs(obu, seq, &RefHeaders::default())
+    }
+
+    /// `FrameIsIntra`.
+    pub fn is_intra(&self) -> bool {
+        matches!(self.frame_type, FrameType::Key | FrameType::IntraOnly)
+    }
+
+    /// Parses a frame header, given the headers saved in the reference slots.
+    pub(crate) fn parse_with_refs(
+        obu: &Obu<'_>,
+        seq: &SequenceHeader,
+        refs: &RefHeaders,
+    ) -> Result<(Self, usize), Error> {
         let mut r = BitReader::new(obu.payload);
+        let end = |r: &mut BitReader<'_>| -> Result<usize, Error> {
+            // A frame header OBU ends with trailing bits; in a frame OBU the tile group starts at
+            // the next byte.
+            if obu.obu_type == ObuType::FrameHeader {
+                r.trailing_bits()?;
+                Ok(obu.payload.len())
+            } else {
+                r.byte_align()
+            }
+        };
+        let id_len = u32::from(seq.delta_frame_id_length + seq.additional_frame_id_length);
         let (frame_type, show_frame, showable_frame, error_resilient_mode);
         if seq.reduced_still_picture_header {
             (frame_type, show_frame, showable_frame, error_resilient_mode) =
                 (FrameType::Key, true, false, true);
         } else {
             if r.flag()? {
-                return Err(Error::Unsupported("show_existing_frame"));
+                // show_existing_frame
+                let idx = r.f(3)? as u8;
+                r.f(seq.timing.presentation_time_bits)?; // temporal_point_info()
+                if seq.frame_id_numbers_present {
+                    r.f(id_len)?; // display_frame_id
+                }
+                let mut h = refs[usize::from(idx)]
+                    .clone()
+                    .ok_or(Error::Invalid("shows an empty reference slot"))?;
+                h.show_existing_frame = Some(idx);
+                h.show_frame = true;
+                h.refresh_frame_flags = if h.frame_type == FrameType::Key {
+                    ALL_FRAMES
+                } else {
+                    0
+                };
+                return Ok((h, end(&mut r)?));
             }
             frame_type = match r.f(2)? {
                 0 => FrameType::Key,
@@ -306,9 +411,6 @@ impl FrameHeader {
                 2 => FrameType::IntraOnly,
                 _ => FrameType::Switch,
             };
-            if !matches!(frame_type, FrameType::Key | FrameType::IntraOnly) {
-                return Err(Error::Unsupported("inter frames"));
-            }
             show_frame = r.flag()?;
             if show_frame {
                 r.f(seq.timing.presentation_time_bits)?; // temporal_point_info()
@@ -318,27 +420,55 @@ impl FrameHeader {
             } else {
                 r.flag()?
             };
-            error_resilient_mode = (frame_type == FrameType::Key && show_frame) || r.flag()?;
+            error_resilient_mode = frame_type == FrameType::Switch
+                || (frame_type == FrameType::Key && show_frame)
+                || r.flag()?;
         }
+        let frame_is_intra = matches!(frame_type, FrameType::Key | FrameType::IntraOnly);
+        // A shown key frame empties every slot (RefValid and RefOrderHint are reset).
+        let no_refs = RefHeaders::default();
+        let refs = if frame_type == FrameType::Key && show_frame {
+            &no_refs
+        } else {
+            refs
+        };
+        let slot = |idx: u8| -> Result<&FrameHeader, Error> {
+            refs[usize::from(idx)]
+                .as_ref()
+                .ok_or(Error::Invalid("reference to an empty slot"))
+        };
         let disable_cdf_update = r.flag()?;
         let allow_screen_content_tools = match seq.seq_force_screen_content_tools {
             2 => r.flag()?,
             v => v == 1,
         };
-        // Intra frames force integer motion vectors, so `force_integer_mv` is not read.
-        if allow_screen_content_tools && seq.seq_force_integer_mv == 2 {
-            r.flag()?;
-        }
+        let force_integer_mv = (allow_screen_content_tools
+            && match seq.seq_force_integer_mv {
+                2 => r.flag()?,
+                v => v == 1,
+            })
+            || frame_is_intra;
+        // shortcut: mark_ref_frames() is skipped, so frame ids never invalidate a slot; only error
+        // concealment needs it.
         let current_frame_id = if seq.frame_id_numbers_present {
-            r.f(u32::from(
-                seq.delta_frame_id_length + seq.additional_frame_id_length,
-            ))?
+            r.f(id_len)?
         } else {
             0
         };
-        let frame_size_override = !seq.reduced_still_picture_header && r.flag()?;
+        let frame_size_override = if frame_type == FrameType::Switch {
+            true
+        } else {
+            !seq.reduced_still_picture_header && r.flag()?
+        };
         let order_hint = r.f(u32::from(seq.order_hint_bits))?;
-        // Intra frames have no primary reference frame (`PRIMARY_REF_NONE`).
+        let primary_ref_frame = if frame_is_intra || error_resilient_mode {
+            None
+        } else {
+            match r.f(3)? {
+                PRIMARY_REF_NONE => None,
+                v => Some(v as u8),
+            }
+        };
         if seq.timing.buffer_removal_time_bits > 0 && r.flag()? {
             for (op, &idc) in seq.operating_point_idc.iter().enumerate() {
                 if !seq
@@ -357,30 +487,64 @@ impl FrameHeader {
                 }
             }
         }
-        let refresh_frame_flags = if frame_type == FrameType::Key && show_frame {
-            ALL_FRAMES
-        } else {
-            r.f(8)? as u8
-        };
+        let refresh_frame_flags =
+            if frame_type == FrameType::Switch || (frame_type == FrameType::Key && show_frame) {
+                ALL_FRAMES
+            } else {
+                r.f(8)? as u8
+            };
         if frame_type == FrameType::IntraOnly && refresh_frame_flags == ALL_FRAMES {
             return Err(Error::Invalid("intra-only frame refreshes every reference"));
         }
-        if refresh_frame_flags != ALL_FRAMES && error_resilient_mode && seq.enable_order_hint {
+        if (!frame_is_intra || refresh_frame_flags != ALL_FRAMES)
+            && error_resilient_mode
+            && seq.enable_order_hint
+        {
+            // shortcut: ref_order_hint only invalidates slots, for error concealment; skipped.
             for _ in 0..8 {
-                r.f(u32::from(seq.order_hint_bits))?; // ref_order_hint
+                r.f(u32::from(seq.order_hint_bits))?;
             }
         }
 
-        // frame_size(), superres_params(), compute_image_size(), render_size().
-        let (frame_width, frame_height) = if frame_size_override {
-            (
+        let mut ref_frame_idx = [0; 7];
+        let mut found_ref = None;
+        if !frame_is_intra {
+            let short_signaling = seq.enable_order_hint && r.flag()?;
+            if short_signaling {
+                let (last, gold) = (r.f(3)? as u8, r.f(3)? as u8);
+                ref_frame_idx = set_frame_refs(seq, refs, order_hint, last, gold);
+            }
+            for idx in &mut ref_frame_idx {
+                if !short_signaling {
+                    *idx = r.f(3)? as u8;
+                }
+                if seq.frame_id_numbers_present {
+                    r.f(u32::from(seq.delta_frame_id_length))?; // delta_frame_id_minus_1
+                }
+            }
+            for &idx in &ref_frame_idx {
+                slot(idx)?;
+            }
+            if frame_size_override && !error_resilient_mode {
+                // frame_size_with_refs()
+                for &idx in &ref_frame_idx {
+                    if r.flag()? {
+                        found_ref = Some(slot(idx)?);
+                        break;
+                    }
+                }
+            }
+        }
+        // frame_size() or the size of the found reference, superres_params(), render_size().
+        let (upscaled_width, frame_height) = match found_ref {
+            Some(h) => (h.upscaled_width, h.frame_height),
+            None if frame_size_override => (
                 r.f(u32::from(seq.frame_width_bits))? + 1,
                 r.f(u32::from(seq.frame_height_bits))? + 1,
-            )
-        } else {
-            (seq.max_frame_width, seq.max_frame_height)
+            ),
+            None => (seq.max_frame_width, seq.max_frame_height),
         };
-        if frame_width > seq.max_frame_width || frame_height > seq.max_frame_height {
+        if upscaled_width > seq.max_frame_width || frame_height > seq.max_frame_height {
             return Err(Error::Invalid(
                 "frame larger than the sequence header allows",
             ));
@@ -390,25 +554,45 @@ impl FrameHeader {
         } else {
             8
         };
-        let upscaled_width = frame_width;
         let frame_width =
             (upscaled_width * 8 + u32::from(superres_denom) / 2) / u32::from(superres_denom);
         let mi_cols = 2 * frame_width.div_ceil(8);
         let mi_rows = 2 * frame_height.div_ceil(8);
-        let (render_width, render_height) = if r.flag()? {
-            (r.f(16)? + 1, r.f(16)? + 1)
-        } else {
-            (upscaled_width, frame_height)
+        let (render_width, render_height) = match found_ref {
+            Some(h) => (h.render_width, h.render_height),
+            None if r.flag()? => (r.f(16)? + 1, r.f(16)? + 1),
+            None => (upscaled_width, frame_height),
         };
-        let allow_intrabc =
-            allow_screen_content_tools && upscaled_width == frame_width && r.flag()?;
+        let allow_intrabc = frame_is_intra
+            && allow_screen_content_tools
+            && upscaled_width == frame_width
+            && r.flag()?;
+        let mut order_hints = [0; 8];
+        let mut ref_frame_sign_bias = [false; 8];
+        let (mut allow_high_precision_mv, mut interpolation_filter) = (false, 0);
+        let (mut is_motion_mode_switchable, mut use_ref_frame_mvs) = (false, false);
+        if !frame_is_intra {
+            allow_high_precision_mv = !force_integer_mv && r.flag()?;
+            interpolation_filter = if r.flag()? { SWITCHABLE } else { r.f(2)? as u8 };
+            is_motion_mode_switchable = r.flag()?;
+            use_ref_frame_mvs = !error_resilient_mode && seq.enable_ref_frame_mvs && r.flag()?;
+            for (i, &idx) in ref_frame_idx.iter().enumerate() {
+                let hint = slot(idx)?.order_hint;
+                order_hints[i + 1] = hint;
+                ref_frame_sign_bias[i + 1] = relative_dist(seq, hint, order_hint) > 0;
+            }
+        }
 
         let disable_frame_end_update_cdf =
             seq.reduced_still_picture_header || disable_cdf_update || r.flag()?;
+        // load_previous()
+        let prev = primary_ref_frame
+            .map(|p| slot(ref_frame_idx[usize::from(p)]))
+            .transpose()?;
         let tile_info = tile_info(&mut r, seq, mi_cols, mi_rows)?;
         let num_planes = if seq.color.monochrome { 1 } else { 3 };
         let quantization = quantization_params(&mut r, seq, num_planes)?;
-        let segmentation = segmentation_params(&mut r)?;
+        let segmentation = segmentation_params(&mut r, prev.map(|h| &h.segmentation))?;
         let delta_q_present = quantization.base_q_idx > 0 && r.flag()?;
         let delta_q_res = if delta_q_present { r.f(2)? as u8 } else { 0 };
         let delta_lf_present = delta_q_present && !allow_intrabc && r.flag()?;
@@ -445,7 +629,7 @@ impl FrameHeader {
                 mode_deltas: [0; 2],
             }
         } else {
-            loop_filter_params(&mut r, num_planes)?
+            loop_filter_params(&mut r, num_planes, prev.map(|h| &h.loop_filter))?
         };
         let cdef = if coded_lossless || allow_intrabc || !seq.enable_cdef {
             Cdef {
@@ -474,24 +658,35 @@ impl FrameHeader {
         } else {
             TxMode::Largest
         };
-        // Intra frames: no reference_select, skip mode, warped motion or global motion.
-        let reduced_tx_set = r.flag()?;
-        let film_grain = if seq.film_grain_params_present && (show_frame || showable_frame) {
-            film_grain_params(&mut r, seq)?
+        let reference_select = !frame_is_intra && r.flag()?;
+        let skip_mode_allowed = if reference_select {
+            skip_mode_frames(seq, &order_hints, order_hint)
         } else {
             None
         };
-        // A frame header OBU ends with trailing bits; in a frame OBU the tile group starts at the
-        // next byte.
-        let size = if obu.obu_type == ObuType::FrameHeader {
-            r.trailing_bits()?;
-            obu.payload.len()
-        } else {
-            r.byte_align()?
+        let skip_mode_frames = match skip_mode_allowed {
+            Some(frames) if r.flag()? => Some(frames), // skip_mode_present
+            _ => None,
         };
+        let allow_warped_motion =
+            !frame_is_intra && !error_resilient_mode && seq.enable_warped_motion && r.flag()?;
+        let reduced_tx_set = r.flag()?;
+        let (gm_types, gm_params) = if frame_is_intra {
+            ([0; 8], [DEFAULT_GM_PARAMS; 8])
+        } else {
+            let prev_gm = prev.map_or([DEFAULT_GM_PARAMS; 8], |h| h.gm_params);
+            global_motion_params(&mut r, allow_high_precision_mv, &prev_gm)?
+        };
+        let film_grain = if seq.film_grain_params_present && (show_frame || showable_frame) {
+            film_grain_params(&mut r, seq, frame_type, refs)?
+        } else {
+            None
+        };
+        let size = end(&mut r)?;
         Ok((
             Self {
                 frame_type,
+                show_existing_frame: None,
                 show_frame,
                 showable_frame,
                 error_resilient_mode,
@@ -527,9 +722,240 @@ impl FrameHeader {
                 tx_mode,
                 reduced_tx_set,
                 film_grain,
+                force_integer_mv,
+                primary_ref_frame,
+                ref_frame_idx,
+                order_hints,
+                ref_frame_sign_bias,
+                allow_high_precision_mv,
+                interpolation_filter,
+                is_motion_mode_switchable,
+                use_ref_frame_mvs,
+                reference_select,
+                skip_mode_frames,
+                allow_warped_motion,
+                gm_types,
+                gm_params,
             },
             size,
         ))
+    }
+}
+
+/// The set frame refs process (§7.8): `ref_frame_idx` from `last_frame_idx` and `gold_frame_idx`.
+fn set_frame_refs(
+    seq: &SequenceHeader,
+    refs: &RefHeaders,
+    order_hint: u32,
+    last: u8,
+    gold: u8,
+) -> [u8; 7] {
+    let mut idx = [-1i32; 7];
+    idx[0] = i32::from(last);
+    idx[3] = i32::from(gold); // GOLDEN_FRAME
+    let mut used = [false; 8];
+    used[usize::from(last)] = true;
+    used[usize::from(gold)] = true;
+    let cur = 1i32 << (seq.order_hint_bits - 1);
+    let shifted: [i32; 8] = std::array::from_fn(|i| {
+        cur + relative_dist(
+            seq,
+            refs[i].as_ref().map_or(0, |h| h.order_hint),
+            order_hint,
+        )
+    });
+    // The unused slot backward (hint >= cur) or forward of the current frame with the latest or
+    // the earliest hint; ties go to the last slot when looking for the latest, the first otherwise.
+    let find = |used: &[bool; 8], backward: bool, latest: bool| -> i32 {
+        let mut best: i32 = -1;
+        for i in 0..8 {
+            let hint = shifted[i];
+            if used[i] || (hint >= cur) != backward {
+                continue;
+            }
+            if best < 0
+                || if latest {
+                    hint >= shifted[best as usize]
+                } else {
+                    hint < shifted[best as usize]
+                }
+            {
+                best = i as i32;
+            }
+        }
+        best
+    };
+    // ALTREF_FRAME, then BWDREF_FRAME and ALTREF2_FRAME.
+    for (slot, latest) in [(6, true), (4, false), (5, false)] {
+        let r = find(&used, true, latest);
+        if r >= 0 {
+            idx[slot] = r;
+            used[r as usize] = true;
+        }
+    }
+    // Ref_Frame_List: LAST2_FRAME, LAST3_FRAME, BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME.
+    for slot in [1, 2, 4, 5, 6] {
+        if idx[slot] < 0 {
+            let r = find(&used, false, true);
+            if r >= 0 {
+                idx[slot] = r;
+                used[r as usize] = true;
+            }
+        }
+    }
+    let mut earliest = 0;
+    for i in 1..8 {
+        if shifted[i] < shifted[earliest] {
+            earliest = i;
+        }
+    }
+    idx.map(|i| if i < 0 { earliest as u8 } else { i as u8 })
+}
+
+/// `skip_mode_params()` up to `skip_mode_present`: `SkipModeFrame` when skip mode is allowed.
+fn skip_mode_frames(
+    seq: &SequenceHeader,
+    order_hints: &[u32; 8],
+    order_hint: u32,
+) -> Option<[u8; 2]> {
+    if !seq.enable_order_hint {
+        return None;
+    }
+    let dist = |a: u32, b: u32| relative_dist(seq, a, b);
+    let hint = |i: usize| order_hints[i + 1];
+    let (mut forward, mut backward): (Option<usize>, Option<usize>) = (None, None);
+    for i in 0..7 {
+        if dist(hint(i), order_hint) < 0 {
+            if forward.is_none_or(|f| dist(hint(i), hint(f)) > 0) {
+                forward = Some(i);
+            }
+        } else if dist(hint(i), order_hint) > 0
+            && backward.is_none_or(|b| dist(hint(i), hint(b)) < 0)
+        {
+            backward = Some(i);
+        }
+    }
+    let forward = forward?;
+    let other = match backward {
+        Some(b) => b,
+        None => {
+            let mut second: Option<usize> = None;
+            for i in 0..7 {
+                if dist(hint(i), hint(forward)) < 0
+                    && second.is_none_or(|s| dist(hint(i), hint(s)) > 0)
+                {
+                    second = Some(i);
+                }
+            }
+            second?
+        }
+    };
+    Some([1 + forward.min(other) as u8, 1 + forward.max(other) as u8])
+}
+
+/// `global_motion_params()` of an inter frame: `GmType` and `gm_params` per reference frame.
+fn global_motion_params(
+    r: &mut BitReader<'_>,
+    allow_high_precision_mv: bool,
+    prev: &[[i32; 6]; 8],
+) -> Result<([u8; 8], [[i32; 6]; 8]), Error> {
+    let mut types = [0; 8];
+    let mut params = [DEFAULT_GM_PARAMS; 8];
+    for rf in 1..8 {
+        let kind = if !r.flag()? {
+            0
+        } else if r.flag()? {
+            ROTZOOM
+        } else if r.flag()? {
+            TRANSLATION
+        } else {
+            AFFINE
+        };
+        types[rf] = kind;
+        let p = &mut params[rf];
+        let hp = allow_high_precision_mv;
+        if kind >= ROTZOOM {
+            p[2] = read_global_param(r, kind, 2, hp, prev[rf][2])?;
+            p[3] = read_global_param(r, kind, 3, hp, prev[rf][3])?;
+            if kind == AFFINE {
+                p[4] = read_global_param(r, kind, 4, hp, prev[rf][4])?;
+                p[5] = read_global_param(r, kind, 5, hp, prev[rf][5])?;
+            } else {
+                p[4] = -p[3];
+                p[5] = p[2];
+            }
+        }
+        if kind >= TRANSLATION {
+            p[0] = read_global_param(r, kind, 0, hp, prev[rf][0])?;
+            p[1] = read_global_param(r, kind, 1, hp, prev[rf][1])?;
+        }
+    }
+    Ok((types, params))
+}
+
+/// `read_global_param()`.
+fn read_global_param(
+    r: &mut BitReader<'_>,
+    kind: u8,
+    idx: usize,
+    allow_high_precision_mv: bool,
+    prev: i32,
+) -> Result<i32, Error> {
+    let lowp = u32::from(!allow_high_precision_mv);
+    let (abs_bits, prec_bits) = match (idx < 2, kind == TRANSLATION) {
+        (true, true) => (9 - lowp, 3 - lowp), // GM_ABS_TRANS_ONLY_BITS, GM_TRANS_ONLY_PREC_BITS
+        (true, false) => (12, 6),             // GM_ABS_TRANS_BITS, GM_TRANS_PREC_BITS
+        _ => (12, 15),                        // GM_ABS_ALPHA_BITS, GM_ALPHA_PREC_BITS
+    };
+    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+    let (round, sub) = if idx % 3 == 2 {
+        (1 << WARPEDMODEL_PREC_BITS, 1 << prec_bits)
+    } else {
+        (0, 0)
+    };
+    let mx = 1i32 << abs_bits;
+    let reference = (prev >> prec_diff) - sub;
+    // decode_signed_subexp_with_ref(-mx, mx + 1, reference)
+    let x = unsigned_subexp_with_ref(r, (2 * mx + 1) as u32, reference + mx)? - mx;
+    Ok((x << prec_diff) + round)
+}
+
+/// `decode_unsigned_subexp_with_ref()`.
+fn unsigned_subexp_with_ref(r: &mut BitReader<'_>, mx: u32, reference: i32) -> Result<i32, Error> {
+    let v = subexp(r, mx)? as i32;
+    let mx = mx as i32;
+    Ok(if (reference << 1) <= mx {
+        inverse_recenter(reference, v)
+    } else {
+        mx - 1 - inverse_recenter(mx - 1 - reference, v)
+    })
+}
+
+/// `decode_subexp()`.
+fn subexp(r: &mut BitReader<'_>, num_syms: u32) -> Result<u32, Error> {
+    let (mut i, mut mk, k) = (0, 0, 3);
+    loop {
+        let b2 = if i > 0 { k + i - 1 } else { k };
+        let a = 1 << b2;
+        if num_syms <= mk + 3 * a {
+            return Ok(r.ns(num_syms - mk)? + mk);
+        }
+        if !r.flag()? {
+            return Ok(r.f(b2)? + mk);
+        }
+        i += 1;
+        mk += a;
+    }
+}
+
+/// `inverse_recenter()`.
+pub(crate) fn inverse_recenter(r: i32, v: i32) -> i32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 == 1 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
     }
 }
 
@@ -684,49 +1110,76 @@ fn quantization_params(
     })
 }
 
-/// `segmentation_params()` (§5.9.14), for a frame without a primary reference frame.
-fn segmentation_params(r: &mut BitReader<'_>) -> Result<Segmentation, Error> {
+/// `segmentation_params()` (§5.9.14); `prev` holds the parameters of the primary reference frame.
+fn segmentation_params(
+    r: &mut BitReader<'_>,
+    prev: Option<&Segmentation>,
+) -> Result<Segmentation, Error> {
     let mut s = Segmentation {
         enabled: r.flag()?,
         feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
         feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
         seg_id_pre_skip: false,
         last_active_seg_id: 0,
+        update_map: false,
+        temporal_update: false,
     };
     if !s.enabled {
         return Ok(s);
     }
-    // Without a primary reference frame the map and the data are always updated.
+    let update_data = match prev {
+        None => {
+            s.update_map = true;
+            true
+        }
+        Some(p) => {
+            s.update_map = r.flag()?;
+            s.temporal_update = s.update_map && r.flag()?;
+            s.feature_enabled = p.feature_enabled;
+            s.feature_data = p.feature_data;
+            r.flag()?
+        }
+    };
+    if update_data {
+        for segment in 0..MAX_SEGMENTS {
+            for feature in 0..SEG_LVL_MAX {
+                let enabled = r.flag()?;
+                s.feature_enabled[segment][feature] = enabled;
+                let bits = SEGMENTATION_FEATURE_BITS[feature];
+                let limit = SEGMENTATION_FEATURE_MAX[feature];
+                s.feature_data[segment][feature] =
+                    match (enabled, SEGMENTATION_FEATURE_SIGNED[feature]) {
+                        (false, _) => 0,
+                        (true, true) => (r.su(1 + bits)? as i16).clamp(-limit, limit),
+                        (true, false) => (r.f(bits)? as i16).clamp(0, limit),
+                    };
+            }
+        }
+    }
     for segment in 0..MAX_SEGMENTS {
         for feature in 0..SEG_LVL_MAX {
-            if !r.flag()? {
-                continue;
-            }
-            s.feature_enabled[segment][feature] = true;
-            let bits = SEGMENTATION_FEATURE_BITS[feature];
-            let limit = SEGMENTATION_FEATURE_MAX[feature];
-            s.feature_data[segment][feature] = if SEGMENTATION_FEATURE_SIGNED[feature] {
-                (r.su(1 + bits)? as i16).clamp(-limit, limit)
-            } else {
-                (r.f(bits)? as i16).clamp(0, limit)
-            };
-            s.last_active_seg_id = segment as u8;
-            if feature >= SEG_LVL_REF_FRAME {
-                s.seg_id_pre_skip = true;
+            if s.feature_enabled[segment][feature] {
+                s.last_active_seg_id = segment as u8;
+                s.seg_id_pre_skip |= feature >= SEG_LVL_REF_FRAME;
             }
         }
     }
     Ok(s)
 }
 
-/// `loop_filter_params()` (§5.9.11), when the filter may be used.
-fn loop_filter_params(r: &mut BitReader<'_>, num_planes: usize) -> Result<LoopFilter, Error> {
+/// `loop_filter_params()` (§5.9.11), when the filter may be used; the deltas start from those
+/// of the primary reference frame, `prev`.
+fn loop_filter_params(
+    r: &mut BitReader<'_>,
+    num_planes: usize,
+    prev: Option<&LoopFilter>,
+) -> Result<LoopFilter, Error> {
     let mut lf = LoopFilter {
         level: [r.f(6)? as u8, r.f(6)? as u8, 0, 0],
         sharpness: 0,
         delta_enabled: false,
-        ref_deltas: DEFAULT_REF_DELTAS,
-        mode_deltas: [0; 2],
+        ref_deltas: prev.map_or(DEFAULT_REF_DELTAS, |p| p.ref_deltas),
+        mode_deltas: prev.map_or([0; 2], |p| p.mode_deltas),
     };
     if num_planes > 1 && (lf.level[0] != 0 || lf.level[1] != 0) {
         lf.level[2] = r.f(6)? as u8;
@@ -811,16 +1264,27 @@ fn lr_params(
     Ok(lr)
 }
 
-/// `film_grain_params()` (§5.9.30) of an intra frame: `None` when grain is not applied.
+/// `film_grain_params()` (§5.9.30): `None` when grain is not applied.
 fn film_grain_params(
     r: &mut BitReader<'_>,
     seq: &SequenceHeader,
+    frame_type: FrameType,
+    refs: &RefHeaders,
 ) -> Result<Option<FilmGrain>, Error> {
     if !r.flag()? {
         return Ok(None); // apply_grain
     }
     let grain_seed = r.f(16)? as u16;
-    // Intra frames always carry new parameters (update_grain = 1).
+    if frame_type == FrameType::Inter && !r.flag()? {
+        // update_grain = 0: load_grain_params(film_grain_params_ref_idx), with this seed.
+        let idx = r.f(3)? as usize;
+        let mut grain = refs[idx]
+            .as_ref()
+            .and_then(|h| h.film_grain.clone())
+            .ok_or(Error::Invalid("film grain from a reference without grain"))?;
+        grain.grain_seed = grain_seed;
+        return Ok(Some(grain));
+    }
     let points = |r: &mut BitReader<'_>, max: u32| -> Result<Vec<(u8, u8)>, Error> {
         let n = r.f(4)?;
         if n > max {
@@ -1191,21 +1655,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unsupported_and_invalid_frames() {
+    fn invalid_frames() {
         let seq = full_sequence();
         let parse = |fields: &[(u32, u32)]| FrameHeader::parse(&header_obu(&pack(fields)), &seq);
+        // Frames that need reference slots, which are empty here.
         assert_eq!(
-            parse(&[(1, 1), (0, 3)]),
-            Err(Error::Unsupported("show_existing_frame"))
+            parse(&[(1, 1), (0, 3), (1, 1)]),
+            Err(Error::Invalid("shows an empty reference slot"))
         );
-        assert_eq!(
-            parse(&[(0, 1), (1, 2)]),
-            Err(Error::Unsupported("inter frames"))
-        );
-        assert_eq!(
-            parse(&[(0, 1), (3, 2)]),
-            Err(Error::Unsupported("inter frames"))
-        );
+        for frame_type in [1, 3] {
+            let mut fields = vec![(0, 1), (frame_type, 2)];
+            fields.extend([(0, 32); 4]);
+            assert_eq!(
+                parse(&fields),
+                Err(Error::Invalid("reference to an empty slot"))
+            );
+        }
         // A hidden key frame that is wider than the sequence allows.
         let hidden_key = [
             (0, 1), // show_existing_frame
