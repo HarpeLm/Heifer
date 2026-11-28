@@ -412,6 +412,63 @@ impl HevcConfig {
     }
 }
 
+/// `av1C`: AV1 codec configuration (AV1 Codec ISO Media File Format Binding §2.3).
+///
+/// Not a [`Property`] variant: [`HeifFile::av1_config`](crate::HeifFile::av1_config) parses it
+/// from the raw property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Av1Config {
+    /// `seq_profile` (0 = Main, 1 = High, 2 = Professional).
+    pub profile: u8,
+    /// `seq_level_idx_0`.
+    pub level_idx: u8,
+    /// `seq_tier_0`.
+    pub tier: u8,
+    /// Bits per sample: 8, 10 or 12.
+    pub bit_depth: u8,
+    /// Whether the image has luma only.
+    pub monochrome: bool,
+    /// Horizontal chroma subsampling (`true` for 4:2:0 and 4:2:2).
+    pub subsampling_x: bool,
+    /// Vertical chroma subsampling (`true` for 4:2:0).
+    pub subsampling_y: bool,
+    /// `chroma_sample_position` (0 = unknown, 1 = vertical, 2 = colocated).
+    pub chroma_sample_position: u8,
+    /// `configOBUs`: OBUs (normally a sequence header) to decode before the item data.
+    pub config_obus: Vec<u8>,
+}
+
+impl Av1Config {
+    /// Parses the content of an `av1C` box.
+    pub fn parse(content: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(content);
+        if r.u8()? != 0x81 {
+            return Err(invalid(b"av1C", "marker must be 1 and version 1"));
+        }
+        let b = r.u8()?;
+        let (profile, level_idx) = (b >> 5, b & 0x1F);
+        let b = r.u8()?;
+        let (high_bitdepth, twelve_bit) = (b & 0x40 != 0, b & 0x20 != 0);
+        r.u8()?; // initial_presentation_delay
+        Ok(Self {
+            profile,
+            level_idx,
+            tier: b >> 7,
+            bit_depth: match (high_bitdepth, twelve_bit) {
+                (false, _) => 8,
+                (true, false) => 10,
+                (true, true) => 12,
+            },
+            monochrome: b & 0x10 != 0,
+            subsampling_x: b & 0x08 != 0,
+            subsampling_y: b & 0x04 != 0,
+            chroma_sample_position: b & 0x03,
+            config_obus: r.rest().to_vec(),
+        })
+    }
+}
+
 /// `colr`: colour information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColorInfo {
@@ -1041,6 +1098,21 @@ mod tests {
         );
         let g = Grid::parse(&[0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2]).unwrap();
         assert_eq!((g.output_width, g.output_height), (65536, 2));
+    }
+
+    #[test]
+    fn av1c_is_parsed() {
+        // Main profile, level 8 (4.0), 10-bit 4:2:0, then a 2-byte config OBU.
+        let c = Av1Config::parse(&[0x81, 0x08, 0x4C, 0x00, 0x0A, 0x0B]).unwrap();
+        assert_eq!((c.profile, c.level_idx, c.tier, c.bit_depth), (0, 8, 0, 10));
+        assert!(!c.monochrome && c.subsampling_x && c.subsampling_y);
+        assert_eq!(c.config_obus, [0x0A, 0x0B]);
+        // Professional profile, 12-bit monochrome, high tier.
+        let c = Av1Config::parse(&[0x81, 0x40, 0xF0, 0x00]).unwrap();
+        assert_eq!((c.profile, c.tier, c.bit_depth), (2, 1, 12));
+        assert!(c.monochrome && c.config_obus.is_empty());
+        assert!(Av1Config::parse(&[0x01, 0, 0, 0]).is_err());
+        assert!(Av1Config::parse(&[0x81, 0]).is_err());
     }
 
     #[test]

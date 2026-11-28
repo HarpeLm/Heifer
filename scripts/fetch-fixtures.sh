@@ -42,3 +42,13 @@ for name in uncompressed_comp_RGB uncompressed_comp_RGB_tiled uncompressed_pix_R
             uncompressed_comp_M uncompressed_comp_B16R16G16 uncompressed_comp_YUV_420; do
   fetch "$LIBHEIF_UNCOMPRESSED/$name.heif" "real/libheif__$name.heif"
 done
+# AVIF test files from AOMediaCodec/av1-avif (BSD-2-Clause), for reading AVIF container info.
+AVIF=https://raw.githubusercontent.com/AOMediaCodec/av1-avif/bf4c18d1f3971069b75e87d6ee469790589f4f09/testFiles
+mkdir -p avif
+for name in fox.profile0.8bpc.yuv420 fox.profile0.10bpc.yuv420.monochrome fox.profile1.8bpc.yuv444 \
+            fox.profile2.12bpc.yuv422.odd-width; do
+  fetch "$AVIF/Link-U/$name.avif" "avif/$name.avif"
+done
+for name in Summer_in_Tomsk_720p_5x4_grid bbb_alpha_inverted Ronda_rotate90 reduced_still_picture_header; do
+  fetch "$AVIF/Microsoft/$name.avif" "avif/$name.avif"
+done

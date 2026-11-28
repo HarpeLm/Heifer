@@ -275,6 +275,8 @@ pub enum FileKind {
     Heif,
     /// Image sequence (`.heics` or MP4/HEIF file with a sequence track).
     Sequence,
+    /// AV1-coded still image (`avif` brand). Its info is read; decoding is not supported yet.
+    Avif,
 }
 
 impl FileKind {
@@ -284,6 +286,7 @@ impl FileKind {
             Self::Heic => "heic",
             Self::Heif => "heif",
             Self::Sequence => "heics",
+            Self::Avif => "avif",
         }
     }
 
@@ -293,6 +296,7 @@ impl FileKind {
             Self::Heic => "image/heic",
             Self::Heif => "image/heif",
             Self::Sequence => "image/heic-sequence",
+            Self::Avif => "image/avif",
         }
     }
 }
@@ -309,7 +313,8 @@ pub struct ImageInfo {
     pub bit_depth: u8,
     /// Whether the image carries an alpha channel or transparency.
     pub has_alpha: bool,
-    /// Container kind ([`FileKind::Heic`], [`FileKind::Heif`], or [`FileKind::Sequence`]).
+    /// Container kind ([`FileKind::Heic`], [`FileKind::Heif`], [`FileKind::Sequence`] or
+    /// [`FileKind::Avif`]).
     pub kind: FileKind,
     /// Major brand from the `ftyp` box (e.g. `heic`, `mif1`, `msf1`).
     pub major_brand: FourCC,
@@ -327,6 +332,8 @@ pub(crate) fn classify_file_kind(major_brand: FourCC, has_sequence: bool) -> Fil
         FileKind::Sequence
     } else if matches!(&major_brand.0, b"heic" | b"heix") {
         FileKind::Heic
+    } else if &major_brand.0 == b"avif" {
+        FileKind::Avif
     } else {
         FileKind::Heif
     }
@@ -449,7 +456,7 @@ fn item_has_alpha(file: &HeifFile<'_>, id: ItemId, depth: u32) -> Result<bool, E
         return Ok(true);
     }
     match &item.item_type.0 {
-        b"hvc1" => Ok(false),
+        b"hvc1" | b"av01" => Ok(false),
         b"unci" => Ok(uncompressed::info(file, id)?.3),
         b"grid" => {
             for &tile in file.referenced_items(id, b"dimg") {
@@ -498,6 +505,21 @@ fn hvc1_info(file: &HeifFile<'_>, id: ItemId) -> Result<(u32, u32, u8, bool), Er
     Ok((width, height, bit_depth, has_alpha))
 }
 
+/// Size and bit depth of an AV1 item, from `ispe` and `av1C` (alpha comes from its auxiliary
+/// item, checked by the caller).
+fn av01_info(file: &HeifFile<'_>, id: ItemId) -> Result<(u32, u32, u8, bool), Error> {
+    let config = file
+        .av1_config(id)?
+        .ok_or(heifer_isobmff::Error::MissingBox(FourCC(*b"av1C")))?;
+    let (width, height) = file
+        .image_size(id)?
+        .ok_or(Error::Invalid("image has no size"))?;
+    if width == 0 || height == 0 {
+        return Err(Error::Invalid("image size is zero or too large"));
+    }
+    Ok((width, height, config.bit_depth, false))
+}
+
 fn item_core_info(
     file: &HeifFile<'_>,
     id: ItemId,
@@ -509,6 +531,7 @@ fn item_core_info(
     let item = file.item(id)?;
     let (mut w, mut h, bit_depth, mut has_alpha) = match &item.item_type.0 {
         b"hvc1" => hvc1_info(file, id)?,
+        b"av01" => av01_info(file, id)?,
         b"unci" => uncompressed::info(file, id)?,
         b"grid" => {
             let grid = file.grid(id)?;

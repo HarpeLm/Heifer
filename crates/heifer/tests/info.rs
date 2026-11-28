@@ -265,3 +265,92 @@ fn read_info_clamps_oversized_ispe_to_sps() {
         (64, 64, 8, false)
     );
 }
+
+fn avif_fixture(name: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/avif")
+        .join(name);
+    let bytes = std::fs::read(path).ok();
+    if bytes.is_none() {
+        eprintln!("skipping {name}: run scripts/fetch-fixtures.sh");
+    }
+    bytes
+}
+
+#[test]
+fn read_info_describes_avif_files() {
+    // AOMediaCodec/av1-avif test files: name, displayed size, bit depth, alpha, item type.
+    for (name, size, bit_depth, alpha, item_type) in [
+        (
+            "fox.profile0.8bpc.yuv420.avif",
+            (1204, 800),
+            8,
+            false,
+            b"av01",
+        ),
+        (
+            "fox.profile0.10bpc.yuv420.monochrome.avif",
+            (1204, 800),
+            10,
+            false,
+            b"av01",
+        ),
+        (
+            "fox.profile1.8bpc.yuv444.avif",
+            (1204, 800),
+            8,
+            false,
+            b"av01",
+        ),
+        (
+            "fox.profile2.12bpc.yuv422.odd-width.avif",
+            (1203, 800),
+            12,
+            false,
+            b"av01",
+        ),
+        (
+            "reduced_still_picture_header.avif",
+            (1280, 720),
+            8,
+            false,
+            b"av01",
+        ),
+        // `irot` turns the 1920×1080 picture upright.
+        ("Ronda_rotate90.avif", (1080, 1920), 8, false, b"av01"),
+        ("bbb_alpha_inverted.avif", (3840, 2160), 8, true, b"av01"),
+        (
+            "Summer_in_Tomsk_720p_5x4_grid.avif",
+            (6400, 2880),
+            8,
+            false,
+            b"grid",
+        ),
+    ] {
+        let Some(bytes) = avif_fixture(name) else {
+            continue;
+        };
+        let info = read_info(&bytes).unwrap();
+        assert_eq!((info.width, info.height), size, "{name}");
+        assert_eq!(info.bit_depth, bit_depth, "{name}");
+        assert_eq!(info.has_alpha, alpha, "{name}");
+        assert_eq!(&info.item_type.0, item_type, "{name}");
+        assert_eq!(info.kind, FileKind::Avif, "{name}");
+        assert_eq!(
+            (info.kind.as_str(), info.kind.mime_type()),
+            ("avif", "image/avif")
+        );
+        assert!(info.has_primary_image && !info.has_sequence, "{name}");
+        assert_eq!(
+            info,
+            read_info_reader(Cursor::new(&bytes)).unwrap(),
+            "{name}"
+        );
+        // Decoding is not supported yet, and says so instead of failing in another way.
+        assert!(
+            matches!(heifer::decode(&bytes), Err(heifer::Error::Unsupported(_))),
+            "{name}: {:?}",
+            heifer::decode(&bytes).err()
+        );
+    }
+}

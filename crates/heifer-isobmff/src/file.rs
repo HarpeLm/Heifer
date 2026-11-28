@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 
 use crate::boxes::{
-    self, ComponentDescriptions, ConstructionMethod, FileType, Grid, HevcConfig, ItemLocation,
-    ItemReference, Property, PropertyAssociation, UncompressedConfig,
+    self, Av1Config, ComponentDescriptions, ConstructionMethod, FileType, Grid, HevcConfig,
+    ItemLocation, ItemReference, Property, PropertyAssociation, UncompressedConfig,
 };
 use crate::{BoxIter, Error, FourCC};
 
@@ -209,6 +209,17 @@ impl<'a> HeifFile<'a> {
             Property::HevcConfig(c) => Some(c),
             _ => None,
         }))
+    }
+
+    /// AV1 codec configuration from the `av1C` property (AVIF).
+    pub fn av1_config(&self, id: ItemId) -> Result<Option<Av1Config>, Error> {
+        self.item_properties(id)?
+            .find_map(|p| match p {
+                Property::Unknown(FourCC([b'a', b'v', b'1', b'C']), data) => Some(data),
+                _ => None,
+            })
+            .map(|data| Av1Config::parse(data))
+            .transpose()
     }
 
     /// Uncompressed frame configuration from the `uncC` property (ISO/IEC 23001-17).

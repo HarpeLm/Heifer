@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**New APIs**
+
+- AVIF files are described without decoding: `read_info` and `read_info_reader` give the size
+  (after `clap`, `irot` and `imir`), bit depth and alpha of `av01` items and grids of them, and
+  the new `FileKind::Avif` (`"avif"`, `"image/avif"`). Decoding AVIF is not supported yet and
+  returns `Error::Unsupported`. Checked on all 172 files of the AOMediaCodec/av1-avif test set.
+- `heifer-isobmff`: new `Av1Config` (the `av1C` box) and `HeifFile::av1_config`.
+
 ## 0.9.0 — 2026-11-27
 
 Bounded-memory tile-by-tile preview decoding (`decode_preview_rgba8` / `decode_reader_preview_rgba8`),
